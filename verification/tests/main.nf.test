@@ -1,0 +1,181 @@
+nextflow_pipeline {
+
+    name "verification parity workflow"
+    script "../main.nf"
+
+    test("hap.py vs hap-rs parity across every selected samplesheet row") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                // nf-test exposes only parameters declared in this block to
+                // the `then` closure; values inherited solely from
+                // nextflow.config run the workflow but are not available to
+                // the assertions below.  Declare the matrix contract here so
+                // coverage is checked against the exact inputs that were run.
+                cases = System.getenv('HAP_TEST_CASES') ?: 'happy,sompy,prepy,ftxpy,qfy,vcfcheck'
+                happy_samplesheet = new File('assets/samplesheet.happy.csv').canonicalPath
+                sompy_samplesheet = new File('assets/samplesheet.sompy.csv').canonicalPath
+                prepy_samplesheet = new File('assets/samplesheet.prepy.csv').canonicalPath
+                ftxpy_samplesheet = new File('assets/samplesheet.ftxpy.csv').canonicalPath
+                qfy_samplesheet = new File('assets/samplesheet.qfy.csv').canonicalPath
+                vcfcheck_samplesheet = new File('assets/samplesheet.vcfcheck.csv').canonicalPath
+            }
+        }
+
+        then {
+            // DIFF_OUTPUTS is the single comparison authority. It invokes
+            // the staged Rust verifier and publishes one status.json per
+            // case/sample.  This test validates those verdicts plus complete
+            // samplesheet coverage; it does not maintain a second, weaker
+            // implementation of the file-format rules in Groovy.
+            def caseSamplesheets = [
+                happy: params.happy_samplesheet,
+                sompy: params.sompy_samplesheet,
+                prepy: params.prepy_samplesheet,
+                ftxpy: params.ftxpy_samplesheet,
+                qfy: params.qfy_samplesheet,
+                vcfcheck: params.vcfcheck_samplesheet,
+            ]
+            def selectedCases = params.cases.toString()
+                .tokenize(',')
+                .collect { it.trim() }
+                .findAll { it }
+
+            def coverageFailures = []
+            def parityFailures = []
+            def checked = 0
+
+            selectedCases.each { caseName ->
+                if (!caseSamplesheets.containsKey(caseName)) {
+                    coverageFailures << "$caseName (selected case has no samplesheet contract)"
+                    return
+                }
+
+                def samplesheet = new File(caseSamplesheets[caseName].toString())
+                if (!samplesheet.isFile()) {
+                    coverageFailures << "$caseName (samplesheet absent: $samplesheet)"
+                    return
+                }
+
+                // sample_id is the first CSV column. Quoted IDs are accepted;
+                // embedded commas are decoded without needing a Groovy CSV
+                // dependency in the nf-test runtime.
+                def sampleIds = samplesheet.readLines('UTF-8')
+                    .drop(1)
+                    .findAll { it.trim() && !it.trim().startsWith('#') }
+                    .collect { line ->
+                        if (!line.startsWith('"')) {
+                            return line.split(',', 2)[0].trim()
+                        }
+                        def value = new StringBuilder()
+                        def offset = 1
+                        while (offset < line.length()) {
+                            def character = line.charAt(offset)
+                            if (character == '"' && offset + 1 < line.length() && line.charAt(offset + 1) == '"') {
+                                value.append('"')
+                                offset += 2
+                            } else if (character == '"') {
+                                break
+                            } else {
+                                value.append(character)
+                                offset++
+                            }
+                        }
+                        return value.toString()
+                    }
+
+                def duplicateIds = sampleIds.groupBy { it }
+                    .findAll { _id, occurrences -> occurrences.size() > 1 }
+                    .keySet()
+                    .sort()
+                if (!duplicateIds.isEmpty()) {
+                    coverageFailures << "$caseName (duplicate sample_id values: ${duplicateIds.join(', ')})"
+                }
+
+                def expectedIds = sampleIds.toSet()
+                def caseRoot = new File("$outputDir/$caseName")
+                if (!caseRoot.isDirectory()) {
+                    coverageFailures << "$caseName (case directory not published)"
+                    return
+                }
+                def actualIds = caseRoot.listFiles()
+                    .findAll { it.isDirectory() && !it.name.startsWith('.') }
+                    .collect { it.name }
+                    .toSet()
+
+                (expectedIds - actualIds).sort().each { sampleId ->
+                    coverageFailures << "$caseName:$sampleId (samplesheet row was not published)"
+                }
+                (actualIds - expectedIds).sort().each { sampleId ->
+                    coverageFailures << "$caseName:$sampleId (published without a samplesheet row)"
+                }
+
+                expectedIds.intersect(actualIds).sort().each { sampleId ->
+                    checked++
+                    def sampleDir = new File(caseRoot, sampleId)
+                    def legacyDir = new File(sampleDir, 'legacy')
+                    def rustDir = new File(sampleDir, 'rust')
+                    def statusFile = new File(sampleDir, 'status.json')
+                    def diffFile = new File(sampleDir, 'diff.log')
+                    if (!legacyDir.isDirectory() || !rustDir.isDirectory()) {
+                        coverageFailures << "$caseName:$sampleId (legacy/rust output directory absent)"
+                        return
+                    }
+                    if (!statusFile.isFile() || !diffFile.isFile()) {
+                        coverageFailures << "$caseName:$sampleId (comparator status or diff absent)"
+                        return
+                    }
+
+                    def status
+                    try {
+                        status = new groovy.json.JsonSlurper().parse(statusFile)
+                    } catch (Exception error) {
+                        coverageFailures << "$caseName:$sampleId (invalid status.json: ${error.message})"
+                        return
+                    }
+                    if (status.case != caseName || status.sample != sampleId) {
+                        coverageFailures << "$caseName:$sampleId (status identity case=${status.case}, sample=${status.sample})"
+                    }
+                    if (!(status.files instanceof List) || status.total != status.files.size() || status.total < 1) {
+                        coverageFailures << "$caseName:$sampleId (empty or internally inconsistent comparator status)"
+                        return
+                    }
+
+                    // Guard against a stale/incomplete status payload: its
+                    // artifact names must cover the symmetric union currently
+                    // published under legacy/ and rust/.
+                    def publishedNames = (legacyDir.listFiles() + rustDir.listFiles())
+                        .findAll { it.isFile() && it.name.startsWith('result') }
+                        .collect { it.name }
+                        .toSet()
+                    def statusNames = status.files
+                        .collect { it.name }
+                        .findAll { it != '<artifact-set>' }
+                        .toSet()
+                    if (publishedNames != statusNames) {
+                        coverageFailures << "$caseName:$sampleId (status artifact set differs from published union)"
+                    }
+
+                    def failedFiles = status.files.findAll { !it.ok }
+                    if (status.failed != failedFiles.size()) {
+                        coverageFailures << "$caseName:$sampleId (status failed count is inconsistent)"
+                    }
+                    if (!failedFiles.isEmpty()) {
+                        def details = failedFiles.collect { "${it.name}: ${it.reason}" }.join('; ')
+                        parityFailures << "$caseName:$sampleId ($details)"
+                    }
+                }
+            }
+
+            assert coverageFailures.isEmpty() :
+                "${coverageFailures.size()} coverage/contract failure(s):\n  " + coverageFailures.join('\n  ')
+            assert checked > 0 : 'no selected samplesheet rows were checked'
+            assert parityFailures.isEmpty() :
+                "${parityFailures.size()} case/sample parity failure(s):\n  " + parityFailures.join('\n  ')
+            assert path("$outputDir/report.md").exists()
+            assert path("$outputDir/report.csv").exists()
+            assert workflow.success
+        }
+    }
+}

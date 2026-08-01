@@ -1,0 +1,57 @@
+[package]
+name = "hap-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A compact, pure-Rust implementation of Illumina hap.py"
+license-file = "LICENSE.txt"
+repository = "https://github.com/Illumina/hap.py"
+homepage = "https://github.com/Illumina/hap.py"
+readme = "README.md"
+default-run = "hap"
+autobins = false
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE.txt",
+    "/README.md",
+    "/rust/src/**",
+    "/rust/FLAG_PARITY.md",
+    "/rust/PHASE1_BASELINE.md",
+    "/tests/**",
+]
+
+[features]
+default = []
+verification = []
+
+[lib]
+path = "rust/src/lib.rs"
+
+[[bin]]
+name = "hap"
+path = "rust/src/main.rs"
+
+[[bin]]
+name = "verify-fixtures"
+path = "rust/src/verify_fixtures.rs"
+required-features = ["verification"]
+
+[[test]]
+name = "compare_fixtures"
+path = "tests/compare_fixtures.rs"
+required-features = ["verification"]
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.53", features = ["derive"] }
+flate2 = "1.1.5"
+noodles-bgzf = "0.46.0"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

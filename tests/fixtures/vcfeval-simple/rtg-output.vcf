@@ -1,0 +1,11 @@
+##fileformat=VCFv4.2
+##FILTER=<ID=PASS,Description="All filters passed">
+##contig=<ID=chr1,length=16>
+##INFO=<ID=BS,Number=.,Type=Integer,Description="Benchmarking superlocus ID for these variants">
+##INFO=<ID=CALL_WEIGHT,Number=1,Type=Float,Description="Call weight (equivalent number of truth variants). When unspecified, assume 1.0">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=BD,Number=1,Type=String,Description="Decision for call (TP/FP/FN/N)">
+##FORMAT=<ID=BK,Number=1,Type=String,Description="Sub-type for decision (match/mismatch type). (Loose match distance is 30)">
+##FORMAT=<ID=QQ,Number=1,Type=Float,Description="Variant quality for ROC creation">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TRUTH	QUERY
+chr1	5	.	G	T	.	.	BS=5	GT:BD:BK:QQ	1/1:TP:gm:60	1/1:TP:gm:60

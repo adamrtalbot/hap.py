@@ -1,0 +1,15 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrT,length=80>
+##FILTER=<ID=LowQ,Description="Low quality">
+##INFO=<ID=TAG,Number=1,Type=String,Description="Test annotation">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth">
+##FORMAT=<ID=GQ,Number=1,Type=Float,Description="Genotype quality">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+##FORMAT=<ID=TXT,Number=1,Type=String,Description="Text value">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TUMOR	NORMAL
+chrT	11	multi	C	T,G	50	PASS	TAG=multi	GT:DP:GQ:AD:TXT	1/2:30:42.5:10,11,9:tumor	0/1:28:40:14,14,0:normal
+chrT	21	called_nonref	G	A,<NON_REF>	40	PASS	TAG=drop	GT:DP:GQ:AD:TXT	0/2:20:30:12,0,8:drop	0/0:18:35:18,0,0:keep
+chrT	31	unused_nonref	T	C,<NON_REF>	30	LowQ	TAG=retain	GT:DP:GQ:AD:TXT	0/1:15:20:7,8,0:variant	0/0:16:25:16,0,0:normal
+chrT	41	block	A	<NON_REF>	.	PASS	END=50;TAG=block	GT:DP:GQ:AD:TXT	0/0:12:18:12,0:block	0/0:14:22:14,0:block

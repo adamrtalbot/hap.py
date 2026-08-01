@@ -1,0 +1,14 @@
+##fileformat=VCFv4.1
+##contig=<ID=chr1,length=100>
+##MaxDepth_chr1=100
+##INFO=<ID=NT,Number=1,Type=String,Description="Genotype of normal in all data tiers">
+##INFO=<ID=QSS_NT,Number=1,Type=Integer,Description="Joint quality score">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+##FORMAT=<ID=FDP,Number=1,Type=Integer,Description="Filtered basecall depth">
+##FORMAT=<ID=SDP,Number=1,Type=Integer,Description="Spanning deletion read depth">
+##FORMAT=<ID=AU,Number=2,Type=Integer,Description="A allelic depths">
+##FORMAT=<ID=CU,Number=2,Type=Integer,Description="C allelic depths">
+##FORMAT=<ID=GU,Number=2,Type=Integer,Description="G allelic depths">
+##FORMAT=<ID=TU,Number=2,Type=Integer,Description="T allelic depths">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NORMAL	TUMOR
+chr1	7	.	A	C	.	PASS	NT=ref;QSS_NT=10	DP:FDP:SDP:AU:CU:GU:TU	9:0:0:9,9:0,0:0,0:0,0	18:0:0:0,0:18,18:0,0:0,0

@@ -1,0 +1,13 @@
+sample_id,truth_vcf,query_vcf,reference,fp_bed,args
+chr21,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,
+chr21_passonly,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--pass-only
+chr21_region,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,-l chr21:15000000-20000000
+chr21_passonly_region,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--pass-only -l chr21:15000000-20000000
+chr21_artifact_controls,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--no-roc --no-write-counts --no-json -l chr21:15000000-20000000
+chr21_unhappy,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--unhappy -l chr21:15000000-20000000
+chr21_scmp_somatic,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--engine scmp-somatic -l chr21:15000000-20000000
+synthetic_scmp_distance,local:assets/scmp_distance/truth.vcf,local:assets/scmp_distance/query.vcf,local:assets/scmp_distance/ref.fa,local:assets/scmp_distance/confident.bed.gz,--engine scmp-distance --scmp-distance 30 --set-gt half --no-leftshift -D
+chr21_xcmp_controls,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--window-size 75 --xcmp-enumeration-threshold 8192 --xcmp-expand-hapblocks 45 -l chr21:15000000-20000000
+chr21_preprocess_controls,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--preprocess-truth --preprocessing-window-size 4096 --no-adjust-conf-regions -l chr21:15000000-20000000
+chr21_filtered_truth,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--usefiltered-truth -l chr21:15000000-20000000
+chr21_output_metadata,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--output-vtc --preserve-info -l chr21:15000000-20000000

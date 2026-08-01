@@ -1,0 +1,14 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=29>
+##FILTER=<ID=PASS,Description="All filters passed">
+##INFO=<ID=BS,Number=1,Type=Integer,Description="Benchmarking superlocus">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=BD,Number=1,Type=String,Description="Decision">
+##FORMAT=<ID=BK,Number=1,Type=String,Description="Decision subtype">
+##FORMAT=<ID=QQ,Number=1,Type=Float,Description="ROC quality">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TRUTH	QUERY
+chr1	2	.	A	G,AT	50	PASS	BS=2	GT:BD:BK:QQ	0/2:TP:gm:40	1/2:TP:am:35
+chr1	5	.	C	T	45	PASS	BS=5	GT:BD:BK:QQ	0/0:N:.:.	./.:N:.:.
+chr1	8	.	CGCG	CTCT	30	PASS	BS=8	GT:BD:BK:QQ	0/1:TP:gm:25	0/1:TP:gm:20
+chr1	15	.	CAA	C	20	PASS	BS=15	GT:BD:BK:QQ	0/1:FN:.:15	./.:N:.:.
+chr1	19	.	G	A	10	PASS	BS=19	GT:BD:BK:QQ	./.:N:.:.	0/1:FP:.:10

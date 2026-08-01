@@ -1,0 +1,126 @@
+name: rust-ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --release --all-targets --all-features
+
+      - name: Build release binary
+        run: cargo build --release --bin hap
+
+      - name: Verify single-binary package installation
+        run: |
+          cargo package --locked
+          cargo install --locked --path . --root "$RUNNER_TEMP/hap-install" --bin hap
+          "$RUNNER_TEMP/hap-install/bin/hap" --version
+          test ! -e "$RUNNER_TEMP/hap-install/bin/verify-fixtures"
+
+      - name: Verify Rust outputs against saved fixture outputs
+        run: cargo run --release --features verification --bin verify-fixtures -- check-rust
+
+  fixture-verification:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Docker
+        run: docker info
+
+      - name: Verify legacy container outputs against saved fixture outputs
+        run: >-
+          cargo run --release --features verification --bin verify-fixtures -- check-legacy
+          --image community.wave.seqera.io/library/hap.py_rtg-tools@sha256:1562a301d591cb42e4465465b579a68fc84429b8ed7c7cbda7f728f2e0a57be6
+
+      - name: Upload verification outputs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixture-verification-output
+          path: target/verification
+
+  nextflow-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      HAP_BIN: ${{ github.workspace }}/target/release/hap
+      VERIFY_BIN: ${{ github.workspace }}/target/release/verify-fixtures
+      NXF_SYNTAX_PARSER: v2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install indexed-VCF query tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tabix
+
+      - name: Install pinned Nextflow and nf-test
+        env:
+          NXF_VER: 26.04.6
+        run: |
+          mkdir -p "$RUNNER_TEMP/hap-tools"
+          cd "$RUNNER_TEMP/hap-tools"
+          curl -fsSL https://get.nextflow.io | bash
+          curl -fsSL https://get.nf-test.com | bash -s 0.9.5
+          chmod 0755 nextflow nf-test
+          echo "$RUNNER_TEMP/hap-tools" >> "$GITHUB_PATH"
+
+      - name: Verify pinned evaluation toolchain
+        run: |
+          nextflow -version | grep 'version 26.04.6'
+          nf-test version | grep 'nf-test 0.9.5'
+
+      - name: Build release binaries
+        run: cargo build --release --features verification --bin hap --bin verify-fixtures
+
+      - name: Validate Nextflow 26.04 syntax
+        run: nextflow run verification/main.nf -preview
+
+      - name: Run direct legacy-to-Rust parity matrix
+        working-directory: verification
+        run: nf-test test --ci --verbose
+
+      - name: Upload parity evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextflow-parity-output
+          path: |
+            verification/.nf-test.log
+            verification/.nf-test/tests/*/meta
+            verification/.nf-test/tests/*/output

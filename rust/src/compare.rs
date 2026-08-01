@@ -1,12 +1,86 @@
-use crate::cli::{CompareArgs, PreprocessArgs};
+use crate::cli::{CompareArgs, CompareEngine, PreprocessArgs};
 use crate::fasta;
 use crate::metrics_json;
+use crate::partial_credit;
 use crate::preprocess;
 use crate::report::{self, CountsBucket};
-use crate::vcf::{self, Variant, VariantKey};
+use crate::vcf::{self, RawVcfRecord, Variant, VariantKey};
 use anyhow::{Context, Result, bail};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
+
+struct ScratchRun {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl ScratchRun {
+    fn create(parent: &Path, keep: bool) -> Result<Self> {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create scratch parent {}", parent.display()))?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+
+        for _ in 0..128 {
+            let id = SCRATCH_RUN_ID.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                "hap-compare-{}-{timestamp}-{id}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path, keep }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to create scratch run directory {}", path.display())
+                    });
+                }
+            }
+        }
+
+        bail!(
+            "failed to allocate a unique scratch run directory under {}",
+            parent.display()
+        )
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(mut self) -> Result<()> {
+        if self.keep {
+            return Ok(());
+        }
+        fs::remove_dir_all(&self.path).with_context(|| {
+            format!(
+                "failed to remove scratch run directory {}",
+                self.path.display()
+            )
+        })?;
+        self.keep = true;
+        Ok(())
+    }
+}
+
+impl Drop for ScratchRun {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct TypeCounts {
@@ -34,6 +108,33 @@ pub struct AnnotatedRow {
     /// `Some("al")` when the allele itself doesn't match any truth at the
     /// same locus. `None` for non-FP rows.
     pub fp_class: Option<&'static str>,
+    /// Legacy xcmp annotates every record in a superlocus with the result of
+    /// the block-level comparison. Kept out-of-band until final decoration so
+    /// ordinary (clean-INFO) output remains unchanged.
+    pub xcmp_ctype: Option<&'static str>,
+    pub xcmp_hap_match: bool,
+}
+
+/// Append one of the legacy report suffixes without treating a dotted report
+/// prefix as a filename extension.
+pub(crate) fn suffixed_report_path(prefix: &Path, suffix: &str) -> PathBuf {
+    let mut path = prefix.as_os_str().to_os_string();
+    path.push(".");
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+struct ComparisonOutputs<'a> {
+    counts: &'a mut BTreeMap<String, TypeCounts>,
+    subtype_counts: &'a mut BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    rows: &'a mut Vec<AnnotatedRow>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ComparisonConfig {
+    no_hc: bool,
+    max_enum: usize,
+    hb_expand: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -57,12 +158,14 @@ struct Entry {
     variant: Variant,
 }
 
+#[cfg(test)]
 const CLUSTER_GAP_BP: usize = 50;
 
 /// Matches legacy hap.py's `--xcmp-enumeration-threshold` default. Beyond this
 /// number of haplotype-assignment states we stop enumerating and treat the
 /// cluster as a mismatch. Without the cap a dense cluster of ~30 het variants
 /// explodes to 2^30 × two `Vec<Event>` allocations — hundreds of GB of RAM.
+#[cfg(test)]
 const XCMP_ENUMERATION_THRESHOLD: usize = 16_768;
 
 /// Upper bound on variants admitted to a single cluster. Once exceeded we
@@ -75,6 +178,12 @@ const XCMP_ENUMERATION_THRESHOLD: usize = 16_768;
 /// 50 bp gaps). The `estimated_state_count` threshold still short-circuits
 /// `cluster_signature` on clusters that would blow up haplotype enumeration.
 const MAX_CLUSTER_VARIANTS: usize = 10_000;
+
+/// Window applied to `cluster_start` when bounding per-primitive left-shift
+/// during the multi-allelic fan-out. Matches legacy hap.py's 1 kbp
+/// `leftshift_limit` parameter so a slid primitive can never escape further
+/// than ~1 kbp upstream of the cluster's anchor.
+const SPLIT_LEFT_SHIFT_WINDOW: usize = 1024;
 
 #[derive(Clone, Debug)]
 enum Event {
@@ -118,12 +227,66 @@ impl RegionState {
             }
         }
         for query in &cluster.query {
-            let covered = variant_is_conf(query, reference, cluster.start, cluster.end, conf_bed);
-            if covered {
-                state.any_conf = true;
+            // Parent-keyed coverage feeds `query_is_conf(parent)` —
+            // used by every emit path that hands the original (parent)
+            // query record to row_tags / shared_qq filtering. Always
+            // register the parent's `query.key` so those lookups stay
+            // consistent regardless of the per-primitive fan-out shape.
+            let parent_covered =
+                variant_is_conf(query, reference, cluster.start, cluster.end, conf_bed);
+            if parent_covered {
                 state.covered_query.insert(query.key.clone());
-            } else {
-                state.any_nonconf = true;
+            }
+
+            // Per-primitive coverage: legacy's QuantifyRegions::annotate
+            // computes Regions tags per-primitive after fan-out (see
+            // hap.py:323), so a multi-allelic query whose deletion allele
+            // is in CONF but whose insertion allele straddles a CONF edge
+            // emits TWO rows with different Regions tags. Without
+            // primitive-level tracking, all primitives inherit the
+            // parent's "covered" verdict and the cluster-wide
+            // any_nonconf bit misses the insertion's non-coverage —
+            // collapsing TS_boundary into TS_contained on every record
+            // and hiding UNK BD on the insertion itself.
+            //
+            // Pinning case (Class F — chr21:47906004): the parent
+            // `AGAACTAAA→A,AAAA` has an `effective_refrange` reaching
+            // into PG_Conf BED at 47906010 even though both fanned-out
+            // primitives at 47906001 / 47906005 sit fully upstream of
+            // CONF. When a parent record fans into per-primitive rows,
+            // its any_conf / any_nonconf vote is replaced by the
+            // primitives' votes — otherwise the cluster picks up a
+            // spurious TS_boundary tag from the parent's coverage that
+            // none of the emitted per-primitive rows actually touches.
+            let primitives = split_query_primitives_with_neighbors(
+                query,
+                reference,
+                cluster.start,
+                &cluster.query,
+                &cluster.truth,
+            );
+            let fans_out =
+                primitives.len() > 1 || (primitives.len() == 1 && primitives[0].key != query.key);
+            if !fans_out {
+                if parent_covered {
+                    state.any_conf = true;
+                } else {
+                    state.any_nonconf = true;
+                }
+            }
+            for primitive in primitives {
+                if primitive.key == query.key {
+                    // Same key as parent — already accounted for above.
+                    continue;
+                }
+                let primitive_covered =
+                    variant_is_conf(&primitive, reference, cluster.start, cluster.end, conf_bed);
+                if primitive_covered {
+                    state.any_conf = true;
+                    state.covered_query.insert(primitive.key);
+                } else {
+                    state.any_nonconf = true;
+                }
             }
         }
 
@@ -164,7 +327,18 @@ impl RegionState {
     }
 }
 
-pub fn run(args: CompareArgs) -> Result<()> {
+pub fn run(mut args: CompareArgs) -> Result<()> {
+    if args.version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.reference.is_empty() {
+        args.reference = resolve_default_reference()?;
+    }
+    ensure_aggregate_roc_region(&mut args.roc_regions);
+    normalize_engine_preprocessing(&mut args);
+    initialize_compare_log(&args)?;
+    log_compare_info(&args, "Starting germline comparison")?;
     let reference_path = Path::new(&args.reference);
     let prefix = Path::new(&args.report_prefix);
     let reference_sequences = fasta::read_sequences(reference_path)?;
@@ -196,10 +370,14 @@ pub fn run(args: CompareArgs) -> Result<()> {
         })
         .collect();
     let contig_set: BTreeSet<String> = contig_lengths.keys().cloned().collect();
-    let bed = args
+    let regions = args
         .regions_bedfile
         .as_ref()
-        .or(args.targets_bedfile.as_ref())
+        .map(|path| vcf::load_bed(Path::new(path), &contig_set))
+        .transpose()?;
+    let targets = args
+        .targets_bedfile
+        .as_ref()
         .map(|path| vcf::load_bed(Path::new(path), &contig_set))
         .transpose()?;
     let conf_bed = args
@@ -225,32 +403,87 @@ pub fn run(args: CompareArgs) -> Result<()> {
     // SuspiciousHomAlt, etc.) before xcmp runs — they're part of the truth
     // set's own "noise", not a call to validate. Query receives the user's
     // flag as-is.
-    let scratch = scratch_dir(prefix)?;
-    let truth_prep = scratch.join("truth.prep.vcf.gz");
-    let query_prep = scratch.join("query.prep.vcf.gz");
+    let scratch_parent = scratch_parent(&args, prefix);
+    let scratch = ScratchRun::create(&scratch_parent, args.keep_scratch)?;
+    let mut preprocessing_args = args.clone();
+    if preprocessing_args.gender == crate::cli::PreprocessGender::Auto {
+        preprocessing_args.gender = preprocess::infer_gender(Path::new(&args.truth))?;
+    }
+    let truth_prep = scratch.path().join(if args.bcf {
+        "truth.prep.bcf"
+    } else {
+        "truth.prep.vcf.gz"
+    });
+    let query_prep = scratch.path().join(if args.bcf {
+        "query.prep.bcf"
+    } else {
+        "query.prep.vcf.gz"
+    });
+    log_compare_info(&args, "Preprocessing truth")?;
     preprocess::run(build_preprocess_args(
-        &args, &args.truth, &truth_prep, true, false,
+        &preprocessing_args,
+        &args.truth,
+        &truth_prep,
+        !args.usefiltered_truth,
+        args.preprocess_truth,
     ))?;
+    log_compare_info(&args, "Preprocessing query")?;
     preprocess::run(build_preprocess_args(
-        &args,
+        &preprocessing_args,
         &args.query,
         &query_prep,
         args.pass_only,
-        false,
+        true,
     ))?;
 
-    let truth = vcf::load_variants(
+    if args.engine == CompareEngine::Vcfeval {
+        log_compare_info(&args, "Running vcfeval comparison")?;
+        return run_vcfeval(&args, &truth_prep, &query_prep, prefix, scratch);
+    }
+    if matches!(
+        args.engine,
+        CompareEngine::ScmpSomatic | CompareEngine::ScmpDistance
+    ) {
+        log_compare_info(&args, "Running SCMP comparison")?;
+        return run_scmp(&args, &truth_prep, &query_prep, prefix, scratch);
+    }
+
+    log_compare_info(&args, "Running Rust comparison")?;
+
+    let (truth_headers, truth_raw) = vcf::load_raw_vcf(&truth_prep)?;
+    let (query_headers, query_raw) = vcf::load_raw_vcf(&query_prep)?;
+
+    let mut truth = vcf::load_variants(
         &truth_prep,
         &contig_set,
-        args.pass_only,
-        bed.as_deref(),
+        false,
+        regions.as_deref(),
+        targets.as_deref(),
         locations.as_deref(),
     )?;
+    // CONF insertion padding is derived from the preprocessed truth stream,
+    // including filtered records retained by `--usefiltered-truth`. xcmp
+    // excludes those records as calls below, but gvcf2bed sees them first;
+    // collisions with PASS records can therefore change the padding lane.
+    let truth_for_conf_padding = truth.clone();
+    let filtered_truth_keys: BTreeSet<VariantKey> = truth
+        .iter()
+        .filter(|variant| !variant.is_pass())
+        .map(|variant| variant.key.clone())
+        .collect();
+    // `--usefiltered-truth` preserves filtered records through pre.py, but
+    // legacy xcmp still excludes them from haplotype enumeration and output.
+    // This distinction matters: letting these records reach Rust comparison
+    // creates spurious truth primitives and can turn otherwise query-only
+    // calls into TPs. Keep preprocessing byte-compatible, then apply xcmp's
+    // PASS-only truth-call contract at the comparison boundary.
+    retain_xcmp_truth_calls(&mut truth);
     let query = vcf::load_variants(
         &query_prep,
         &contig_set,
-        args.pass_only,
-        bed.as_deref(),
+        false,
+        regions.as_deref(),
+        targets.as_deref(),
         locations.as_deref(),
     )?;
 
@@ -295,7 +528,12 @@ pub fn run(args: CompareArgs) -> Result<()> {
         );
     }
 
-    let clusters = build_clusters(&truth, &query);
+    let cluster_gap = match args.engine {
+        CompareEngine::ScmpSomatic => 0,
+        CompareEngine::ScmpDistance => args.engine_scmp_distance,
+        CompareEngine::Xcmp | CompareEngine::Vcfeval => args.window,
+    };
+    let clusters = build_clusters_with_gap(&truth, &query, cluster_gap);
     // Fold gvcf2bed-style insertion padding (derived from truth) into
     // the raw CONF bed before classification. Legacy hap.py does the
     // same in Python (hap.py:323): `args.strat_regions.append(
@@ -304,29 +542,77 @@ pub fn run(args: CompareArgs) -> Result<()> {
     // Merging here bridges the 1-base gaps legacy's CONF beds carry at
     // every interval boundary (e.g. chr21:17562905) whenever an
     // adjacent truth insertion would pad them.
+    // gvcf2bed-style padding: produced once, used twice. The merged
+    // form (`adjusted_conf_bed`) is the union of raw CONF ∪ padding and
+    // drives per-variant `is_conf` classification. The un-merged
+    // **per-file BED-length sum** is what legacy reports as
+    // `Subset.IS_CONF.Size` (`region_sizes[CONF] += stop-start+1` for
+    // every interval loaded, with no cross-file dedup — see
+    // QuantifyRegions::load).
+    let adjust_conf = args.adjust_conf_regions && !args.no_adjust_conf_regions;
+    let gvcf_padding: Option<Vec<vcf::BedInterval>> = conf_bed.as_ref().map(|raw| {
+        if adjust_conf {
+            gvcf2bed_padding(&truth_for_conf_padding, Some(raw))
+        } else {
+            Vec::new()
+        }
+    });
     let adjusted_conf_bed: Option<Vec<vcf::BedInterval>> = conf_bed.as_ref().map(|raw| {
         let mut combined = raw.clone();
-        combined.extend(gvcf2bed_padding(&truth));
+        if let Some(pad) = gvcf_padding.as_ref() {
+            combined.extend(pad.iter().cloned());
+        }
         merge_bed_intervals(&combined)
     });
-    let conf_size = adjusted_conf_bed.as_deref().map(inclusive_region_size).unwrap_or(0);
+    // Sum half-open BED lengths per file separately, exactly as legacy's
+    // QuantifyRegions::load does. The raw CONF bed is already disjoint
+    // (BED files are conventionally non-overlapping), so its sum equals
+    // its merged span. The padding output, however, often lies inside
+    // the CONF bed — counting it via a cross-file merge would silently
+    // drop those overlapping bases (legacy adds them anyway).
+    let raw_conf_size = conf_bed
+        .as_ref()
+        .map(|raw| {
+            raw.iter()
+                .map(|iv| iv.end.saturating_sub(iv.start))
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let padding_size = gvcf_padding
+        .as_ref()
+        .map(|pad| {
+            pad.iter()
+                .map(|iv| iv.end.saturating_sub(iv.start))
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let conf_size = raw_conf_size + padding_size;
     let mut rows = Vec::new();
     for cluster in clusters {
         process_cluster(
             &cluster,
             &reference_sequences,
             adjusted_conf_bed.as_deref(),
+            ComparisonConfig {
+                no_hc: args.no_hc || args.engine != CompareEngine::Xcmp,
+                max_enum: args.max_enum,
+                hb_expand: args.hb_expand,
+            },
             &mut counts,
             &mut subtype_counts,
             &mut rows,
         )?;
     }
 
-    rows.sort_by(|left, right| {
-        left.sort_key
-            .cmp(&right.sort_key)
-            .then_with(|| left.line.cmp(&right.line))
-    });
+    sort_comparison_rows(&mut rows, &filtered_truth_keys);
+    decorate_output_rows(
+        &mut rows,
+        &truth_raw,
+        &query_raw,
+        args.preserve_info,
+        args.output_vtc,
+        &args.roc,
+    )?;
 
     if let Some(parent) = prefix.parent()
         && !parent.as_os_str().is_empty()
@@ -345,106 +631,1257 @@ pub fn run(args: CompareArgs) -> Result<()> {
     let pass_subset_subtype = derive_subset_subtype_counts(&rows, true);
     let all_fp = derive_fp_classes(&rows, false);
     let pass_fp = derive_fp_classes(&rows, true);
+    let all_subset_fp = derive_subset_fp_classes(&rows, false);
+    let pass_subset_fp = derive_subset_fp_classes(&rows, true);
+    let all_subtype_fp = derive_subtype_fp_classes(&rows, false);
+    let pass_subtype_fp = derive_subtype_fp_classes(&rows, true);
+    let all_subset_subtype_fp = derive_subset_subtype_fp_classes(&rows, false);
+    let pass_subset_subtype_fp = derive_subset_subtype_fp_classes(&rows, true);
     report::write_summary(
-        &prefix.with_extension("summary.csv"),
+        &suffixed_report_path(prefix, "summary.csv"),
         &all_counts,
         &pass_counts,
         &all_fp,
         &pass_fp,
     )?;
-    report::write_extended(
-        &prefix.with_extension("extended.csv"),
-        &all_counts,
-        &pass_counts,
-        &all_subtype,
-        &pass_subtype,
-        subset_size,
-        conf_size,
-        &all_subset,
-        &pass_subset,
-        &all_subset_subtype,
-        &pass_subset_subtype,
-        &all_fp,
-        &pass_fp,
-    )?;
-    let vcf_headers = build_vcf_headers(&contig_lengths);
-    report::write_vcf(&prefix.with_extension("vcf.gz"), &vcf_headers, &rows)?;
-    crate::roc::write_roc_files(prefix, &rows, subset_size, conf_size)?;
-    let commandline = format!(
-        "hap germline {} {} -r {} -o {}",
-        args.truth, args.query, args.reference, args.report_prefix
+    let write_counts = args.write_counts && !args.no_write_counts;
+    if write_counts {
+        report::write_extended(
+            &suffixed_report_path(prefix, "extended.csv"),
+            &all_counts,
+            &pass_counts,
+            &all_subtype,
+            &pass_subtype,
+            subset_size,
+            conf_size,
+            conf_bed.is_some(),
+            &all_subset,
+            &pass_subset,
+            &all_subset_subtype,
+            &pass_subset_subtype,
+            &all_fp,
+            &pass_fp,
+            &all_subset_fp,
+            &pass_subset_fp,
+            &all_subtype_fp,
+            &pass_subtype_fp,
+            &all_subset_subtype_fp,
+            &pass_subset_subtype_fp,
+        )?;
+    }
+    let vcf_headers = build_vcf_headers(
+        &truth_headers,
+        &query_headers,
+        args.pass_only,
+        args.output_vtc,
+        args.preserve_info,
     );
-    let mut final_args = BTreeMap::new();
-    final_args.insert("truth", args.truth.clone());
-    final_args.insert("query", args.query.clone());
-    final_args.insert("ref", args.reference.clone());
-    final_args.insert("reports_prefix", args.report_prefix.clone());
-    final_args.insert("pass_only", args.pass_only.to_string());
-    final_args.insert(
-        "regions_bedfile",
-        args.regions_bedfile.clone().unwrap_or_default(),
-    );
-    final_args.insert(
-        "targets_bedfile",
-        args.targets_bedfile.clone().unwrap_or_default(),
-    );
-    final_args.insert("fp_bedfile", args.fp_bedfile.clone().unwrap_or_default());
-    final_args.insert("locations", args.locations.clone().unwrap_or_default());
-    final_args.insert("threads", args.threads.unwrap_or_default().to_string());
-    final_args.insert("strat_tsv", args.strat_tsv.clone().unwrap_or_default());
+    let requantify = args.strat_tsv.is_some()
+        || !args.strat_regions.is_empty()
+        || args.strat_fixchr
+        || args.roc != "QUAL"
+        || args.roc_filter.is_some()
+        || args.roc_regions.iter().any(|region| region != "*")
+        || (args.roc_delta - 0.5).abs() > f64::EPSILON
+        || args.ci_alpha != 0.0;
+    let comparison_vcf = if requantify {
+        scratch.path().join("comparison.vcf.gz")
+    } else {
+        suffixed_report_path(prefix, "vcf.gz")
+    };
+    report::write_vcf(&comparison_vcf, &vcf_headers, &rows)?;
+    if requantify {
+        crate::quantify::run(crate::cli::QuantifyArgs {
+            input_vcf: comparison_vcf.display().to_string(),
+            report_prefix: args.report_prefix.clone(),
+            reference: args.reference.clone(),
+            // Rust comparison rows already carry finalized GA4GH BD/BK/BVT
+            // sample fields. Re-quantify those decisions while adding user
+            // stratifications/ROC controls; XCMP mode would instead expect
+            // the legacy pre-quantify INFO/type annotations.
+            annotation_type: Some("ga4gh".to_string()),
+            fp_bedfile: args.fp_bedfile.clone(),
+            strat_tsv: args.strat_tsv.clone(),
+            strat_regions: args.strat_regions.clone(),
+            strat_fixchr: args.strat_fixchr,
+            write_vcf: true,
+            write_counts,
+            roc: args.roc.clone(),
+            do_roc: !args.no_roc,
+            roc_regions: args.roc_regions.clone(),
+            roc_filter: args.roc_filter.clone(),
+            roc_delta: args.roc_delta,
+            ci_alpha: args.ci_alpha,
+            no_json: args.no_json,
+        })?;
+    } else {
+        crate::roc::write_roc_files(prefix, &rows, subset_size, conf_size)?;
+        if args.no_roc {
+            compact_no_roc_outputs(prefix)?;
+        }
+    }
+    let commandline = std::env::args().collect::<Vec<_>>().join(" ");
+    let run_args = metrics_json::CompareRunArgs {
+        truth: &args.truth,
+        query: &args.query,
+        reference: &args.reference,
+        reports_prefix: &args.report_prefix,
+        annotation_type: args.annotation_type.as_deref(),
+        pass_only: args.pass_only,
+        preprocessing_truth: args.preprocess_truth,
+        preprocessing_leftshift: args.engine == CompareEngine::ScmpSomatic || !args.no_leftshift,
+        preprocessing_decompose: effective_decomposition(&args),
+        regions_bedfile: args.regions_bedfile.as_deref(),
+        targets_bedfile: args.targets_bedfile.as_deref(),
+        fp_bedfile: args.fp_bedfile.as_deref(),
+        locations: args.locations.as_deref(),
+        threads: args.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        }),
+        strat_tsv: args.strat_tsv.as_deref(),
+        scratch_prefix: args.scratch_prefix.as_deref(),
+        keep_scratch: args.keep_scratch,
+        bcf: args.bcf,
+        ci_alpha: args.ci_alpha,
+        convert_gvcf_query: args.convert_gvcf_query,
+        convert_gvcf_to_vcf: args.convert_gvcf_to_vcf,
+        convert_gvcf_truth: args.convert_gvcf_truth,
+        do_roc: !args.no_roc,
+        engine: args.engine.legacy_name(),
+        engine_scmp_distance: args.engine_scmp_distance,
+        engine_vcfeval: &args.engine_vcfeval,
+        engine_vcfeval_template: args.engine_vcfeval_template.as_deref(),
+        filter_nonref: args.filter_nonref,
+        filters_only: args.filters_only.as_deref(),
+        fixchr: if args.no_fixchr {
+            Some(false)
+        } else {
+            args.fixchr
+        },
+        fp_adjust_conf: args.adjust_conf_regions && !args.no_adjust_conf_regions,
+        gender: match args.gender {
+            crate::cli::PreprocessGender::Male => "male",
+            crate::cli::PreprocessGender::Female => "female",
+            crate::cli::PreprocessGender::Auto => "auto",
+            crate::cli::PreprocessGender::None => "none",
+        },
+        hb_expand: args.hb_expand,
+        logfile: args.logfile.as_deref(),
+        max_enum: args.max_enum,
+        no_hc: args.no_hc,
+        output_vtc: args.output_vtc,
+        preprocess_window: args.preprocess_window,
+        preprocessing_norm: args.bcftools_norm,
+        preserve_info: args.preserve_info,
+        quiet: args.quiet,
+        roc: &args.roc,
+        roc_delta: args.roc_delta,
+        roc_filter: args.roc_filter.as_deref(),
+        roc_regions: &args.roc_regions,
+        somatic: args.somatic,
+        somatic_mode: somatic_mode_name(args.set_gt),
+        strat_fixchr: args.strat_fixchr,
+        strat_regions: &args.strat_regions,
+        usefiltered_truth: args.usefiltered_truth,
+        verbose: args.verbose,
+        window: args.window,
+        write_counts,
+        write_json: !args.no_json,
+        write_vcf: true,
+    };
     metrics_json::write_compare_runinfo(
-        &prefix.with_extension("runinfo.json"),
+        &suffixed_report_path(prefix, "runinfo.json"),
         &commandline,
-        &final_args,
+        &run_args,
     )?;
-    metrics_json::write_metrics_gz(
-        &prefix.with_extension("metrics.json.gz"),
-        "hap.py",
-        &commandline,
-        &[
-            (
-                "summary.metrics",
-                "summary.metrics",
-                &prefix.with_extension("summary.csv"),
-            ),
+    let mut metric_tables = vec![
+        (
+            "summary.metrics",
+            "summary.metrics",
+            suffixed_report_path(prefix, "summary.csv"),
+        ),
+        (
+            "roc.all",
+            "roc.all",
+            suffixed_report_path(prefix, "roc.all.csv.gz"),
+        ),
+    ];
+    if write_counts {
+        metric_tables.insert(
+            1,
             (
                 "all.metrics",
                 "all.metrics",
-                &prefix.with_extension("extended.csv"),
+                suffixed_report_path(prefix, "extended.csv"),
             ),
-            (
-                "roc.all",
-                "roc.all",
-                &prefix.with_extension("roc.all.csv.gz"),
-            ),
-        ],
-    )?;
+        );
+    }
+    // Legacy only adds Locations metrics for tables produced by happyroc.
+    // Keep the observed legacy ordering for the per-type table family while
+    // omitting absent variant types entirely.
+    for id in [
+        "roc.Locations.INDEL",
+        "roc.Locations.SNP",
+        "roc.Locations.INDEL.PASS",
+        "roc.Locations.SNP.PASS",
+    ] {
+        let path = suffixed_report_path(prefix, &format!("{id}.csv.gz"));
+        if !args.no_roc && path.exists() {
+            metric_tables.push((id, id, path));
+        }
+    }
+    let metric_table_refs = metric_tables
+        .iter()
+        .map(|(id, label, path)| (*id, *label, path.as_path()))
+        .collect::<Vec<_>>();
+    if !args.no_json {
+        metrics_json::write_metrics_gz(
+            &suffixed_report_path(prefix, "metrics.json.gz"),
+            "hap.py.comparison",
+            &commandline,
+            &metric_table_refs,
+        )?;
+    }
+    log_compare_info(&args, "Germline comparison completed successfully")?;
+    scratch.cleanup()?;
     Ok(())
 }
 
-fn build_vcf_headers(contig_lengths: &BTreeMap<String, usize>) -> Vec<String> {
-    let mut headers = vec![
-        "##fileformat=VCFv4.1".to_string(),
-        "##FILTER=<ID=PASS,Description=\"All filters passed\">".to_string(),
-        "##INFO=<ID=BS,Number=1,Type=Integer,Description=\"Start position of the benchmarking superlocus on current chromosome\">".to_string(),
-        "##INFO=<ID=END,Number=.,Type=Integer,Description=\"SV end position\">".to_string(),
-        "##INFO=<ID=IMPORT_FAIL,Number=.,Type=Flag,Description=\"Flag to identify variants that could not be imported.\">".to_string(),
-        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">".to_string(),
-        "##FORMAT=<ID=BD,Number=1,Type=String,Description=\"Decision for call (TP/FP/FN/N)\">".to_string(),
-        "##FORMAT=<ID=BK,Number=1,Type=String,Description=\"Sub-type for decision (match/mismatch type)\">".to_string(),
-        "##FORMAT=<ID=BI,Number=1,Type=String,Description=\"Subtype for comparison\">".to_string(),
-        "##FORMAT=<ID=BVT,Number=1,Type=String,Description=\"Variant type\">".to_string(),
-        "##FORMAT=<ID=BLT,Number=1,Type=String,Description=\"Genotype label\">".to_string(),
-        "##FORMAT=<ID=QQ,Number=1,Type=String,Description=\"Quality score\">".to_string(),
-    ];
-    for (name, length) in contig_lengths {
-        headers.push(format!("##contig=<ID={name},length={length}>"));
+fn retain_xcmp_truth_calls(variants: &mut Vec<Variant>) {
+    variants.retain(Variant::is_pass);
+}
+
+fn sort_comparison_rows(rows: &mut [AnnotatedRow], filtered_truth_keys: &BTreeSet<VariantKey>) {
+    rows.sort_by(|left, right| {
+        left.sort_key
+            .0
+            .cmp(&right.sort_key.0)
+            .then(left.sort_key.1.cmp(&right.sort_key.1))
+            // A query record sharing the exact key of a filtered truth call
+            // occupies that merged record's slot in legacy xcmp, even though
+            // the truth sample itself is excluded from comparison. It sorts
+            // before other records at the locus (PASS truth included).
+            .then_with(|| {
+                let left_filtered = row_matches_variant_key(left, filtered_truth_keys);
+                let right_filtered = row_matches_variant_key(right, filtered_truth_keys);
+                right_filtered.cmp(&left_filtered)
+            })
+            .then(left.sort_key.2.cmp(&right.sort_key.2))
+            .then(left.sort_key.3.cmp(&right.sort_key.3))
+            .then_with(|| left.line.cmp(&right.line))
+    });
+}
+
+fn row_matches_variant_key(row: &AnnotatedRow, keys: &BTreeSet<VariantKey>) -> bool {
+    let mut fields = row.line.split('\t');
+    let (Some(chrom), Some(pos), Some(_id), Some(ref_allele), Some(alt_allele)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    let Ok(pos) = pos.parse::<usize>() else {
+        return false;
+    };
+    keys.contains(&VariantKey {
+        chrom: chrom.to_string(),
+        pos,
+        ref_allele: ref_allele.to_string(),
+        alt_allele: alt_allele.to_string(),
+    })
+}
+
+fn run_vcfeval(
+    args: &CompareArgs,
+    truth_prep: &Path,
+    query_prep: &Path,
+    prefix: &Path,
+    scratch: ScratchRun,
+) -> Result<()> {
+    if let Some(parent) = prefix
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    headers.push("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTRUTH\tQUERY".to_string());
+    let inferred_template = args
+        .reference
+        .strip_suffix(".fa")
+        .map(|stem| PathBuf::from(format!("{stem}.sdf")))
+        .filter(|path| path.is_dir());
+    let supplied_template = args
+        .engine_vcfeval_template
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.exists());
+    let template = if let Some(template) = supplied_template.or(inferred_template) {
+        template
+    } else {
+        let template = scratch.path().join("vcfeval-template.sdf");
+        let output = Command::new(&args.engine_vcfeval)
+            .arg("format")
+            .arg("-o")
+            .arg(&template)
+            .arg(&args.reference)
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    anyhow::anyhow!(
+                        "Error running rtg tools: executable '{}' was not found",
+                        args.engine_vcfeval
+                    )
+                } else {
+                    anyhow::anyhow!(error)
+                }
+            })?;
+        if !output.status.success() {
+            bail!(
+                "Error running rtg tools. Return code was {}, output: {} / {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        template
+    };
+
+    let output_dir = scratch.path().join("vcfeval.result");
+    let threads = args.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    });
+    let mut command = Command::new(&args.engine_vcfeval);
+    command
+        .arg("vcfeval")
+        .arg("-b")
+        .arg(truth_prep)
+        .arg("-c")
+        .arg(query_prep)
+        .arg("-t")
+        .arg(&template)
+        .arg("-o")
+        .arg(&output_dir)
+        .arg("-T")
+        .arg(threads.to_string())
+        .args(["-m", "ga4gh", "--ref-overlap"])
+        .arg(format!(
+            "--Xloose-match-distance={}",
+            args.engine_scmp_distance
+        ));
+    if !args.pass_only {
+        command.arg("--all-records");
+    }
+    if !args.roc.is_empty() {
+        command.arg("-f").arg(&args.roc);
+    }
+    let output = command.output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "Error running rtg tools / vcfeval: executable '{}' was not found",
+                args.engine_vcfeval
+            )
+        } else {
+            anyhow::anyhow!(error)
+        }
+    })?;
+    if !output.status.success() {
+        bail!(
+            "Error running rtg tools / vcfeval. Return code was {}, output: {} / {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let vcfeval_vcf = output_dir.join("output.vcf.gz");
+    if !vcfeval_vcf.is_file() {
+        bail!(
+            "Error running rtg tools / vcfeval: expected output is absent: {}",
+            vcfeval_vcf.display()
+        );
+    }
+    crate::quantify::run(crate::cli::QuantifyArgs {
+        input_vcf: vcfeval_vcf.display().to_string(),
+        report_prefix: args.report_prefix.clone(),
+        reference: args.reference.clone(),
+        annotation_type: Some("ga4gh".to_string()),
+        fp_bedfile: args.fp_bedfile.clone(),
+        strat_tsv: args.strat_tsv.clone(),
+        strat_regions: args.strat_regions.clone(),
+        strat_fixchr: args.strat_fixchr,
+        write_vcf: true,
+        write_counts: args.write_counts && !args.no_write_counts,
+        roc: args.roc.clone(),
+        do_roc: !args.no_roc,
+        roc_regions: args.roc_regions.clone(),
+        roc_filter: args.roc_filter.clone(),
+        roc_delta: args.roc_delta,
+        ci_alpha: args.ci_alpha,
+        no_json: args.no_json,
+    })?;
+    if args.preserve_info || args.output_vtc {
+        decorate_existing_comparison_vcf(
+            &suffixed_report_path(prefix, "vcf.gz"),
+            truth_prep,
+            query_prep,
+            args.preserve_info,
+            args.output_vtc,
+        )?;
+    }
+    let commandline = std::env::args().collect::<Vec<_>>().join(" ");
+    write_runinfo_for_args(args, prefix, &commandline)?;
+    rewrite_compare_metrics(args, prefix, &commandline)?;
+    log_compare_info(args, "Germline comparison completed successfully")?;
+    scratch.cleanup()?;
+    Ok(())
+}
+
+fn run_scmp(
+    args: &CompareArgs,
+    truth_prep: &Path,
+    query_prep: &Path,
+    prefix: &Path,
+    scratch: ScratchRun,
+) -> Result<()> {
+    let comparison_vcf = scratch.path().join("scmp.comparison.vcf.gz");
+    let mut strat_regions = args.strat_regions.clone();
+    if args.adjust_conf_regions
+        && !args.no_adjust_conf_regions
+        && let Some(conf_path) = args.fp_bedfile.as_deref()
+    {
+        let reference = fasta::read_sequences(Path::new(&args.reference))?;
+        let contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
+        let raw_conf = vcf::load_bed(Path::new(conf_path), &contigs)?;
+        let truth = vcf::load_variants(truth_prep, &contigs, false, None, None, None)?;
+        let padding = gvcf2bed_padding(&truth, Some(&raw_conf));
+        let padding_path = scratch.path().join("truth.conf-vars.bed");
+        let mut output = fs::File::create(&padding_path)
+            .with_context(|| format!("failed to create {}", padding_path.display()))?;
+        for interval in padding {
+            writeln!(
+                output,
+                "{}\t{}\t{}",
+                interval.chrom, interval.start, interval.end
+            )
+            .with_context(|| format!("failed to write {}", padding_path.display()))?;
+        }
+        strat_regions.push(format!("CONF_VARS:{}", padding_path.display()));
+    }
+    let mode = match args.engine {
+        CompareEngine::ScmpSomatic => crate::scmp::ScmpMode::Alleles,
+        CompareEngine::ScmpDistance => crate::scmp::ScmpMode::Distance {
+            max_distance: i64::try_from(args.engine_scmp_distance)
+                .context("SCMP match distance exceeds the supported range")?,
+        },
+        CompareEngine::Xcmp | CompareEngine::Vcfeval => {
+            bail!("internal error: run_scmp called for a non-SCMP engine")
+        }
+    };
+    crate::scmp::compare_files(
+        truth_prep,
+        query_prep,
+        Path::new(&args.reference),
+        mode,
+        &args.roc,
+        &comparison_vcf,
+    )?;
+    let write_counts = args.write_counts && !args.no_write_counts;
+    crate::quantify::run(crate::cli::QuantifyArgs {
+        input_vcf: comparison_vcf.display().to_string(),
+        report_prefix: args.report_prefix.clone(),
+        reference: args.reference.clone(),
+        annotation_type: Some("ga4gh".to_string()),
+        fp_bedfile: args.fp_bedfile.clone(),
+        strat_tsv: args.strat_tsv.clone(),
+        strat_regions,
+        strat_fixchr: args.strat_fixchr,
+        write_vcf: true,
+        write_counts,
+        roc: args.roc.clone(),
+        do_roc: !args.no_roc,
+        roc_regions: args.roc_regions.clone(),
+        roc_filter: args.roc_filter.clone(),
+        roc_delta: args.roc_delta,
+        ci_alpha: args.ci_alpha,
+        no_json: args.no_json,
+    })?;
+    let commandline = std::env::args().collect::<Vec<_>>().join(" ");
+    write_runinfo_for_args(args, prefix, &commandline)?;
+    rewrite_compare_metrics(args, prefix, &commandline)?;
+    log_compare_info(args, "Germline comparison completed successfully")?;
+    scratch.cleanup()?;
+    Ok(())
+}
+
+fn ensure_aggregate_roc_region(regions: &mut Vec<String>) {
+    if !regions.iter().any(|region| region == "*") {
+        regions.insert(0, "*".to_string());
+    }
+}
+
+fn normalize_engine_preprocessing(args: &mut CompareArgs) {
+    match args.engine {
+        CompareEngine::ScmpSomatic => {
+            if !args.somatic && args.set_gt.is_none() {
+                args.somatic = true;
+            }
+            // Legacy turns partial-credit normalization off for the somatic
+            // scmp engine after selecting the synthetic half genotype.
+            args.preprocess_truth = false;
+            args.leftshift = false;
+            args.no_leftshift = true;
+            args.decompose = false;
+            args.bcftools_norm = false;
+        }
+        CompareEngine::ScmpDistance => {
+            if !args.somatic && args.set_gt.is_none() {
+                args.set_gt = Some(crate::cli::SomaticGtMode::First);
+            }
+            args.decompose = false;
+        }
+        CompareEngine::Xcmp | CompareEngine::Vcfeval => {}
+    }
+}
+
+fn somatic_mode_name(mode: Option<crate::cli::SomaticGtMode>) -> Option<&'static str> {
+    mode.map(|mode| match mode {
+        crate::cli::SomaticGtMode::Half => "half",
+        crate::cli::SomaticGtMode::Hemi => "hemi",
+        crate::cli::SomaticGtMode::Het => "het",
+        crate::cli::SomaticGtMode::Hom => "hom",
+        crate::cli::SomaticGtMode::First => "first",
+    })
+}
+
+fn initialize_compare_log(args: &CompareArgs) -> Result<()> {
+    let Some(path) = args.logfile.as_deref() else {
+        return Ok(());
+    };
+    if let Some(parent) = Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create logfile directory {}", parent.display()))?;
+    }
+    fs::write(path, "").with_context(|| format!("failed to initialize logfile {path}"))
+}
+
+fn log_compare_info(args: &CompareArgs, message: &str) -> Result<()> {
+    if !args.verbose || args.quiet {
+        return Ok(());
+    }
+    if let Some(path) = args.logfile.as_deref() {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open logfile {path}"))?;
+        writeln!(file, "INFO {message}")
+            .with_context(|| format!("failed to write logfile {path}"))?;
+    } else {
+        eprintln!("INFO {message}");
+    }
+    Ok(())
+}
+
+fn write_runinfo_for_args(args: &CompareArgs, prefix: &Path, commandline: &str) -> Result<()> {
+    let write_counts = args.write_counts && !args.no_write_counts;
+    let run_args = metrics_json::CompareRunArgs {
+        truth: &args.truth,
+        query: &args.query,
+        reference: &args.reference,
+        reports_prefix: &args.report_prefix,
+        annotation_type: args.annotation_type.as_deref(),
+        pass_only: args.pass_only,
+        preprocessing_truth: args.preprocess_truth,
+        preprocessing_leftshift: args.engine == CompareEngine::ScmpSomatic || !args.no_leftshift,
+        preprocessing_decompose: effective_decomposition(args),
+        regions_bedfile: args.regions_bedfile.as_deref(),
+        targets_bedfile: args.targets_bedfile.as_deref(),
+        fp_bedfile: args.fp_bedfile.as_deref(),
+        locations: args.locations.as_deref(),
+        threads: args.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        }),
+        strat_tsv: args.strat_tsv.as_deref(),
+        scratch_prefix: args.scratch_prefix.as_deref(),
+        keep_scratch: args.keep_scratch,
+        bcf: args.bcf,
+        ci_alpha: args.ci_alpha,
+        convert_gvcf_query: args.convert_gvcf_query,
+        convert_gvcf_to_vcf: args.convert_gvcf_to_vcf,
+        convert_gvcf_truth: args.convert_gvcf_truth,
+        do_roc: !args.no_roc,
+        engine: args.engine.legacy_name(),
+        engine_scmp_distance: args.engine_scmp_distance,
+        engine_vcfeval: &args.engine_vcfeval,
+        engine_vcfeval_template: args.engine_vcfeval_template.as_deref(),
+        filter_nonref: args.filter_nonref,
+        filters_only: args.filters_only.as_deref(),
+        fixchr: if args.no_fixchr {
+            Some(false)
+        } else {
+            args.fixchr
+        },
+        fp_adjust_conf: args.adjust_conf_regions && !args.no_adjust_conf_regions,
+        gender: match args.gender {
+            crate::cli::PreprocessGender::Male => "male",
+            crate::cli::PreprocessGender::Female => "female",
+            crate::cli::PreprocessGender::Auto => "auto",
+            crate::cli::PreprocessGender::None => "none",
+        },
+        hb_expand: args.hb_expand,
+        logfile: args.logfile.as_deref(),
+        max_enum: args.max_enum,
+        no_hc: args.no_hc,
+        output_vtc: args.output_vtc,
+        preprocess_window: args.preprocess_window,
+        preprocessing_norm: args.bcftools_norm,
+        preserve_info: args.preserve_info,
+        quiet: args.quiet,
+        roc: &args.roc,
+        roc_delta: args.roc_delta,
+        roc_filter: args.roc_filter.as_deref(),
+        roc_regions: &args.roc_regions,
+        somatic: args.somatic,
+        somatic_mode: somatic_mode_name(args.set_gt),
+        strat_fixchr: args.strat_fixchr,
+        strat_regions: &args.strat_regions,
+        usefiltered_truth: args.usefiltered_truth,
+        verbose: args.verbose,
+        window: args.window,
+        write_counts,
+        write_json: !args.no_json,
+        write_vcf: true,
+    };
+    metrics_json::write_compare_runinfo(
+        &suffixed_report_path(prefix, "runinfo.json"),
+        commandline,
+        &run_args,
+    )
+}
+
+fn rewrite_compare_metrics(args: &CompareArgs, prefix: &Path, commandline: &str) -> Result<()> {
+    if args.no_json {
+        return Ok(());
+    }
+    let mut tables = vec![(
+        "summary.metrics",
+        "summary.metrics",
+        suffixed_report_path(prefix, "summary.csv"),
+    )];
+    if args.write_counts && !args.no_write_counts {
+        tables.push((
+            "all.metrics",
+            "all.metrics",
+            suffixed_report_path(prefix, "extended.csv"),
+        ));
+    }
+    tables.push((
+        "roc.all",
+        "roc.all",
+        suffixed_report_path(prefix, "roc.all.csv.gz"),
+    ));
+    for id in [
+        "roc.Locations.INDEL",
+        "roc.Locations.SNP",
+        "roc.Locations.INDEL.PASS",
+        "roc.Locations.SNP.PASS",
+    ] {
+        let path = suffixed_report_path(prefix, &format!("{id}.csv.gz"));
+        if !args.no_roc && path.is_file() {
+            tables.push((id, id, path));
+        }
+    }
+    let refs = tables
+        .iter()
+        .map(|(id, label, path)| (*id, *label, path.as_path()))
+        .collect::<Vec<_>>();
+    metrics_json::write_metrics_gz(
+        &suffixed_report_path(prefix, "metrics.json.gz"),
+        "hap.py.comparison",
+        commandline,
+        &refs,
+    )
+}
+
+type InfoKey = (String, usize, String, String);
+type SemanticInfoKey = (String, usize, String, Vec<String>);
+
+fn semantic_info_key(record: &RawVcfRecord) -> SemanticInfoKey {
+    let mut alts = record
+        .alt_allele
+        .split(',')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    alts.sort();
+    let reference = if alts
+        .iter()
+        .any(|alt| alt.starts_with('<') && alt.ends_with('>'))
+    {
+        "*".to_string()
+    } else {
+        record.ref_allele.clone()
+    };
+    (record.chrom.clone(), record.pos, reference, alts)
+}
+
+fn decorate_output_rows(
+    rows: &mut [AnnotatedRow],
+    truth: &[RawVcfRecord],
+    query: &[RawVcfRecord],
+    preserve_info: bool,
+    output_vtc: bool,
+    roc_field: &str,
+) -> Result<()> {
+    if !preserve_info && !output_vtc && matches!(roc_field, "QUAL" | "QQ") {
+        return Ok(());
+    }
+    let mut preserved = BTreeMap::<InfoKey, BTreeSet<String>>::new();
+    let mut semantic_preserved = BTreeMap::<SemanticInfoKey, BTreeSet<String>>::new();
+    if preserve_info {
+        for record in truth.iter().chain(query) {
+            let key = (
+                record.chrom.clone(),
+                record.pos,
+                record.ref_allele.clone(),
+                record.alt_allele.clone(),
+            );
+            for field in record
+                .info
+                .split(';')
+                .filter(|field| !matches!(*field, "" | "."))
+            {
+                preserved
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(field.to_string());
+                semantic_preserved
+                    .entry(semantic_info_key(record))
+                    .or_default()
+                    .insert(field.to_string());
+            }
+        }
+    }
+    let normalized_roc_field = roc_field
+        .strip_prefix("INFO.")
+        .or_else(|| roc_field.strip_prefix("FORMAT."))
+        .or_else(|| roc_field.strip_prefix("I."))
+        .or_else(|| roc_field.strip_prefix("F."))
+        .unwrap_or(roc_field);
+    let mut roc_values = BTreeMap::<InfoKey, String>::new();
+    if !matches!(roc_field, "QUAL" | "QQ" | ".") {
+        for record in truth.iter().chain(query) {
+            let value = record
+                .info
+                .split(';')
+                .find_map(|entry| {
+                    entry
+                        .split_once('=')
+                        .filter(|(key, _)| *key == normalized_roc_field)
+                        .map(|(_, value)| value.to_string())
+                })
+                .or_else(|| record.sample_map(0).get(normalized_roc_field).cloned());
+            if let Some(value) = value {
+                roc_values.insert(
+                    (
+                        record.chrom.clone(),
+                        record.pos,
+                        record.ref_allele.clone(),
+                        record.alt_allele.clone(),
+                    ),
+                    value,
+                );
+            }
+        }
+    }
+    for row in rows {
+        let mut record = RawVcfRecord::from_line(&row.line, Path::new("comparison-output"))?;
+        let key = (
+            record.chrom.clone(),
+            record.pos,
+            record.ref_allele.clone(),
+            record.alt_allele.clone(),
+        );
+        let current = info_fields_by_key(&record.info);
+        let regions = current.get("Regions").cloned();
+        let mut base = BTreeMap::<String, String>::new();
+        if preserve_info {
+            let fields = preserved
+                .get(&key)
+                .into_iter()
+                .chain(semantic_preserved.get(&semantic_info_key(&record)));
+            for fields in fields {
+                for field in fields {
+                    let field_key = field.split_once('=').map_or(field.as_str(), |(key, _)| key);
+                    if field_key != "Regions" {
+                        base.insert(field_key.to_string(), field.clone());
+                    }
+                }
+            }
+        }
+        if let Some(bs) = current.get("BS") {
+            base.insert("BS".to_string(), bs.clone());
+        }
+        if let Some(value) = roc_values.get(&key) {
+            base.insert(roc_field.to_string(), format!("{roc_field}={value}"));
+        }
+
+        let truth_fields = record.sample_map(0);
+        let query_fields = record.sample_map(1);
+        let comparison = legacy_comparison_fields(
+            &record,
+            &truth_fields,
+            &query_fields,
+            row.xcmp_ctype.unwrap_or("simple:match"),
+        );
+        if preserve_info {
+            for (name, value) in comparison.preserved_fields(row.xcmp_hap_match) {
+                base.insert(name.to_string(), value);
+            }
+        }
+
+        let mut info = base.into_values().collect::<Vec<_>>();
+        let append_regions_last = regions.as_deref() == Some("Regions=TS_boundary");
+        if !append_regions_last && let Some(regions) = regions.as_ref() {
+            info.push(regions.clone());
+        }
+        if preserve_info {
+            info.push(format!("RegionsExtent={}", legacy_regions_extent(&record)));
+        }
+        if output_vtc {
+            let mut xcmp_type = comparison.decision;
+            let mut xcmp_kind = comparison.kind.to_string();
+            if row.xcmp_hap_match && xcmp_type != "TP" {
+                xcmp_kind = format!("hapmatch__{xcmp_type}__{xcmp_kind}");
+                xcmp_type = "TP".to_string();
+            }
+            if !info_list_values(&record.info, "Regions").contains(&"CONF") {
+                xcmp_type = "UNK".to_string();
+            }
+            info.push(format!(
+                "XCMP={xcmp_type}:{xcmp_kind}:{}:{}:{}",
+                comparison.gtt1, comparison.gtt2, comparison.ctype
+            ));
+            let vtc = legacy_vtc(&record, &truth_fields, &query_fields);
+            if !vtc.is_empty() {
+                info.push(format!("VTC={vtc}"));
+            }
+        }
+        if append_regions_last && let Some(regions) = regions {
+            info.push(regions);
+        }
+        record.info = if info.is_empty() {
+            ".".to_string()
+        } else {
+            info.join(";")
+        };
+        row.line = record.to_line();
+    }
+    Ok(())
+}
+
+fn info_fields_by_key(info: &str) -> BTreeMap<String, String> {
+    info.split(';')
+        .filter(|field| !matches!(*field, "" | "."))
+        .map(|field| {
+            let key = field.split_once('=').map_or(field, |(key, _)| key);
+            (key.to_string(), field.to_string())
+        })
+        .collect()
+}
+
+struct LegacyComparison {
+    decision: String,
+    kind: String,
+    gtt1: String,
+    gtt2: String,
+    ctype: &'static str,
+    iqq: String,
+}
+
+impl LegacyComparison {
+    fn preserved_fields(&self, hap_match: bool) -> Vec<(&'static str, String)> {
+        let mut fields = vec![
+            ("IQQ", format!("IQQ={}", self.iqq)),
+            ("ctype", format!("ctype={}", self.ctype)),
+            ("kind", format!("kind={}", self.kind)),
+            ("type", format!("type={}", self.decision)),
+        ];
+        if self.gtt1 != "." {
+            fields.push(("gtt1", format!("gtt1={}", self.gtt1)));
+        }
+        if self.gtt2 != "." {
+            fields.push(("gtt2", format!("gtt2={}", self.gtt2)));
+        }
+        if hap_match {
+            fields.push(("HapMatch", "HapMatch".to_string()));
+        }
+        fields
+    }
+}
+
+fn legacy_comparison_fields(
+    record: &RawVcfRecord,
+    truth: &BTreeMap<String, String>,
+    query: &BTreeMap<String, String>,
+    ctype: &'static str,
+) -> LegacyComparison {
+    let truth_called = sample_is_called(truth);
+    let query_called = sample_is_called(query);
+    let (decision, kind) = match (truth_called, query_called) {
+        (true, false) => ("FN", "missing"),
+        (false, true) => ("FP", "missing"),
+        (false, false) => ("N", "match"),
+        (true, true) => {
+            let truth_bd = truth.get("BD").map(String::as_str).unwrap_or(".");
+            let query_bd = query.get("BD").map(String::as_str).unwrap_or(".");
+            let bk = query
+                .get("BK")
+                .or_else(|| truth.get("BK"))
+                .map(String::as_str)
+                .unwrap_or(".");
+            if truth_bd == "FN" || query_bd == "FP" || bk == "am" || bk == "lm" {
+                ("FP", legacy_mismatch_kind(record, truth, query))
+            } else {
+                ("TP", "match")
+            }
+        }
+    };
+    let iqq = query
+        .get("QQ")
+        .filter(|value| !matches!(value.as_str(), "" | "."))
+        .cloned()
+        .unwrap_or_else(|| "0".to_string());
+    LegacyComparison {
+        decision: decision.to_string(),
+        kind: kind.to_string(),
+        gtt1: legacy_gt_label(truth, truth_called),
+        gtt2: legacy_gt_label(query, query_called),
+        ctype,
+        iqq,
+    }
+}
+
+fn sample_is_called(sample: &BTreeMap<String, String>) -> bool {
+    sample
+        .get("BVT")
+        .is_some_and(|value| !matches!(value.as_str(), "" | "." | "NOCALL" | "HOMREF"))
+}
+
+fn legacy_gt_label(sample: &BTreeMap<String, String>, called: bool) -> String {
+    if !called {
+        return ".".to_string();
+    }
+    sample
+        .get("BLT")
+        .filter(|value| !matches!(value.as_str(), "" | "." | "nocall"))
+        .map(|value| format!("gt_{value}"))
+        .unwrap_or_else(|| "gt_unknown".to_string())
+}
+
+fn legacy_mismatch_kind<'a>(
+    _record: &RawVcfRecord,
+    truth: &'a BTreeMap<String, String>,
+    query: &'a BTreeMap<String, String>,
+) -> &'static str {
+    let truth_gt = truth.get("GT").map(String::as_str).unwrap_or(".");
+    let query_gt = query.get("GT").map(String::as_str).unwrap_or(".");
+    let truth_alleles = parse_gt_alleles(truth_gt)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let query_alleles = parse_gt_alleles(query_gt)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if truth_alleles == query_alleles {
+        return "gtmismatch";
+    }
+    let truth_nonref = truth_alleles
+        .into_iter()
+        .filter(|allele| *allele > 0)
+        .collect::<BTreeSet<_>>();
+    let query_nonref = query_alleles
+        .into_iter()
+        .filter(|allele| *allele > 0)
+        .collect::<BTreeSet<_>>();
+    if truth_nonref == query_nonref {
+        "gtmismatch"
+    } else if !truth_nonref.is_disjoint(&query_nonref) {
+        "alpartial"
+    } else {
+        "almismatch"
+    }
+}
+
+fn legacy_regions_extent(record: &RawVcfRecord) -> String {
+    let variant = Variant {
+        key: VariantKey {
+            chrom: record.chrom.clone(),
+            pos: record.pos,
+            ref_allele: record.ref_allele.clone(),
+            alt_allele: record.alt_allele.clone(),
+        },
+        qual: record.qual.clone(),
+        filter: record.filter.clone(),
+        gt: ".".to_string(),
+    };
+    effective_refrange(&variant)
+        .map(|(start, end, _)| format!("{start}-{end}"))
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                record.pos,
+                record.pos + record.ref_allele.len().saturating_sub(1)
+            )
+        })
+}
+
+fn legacy_vtc(
+    record: &RawVcfRecord,
+    truth: &BTreeMap<String, String>,
+    query: &BTreeMap<String, String>,
+) -> String {
+    let mut types = BTreeMap::<u8, String>::new();
+    for sample in [truth, query] {
+        if !sample_is_called(sample) {
+            types.insert(0x80, "nocall__nc".to_string());
+            continue;
+        }
+        let gt = sample.get("GT").map(String::as_str).unwrap_or(".");
+        let gt_alleles = parse_gt_alleles(gt);
+        let mut allele_bits = 0u8;
+        for allele in gt_alleles.iter().copied().filter(|allele| *allele > 0) {
+            let Some(alt) = record.alt_allele.split(',').nth(allele - 1) else {
+                continue;
+            };
+            let bits = allele_edit_bits(&record.ref_allele, alt);
+            allele_bits |= bits;
+            for bit in [1u8, 2, 4] {
+                if bits & bit != 0 {
+                    types.insert(bit, format!("nuc__{}", legacy_type_bits(bit)));
+                }
+            }
+            if bits != 0 {
+                types.insert(0x10 | bits, format!("al__{}", legacy_type_bits(bits)));
+            }
+        }
+        if allele_bits == 0 {
+            continue;
+        }
+        let location = match sample.get("BLT").map(String::as_str).unwrap_or("") {
+            "het" => 0x30,
+            "hetalt" => 0x40,
+            "homalt" => 0x90,
+            "hemi" => 0x50,
+            _ => 0xa0,
+        };
+        let ref_bit = u8::from(gt_alleles.contains(&0)) * 8;
+        types.insert(
+            location | ref_bit | allele_bits,
+            format!(
+                "{}__{}",
+                sample.get("BLT").map(String::as_str).unwrap_or("unknown"),
+                legacy_type_bits(ref_bit | allele_bits)
+            ),
+        );
+    }
+    types.into_values().collect::<Vec<_>>().join(",")
+}
+
+fn allele_edit_bits(reference: &str, alternate: &str) -> u8 {
+    if alternate.starts_with('<') {
+        return if alternate.starts_with("<DEL") { 4 } else { 2 };
+    }
+    let ref_bytes = reference.as_bytes();
+    let alt_bytes = alternate.as_bytes();
+    let prefix = ref_bytes
+        .iter()
+        .zip(alt_bytes)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix_limit = (ref_bytes.len() - prefix).min(alt_bytes.len() - prefix);
+    let suffix = (0..suffix_limit)
+        .take_while(|offset| {
+            ref_bytes[ref_bytes.len() - 1 - offset] == alt_bytes[alt_bytes.len() - 1 - offset]
+        })
+        .count();
+    let ref_remaining = ref_bytes.len() - prefix - suffix;
+    let alt_remaining = alt_bytes.len() - prefix - suffix;
+    match (ref_remaining, alt_remaining) {
+        (0, 0) => 0,
+        (0, _) => 2,
+        (_, 0) => 4,
+        (left, right) if left == right => 1,
+        (left, right) if left < right => 1 | 2,
+        _ => 1 | 4,
+    }
+}
+
+fn legacy_type_bits(bits: u8) -> &'static str {
+    const NAMES: [&str; 16] = [
+        "nc", "s", "i", "si", "d", "sd", "id", "sid", "r", "rs", "ri", "rsi", "rd", "rsd", "rid",
+        "rsid",
+    ];
+    NAMES[usize::from(bits & 0x0f)]
+}
+
+fn decorate_existing_comparison_vcf(
+    output_path: &Path,
+    truth_path: &Path,
+    query_path: &Path,
+    preserve_info: bool,
+    output_vtc: bool,
+) -> Result<()> {
+    let (mut headers, records) = vcf::load_raw_vcf(output_path)?;
+    let (_, truth) = vcf::load_raw_vcf(truth_path)?;
+    let (_, query) = vcf::load_raw_vcf(query_path)?;
+    let mut rows = records
+        .into_iter()
+        .map(|record| AnnotatedRow {
+            sort_key: (record.chrom.clone(), record.pos, 0, 0),
+            line: record.to_line(),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+        })
+        .collect::<Vec<_>>();
+    decorate_output_rows(&mut rows, &truth, &query, preserve_info, output_vtc, "QUAL")?;
+    if output_vtc {
+        let mut chrom_index = headers
+            .iter()
+            .position(|line| line.starts_with("#CHROM"))
+            .unwrap_or(headers.len());
+        for declaration in [
+            "##INFO=<ID=VTC,Number=.,Type=String,Description=\"Variant types used for counting.\">",
+            "##INFO=<ID=XCMP,Number=.,Type=String,Description=\"XCMP extra information.\">",
+        ] {
+            let identity = preprocess::structured_header_identity(declaration);
+            let present = headers
+                .iter()
+                .any(|line| preprocess::structured_header_identity(line) == identity);
+            if !present {
+                headers.insert(chrom_index, declaration.to_string());
+                chrom_index += 1;
+            }
+        }
+    }
+    let decorated = rows
+        .iter()
+        .map(|row| RawVcfRecord::from_line(&row.line, output_path))
+        .collect::<Result<Vec<_>>>()?;
+    vcf::write_raw_vcf(output_path, &headers, &decorated)
+}
+
+fn resolve_default_reference() -> Result<String> {
+    for candidate in [
+        std::env::var_os("HG19"),
+        std::env::var_os("HGREF"),
+        Some("/opt/hap.py-data/hg19.fa".into()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Ok(path.display().to_string());
+        }
+    }
+    bail!("no reference file found; pass --reference or set HG19/HGREF")
+}
+
+fn build_vcf_headers(
+    truth_headers: &[String],
+    query_headers: &[String],
+    apply_filters_query: bool,
+    output_vtc: bool,
+    preserve_info: bool,
+) -> Vec<String> {
+    let mut supplied: Vec<String> = truth_headers
+        .iter()
+        .chain(query_headers)
+        .filter(|line| line.starts_with("##"))
+        .cloned()
+        .collect();
+    supplied.extend([
+        "##INFO=<ID=gtt1,Number=1,Type=String,Description=\"GT of truth call\">".to_string(),
+        "##INFO=<ID=gtt2,Number=1,Type=String,Description=\"GT of query call\">".to_string(),
+        "##INFO=<ID=type,Number=1,Type=String,Description=\"Decision for call (TP/FP/FN/N)\">".to_string(),
+        "##INFO=<ID=kind,Number=1,Type=String,Description=\"Sub-type for decision (match/mismatch type)\">".to_string(),
+        "##INFO=<ID=ctype,Number=1,Type=String,Description=\"Type of comparison performed\">".to_string(),
+        "##INFO=<ID=HapMatch,Number=0,Type=Flag,Description=\"Variant is in matching haplotype block\">".to_string(),
+        "##INFO=<ID=BS,Number=1,Type=Integer,Description=\"Start position of the benchmarking superlocus on current chromosome\">".to_string(),
+        "##INFO=<ID=IQQ,Number=1,Type=Float,Description=\"Quality value for query variants (QUAL).\">".to_string(),
+    ]);
+    if apply_filters_query {
+        supplied.push(
+            "##INFO=<ID=Q_FILTERED,Number=0,Type=Flag,Description=\"Filtered call in query\">"
+                .to_string(),
+        );
+    }
+    supplied
+        .push("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTRUTH\tQUERY".to_string());
+
+    // xcmp first writes through VariantWriter (base + sorted merged input
+    // headers). Quantify then appends its region/FORMAT declarations in this
+    // exact order before writing the final two-sample VCF.
+    let mut headers = preprocess::canonicalize_legacy_headers(&supplied);
+    let chrom = headers.pop().expect("comparison header has #CHROM line");
+    let mut quantified_headers =
+        vec!["##INFO=<ID=Regions,Number=.,Type=String,Description=\"Tags for regions.\">"];
+    if preserve_info {
+        quantified_headers.push(
+            "##INFO=<ID=RegionsExtent,Number=.,Type=String,Description=\"Trimmed reference coordinates matched to regions for this record.\">",
+        );
+    }
+    quantified_headers.extend([
+        "##FORMAT=<ID=BD,Number=1,Type=String,Description=\"Decision for call (TP/FP/FN/N)\">",
+        "##FORMAT=<ID=BK,Number=1,Type=String,Description=\"Sub-type for decision (match/mismatch type)\">",
+        "##FORMAT=<ID=BI,Number=1,Type=String,Description=\"Additional comparison information\">",
+        "##FORMAT=<ID=QQ,Number=1,Type=Float,Description=\"Variant quality for ROC creation.\">",
+        "##FORMAT=<ID=BVT,Number=1,Type=String,Description=\"High-level variant type (SNP|INDEL).\">",
+        "##FORMAT=<ID=BLT,Number=1,Type=String,Description=\"High-level location type (het|homref|hetalt|homalt|nocall).\">",
+    ]);
+    if output_vtc {
+        quantified_headers.extend([
+            "##INFO=<ID=VTC,Number=.,Type=String,Description=\"Variant types used for counting.\">",
+            "##INFO=<ID=XCMP,Number=.,Type=String,Description=\"XCMP extra information.\">",
+        ]);
+    }
+    for line in quantified_headers {
+        let identity = preprocess::structured_header_identity(line);
+        let already_present = identity.as_ref().is_some_and(|wanted| {
+            headers.iter().any(|existing| {
+                preprocess::structured_header_identity(existing).as_ref() == Some(wanted)
+            })
+        });
+        if !already_present {
+            headers.push(line.to_string());
+        }
+    }
+    headers.push(chrom);
     headers
 }
 
+#[cfg(test)]
 fn build_clusters(truth: &[Variant], query: &[Variant]) -> Vec<Cluster> {
+    build_clusters_with_gap(truth, query, CLUSTER_GAP_BP)
+}
+
+fn build_clusters_with_gap(
+    truth: &[Variant],
+    query: &[Variant],
+    cluster_gap: usize,
+) -> Vec<Cluster> {
     let mut entries = Vec::new();
     entries.extend(truth.iter().cloned().map(|variant| Entry {
         side: Side::Truth,
@@ -471,7 +1908,7 @@ fn build_clusters(truth: &[Variant], query: &[Variant]) -> Vec<Cluster> {
         match &mut current {
             Some(cluster)
                 if cluster.chrom == entry.variant.key.chrom
-                    && start <= cluster.end.saturating_add(CLUSTER_GAP_BP)
+                    && start <= cluster.end.saturating_add(cluster_gap)
                     && cluster.truth.len() + cluster.query.len() < MAX_CLUSTER_VARIANTS =>
             {
                 cluster.end = cluster.end.max(end);
@@ -510,28 +1947,91 @@ fn process_cluster(
     cluster: &Cluster,
     reference_sequences: &BTreeMap<String, String>,
     conf_bed: Option<&[vcf::BedInterval]>,
+    config: ComparisonConfig,
     counts: &mut BTreeMap<String, TypeCounts>,
     subtype_counts: &mut BTreeMap<String, BTreeMap<String, TypeCounts>>,
     rows: &mut Vec<AnnotatedRow>,
 ) -> Result<()> {
+    let output_start = rows.len();
     let reference = reference_sequences
         .get(&cluster.chrom)
         .ok_or_else(|| anyhow::anyhow!("reference contig {} not found", cluster.chrom))?;
+    // Class F: when a multi-allelic deletion query primitive slides left of
+    // the cluster's original anchor, the BS column and BED-derived Region
+    // tags must reflect the extended cluster span. Pre-compute the
+    // post-shift primitive positions, extend cluster.start (and end) to
+    // cover them, and proceed with the widened span. Without this both
+    // chr21:44413756 / chr21:47906001 emit `BS=44413761` / `BS=47906004`
+    // (the original parent anchor) while legacy emits `BS=44413756` /
+    // `BS=47906001`.
+    let mut min_primitive_start = cluster.start;
+    let mut max_primitive_end = cluster.end;
+    for query in &cluster.query {
+        for primitive in split_query_primitives_with_neighbors(
+            query,
+            reference,
+            cluster.start,
+            &cluster.query,
+            &cluster.truth,
+        ) {
+            if primitive.key.pos < min_primitive_start {
+                min_primitive_start = primitive.key.pos;
+            }
+            let p_end = primitive.key.pos + primitive.key.ref_allele.len().max(1) - 1;
+            if p_end > max_primitive_end {
+                max_primitive_end = p_end;
+            }
+        }
+    }
+    let cluster: Cluster = if min_primitive_start < cluster.start || max_primitive_end > cluster.end
+    {
+        Cluster {
+            chrom: cluster.chrom.clone(),
+            start: min_primitive_start,
+            end: max_primitive_end,
+            truth: cluster.truth.clone(),
+            query: cluster.query.clone(),
+        }
+    } else {
+        cluster.clone()
+    };
+    let cluster = &cluster;
     let region_state = RegionState::from_cluster(cluster, reference, conf_bed);
     let mut truth_remaining = cluster.truth.clone();
     let mut query_remaining = cluster.query.clone();
+    // Capture the row range emitted by `exact_match_pairs` so the post-
+    // hap_mismatch pass can degrade `BK=lm` on UNK combined rows when the
+    // cluster turns out to have hap_mismatch=false. legacy emits BK=lm
+    // on outside-CONF exact-match pairs only when the cluster's block-
+    // level hap-compare also disagrees; otherwise it stays at BK=`.`.
+    let exact_match_pre_count = rows.len();
     exact_match_pairs(
         cluster,
         reference,
         &region_state,
-        counts,
-        subtype_counts,
-        rows,
+        ComparisonOutputs {
+            counts,
+            subtype_counts,
+            rows,
+        },
         &mut truth_remaining,
         &mut query_remaining,
     );
+    let exact_match_post_count = rows.len();
+    // Prepared truth can carry the same unphased GT spelling as query. For
+    // those byte-identical exact indel pairs legacy's block comparison leaves
+    // an outside-CONF row at BK=`.` when the rest of the block reconciles. The
+    // ordinary (phased) truth stream does not take this path.
+    let identical_exact_keys = identical_gt_exact_indel_keys(cluster);
 
     if truth_remaining.is_empty() && query_remaining.is_empty() {
+        if !config.no_hc {
+            degrade_identical_exact_unk_rows(
+                &mut rows[exact_match_pre_count..exact_match_post_count],
+                &identical_exact_keys,
+            );
+        }
+        set_xcmp_context(&mut rows[output_start..], "simple:match", false);
         return Ok(());
     }
 
@@ -547,7 +2047,8 @@ fn process_cluster(
     // `cluster_signature` would otherwise synthesize a spurious "block
     // mismatch" against an empty counterpart side and promote every
     // unmatched indel to BK=lm.
-    let allow_haplotype_match = cluster_has_gt_selected_nonsnp(cluster)
+    let allow_haplotype_match = !config.no_hc
+        && cluster_has_gt_selected_nonsnp(cluster)
         && !cluster.truth.is_empty()
         && !cluster.query.is_empty();
     // Truth variants that were exact-matched (removed from truth_remaining).
@@ -555,14 +2056,53 @@ fn process_cluster(
     // should suppress the spurious BK=lm via drain restoration in
     // enumerate_haplotype_assignments. Variants still present in
     // truth_remaining were not matched, so BK=lm remains correct.
-    let truth_matched: Vec<Variant> = cluster.truth.iter()
+    let truth_matched: Vec<Variant> = cluster
+        .truth
+        .iter()
         .filter(|tv| !truth_remaining.iter().any(|r| r.key == tv.key))
         .cloned()
         .collect();
+    // Class C narrow relaxation: at positions where the query has both an
+    // Insert and a Subst record AND truth has a multi-allelic record at
+    // the same anchor whose alts cover BOTH the query's insert allele and
+    // its subst allele, allow the Insert+Subst conflict in the query
+    // enumeration. This mirrors legacy's reinterpretation of overlapping
+    // query records as a single hetalt multi-allelic — chr21:30374435
+    // query `G→GT 1/1` + `G→T 0/1` reconciles against truth `G→GT,T 2|1`
+    // by placing the insert+sub combo on one hap and the insert alone on
+    // the other (apply_events emits sub_alt + inserted at the shared
+    // anchor). The truth-counterpart guard prevents over-firing on shapes
+    // like chr21:16328989 (truth has `G→GA` only, no SNP allele in alts)
+    // where legacy keeps the strict drain semantics → BK=`.`.
+    let relax_positions = compute_class_c_relaxation_positions(&cluster.query, &cluster.truth);
+    let signature_cluster = Cluster {
+        chrom: cluster.chrom.clone(),
+        start: cluster.start.saturating_sub(config.hb_expand).max(1),
+        end: cluster
+            .end
+            .saturating_add(config.hb_expand)
+            .min(reference.len()),
+        truth: cluster.truth.clone(),
+        query: cluster.query.clone(),
+    };
     let (truth_sig, query_sig) = if allow_haplotype_match {
         (
-            cluster_signature(cluster, &cluster.truth, reference, None)?,
-            cluster_signature(cluster, &cluster.query, reference, Some(&truth_matched))?,
+            cluster_signature_with_limit(
+                &signature_cluster,
+                &cluster.truth,
+                reference,
+                None,
+                &BTreeSet::new(),
+                config.max_enum,
+            )?,
+            cluster_signature_with_limit(
+                &signature_cluster,
+                &cluster.query,
+                reference,
+                Some(&truth_matched),
+                &relax_positions,
+                config.max_enum,
+            )?,
         )
     } else {
         (None, None)
@@ -588,8 +2128,10 @@ fn process_cluster(
     // BK=lm.
     let hap_mismatch = if allow_haplotype_match && truth_sig.is_some() && query_sig.is_some() {
         !is_match
-    } else if allow_haplotype_match && truth_sig.is_some() && query_sig.is_none()
-        && estimated_state_count(&cluster.query) <= XCMP_ENUMERATION_THRESHOLD
+    } else if allow_haplotype_match
+        && truth_sig.is_some()
+        && query_sig.is_none()
+        && estimated_state_count_with_limit(&cluster.query, config.max_enum) <= config.max_enum
     {
         // Query states drained due to Insert+Subst conflict or ref-overlap (not
         // budget overflow). Budget overflow → hapfail → BK=.; state drain →
@@ -610,6 +2152,24 @@ fn process_cluster(
         false
     };
 
+    // Class E (chr21:35384302 chr21 case) — degrade BK=lm to `.` on UNK
+    // exact-match-pair rows when the cluster's haplotype comparator also
+    // matches (hap_mismatch=false). `unk_combined_row` hardcodes BK=lm at
+    // emission time because exact_match_pairs runs before cluster_signature
+    // is computed. Once we know the cluster has no hap-level mismatch, the
+    // legacy verdict is BK=`.` (same as a TP combined row would carry
+    // BK=gm). Restrict to clusters where hap-compare actually ran
+    // (`allow_haplotype_match`) so SNP-only or single-side clusters keep
+    // their pre-fix behaviour — those never had hap_mismatch evaluated and
+    // their BK=lm hardcode is what legacy emits in those shapes.
+    if allow_haplotype_match && !hap_mismatch {
+        for row in &mut rows[exact_match_pre_count..exact_match_post_count] {
+            if row.line.contains(":UNK:lm:") {
+                row.line = row.line.replace(":UNK:lm:", ":UNK:.:");
+            }
+        }
+    }
+
     let remainder = Cluster {
         chrom: cluster.chrom.clone(),
         start: cluster.start,
@@ -617,15 +2177,42 @@ fn process_cluster(
         truth: truth_remaining,
         query: query_remaining,
     };
+    // Legacy's graph hapcmp can reconcile a hom-alt query indel with two
+    // nearby heterozygous truth copies of the same edit inside a repetitive
+    // block, even when the copies use different VCF anchors. The linear
+    // signature enumerator intentionally does not generally collapse such
+    // anchors (that would be unsound for heterogeneous insertions), so retain
+    // this narrowly evidenced promotion path. chr21_preprocess_controls at
+    // 15181523/15181526 is the fixture: the earlier truth copy is outside
+    // CONF, the same-key 15181526 pair is a GT mismatch, and an exact shared
+    // SNP anchors the block. Legacy emits the mismatch pair as TP/gm with
+    // HapMatch rather than FN/FP am.
+    let legacy_hap_promotions = if is_match {
+        BTreeSet::new()
+    } else {
+        legacy_repetitive_indel_hap_promotions(cluster, &region_state)
+    };
+    let (mut xcmp_ctype, mut xcmp_hap_match) = if !allow_haplotype_match {
+        ("simple:mismatch", false)
+    } else {
+        match (&truth_sig, &query_sig) {
+            (Some(_), Some(_)) if is_match => ("hap:match", true),
+            (Some(_), Some(_)) => ("hap:mismatch", false),
+            _ if hap_mismatch => ("hap:mismatch", false),
+            _ => ("hapfail:mismatch", false),
+        }
+    };
     if is_match {
         mark_cluster_match(
             &remainder,
             cluster,
             reference,
             &region_state,
-            counts,
-            subtype_counts,
-            rows,
+            ComparisonOutputs {
+                counts,
+                subtype_counts,
+                rows,
+            },
         );
     } else {
         mark_cluster_mismatch(
@@ -634,33 +2221,274 @@ fn process_cluster(
             hap_mismatch,
             reference,
             &region_state,
-            counts,
-            subtype_counts,
-            rows,
+            ComparisonOutputs {
+                counts,
+                subtype_counts,
+                rows,
+            },
         );
     }
+    if !legacy_hap_promotions.is_empty() {
+        for row in &mut rows[exact_match_post_count..] {
+            if row_matches_variant_key(row, &legacy_hap_promotions)
+                && row.line.contains(":FN:am:")
+                && row.line.contains(":FP:am:")
+            {
+                let key = legacy_hap_promotions
+                    .iter()
+                    .find(|key| row_matches_variant_key(row, &BTreeSet::from([(*key).clone()])))
+                    .expect("promoted row has a matching variant key");
+                let truth = cluster
+                    .truth
+                    .iter()
+                    .find(|variant| variant.key == *key)
+                    .expect("promoted truth variant exists");
+                let query = cluster
+                    .query
+                    .iter()
+                    .find(|variant| variant.key == *key)
+                    .expect("promoted query variant exists");
+                *row = tp_combined_row(
+                    truth,
+                    query,
+                    reference,
+                    cluster.start,
+                    &region_state.row_tags(Some(truth), Some(query)),
+                );
+            }
+        }
+        xcmp_ctype = "hap:match";
+        xcmp_hap_match = true;
+    }
+    // The provisional exact-pair `UNK:lm` becomes `UNK:.` only when no
+    // residual row proves that the enclosing block remains unreconciled.
+    // Preprocess-controls dot blocks contain only TP/gm sibling rows; true
+    // local-mismatch blocks retain at least one residual lm/am row.
+    if !config.no_hc
+        && !rows[exact_match_post_count..]
+            .iter()
+            .any(annotated_row_has_unreconciled_allele)
+    {
+        degrade_identical_exact_unk_rows(
+            &mut rows[exact_match_pre_count..exact_match_post_count],
+            &identical_exact_keys,
+        );
+    }
+    if xcmp_hap_match
+        && rows[output_start..]
+            .iter()
+            .any(annotated_row_has_unreconciled_allele)
+    {
+        xcmp_ctype = "hap:mismatch";
+        xcmp_hap_match = false;
+    }
+    // pre.py emits unphased, decomposed truth records. When a decomposed SNP
+    // and indel share an anchor and the SNP has an exact query counterpart,
+    // legacy's VariantLocationAggregator orders the SNP record first. The
+    // phased non-preprocessed stream follows the ordinary decision/type sort,
+    // so gate this on the all-unphased same-anchor truth shape.
+    let snp_first_positions = legacy_preprocessed_snp_first_positions(cluster);
+    for row in &mut rows[output_start..] {
+        if snp_first_positions.contains(&row.sort_key.1) {
+            row.sort_key.2 = usize::from(!annotated_row_is_snp(row));
+        }
+    }
+    set_xcmp_context(&mut rows[output_start..], xcmp_ctype, xcmp_hap_match);
     Ok(())
 }
 
+fn identical_gt_exact_indel_keys(cluster: &Cluster) -> BTreeSet<VariantKey> {
+    cluster
+        .truth
+        .iter()
+        .filter(|truth| {
+            truth.primary_type() == "INDEL"
+                && cluster
+                    .query
+                    .iter()
+                    .any(|query| truth.key == query.key && truth.gt == query.gt)
+        })
+        .map(|truth| truth.key.clone())
+        .collect()
+}
+
+fn degrade_identical_exact_unk_rows(rows: &mut [AnnotatedRow], keys: &BTreeSet<VariantKey>) {
+    for row in rows {
+        if row_matches_variant_key(row, keys) && row.line.contains(":UNK:lm:") {
+            row.line = row.line.replace(":UNK:lm:", ":UNK:.:");
+        }
+    }
+}
+
+fn legacy_preprocessed_snp_first_positions(cluster: &Cluster) -> BTreeSet<usize> {
+    let positions = cluster
+        .truth
+        .iter()
+        .map(|variant| variant.key.pos)
+        .collect::<BTreeSet<_>>();
+    positions
+        .into_iter()
+        .filter(|pos| {
+            let truth_at_pos = cluster
+                .truth
+                .iter()
+                .filter(|variant| variant.key.pos == *pos)
+                .collect::<Vec<_>>();
+            truth_at_pos
+                .iter()
+                .all(|variant| variant.gt.contains('/') && !variant.gt.contains('|'))
+                && truth_at_pos
+                    .iter()
+                    .any(|variant| variant.primary_type() == "SNP")
+                && truth_at_pos
+                    .iter()
+                    .any(|variant| variant.primary_type() == "INDEL")
+                && truth_at_pos.iter().any(|truth| {
+                    truth.primary_type() == "SNP"
+                        && cluster.query.iter().any(|query| {
+                            query.key == truth.key && equivalent_gt(&query.gt, &truth.gt)
+                        })
+                })
+        })
+        .collect()
+}
+
+fn annotated_row_is_snp(row: &AnnotatedRow) -> bool {
+    let fields = row.line.split('\t').collect::<Vec<_>>();
+    fields.get(3).is_some_and(|reference| reference.len() == 1)
+        && fields
+            .get(4)
+            .is_some_and(|alternate| alternate.split(',').all(|allele| allele.len() == 1))
+}
+
+fn legacy_repetitive_indel_hap_promotions(
+    cluster: &Cluster,
+    region_state: &RegionState,
+) -> BTreeSet<VariantKey> {
+    let has_exact_shared_anchor = cluster.truth.iter().any(|truth| {
+        cluster.query.iter().any(|query| {
+            truth.key == query.key
+                && equivalent_gt(&truth.gt, &query.gt)
+                && truth.primary_type() == "SNP"
+        })
+    });
+    if !has_exact_shared_anchor {
+        return BTreeSet::new();
+    }
+
+    cluster
+        .truth
+        .iter()
+        .filter(|truth| {
+            truth.primary_type() == "INDEL"
+                && truth.is_het()
+                && region_state.truth_is_conf(truth)
+                && cluster.query.iter().any(|query| {
+                    query.key == truth.key
+                        && query.is_homalt()
+                        && region_state.query_is_conf(query)
+                        && cluster.truth.iter().any(|other_truth| {
+                            other_truth.key != truth.key
+                                && other_truth.primary_type() == "INDEL"
+                                && other_truth.is_het()
+                                && !region_state.truth_is_conf(other_truth)
+                                && same_single_alt_indel_edit(other_truth, truth)
+                        })
+                })
+        })
+        .map(|truth| truth.key.clone())
+        .collect()
+}
+
+fn same_single_alt_indel_edit(left: &Variant, right: &Variant) -> bool {
+    fn edit(variant: &Variant) -> Option<(String, String)> {
+        if variant.key.alt_allele.contains(',') {
+            return None;
+        }
+        let (_, reference, alternate) = trim_variant(
+            variant.key.pos,
+            &variant.key.ref_allele,
+            &variant.key.alt_allele,
+        );
+        Some((reference, alternate))
+    }
+
+    edit(left) == edit(right)
+}
+
+fn set_xcmp_context(rows: &mut [AnnotatedRow], ctype: &'static str, hap_match: bool) {
+    for row in rows {
+        row.xcmp_ctype = Some(ctype);
+        row.xcmp_hap_match = hap_match;
+    }
+}
+
+fn annotated_row_has_unreconciled_allele(row: &AnnotatedRow) -> bool {
+    let fields = row.line.split('\t').collect::<Vec<_>>();
+    if fields.len() < 11 {
+        return false;
+    }
+    let format = fields[8].split(':').collect::<Vec<_>>();
+    let Some(bk_index) = format.iter().position(|key| *key == "BK") else {
+        return false;
+    };
+    for sample in [&fields[9], &fields[10]] {
+        let values = sample.split(':').collect::<Vec<_>>();
+        if values
+            .get(bk_index)
+            .is_some_and(|bk| matches!(*bk, "lm" | "am"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
 fn cluster_signature(
     cluster: &Cluster,
     variants: &[Variant],
     reference: &str,
     truth_variants: Option<&[Variant]>,
+    relax_positions: &BTreeSet<usize>,
+) -> Result<Option<BTreeSet<String>>> {
+    cluster_signature_with_limit(
+        cluster,
+        variants,
+        reference,
+        truth_variants,
+        relax_positions,
+        XCMP_ENUMERATION_THRESHOLD,
+    )
+}
+
+fn cluster_signature_with_limit(
+    cluster: &Cluster,
+    variants: &[Variant],
+    reference: &str,
+    truth_variants: Option<&[Variant]>,
+    relax_positions: &BTreeSet<usize>,
+    max_enum: usize,
 ) -> Result<Option<BTreeSet<String>>> {
     // Skip enumeration when the predicted state space exceeds the legacy
     // xcmp cap. A `None` result forces the caller to treat the cluster as
     // mismatch — the same conservative fallback legacy applies when the
     // hap-block enumeration budget is blown.
-    if estimated_state_count(variants) > XCMP_ENUMERATION_THRESHOLD {
+    if estimated_state_count_with_limit(variants, max_enum) > max_enum {
         return Ok(None);
     }
 
     let segment = reference_segment(reference, cluster.start, cluster.end)?;
     let mut signatures = BTreeSet::new();
-    for (hap1_events, hap2_events) in
-        enumerate_haplotype_assignments(variants, reference, cluster.start, cluster.end, truth_variants)?
-    {
+    for (hap1_events, hap2_events) in enumerate_haplotype_assignments(
+        variants,
+        reference,
+        cluster.start,
+        cluster.end,
+        truth_variants,
+        relax_positions,
+        max_enum,
+    )? {
         let Some(hap1) = apply_events(reference, cluster.start, cluster.end, &hap1_events)? else {
             continue;
         };
@@ -801,6 +2629,100 @@ fn trimmed_primitive_lens(ref_allele: &str, alt_allele: &str) -> (usize, usize) 
 ///                   an extra FP SNP beside a shared insert) → hap_mismatch=FALSE.
 ///   `Some(false)` — conflict found but no truth counterpart for any conflict-
 ///                   position insert → genuine mismatch → hap_mismatch=TRUE.
+/// Class D BK classifier for `fn_fp_combined_row` pairs (truth+query at
+/// same byte-equal alt column, GT multisets disagree). Mirrors legacy's
+/// XCmpQuantify branching:
+///   * Same selected allele set, different multiset (zygosity diff —
+///     truth het vs query homalt of the same allele) → `am`.
+///   * Different selected sets with at least one shared allele,
+///     INDEL → `lm`. chr21:38861935 fixture: truth `T→TAA,TA 1|1` vs
+///     query `T→TAA,TA 1/2`.
+///   * Different selected sets with at least one shared allele,
+///     SNP → `.` (legacy quirk; chr21:9922359 truth `T→A,C 1|0` vs
+///     query `T→A,C 2/1`).
+///   * Disjoint selected sets → `lm` (almismatch path).
+fn compute_paired_bk(truth: &Variant, query: &Variant) -> &'static str {
+    let truth_set = gt_selected_nonref_alts(truth);
+    let query_set = gt_selected_nonref_alts(query);
+    if truth_set == query_set {
+        return "am";
+    }
+    let intersect_count = truth_set.intersection(&query_set).count();
+    if intersect_count == 0 {
+        return "lm";
+    }
+    // Overlapping but unequal selected sets — type-dependent.
+    if truth.primary_type() == "SNP" && query.primary_type() == "SNP" {
+        return ".";
+    }
+    "lm"
+}
+
+/// Compute the set of positions where the query side's `Insert+Subst at
+/// same anchor` conflict should be RELAXED during haplotype enumeration.
+///
+/// A position qualifies when:
+///   * the query has at least one Insert (alt longer than ref) AND at
+///     least one Subst (alt same length as ref) record AT THAT POSITION,
+///   * truth has a record AT THE SAME (chrom, pos, ref) whose declared
+///     alts include BOTH the query's insert allele AND the query's subst
+///     allele — i.e. truth's multi-allelic mirrors the union of query's
+///     overlapping single-allelic records.
+///
+/// chr21:30374435 example: query has `G→GT 1/1` (insert) + `G→T 0/1`
+/// (subst); truth has `G→GT,T 2|1` (alts `{GT, T}`). Truth's alt set
+/// covers both query alleles → relaxation fires at 30374435 → query's
+/// hap pair reconciles into `(GT, T+T)` matching truth's `(GT, T)` over
+/// the cluster span.
+///
+/// chr21:16328989 (negative test): query has `G→GA 1/1` (insert) +
+/// `G→A 0/1` (subst); truth has `G→GA 1|1` (alts `{GA}`). Truth's alt
+/// set lacks the SNP `A` → no relaxation → strict drain → BK=`.`.
+fn compute_class_c_relaxation_positions(query: &[Variant], truth: &[Variant]) -> BTreeSet<usize> {
+    use std::collections::BTreeMap;
+    // Group query selected alts by (pos, ref_allele), splitting into
+    // insert and subst buckets.
+    let mut insert_alts: BTreeMap<(usize, String), BTreeSet<String>> = BTreeMap::new();
+    let mut subst_alts: BTreeMap<(usize, String), BTreeSet<String>> = BTreeMap::new();
+    for v in query {
+        let key = (v.key.pos, v.key.ref_allele.clone());
+        for alt in selected_alt_sequences(v) {
+            if alt.len() > v.key.ref_allele.len() {
+                insert_alts.entry(key.clone()).or_default().insert(alt);
+            } else if alt.len() == v.key.ref_allele.len() {
+                subst_alts.entry(key.clone()).or_default().insert(alt);
+            }
+        }
+    }
+    let mut out: BTreeSet<usize> = BTreeSet::new();
+    let chrom_opt = query.first().map(|v| v.key.chrom.clone());
+    let Some(chrom) = chrom_opt else {
+        return out;
+    };
+    for (key, ialts) in &insert_alts {
+        let Some(salts) = subst_alts.get(key) else {
+            continue;
+        };
+        let combined: BTreeSet<String> = ialts.iter().chain(salts.iter()).cloned().collect();
+        for tv in truth {
+            if tv.key.chrom != chrom || tv.key.pos != key.0 || tv.key.ref_allele != key.1 {
+                continue;
+            }
+            let t_alts: BTreeSet<String> = tv
+                .key
+                .alt_allele
+                .split(',')
+                .map(|s| s.to_string())
+                .collect();
+            if combined.is_subset(&t_alts) {
+                out.insert(key.0);
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn query_insert_conflict_has_truth_counterpart(
     query_variants: &[Variant],
     truth_variants: &[Variant],
@@ -811,7 +2733,13 @@ fn query_insert_conflict_has_truth_counterpart(
     let mut insert_positions: BTreeSet<usize> = BTreeSet::new();
     let mut subst_positions: BTreeSet<usize> = BTreeSet::new();
     for v in query_variants {
-        let max_alt_len = v.key.alt_allele.split(',').map(|a| a.len()).max().unwrap_or(0);
+        let max_alt_len = v
+            .key
+            .alt_allele
+            .split(',')
+            .map(|a| a.len())
+            .max()
+            .unwrap_or(0);
         if max_alt_len > v.key.ref_allele.len() {
             insert_positions.insert(v.key.pos);
         } else {
@@ -838,19 +2766,43 @@ fn query_insert_conflict_has_truth_counterpart(
         // truth call at ipos), the drain is an internal query conflict unrelated to
         // truth → return None instead of a spurious Some(false).
         if insert_positions.iter().any(|&ipos| {
-            query_variants.iter().any(|v| {
+            // Find a deletion present on BOTH query haplotypes that covers the
+            // insert anchor `ipos`. Coverage means `ipos ∈ (deletion.pos,
+            // deletion.pos + ref_len - 1]` (the anchor itself is not consumed
+            // by the deletion in VCF normalization, so we use strict `<`).
+            let blocking_deletion = query_variants.iter().find(|v| {
                 let ref_len = v.key.ref_allele.len();
-                let max_alt = v.key.alt_allele.split(',').map(|a| a.len()).max().unwrap_or(0);
+                let max_alt = v
+                    .key
+                    .alt_allele
+                    .split(',')
+                    .map(|a| a.len())
+                    .max()
+                    .unwrap_or(0);
                 ref_len > max_alt // deletion
                     && v.key.pos < ipos
-                    && ipos <= v.key.pos + ref_len - 1
+                    && ipos < v.key.pos + ref_len
                     // deletion must be on both haplotypes (no 0/ref allele in GT)
                     && !v.gt.split(['/', '|']).any(|a| a == "0")
-            })
-            && (
-                !truth_remaining.is_empty()
-                || truth_variants.iter().any(|tv| tv.key.pos == ipos)
-            )
+            });
+            let Some(del) = blocking_deletion else {
+                return false;
+            };
+            // Genuine-mismatch evidence must be POSITIONALLY RELATED to the
+            // blocked insert: either the original truth side declared a variant
+            // exactly at the blocked anchor (truth predicted the insert), or an
+            // unmatched truth variant overlaps the deletion's claimed range
+            // (truth disagreement falls inside the deleted span). chr21:44049606
+            // (chr21_passonly) is a counter-example for the prior loose gate:
+            // truth has TGATA→T at 44049663, well outside the AATGATAGATAG→A
+            // deletion at 44049606..44049617 — legacy emits BK=`.` because the
+            // drain is an internal query conflict unrelated to truth.
+            let del_end = del.key.pos + del.key.ref_allele.len() - 1;
+            let truth_at_ipos = truth_variants.iter().any(|tv| tv.key.pos == ipos);
+            let truth_in_del_range = truth_remaining
+                .iter()
+                .any(|tv| tv.key.pos >= del.key.pos && tv.key.pos <= del_end);
+            truth_at_ipos || truth_in_del_range
         }) {
             return Some(false); // deletion on both haps covers insert → genuine mismatch
         }
@@ -863,15 +2815,20 @@ fn query_insert_conflict_has_truth_counterpart(
             if qv.key.pos != *pos {
                 continue;
             }
-            let max_alt_len = qv.key.alt_allele.split(',').map(|a| a.len()).max().unwrap_or(0);
+            let max_alt_len = qv
+                .key
+                .alt_allele
+                .split(',')
+                .map(|a| a.len())
+                .max()
+                .unwrap_or(0);
             if max_alt_len <= qv.key.ref_allele.len() {
                 continue; // not an insert at this position
             }
             // Use alt-set equality comparison: "CAA,CA" matches truth "CA,CAA"
             // (same set, different order), but "TAA" does NOT match "TAA,TA"
             // (strict subset → genuine mismatch, legacy gives BK=lm).
-            let q_alts: std::collections::BTreeSet<&str> =
-                qv.key.alt_allele.split(',').collect();
+            let q_alts: std::collections::BTreeSet<&str> = qv.key.alt_allele.split(',').collect();
             if truth_variants.iter().any(|tv| {
                 if tv.key.pos != qv.key.pos || tv.key.ref_allele != qv.key.ref_allele {
                     return false;
@@ -892,15 +2849,23 @@ fn query_insert_conflict_has_truth_counterpart(
 /// unphased variants double the state count; everything else leaves it alone.
 /// Returns `usize::MAX` as soon as the cap is exceeded, so callers can branch
 /// without waiting for overflow.
+#[cfg(test)]
 fn estimated_state_count(variants: &[Variant]) -> usize {
+    estimated_state_count_with_limit(variants, XCMP_ENUMERATION_THRESHOLD)
+}
+
+fn estimated_state_count_with_limit(variants: &[Variant], max_enum: usize) -> usize {
     let mut total: usize = 1;
     for variant in variants {
         let alleles = parse_gt_alleles(&variant.gt);
         let phased = variant.gt.contains('|');
-        let multiplier =
-            if !phased && alleles.len() == 2 && alleles[0] != alleles[1] { 2 } else { 1 };
+        let multiplier = if !phased && alleles.len() == 2 && alleles[0] != alleles[1] {
+            2
+        } else {
+            1
+        };
         total = total.saturating_mul(multiplier);
-        if total > XCMP_ENUMERATION_THRESHOLD {
+        if total > max_enum {
             return usize::MAX;
         }
     }
@@ -925,6 +2890,8 @@ fn enumerate_haplotype_assignments(
     cluster_start: usize,
     cluster_end: usize,
     truth_variants: Option<&[Variant]>,
+    relax_positions: &BTreeSet<usize>,
+    max_enum: usize,
 ) -> Result<Vec<(Vec<Event>, Vec<Event>)>> {
     // State per haplotype: (claimed_end, subst_end, insert_end).
     //
@@ -957,8 +2924,17 @@ fn enumerate_haplotype_assignments(
     //   Insert:       claimed_end = max(claimed_end, var_end)   [keeps BK=lm for
     //                               Insert-before-Subst-at-same-pos]
     //                 insert_end  = max(insert_end, var_start)
-    let mut states: Vec<(Vec<Event>, Vec<Event>, usize, usize, usize, usize, usize, usize)> =
-        vec![(Vec::new(), Vec::new(), 0, 0, 0, 0, 0, 0)];
+    type HaplotypeState = (
+        Vec<Event>,
+        Vec<Event>,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    );
+    let mut states: Vec<HaplotypeState> = vec![(Vec::new(), Vec::new(), 0, 0, 0, 0, 0, 0)];
     for variant in variants {
         let var_start = variant.key.pos;
         let var_end = var_start + variant.key.ref_allele.len() - 1;
@@ -972,14 +2948,24 @@ fn enumerate_haplotype_assignments(
         // the enumeration cap — this is a belt-and-braces check behind the
         // `estimated_state_count` gate in `cluster_signature`.
         let projected = states.len().saturating_mul(variant_assignments.len());
-        if projected > XCMP_ENUMERATION_THRESHOLD {
+        if projected > max_enum {
             bail!(
                 "xcmp enumeration exceeded threshold ({} projected states)",
                 projected
             );
         }
         let mut next = Vec::with_capacity(projected);
-        for (hap1_events, hap2_events, h1_claimed, h1_subst, h1_insert, h2_claimed, h2_subst, h2_insert) in &states {
+        for (
+            hap1_events,
+            hap2_events,
+            h1_claimed,
+            h1_subst,
+            h1_insert,
+            h2_claimed,
+            h2_subst,
+            h2_insert,
+        ) in &states
+        {
             for (left_events, right_events) in &variant_assignments {
                 let left_nonref = !left_events.is_empty();
                 let right_nonref = !right_events.is_empty();
@@ -1005,33 +2991,67 @@ fn enumerate_haplotype_assignments(
                 // query hap state would include deletion+SNP while truth has deletion
                 // only — no intersection → spurious BK=lm. Restore legacy drain by
                 // falling back to var_start (pre-fix behaviour) for this variant.
-                let truth_has_variant = truth_variants.map_or(false, |tv| {
+                let truth_has_variant = truth_variants.is_some_and(|tv| {
                     tv.iter().any(|t| {
                         t.key.pos == variant.key.pos
                             && t.key.ref_allele == variant.key.ref_allele
                             && t.key.alt_allele == variant.key.alt_allele
                     })
                 });
-                let left_conflict_start =
-                    if left_eff_start > var_start && truth_has_variant { var_start } else { left_eff_start };
-                let right_conflict_start =
-                    if right_eff_start > var_start && truth_has_variant { var_start } else { right_eff_start };
-                // Subst/Delete conflict: ref overlap OR prior Insert at same anchor.
-                if left_nonref && !left_insert_only
-                    && (left_conflict_start <= *h1_claimed || left_conflict_start <= *h1_insert)
+                let left_conflict_start = if left_eff_start > var_start && truth_has_variant {
+                    var_start
+                } else {
+                    left_eff_start
+                };
+                let right_conflict_start = if right_eff_start > var_start && truth_has_variant {
+                    var_start
+                } else {
+                    right_eff_start
+                };
+                // Class C narrow relaxation: at relaxation positions, allow
+                // Insert+Subst at the same anchor on the same hap. The
+                // single-node "ref overlap with prior Subst/Delete" check
+                // still applies, but the Insert↔Subst single-node block is
+                // skipped — this lets the chr21:30374435 query records
+                // (G→GT 1/1 + G→T 0/1) compose into truth-matching
+                // haplotypes.
+                let left_relax_subst = left_nonref
+                    && !left_insert_only
+                    && relax_positions.contains(&left_conflict_start);
+                let right_relax_subst = right_nonref
+                    && !right_insert_only
+                    && relax_positions.contains(&right_conflict_start);
+                let left_relax_insert =
+                    left_nonref && left_insert_only && relax_positions.contains(&var_start);
+                let right_relax_insert =
+                    right_nonref && right_insert_only && relax_positions.contains(&var_start);
+                // Subst/Delete conflict: ref overlap OR prior Insert at same
+                // anchor. The Insert-at-same-anchor part is suppressed at
+                // relaxation positions.
+                if left_nonref
+                    && !left_insert_only
+                    && (left_conflict_start <= *h1_claimed
+                        || (!left_relax_subst && left_conflict_start <= *h1_insert))
                 {
                     continue;
                 }
-                if right_nonref && !right_insert_only
-                    && (right_conflict_start <= *h2_claimed || right_conflict_start <= *h2_insert)
+                if right_nonref
+                    && !right_insert_only
+                    && (right_conflict_start <= *h2_claimed
+                        || (!right_relax_subst && right_conflict_start <= *h2_insert))
                 {
                     continue;
                 }
-                // Insert conflict: prior Subst at same anchor.
-                if left_nonref && left_insert_only && var_start <= *h1_subst {
+                // Insert conflict: prior Subst at same anchor (suppressed at
+                // relaxation positions).
+                if left_nonref && left_insert_only && !left_relax_insert && var_start <= *h1_subst {
                     continue;
                 }
-                if right_nonref && right_insert_only && var_start <= *h2_subst {
+                if right_nonref
+                    && right_insert_only
+                    && !right_relax_insert
+                    && var_start <= *h2_subst
+                {
                     continue;
                 }
                 let mut next_hap1 = hap1_events.clone();
@@ -1040,8 +3060,22 @@ fn enumerate_haplotype_assignments(
                 next_hap2.extend_from_slice(right_events);
                 // Update claimed_end for ALL non-ref (including Insert) so that
                 // a later Subst at the same pos sees conflict via claimed_end.
-                let new_h1_claimed = if left_nonref { (*h1_claimed).max(var_end) } else { *h1_claimed };
-                let new_h2_claimed = if right_nonref { (*h2_claimed).max(var_end) } else { *h2_claimed };
+                // Exception: at relaxation positions, an Insert must NOT bump
+                // h_claimed; otherwise a follow-on Subst at the same anchor
+                // would still be blocked by the ref-overlap rule.
+                let left_inserts_skip_claim = left_nonref && left_insert_only && left_relax_insert;
+                let right_inserts_skip_claim =
+                    right_nonref && right_insert_only && right_relax_insert;
+                let new_h1_claimed = if left_nonref && !left_inserts_skip_claim {
+                    (*h1_claimed).max(var_end)
+                } else {
+                    *h1_claimed
+                };
+                let new_h2_claimed = if right_nonref && !right_inserts_skip_claim {
+                    (*h2_claimed).max(var_end)
+                } else {
+                    *h2_claimed
+                };
                 // Update subst_end for Subst/Delete only.
                 let new_h1_subst = if left_nonref && !left_insert_only {
                     (*h1_subst).max(var_start)
@@ -1064,22 +3098,24 @@ fn enumerate_haplotype_assignments(
                 } else {
                     *h2_insert
                 };
-                next.push((next_hap1, next_hap2, new_h1_claimed, new_h1_subst, new_h1_insert, new_h2_claimed, new_h2_subst, new_h2_insert));
+                next.push((
+                    next_hap1,
+                    next_hap2,
+                    new_h1_claimed,
+                    new_h1_subst,
+                    new_h1_insert,
+                    new_h2_claimed,
+                    new_h2_subst,
+                    new_h2_insert,
+                ));
             }
         }
         states = next;
     }
-    Ok(states.into_iter().map(|(h1, h2, _, _, _, _, _, _)| (h1, h2)).collect())
-}
-
-/// Returns true when `events` contains any Subst or Delete — i.e., when the
-/// haplotype assignment actually consumes reference bases at the variant
-/// position. Pure-insertion assignments (only Event::Insert) are excluded
-/// because they are anchored at a ref position without consuming it.
-fn events_claim_ref_bases(events: &[Event]) -> bool {
-    events
-        .iter()
-        .any(|e| matches!(e, Event::Subst { .. } | Event::Delete { .. }))
+    Ok(states
+        .into_iter()
+        .map(|(h1, h2, _, _, _, _, _, _)| (h1, h2))
+        .collect())
 }
 
 fn variant_haplotype_assignments(
@@ -1157,7 +3193,14 @@ fn selected_alt_sequences(variant: &Variant) -> Vec<String> {
 /// `0/1`. Both select `{ATCTC}`, but legacy's reader keeps them as two
 /// records with different ALT columns and emits one truth-only TP row +
 /// one query-only TP row.
-fn simple_compare_pairs_match(truth: &Variant, query: &Variant) -> bool {
+fn simple_compare_pairs_match(
+    truth: &Variant,
+    query: &Variant,
+    reference: &str,
+    cluster_start: usize,
+    cluster_truth: &[Variant],
+    cluster_query: &[Variant],
+) -> bool {
     if truth.key.chrom != query.key.chrom
         || truth.key.pos != query.key.pos
         || truth.key.ref_allele != query.key.ref_allele
@@ -1185,7 +3228,19 @@ fn simple_compare_pairs_match(truth: &Variant, query: &Variant) -> bool {
     // so we leave those pairs unmatched here and let
     // `cluster_signature` / `mark_cluster_match` / `mark_cluster_mismatch`
     // drive the classification.
-    if query_primitive_splits(query) || query_primitive_splits(truth) {
+    if query_primitive_splits(
+        query,
+        reference,
+        cluster_start,
+        cluster_truth,
+        cluster_query,
+    ) || query_primitive_splits(
+        truth,
+        reference,
+        cluster_start,
+        cluster_truth,
+        cluster_query,
+    ) {
         return false;
     }
     // `gttype` equality is implied by the selected multi-set equality —
@@ -1195,36 +3250,349 @@ fn simple_compare_pairs_match(truth: &Variant, query: &Variant) -> bool {
 }
 
 /// True iff `split_query_primitives(query)` would fan the record into
-/// multiple per-primitive rows (distinct trimmed anchors). Mirrors the
-/// `all_same_anchor` negation at the top of that function.
-fn query_primitive_splits(query: &Variant) -> bool {
+/// multiple per-primitive rows. Two paths qualify:
+///
+/// * Distinct trimmed anchors — the `all_same_anchor` negation at the top of
+///   `split_query_primitives_with_neighbors`.
+/// * Same-anchor multi-allelic insertion that splits via per-primitive
+///   left-shift to orphan anchors (Class B fan-out — `try_split_same_anchor_via_shift`).
+fn query_primitive_splits(
+    query: &Variant,
+    reference: &str,
+    cluster_start: usize,
+    cluster_truth: &[Variant],
+    cluster_neighbors: &[Variant],
+) -> bool {
     let alleles = parse_gt_alleles(&query.gt);
     let used: BTreeSet<usize> = alleles.into_iter().filter(|a| *a > 0).collect();
     if used.is_empty() {
         return false;
     }
     let alts: Vec<&str> = query.key.alt_allele.split(',').collect();
-    let mut trimmed: Vec<(usize, String)> = Vec::new();
+    let mut trimmed: Vec<(usize, String, String)> = Vec::new();
     for idx in &used {
         let Some(alt) = alts.get(*idx - 1).copied() else {
             continue;
         };
-        let (pos, r, _) = trim_variant(query.key.pos, &query.key.ref_allele, alt);
-        trimmed.push((pos, r));
+        trimmed.push(trim_variant(query.key.pos, &query.key.ref_allele, alt));
     }
     if trimmed.len() <= 1 {
         return false;
     }
-    let first = trimmed[0].clone();
-    !trimmed.iter().all(|(pos, r)| pos == &first.0 && r == &first.1)
+    let first = (trimmed[0].0, trimmed[0].1.clone());
+    let all_same_anchor = trimmed
+        .iter()
+        .all(|(pos, r, _)| *pos == first.0 && r == &first.1);
+    if !all_same_anchor {
+        return true;
+    }
+    // Same-anchor: only "splits" when Class B insertion fan-out would fire
+    // (at least one primitive shifts to a distinct anchor that has no truth
+    // representation in the cluster).
+    let bases = reference.as_bytes();
+    let pos_min = cluster_start.saturating_sub(SPLIT_LEFT_SHIFT_WINDOW).max(1);
+    try_split_same_anchor_via_shift(
+        &query.key.chrom,
+        query.key.pos,
+        &trimmed,
+        bases,
+        pos_min,
+        cluster_truth,
+        cluster_neighbors,
+    )
+    .is_some()
 }
 
-/// Remap `query.gt` into `truth`'s ALT-index space so the combined row
-/// displays the query's genotype using truth's column ordering. Legacy
-/// does this implicitly via its unified `variation[]` table; rust stores
-/// the two sides' ALT columns independently, so we re-resolve each
-/// query allele index to its sequence, then look that sequence up in
-/// truth's ALT list. Unknown alleles (`.`) pass through.
+/// Compute the post-`partial_credit::left_shift` (pos, ref, alt) for a
+/// trimmed primitive, falling back to the input on out-of-bounds reference
+/// access. Mirrors the slide block inside
+/// `split_query_primitives_with_neighbors` so the fan-out decision and the
+/// emission share identical semantics.
+fn compute_shift_target(
+    pos: usize,
+    ref_allele: &str,
+    alt_allele: &str,
+    bases: &[u8],
+    pos_min: usize,
+) -> (usize, String, String) {
+    if pos == 0 || ref_allele.is_empty() || pos + ref_allele.len() - 1 > bases.len() {
+        return (pos, ref_allele.to_string(), alt_allele.to_string());
+    }
+    let mut rv = partial_credit::RefVar {
+        start: pos,
+        end: pos + ref_allele.len() - 1,
+        alt: alt_allele.to_string(),
+    };
+    partial_credit::left_shift(bases, &mut rv, pos_min.max(1), true);
+    let ref_start = rv.start.saturating_sub(1);
+    let ref_end = rv.end;
+    if ref_end < ref_start || ref_end > bases.len() || rv.start < 1 {
+        return (pos, ref_allele.to_string(), alt_allele.to_string());
+    }
+    let new_ref: String = bases[ref_start..ref_end]
+        .iter()
+        .map(|&b| b.to_ascii_uppercase() as char)
+        .collect();
+    if new_ref.is_empty() {
+        return (pos, ref_allele.to_string(), alt_allele.to_string());
+    }
+    (rv.start, new_ref, rv.alt)
+}
+
+/// Class B same-anchor multi-allelic insertion fan-out. When all trimmed
+/// primitives share the same `(pos, ref)` anchor (legacy keeps these
+/// multi-allelic by default), this helper checks whether per-primitive
+/// `partial_credit::left_shift` would canonicalize at least one alt to a
+/// DISTINCT anchor while leaving its sibling at the original anchor. If
+/// that shifted alt lands at a position where the cluster's truth has no
+/// matching record, return the per-primitive shifted (pos, ref, alt)
+/// triples — the caller fans the record out into per-row primitives.
+///
+/// The truth-orphan gate distinguishes:
+/// * chr21:21690513 — truth declares `C→CACAT` only; CACAC slides to
+///   (21690501, T, TACAC) which has no truth match → fan out.
+/// * chr21:40096658 — truth declares `T→TAGATAGAG` AND `C→CAGATAGAT,...`
+///   at 40096650; TAGATAGAT slides to (40096650, C, CAGATAGAT) which IS
+///   represented in truth → keep multi-allelic and let block-level
+///   haplotype matching reconcile.
+///
+/// Returns `None` when the multi-allelic should stay intact (insertions
+/// don't shift, all shifts collapse to the same anchor, or every shifted
+/// alt has truth representation at the shifted anchor).
+fn try_split_same_anchor_via_shift(
+    chrom: &str,
+    variant_pos: usize,
+    trimmed: &[(usize, String, String)],
+    bases: &[u8],
+    pos_min: usize,
+    cluster_truth: &[Variant],
+    cluster_neighbors: &[Variant],
+) -> Option<Vec<(usize, String, String)>> {
+    if trimmed.len() < 2 {
+        return None;
+    }
+    // Insertion-only: ref length 1, alt length > 1. Same-anchor deletions
+    // are handled separately by the existing all_same_anchor=false fan-out.
+    if !trimmed
+        .iter()
+        .all(|(_, r, a)| r.len() == 1 && a.len() > r.len())
+    {
+        return None;
+    }
+    // Per-primitive slide floor: the highest cluster-query record position
+    // strictly below the primitive's anchor (excluding the variant being
+    // shifted). Sliding onto an already-occupied locus would duplicate
+    // that record (chr21:21690513 chr21 case has a neighboring SNP
+    // T→C at 21690501; the CACAC primitive would otherwise slide on
+    // top of it — legacy stops one position above at 21690502 A→ACACA
+    // because xcmp doesn't permit two records to share an anchor).
+    let neighbor_floor = cluster_neighbors
+        .iter()
+        .filter(|n| n.key.pos != variant_pos)
+        .map(|n| n.key.pos)
+        .max();
+    let effective_pos_min = match neighbor_floor {
+        Some(n) => pos_min.max(n),
+        None => pos_min,
+    };
+    let shifted: Vec<(usize, String, String)> = trimmed
+        .iter()
+        .map(|(pos, r, a)| compute_shift_target(*pos, r, a, bases, effective_pos_min))
+        .collect();
+    let first = (shifted[0].0, shifted[0].1.clone());
+    let distinct = !shifted
+        .iter()
+        .all(|(pos, r, _)| *pos == first.0 && r == &first.1);
+    if !distinct {
+        return None;
+    }
+    // Require at least one stayer to have truth representation at the
+    // ORIGINAL (un-shifted) anchor. Without this gate a multi-allelic
+    // query whose alts shift apart but neither side matches truth (e.g.
+    // chr21:32767041 `T→TCTCACA,TCTCTCT` in a truth-less cluster) would
+    // fan out into two orphan rows, while legacy keeps it as a single
+    // hetalt UNK row. The truth match at the original anchor is what
+    // licenses the truth_subset_match-style emit (combined TP at
+    // truth's repr plus residual at the shifted anchor).
+    let any_truth_at_original = trimmed.iter().any(|(pos, r, a)| {
+        cluster_truth.iter().any(|t| {
+            t.key.chrom == chrom
+                && t.key.pos == *pos
+                && t.key.ref_allele == *r
+                && t.key.alt_allele.split(',').any(|alt| alt == a)
+        })
+    });
+    if !any_truth_at_original {
+        return None;
+    }
+    // Block fan-out when ANY shifted alt has truth representation at the
+    // shifted anchor. Legacy keeps the query as multi-allelic in those
+    // cases and lets the block-level haplotype matcher reconcile.
+    let any_truth_at_shifted = shifted.iter().enumerate().any(|(i, (p, r, a))| {
+        // Only count primitives that actually moved.
+        if *p == trimmed[i].0 && *r == trimmed[i].1 {
+            return false;
+        }
+        cluster_truth.iter().any(|t| {
+            t.key.chrom == chrom
+                && t.key.pos == *p
+                && t.key.ref_allele == *r
+                && t.key.alt_allele.split(',').any(|alt| alt == a)
+        })
+    });
+    if any_truth_at_shifted {
+        return None;
+    }
+    Some(shifted)
+}
+
+/// Truth-subset match: truth selects ALL of its declared alts AND those
+/// alts are a (proper) subset of query's GT-selected alleles. Legacy
+/// emits a single TP/gm row at truth's representation, with query's GT
+/// remapped against truth's allele indices (alleles missing from truth's
+/// column collapse to ref `0`); the unmatched portion of the multi-
+/// allelic query then emits as a separate per-primitive FP row.
+///
+/// Pinning case: chr21:27249918 — truth `CTAAATAAA→C` GT `1|0` selects
+/// `[C]`; query `CTAAATAAA→C,CTAAA` GT `1/2` selects `[C, CTAAA]`.
+/// Truth's `[C]` ⊊ query's `[C, CTAAA]` and the shared C allele is what
+/// legacy haplotype-matches against. Output: combined TP/gm row at
+/// `CTAAATAAA→C` (truth GT `1|0`, query GT `0/1`) plus orphan FP at
+/// pos+4 `ATAAA→A` for the unmatched CTAAA primitive.
+///
+/// This path is intentionally narrow:
+///   * truth declared alts ⊆ query declared alts (proper subset);
+///   * truth selects all of its declared alts (otherwise the unselected
+///     truth alt would not have a haplotype counterpart);
+///   * truth's selected MULTISET ⊆ query's selected MULTISET — guards
+///     against zygosity mismatches like truth `1|1` (homalt G×2) vs
+///     query `2/1` ({G, A}) where set-subset would over-match a
+///     hetalt query into a homalt truth;
+///   * `query_primitive_splits(query)` is true — the multi-allelic
+///     query trims into per-primitive rows at distinct anchors.
+///     Otherwise legacy emits two separate rows (truth-only TP at
+///     truth's repr, query-only TP at query's repr — chr21:40096658).
+fn truth_subset_match(
+    truth: &Variant,
+    query: &Variant,
+    reference: &str,
+    cluster_start: usize,
+    cluster_truth: &[Variant],
+    cluster_query: &[Variant],
+) -> bool {
+    if truth.key.chrom != query.key.chrom
+        || truth.key.pos != query.key.pos
+        || truth.key.ref_allele != query.key.ref_allele
+    {
+        return false;
+    }
+    let truth_alts: BTreeSet<&str> = truth.key.alt_allele.split(',').collect();
+    let query_alts: BTreeSet<&str> = query.key.alt_allele.split(',').collect();
+    if truth_alts == query_alts {
+        // Equal alt sets are handled by simple_compare_pairs_match.
+        return false;
+    }
+    if !truth_alts.is_subset(&query_alts) {
+        return false;
+    }
+    let mut truth_selected = selected_alt_sequences(truth);
+    if truth_selected.is_empty() {
+        return false;
+    }
+    let truth_selected_set: BTreeSet<&str> = truth_selected.iter().map(String::as_str).collect();
+    // Truth must select all of its declared alts.
+    if truth_selected_set != truth_alts {
+        return false;
+    }
+    let mut query_selected = selected_alt_sequences(query);
+    if query_selected.is_empty() {
+        return false;
+    }
+    // Multiset subset: every truth-selected occurrence must have a
+    // corresponding occurrence in query. selected_alt_sequences returns
+    // sorted vectors so we can sweep both with a two-pointer scan.
+    truth_selected.sort();
+    query_selected.sort();
+    let mut qi = 0;
+    for t in &truth_selected {
+        loop {
+            if qi >= query_selected.len() {
+                return false;
+            }
+            if &query_selected[qi] == t {
+                qi += 1;
+                break;
+            }
+            if &query_selected[qi] > t {
+                return false;
+            }
+            qi += 1;
+        }
+    }
+    // Legacy only fans into a combined row + orphan primitive when the
+    // multi-allelic query trims into distinct per-primitive anchors
+    // (after left-shift) AND no shifted alt has truth representation at
+    // the shifted anchor. Without this gate we'd over-match same-anchor
+    // multi-allelics like chr21:40096658 (truth `T→TAGATAGAG` vs query
+    // `T→TAGATAGAG,TAGATAGAT`) — TAGATAGAT slides to (40096650, C,
+    // CAGATAGAT) which IS in cluster_truth at 40096650, so the shift
+    // fan-out is suppressed and the multi-allelic stays intact.
+    query_primitive_splits(
+        query,
+        reference,
+        cluster_start,
+        cluster_truth,
+        cluster_query,
+    )
+}
+
+/// Remap query's GT into truth's allele-index space, with alleles that
+/// aren't present in truth's ALT column collapsing to ref (`0`). Unphased
+/// hetalt-with-ref forms are normalised so the smaller index prints
+/// first (e.g. unphased `1/2` whose second allele drops to `0` becomes
+/// `0/1` rather than `1/0`). Phased GTs preserve their original order.
+fn remap_query_gt_subset(truth: &Variant, query: &Variant) -> String {
+    let truth_alts: Vec<&str> = truth.key.alt_allele.split(',').collect();
+    let query_alts: Vec<&str> = query.key.alt_allele.split(',').collect();
+    let separator = if query.gt.contains('|') {
+        '|'
+    } else if query.gt.contains('/') {
+        '/'
+    } else {
+        return query.gt.clone();
+    };
+    let parts: Vec<String> = query
+        .gt
+        .split(['/', '|'])
+        .map(|tok| {
+            if tok == "." {
+                return ".".to_string();
+            }
+            let Ok(idx) = tok.parse::<usize>() else {
+                return tok.to_string();
+            };
+            if idx == 0 {
+                return "0".to_string();
+            }
+            let Some(alt) = query_alts.get(idx - 1).copied() else {
+                return ".".to_string();
+            };
+            match truth_alts.iter().position(|ta| *ta == alt) {
+                Some(pos) => (pos + 1).to_string(),
+                None => "0".to_string(),
+            }
+        })
+        .collect();
+    if separator == '/'
+        && parts.len() == 2
+        && let (Ok(a), Ok(b)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>())
+        && a > b
+    {
+        return format!("{}/{}", b, a);
+    }
+    parts.join(&separator.to_string())
+}
+
 /// Render a query hetalt GT in legacy xcmp's canonical "alpha-later /
 /// alpha-earlier" form, expressed against the OUTPUT record's ALT
 /// ordering (`output_alts` — usually truth's). For every observed
@@ -1250,8 +3618,10 @@ fn canonical_hetalt_gt(output_alts: &str, query: &Variant) -> String {
     if tokens.len() != 2 {
         return gt.to_string();
     }
-    let (Some(a), Some(b)) = (tokens[0].parse::<usize>().ok(), tokens[1].parse::<usize>().ok())
-    else {
+    let (Some(a), Some(b)) = (
+        tokens[0].parse::<usize>().ok(),
+        tokens[1].parse::<usize>().ok(),
+    ) else {
         return gt.to_string();
     };
     if a == 0 || b == 0 || a == b {
@@ -1279,66 +3649,8 @@ fn canonical_hetalt_gt(output_alts: &str, query: &Variant) -> String {
     format!("{}{}{}", p_later + 1, separator, p_earlier + 1)
 }
 
-fn remap_query_gt_to_truth(truth: &Variant, query: &Variant) -> String {
-    let truth_alts: Vec<&str> = truth.key.alt_allele.split(',').collect();
-    let query_alts: Vec<&str> = query.key.alt_allele.split(',').collect();
-    let mut out = String::new();
-    let mut token = String::new();
-    for c in query.gt.chars() {
-        if c == '|' || c == '/' {
-            out.push_str(&remap_gt_token(&token, &truth_alts, &query_alts));
-            out.push(c);
-            token.clear();
-        } else {
-            token.push(c);
-        }
-    }
-    out.push_str(&remap_gt_token(&token, &truth_alts, &query_alts));
-    out
-}
-
-/// Reverse an unphased multi-allelic hetalt GT (`1/2` ↔ `2/1`). Legacy's
-/// `VariantLocationAggregator::addAlleleToVariant` with `MAX_GT=2` writes
-/// the second allele into the first zero slot, producing reversed-index
-/// GTs. Phased, hom, het-with-ref, and single-allele GTs pass through.
-fn swap_unphased_hetalt(gt: &str) -> String {
-    if !gt.contains('/') {
-        return gt.to_string();
-    }
-    let tokens: Vec<&str> = gt.split('/').collect();
-    if tokens.len() != 2 {
-        return gt.to_string();
-    }
-    let parsed: Vec<Option<u32>> = tokens.iter().map(|t| t.parse::<u32>().ok()).collect();
-    if let (Some(a), Some(b)) = (parsed[0], parsed[1]) {
-        if a > 0 && b > 0 && a != b {
-            return format!("{}/{}", b, a);
-        }
-    }
-    gt.to_string()
-}
-
 fn is_multi_allelic(variant: &Variant) -> bool {
     variant.key.alt_allele.contains(',')
-}
-
-fn remap_gt_token(token: &str, truth_alts: &[&str], query_alts: &[&str]) -> String {
-    if token == "." {
-        return ".".to_string();
-    }
-    let Ok(idx) = token.parse::<usize>() else {
-        return token.to_string();
-    };
-    if idx == 0 {
-        return "0".to_string();
-    }
-    let Some(alt_seq) = query_alts.get(idx - 1).copied() else {
-        return ".".to_string();
-    };
-    match truth_alts.iter().position(|&ta| ta == alt_seq) {
-        Some(pos) => (pos + 1).to_string(),
-        None => ".".to_string(),
-    }
 }
 
 fn normalized_events_for_allele(
@@ -1436,9 +3748,7 @@ fn normalize_ref_alt(
                     .bytes()
                     .all(|b| b.eq_ignore_ascii_case(&anchor_base));
             if is_homopolymer_extension {
-                while anchor < cluster_end
-                    && bases[anchor].eq_ignore_ascii_case(&anchor_base)
-                {
+                while anchor < cluster_end && bases[anchor].eq_ignore_ascii_case(&anchor_base) {
                     anchor += 1;
                 }
                 if anchor < cluster_start {
@@ -1547,41 +3857,101 @@ fn exact_match_pairs(
     cluster: &Cluster,
     reference: &str,
     region_state: &RegionState,
-    counts: &mut BTreeMap<String, TypeCounts>,
-    subtype_counts: &mut BTreeMap<String, BTreeMap<String, TypeCounts>>,
-    rows: &mut Vec<AnnotatedRow>,
+    outputs: ComparisonOutputs<'_>,
     truth_remaining: &mut Vec<Variant>,
     query_remaining: &mut Vec<Variant>,
 ) {
+    let ComparisonOutputs {
+        counts,
+        subtype_counts,
+        rows,
+    } = outputs;
     let mut matched_truth = BTreeSet::new();
     let mut matched_query = BTreeSet::new();
+    // Residual query records produced by truth-subset matches: the matched
+    // alleles are emitted in the combined TP row, but the unmatched alts
+    // need to fall through to the downstream per-primitive emission. We
+    // collect them here and append after the matched-index filter.
+    let mut residual_queries: Vec<Variant> = Vec::new();
 
     for (truth_index, truth) in truth_remaining.iter().enumerate() {
-        if let Some((query_index, query)) = query_remaining
-            .iter()
-            .enumerate()
-            .find(|(_, query)| simple_compare_pairs_match(truth, query))
-        {
-            add_variant_stats(
-                &mut counts
-                    .entry(truth.primary_type().to_string())
-                    .or_default()
-                    .truth_tp,
+        // Match precedence: prefer the strict simple-compare match
+        // (equal declared alt sets, equal GT-selected sub-multisets);
+        // fall back to truth-subset match (truth's alts ⊊ query's
+        // alts, truth selects all of its alts, truth's selected
+        // alleles ⊆ query's selected). The subset case emits using
+        // truth's representation with query's GT remapped.
+        let exact = query_remaining.iter().enumerate().find(|(_, query)| {
+            simple_compare_pairs_match(
                 truth,
-            );
-            add_variant_stats_subtype(subtype_counts, truth.primary_type(), truth, |stats| {
-                &mut stats.truth_tp
-            });
-            add_variant_stats(
-                &mut counts
-                    .entry(query.primary_type().to_string())
-                    .or_default()
-                    .query_tp,
                 query,
-            );
-            add_variant_stats_subtype(subtype_counts, query.primary_type(), query, |stats| {
-                &mut stats.query_tp
-            });
+                reference,
+                cluster.start,
+                &cluster.truth,
+                &cluster.query,
+            )
+        });
+        let subset = if exact.is_none() {
+            query_remaining.iter().enumerate().find(|(_, query)| {
+                truth_subset_match(
+                    truth,
+                    query,
+                    reference,
+                    cluster.start,
+                    &cluster.truth,
+                    &cluster.query,
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((query_index, query, is_subset)) = exact
+            .map(|(i, q)| (i, q, false))
+            .or_else(|| subset.map(|(i, q)| (i, q, true)))
+        {
+            // Per-record CONF gate (legacy `count_unk && !CONF → UNK`):
+            // a same-key truth+query pair outside the confident region
+            // collapses to UNK/lm on both sides, not TP/gm. The stats
+            // counters mirror the row's BD: outside-CONF query becomes
+            // query_unk, and the truth side drops out of truth_tp.
+            let truth_in_conf = region_state.truth_is_conf(truth);
+            let query_in_conf = region_state.query_is_conf(query);
+            let combined_unk = !truth_in_conf && !query_in_conf;
+            if truth_in_conf {
+                add_variant_stats(
+                    &mut counts
+                        .entry(truth.primary_type().to_string())
+                        .or_default()
+                        .truth_tp,
+                    truth,
+                );
+                add_variant_stats_subtype(subtype_counts, truth.primary_type(), truth, |stats| {
+                    &mut stats.truth_tp
+                });
+            }
+            if query_in_conf {
+                add_variant_stats(
+                    &mut counts
+                        .entry(query.primary_type().to_string())
+                        .or_default()
+                        .query_tp,
+                    query,
+                );
+                add_variant_stats_subtype(subtype_counts, query.primary_type(), query, |stats| {
+                    &mut stats.query_tp
+                });
+            } else {
+                add_variant_stats(
+                    &mut counts
+                        .entry(query.primary_type().to_string())
+                        .or_default()
+                        .query_unk,
+                    query,
+                );
+                add_variant_stats_subtype(subtype_counts, query.primary_type(), query, |stats| {
+                    &mut stats.query_unk
+                });
+            }
             // When truth and query share a byte-equal ALT column we can
             // emit a single combined row. Legacy's loader canonicalises
             // unphased multi-allelic hetalt GTs into `<later>/<earlier>`
@@ -1599,7 +3969,124 @@ fn exact_match_pairs(
             // simple_compare_pairs_match only fires when neither side
             // primitive-splits, so the combined or remap paths always
             // emit a single TP row.
-            if truth.key.alt_allele == query.key.alt_allele
+            if is_subset {
+                // Truth-subset path: truth's alts ⊊ query's selected.
+                // Emit at truth's representation; remap query GT so
+                // alleles missing from truth's column collapse to ref.
+                let canonicalized = Variant {
+                    key: VariantKey {
+                        chrom: query.key.chrom.clone(),
+                        pos: query.key.pos,
+                        ref_allele: query.key.ref_allele.clone(),
+                        alt_allele: truth.key.alt_allele.clone(),
+                    },
+                    qual: query.qual.clone(),
+                    filter: query.filter.clone(),
+                    gt: remap_query_gt_subset(truth, query),
+                };
+                let regions = region_state.row_tags(Some(truth), Some(query));
+                if combined_unk {
+                    rows.push(unk_combined_row(
+                        truth,
+                        &canonicalized,
+                        reference,
+                        cluster.start,
+                        &regions,
+                    ));
+                } else {
+                    rows.push(tp_combined_row(
+                        truth,
+                        &canonicalized,
+                        reference,
+                        cluster.start,
+                        &regions,
+                    ));
+                }
+                // Build residual queries for the unmatched alleles so the
+                // downstream emission path produces orphan FP/UNK rows at
+                // each primitive's natural anchor. Legacy keeps the
+                // unmatched primitive (e.g. CTAAA at chr21:27249918 →
+                // ATAAA→A at pos+4) as a separate row.
+                //
+                // Pre-trim each unmatched alt with `trim_variant` so the
+                // residual's VariantKey matches the per-primitive key
+                // RegionState already registered in `covered_query` (line
+                // 158). Without the trim the residual lands at the parent
+                // anchor with an un-trimmed alt and misses the CONF
+                // registration → BD downgrades from FP to UNK.
+                //
+                // Class B same-anchor multi-allelic insertion (chr21:21690513
+                // — `C→CACAC,CACAT`): when truth declares only CACAT and the
+                // unmatched CACAC primitive shifts via `partial_credit::
+                // left_shift` into a microsat-canonical anchor (21690501
+                // T→TACAC), the residual must be created at the SHIFTED
+                // anchor. Otherwise the orphan emits at the parent's 21690513
+                // anchor — losing the byte-equality with legacy's
+                // `T→TACAC` row. Apply `compute_shift_target` for
+                // insertion residuals so they land where
+                // `split_query_primitives_with_neighbors` placed the
+                // matching primitive in `covered_query`.
+                let truth_alts_set: BTreeSet<&str> = truth.key.alt_allele.split(',').collect();
+                let bases_for_residual = reference.as_bytes();
+                // Neighbor floor mirrors `try_split_same_anchor_via_shift`:
+                // the residual must NOT slide onto an anchor occupied by
+                // another raw cluster query. chr21:21690513 chr21 case has
+                // a filtered SNP `T→C` at 21690501; the CACAC residual
+                // would otherwise slide there and clobber that record's
+                // anchor — legacy stops one position above (21690502
+                // A→ACACA) because xcmp doesn't permit two records to
+                // share an anchor.
+                let neighbor_floor_for_residual = cluster
+                    .query
+                    .iter()
+                    .filter(|n| n.key.pos != query.key.pos)
+                    .map(|n| n.key.pos)
+                    .max();
+                let pos_min_for_residual = match neighbor_floor_for_residual {
+                    Some(n) => cluster.start.saturating_sub(SPLIT_LEFT_SHIFT_WINDOW).max(n),
+                    None => cluster.start.saturating_sub(SPLIT_LEFT_SHIFT_WINDOW).max(1),
+                };
+                for unmatched_alt in query
+                    .key
+                    .alt_allele
+                    .split(',')
+                    .filter(|a| !truth_alts_set.contains(a))
+                {
+                    let (tpos, tref, talt) =
+                        trim_variant(query.key.pos, &query.key.ref_allele, unmatched_alt);
+                    // Shift insertion residuals through homopolymer /
+                    // microsat reference patterns. Deletions and SNP
+                    // primitives are returned unchanged by
+                    // `compute_shift_target` because `partial_credit::
+                    // left_shift` slides only when the deleted segment's
+                    // last base matches the alt's last base — which is
+                    // why the existing `apply_slide` gate in
+                    // `split_query_primitives_with_neighbors` is
+                    // restricted to deletion primitives.
+                    let (rpos, rref, ralt) = if talt.len() > tref.len() && tref.len() == 1 {
+                        compute_shift_target(
+                            tpos,
+                            &tref,
+                            &talt,
+                            bases_for_residual,
+                            pos_min_for_residual,
+                        )
+                    } else {
+                        (tpos, tref, talt)
+                    };
+                    residual_queries.push(Variant {
+                        key: VariantKey {
+                            chrom: query.key.chrom.clone(),
+                            pos: rpos,
+                            ref_allele: rref,
+                            alt_allele: ralt,
+                        },
+                        qual: query.qual.clone(),
+                        filter: query.filter.clone(),
+                        gt: "0/1".to_string(),
+                    });
+                }
+            } else if truth.key.alt_allele == query.key.alt_allele
                 && equivalent_gt(&truth.gt, &query.gt)
             {
                 let query_for_row = if is_multi_allelic(query) {
@@ -1623,13 +4110,24 @@ fn exact_match_pairs(
                 } else {
                     query.clone()
                 };
-                rows.push(tp_combined_row(
-                    truth,
-                    &query_for_row,
-                    reference,
-                    cluster.start,
-                    &region_state.row_tags(Some(truth), Some(query)),
-                ));
+                let regions = region_state.row_tags(Some(truth), Some(query));
+                if combined_unk {
+                    rows.push(unk_combined_row(
+                        truth,
+                        &query_for_row,
+                        reference,
+                        cluster.start,
+                        &regions,
+                    ));
+                } else {
+                    rows.push(tp_combined_row(
+                        truth,
+                        &query_for_row,
+                        reference,
+                        cluster.start,
+                        &regions,
+                    ));
+                }
             } else {
                 // Multi-allelic pair whose ALT columns are reordered
                 // (e.g. truth `C→CA,CAA` vs query `C→CAA,CA`). Legacy's
@@ -1652,13 +4150,24 @@ fn exact_match_pairs(
                     filter: query.filter.clone(),
                     gt: canonical_hetalt_gt(&truth.key.alt_allele, query),
                 };
-                rows.push(tp_combined_row(
-                    truth,
-                    &canonicalized,
-                    reference,
-                    cluster.start,
-                    &region_state.row_tags(Some(truth), Some(query)),
-                ));
+                let regions = region_state.row_tags(Some(truth), Some(query));
+                if combined_unk {
+                    rows.push(unk_combined_row(
+                        truth,
+                        &canonicalized,
+                        reference,
+                        cluster.start,
+                        &regions,
+                    ));
+                } else {
+                    rows.push(tp_combined_row(
+                        truth,
+                        &canonicalized,
+                        reference,
+                        cluster.start,
+                        &regions,
+                    ));
+                }
             }
             matched_truth.insert(truth_index);
             matched_query.insert(query_index);
@@ -1671,12 +4180,14 @@ fn exact_match_pairs(
         .filter(|(index, _)| !matched_truth.contains(index))
         .map(|(_, variant)| variant.clone())
         .collect();
-    *query_remaining = query_remaining
+    let mut new_query_remaining: Vec<Variant> = query_remaining
         .iter()
         .enumerate()
         .filter(|(index, _)| !matched_query.contains(index))
         .map(|(_, variant)| variant.clone())
         .collect();
+    new_query_remaining.append(&mut residual_queries);
+    *query_remaining = new_query_remaining;
 }
 
 fn mark_cluster_match(
@@ -1689,48 +4200,106 @@ fn mark_cluster_match(
     full_cluster: &Cluster,
     reference: &str,
     region_state: &RegionState,
-    counts: &mut BTreeMap<String, TypeCounts>,
-    subtype_counts: &mut BTreeMap<String, BTreeMap<String, TypeCounts>>,
-    rows: &mut Vec<AnnotatedRow>,
+    outputs: ComparisonOutputs<'_>,
 ) {
+    let ComparisonOutputs {
+        counts,
+        subtype_counts,
+        rows,
+    } = outputs;
+    // Per-record CONF gate: legacy's `XCmpQuantify::countVariants`
+    // unconditionally rewrites any output record's BD to UNK when the
+    // record's Regions tag set lacks "CONF":
+    //   if (count_unk && !tag_contains("CONF")) type = "UNK";
+    // This applies even inside a haplotype-matched cluster, so a query
+    // SNP at a TS_boundary-but-not-CONF position is emitted as UNK with
+    // BK=. while the in-CONF indels around it stay TP/gm. Without this,
+    // rust over-credits outside-CONF query records as TP and inflates
+    // shared_qq calculation by including their qual values.
     for truth in &cluster.truth {
-        add_variant_stats(
-            &mut counts
-                .entry(truth.primary_type().to_string())
-                .or_default()
-                .truth_tp,
-            truth,
-        );
-        add_variant_stats_subtype(subtype_counts, truth.primary_type(), truth, |stats| {
-            &mut stats.truth_tp
-        });
+        if region_state.truth_is_conf(truth) {
+            add_variant_stats(
+                &mut counts
+                    .entry(truth.primary_type().to_string())
+                    .or_default()
+                    .truth_tp,
+                truth,
+            );
+            add_variant_stats_subtype(subtype_counts, truth.primary_type(), truth, |stats| {
+                &mut stats.truth_tp
+            });
+        }
     }
     for query in &cluster.query {
-        add_variant_stats(
-            &mut counts
-                .entry(query.primary_type().to_string())
-                .or_default()
-                .query_tp,
-            query,
-        );
-        add_variant_stats_subtype(subtype_counts, query.primary_type(), query, |stats| {
-            &mut stats.query_tp
-        });
+        if region_state.query_is_conf(query) {
+            add_variant_stats(
+                &mut counts
+                    .entry(query.primary_type().to_string())
+                    .or_default()
+                    .query_tp,
+                query,
+            );
+            add_variant_stats_subtype(subtype_counts, query.primary_type(), query, |stats| {
+                &mut stats.query_tp
+            });
+        } else {
+            add_variant_stats(
+                &mut counts
+                    .entry(query.primary_type().to_string())
+                    .or_default()
+                    .query_unk,
+                query,
+            );
+            add_variant_stats_subtype(subtype_counts, query.primary_type(), query, |stats| {
+                &mut stats.query_unk
+            });
+        }
     }
 
     if cluster.truth.len() == 1
         && cluster.query.len() == 1
         && query_matches_truth_key(&cluster.query[0], &cluster.truth[0])
-        && !query_primitive_splits(&cluster.truth[0])
-        && !query_primitive_splits(&cluster.query[0])
-    {
-        rows.push(tp_combined_row(
+        && !query_primitive_splits(
             &cluster.truth[0],
+            reference,
+            cluster.start,
+            &cluster.truth,
+            &cluster.query,
+        )
+        && !query_primitive_splits(
             &cluster.query[0],
             reference,
             cluster.start,
-            &region_state.row_tags(Some(&cluster.truth[0]), Some(&cluster.query[0])),
-        ));
+            &cluster.truth,
+            &cluster.query,
+        )
+    {
+        let truth = &cluster.truth[0];
+        let query = &cluster.query[0];
+        let regions = region_state.row_tags(Some(truth), Some(query));
+        // Combined-row emit also obeys the per-record CONF gate: a single
+        // truth+query exact match outside the confident region collapses
+        // to UNK/lm on both sides rather than TP/gm. BK=lm is the legacy
+        // verdict whenever the same-locus counterpart shares an alt
+        // allele (which is by construction here — `query_matches_truth_key`
+        // demands ref+alt equality).
+        if !region_state.truth_is_conf(truth) && !region_state.query_is_conf(query) {
+            rows.push(unk_combined_row(
+                truth,
+                query,
+                reference,
+                cluster.start,
+                &regions,
+            ));
+        } else {
+            rows.push(tp_combined_row(
+                truth,
+                query,
+                reference,
+                cluster.start,
+                &regions,
+            ));
+        }
         return;
     }
 
@@ -1744,9 +4313,16 @@ fn mark_cluster_match(
     // on truth-only TP rows byte-equal to legacy when the cluster carries
     // multiple query variants at different quals (e.g. chr21:15246157
     // TA→TAA,T → QQ=174.59, not the earlier SNP's 817.09).
+    //
+    // Restrict shared_qq to IN-CONF query records: outside-CONF queries
+    // are reclassified to UNK below and never contribute their qual to
+    // the truth-side TP rows. Without this filter, a chr21:18827409
+    // cluster (truth indels in CONF, query SNPs outside CONF) picks up
+    // the SNP min-qual instead of the matched indel's qual.
     let shared_qq = full_cluster
         .query
         .iter()
+        .filter(|q| region_state.query_is_conf(q))
         .filter_map(|q| {
             q.qual
                 .parse::<f64>()
@@ -1764,31 +4340,136 @@ fn mark_cluster_match(
     // that were already consumed still contribute.
     let truth_cluster_filter = cluster_query_filter(full_cluster);
     for truth in &cluster.truth {
-        rows.push(tp_single_side_row(
-            truth,
-            reference,
-            cluster.start,
-            &region_state.row_tags(Some(truth), None),
-            Side::Truth,
-            shared_qq,
-            &truth_cluster_filter,
-        ));
-    }
-    for query in &cluster.query {
-        // Multi-allelic query records emit one VCF row per per-allele
-        // primitive, matching legacy's per-primitive output grain. Each
-        // primitive inherits the cluster-level TP classification.
-        for primitive in split_query_primitives(query) {
+        if region_state.truth_is_conf(truth) {
             rows.push(tp_single_side_row(
-                &primitive,
+                truth,
                 reference,
                 cluster.start,
-                &region_state.row_tags(None, Some(query)),
-                Side::Query,
-                None,
-                ".",
+                &region_state.row_tags(Some(truth), None),
+                Side::Truth,
+                shared_qq,
+                &truth_cluster_filter,
+            ));
+        } else {
+            // Truth outside CONF in a gm-matched cluster: emit UNK,
+            // matching legacy's unconditional `count_unk && !CONF → UNK`
+            // rewrite. BK=lm if a same-locus query counterpart exists,
+            // else BK=. via bk_for_row. mark_cluster_match is reached
+            // only when hapcmp returned match, so hap_mismatch=false.
+            let bk = bk_for_row(truth, &full_cluster.query, false);
+            rows.push(unk_truth_row(
+                truth,
+                reference,
+                cluster.start,
+                &region_state.row_tags(Some(truth), None),
+                bk,
             ));
         }
+    }
+    for query in &cluster.query {
+        // pre.py decomposes a complex indel into adjacent insertion/deletion
+        // records with the same QUAL. In a hap:match block legacy still
+        // stamps those unmatched sibling primitives BK=lm. Keep this on the
+        // hap-match path only: `--unhappy` skips hapcmp and leaves the same
+        // query-only primitives at BK=`.`.
+        let split_sibling = has_nonconf_split_sibling(query, full_cluster, region_state);
+        // Multi-allelic query records emit one VCF row per per-allele
+        // primitive, matching legacy's per-primitive output grain. CONF
+        // status is evaluated per primitive: a multi-allelic record's
+        // deletion allele can sit fully inside CONF while its insertion
+        // allele straddles a CONF edge, in which case the deletion gets
+        // TP/gm but the insertion gets UNK/. (legacy's
+        // `count_unk && !CONF → UNK` rewrite applies per output row).
+        let primitives = split_query_primitives_with_neighbors(
+            query,
+            reference,
+            cluster.start,
+            &full_cluster.query,
+            &full_cluster.truth,
+        );
+        let any_primitive_in_conf = primitives
+            .iter()
+            .any(|primitive| region_state.query_is_conf(primitive));
+        let fanned_out = primitives.len() > 1;
+        for primitive in primitives {
+            let primitive_in_conf = region_state.query_is_conf(&primitive);
+            let regions = region_state.row_tags(None, Some(&primitive));
+            if primitive_in_conf {
+                rows.push(tp_single_side_row(
+                    &primitive,
+                    reference,
+                    cluster.start,
+                    &regions,
+                    Side::Query,
+                    None,
+                    ".",
+                ));
+            } else {
+                let fallback = bk_for_row(&primitive, &full_cluster.truth, false);
+                let bk = if split_sibling {
+                    "lm"
+                } else {
+                    matched_query_unk_bk(fanned_out, any_primitive_in_conf, fallback)
+                };
+                rows.push(fp_like_row(
+                    &primitive,
+                    reference,
+                    cluster.start,
+                    &regions,
+                    "UNK",
+                    None,
+                    bk,
+                ));
+            }
+        }
+    }
+}
+
+fn has_nonconf_split_sibling(
+    query: &Variant,
+    cluster: &Cluster,
+    region_state: &RegionState,
+) -> bool {
+    if query.primary_type() != "INDEL" || region_state.query_is_conf(query) {
+        return false;
+    }
+    let query_is_insertion = query.key.alt_allele.len() > query.key.ref_allele.len();
+    let query_is_deletion = query.key.ref_allele.len() > query.key.alt_allele.len();
+    if !query_is_insertion && !query_is_deletion {
+        return false;
+    }
+
+    cluster.query.iter().any(|sibling| {
+        if sibling.key == query.key
+            || sibling.qual != query.qual
+            || sibling.primary_type() != "INDEL"
+            || region_state.query_is_conf(sibling)
+        {
+            return false;
+        }
+        let sibling_is_insertion = sibling.key.alt_allele.len() > sibling.key.ref_allele.len();
+        let sibling_is_deletion = sibling.key.ref_allele.len() > sibling.key.alt_allele.len();
+        let complementary = (query_is_insertion && sibling_is_deletion)
+            || (query_is_deletion && sibling_is_insertion);
+        let split_span = query
+            .key
+            .ref_allele
+            .len()
+            .max(sibling.key.ref_allele.len())
+            .max(1);
+        complementary && query.key.pos.abs_diff(sibling.key.pos) < split_span
+    })
+}
+
+fn matched_query_unk_bk(
+    fanned_out: bool,
+    any_primitive_in_conf: bool,
+    fallback: &'static str,
+) -> &'static str {
+    if fanned_out && !any_primitive_in_conf {
+        "lm"
+    } else {
+        fallback
     }
 }
 
@@ -1807,10 +4488,13 @@ fn mark_cluster_mismatch(
     hap_mismatch: bool,
     reference: &str,
     region_state: &RegionState,
-    counts: &mut BTreeMap<String, TypeCounts>,
-    subtype_counts: &mut BTreeMap<String, BTreeMap<String, TypeCounts>>,
-    rows: &mut Vec<AnnotatedRow>,
+    outputs: ComparisonOutputs<'_>,
 ) {
+    let ComparisonOutputs {
+        counts,
+        subtype_counts,
+        rows,
+    } = outputs;
     // Same-locus FN+FP pairs: when a truth record and a query record
     // share chrom/pos/ref/alt set but disagree on genotype (e.g. truth
     // 0|1 het vs query 1/1 homalt), legacy emits a single combined row
@@ -1829,7 +4513,9 @@ fn mark_cluster_mismatch(
             if paired_query.contains(&qi) {
                 continue;
             }
-            if query_matches_truth_key(query, truth) && !equivalent_gt(&truth.gt, &query.gt) {
+            if query_matches_truth_allele_set(query, truth)
+                && selected_alt_sequences(truth) != selected_alt_sequences(query)
+            {
                 pairs.push((ti, qi));
                 paired_truth.insert(ti);
                 paired_query.insert(qi);
@@ -1840,19 +4526,31 @@ fn mark_cluster_mismatch(
     for (ti, qi) in pairs {
         let truth = &cluster.truth[ti];
         let query = &cluster.query[qi];
-        add_variant_stats(
-            &mut counts
-                .entry(truth.primary_type().to_string())
-                .or_default()
-                .truth_fn,
-            truth,
-        );
-        add_variant_stats_subtype(subtype_counts, truth.primary_type(), truth, |stats| {
-            &mut stats.truth_fn
-        });
-        let is_conf = region_state.query_is_conf(query);
-        let query_bd: &'static str = if is_conf { "FP" } else { "UNK" };
-        if is_conf {
+        let truth_in_conf = region_state.truth_is_conf(truth);
+        let query_in_conf = region_state.query_is_conf(query);
+        // Only count as truth_fn when truth is inside CONF — outside CONF
+        // the row emits BD=UNK so it must not contribute to the FN tally.
+        if truth_in_conf {
+            add_variant_stats(
+                &mut counts
+                    .entry(truth.primary_type().to_string())
+                    .or_default()
+                    .truth_fn,
+                truth,
+            );
+            add_variant_stats_subtype(subtype_counts, truth.primary_type(), truth, |stats| {
+                &mut stats.truth_fn
+            });
+        }
+        let query_bd: &'static str = if query_in_conf { "FP" } else { "UNK" };
+        // Per legacy's `count_unk && !CONF → UNK` rewrite, a paired
+        // truth+query in a non-CONF region downgrades both samples to
+        // BD=UNK. Truth-side BD respects this even when query is FP/CONF:
+        // a hetalt truth in TS_boundary keeps `UNK:am` while the matched
+        // query inside CONF emits `FP:am`. Without this, chr21:38484260
+        // emits FN where legacy says UNK on truth.
+        let truth_bd: &'static str = if truth_in_conf { "FN" } else { "UNK" };
+        if query_in_conf {
             add_variant_stats(
                 &mut counts
                     .entry(query.primary_type().to_string())
@@ -1875,13 +4573,33 @@ fn mark_cluster_mismatch(
                 &mut stats.query_unk
             });
         }
+        let bk = compute_paired_bk(truth, query);
+        // Canonicalise unphased hetalt query GT to legacy's
+        // `<later>/<earlier>` ordering when the row is hetalt and the
+        // declared alts have a non-canonical order. SNP cases like
+        // chr21:9922359 (`T→A,C` query GT `1/2`) emit `2/1` per
+        // VariantLocationAggregator's MAX_GT=2 rule. Phased / hom /
+        // het-with-ref pass through unchanged.
+        let query_gt = if is_distinct_hetalt(&query.gt) {
+            canonical_hetalt_gt(&truth.key.alt_allele, query)
+        } else {
+            remap_query_gt_subset(truth, query)
+        };
+        let query_for_row = Variant {
+            key: truth.key.clone(),
+            qual: query.qual.clone(),
+            filter: query.filter.clone(),
+            gt: query_gt,
+        };
         rows.push(fn_fp_combined_row(
             truth,
-            query,
+            &query_for_row,
             reference,
             cluster.start,
             &region_state.row_tags(Some(truth), Some(query)),
+            truth_bd,
             query_bd,
+            bk,
         ));
     }
     for (ti, truth) in cluster.truth.iter().enumerate() {
@@ -1982,12 +4700,12 @@ fn mark_cluster_mismatch(
                     &pseudo,
                     |stats| &mut stats.query_total,
                 );
+                let pseudo_bk = bk_for_row(&pseudo, &full_cluster.truth, hap_mismatch);
                 let pseudo_fp_class = if bd == "FP" {
-                    classify_fp(&pseudo, full_cluster)
+                    fp_class_from_bk(pseudo_bk)
                 } else {
                     None
                 };
-                let pseudo_bk = bk_for_row(&pseudo, &full_cluster.truth, hap_mismatch);
                 rows.push(fp_like_row(
                     &pseudo,
                     reference,
@@ -2000,13 +4718,29 @@ fn mark_cluster_mismatch(
             }
             continue;
         }
-        let is_conf = region_state.query_is_conf(query);
-        let bd: &'static str = if is_conf { "FP" } else { "UNK" };
-        let regions = region_state.row_tags(None, Some(query));
         // Even same-type multi-allelic queries fan out one primitive row
         // per active allele in legacy's output — matches the decomposed
         // per-primitive representation xcmp emits after classification.
-        for primitive in split_query_primitives(query) {
+        // Each primitive picks up its OWN Regions classification: a
+        // multi-allelic record whose deletion allele sits inside CONF
+        // but whose insertion allele straddles a CONF edge emits one
+        // row with FP/CONF and a second with UNK/no-CONF. The parent's
+        // any-allele coverage decision is too coarse for that.
+        let primitives = split_query_primitives_with_neighbors(
+            query,
+            reference,
+            cluster.start,
+            &full_cluster.query,
+            &full_cluster.truth,
+        );
+        let any_primitive_in_conf = primitives
+            .iter()
+            .any(|primitive| region_state.query_is_conf(primitive));
+        let fanned_out = primitives.len() > 1;
+        for primitive in primitives {
+            let is_conf = region_state.query_is_conf(&primitive);
+            let bd: &'static str = if is_conf { "FP" } else { "UNK" };
+            let regions = region_state.row_tags(None, Some(&primitive));
             if is_conf {
                 add_variant_stats(
                     &mut counts
@@ -2036,12 +4770,13 @@ fn mark_cluster_mismatch(
                     |stats| &mut stats.query_unk,
                 );
             }
+            let fallback = bk_for_row(&primitive, &full_cluster.truth, hap_mismatch);
+            let primitive_bk = matched_query_unk_bk(fanned_out, any_primitive_in_conf, fallback);
             let fp_class = if bd == "FP" {
-                classify_fp(&primitive, full_cluster)
+                fp_class_from_bk(primitive_bk)
             } else {
                 None
             };
-            let primitive_bk = bk_for_row(&primitive, &full_cluster.truth, hap_mismatch);
             rows.push(fp_like_row(
                 &primitive,
                 reference,
@@ -2055,25 +4790,17 @@ fn mark_cluster_mismatch(
     }
 }
 
-/// Classify an FP query variant as genotype-mismatch (`"gt"`), allele-mismatch
-/// (`"al"`), or novel (`None`).
-///
-/// - `"gt"`: a truth variant at the same locus (chrom/pos/ref/alt) exists —
-///   the alleles agree, only the genotype differs.
-/// - `None`: truth variant is absent at this position, or exists but with a
-///   different alt allele — the call is not counted in FP.gt or FP.al.
-///
-/// Uses `full_cluster` (pre-exact-match truth set) so that truth variants
-/// already consumed by exact-match TP pairing are still visible here.
-fn classify_fp(query: &Variant, full_cluster: &Cluster) -> Option<&'static str> {
-    if full_cluster
-        .truth
-        .iter()
-        .any(|truth| query_matches_truth_key(query, truth))
-    {
-        Some("gt")
-    } else {
-        None
+/// Map the per-row `BK` (block kind) tag to the FP classification used by
+/// the summary / extended / ROC `FP.gt` / `FP.al` columns. Mirrors legacy
+/// hap.py's quantify aggregation: FP rows tagged `BK=am` (allele match,
+/// genotype mismatch) bump `FP.gt`; FP rows tagged `BK=lm` (locus match,
+/// allele mismatch) bump `FP.al`; everything else (novel FPs with `BK=.`)
+/// stays unclassified and is omitted from both columns.
+fn fp_class_from_bk(bk: &str) -> Option<&'static str> {
+    match bk {
+        "am" => Some("gt"),
+        "lm" => Some("al"),
+        _ => None,
     }
 }
 
@@ -2099,6 +4826,23 @@ fn query_matches_truth_key(query: &Variant, truth: &Variant) -> bool {
         && query.key.pos == truth.key.pos
         && query.key.ref_allele == truth.key.ref_allele
         && query.key.alt_allele == truth.key.alt_allele
+}
+
+/// Same physical VCF locus with the same declared alleles, allowing ALT
+/// columns to use different index orders. Legacy's shared allele table uses
+/// this equivalence when it emits a combined FN/FP genotype-mismatch row;
+/// the query GT is remapped into truth's ALT order before serialization.
+fn query_matches_truth_allele_set(query: &Variant, truth: &Variant) -> bool {
+    query.key.chrom == truth.key.chrom
+        && query.key.pos == truth.key.pos
+        && query.key.ref_allele == truth.key.ref_allele
+        && query.key.alt_allele.split(',').collect::<BTreeSet<_>>()
+            == truth.key.alt_allele.split(',').collect::<BTreeSet<_>>()
+}
+
+fn is_distinct_hetalt(gt: &str) -> bool {
+    let alleles = parse_gt_alleles(gt);
+    alleles.len() == 2 && alleles[0] > 0 && alleles[1] > 0 && alleles[0] != alleles[1]
 }
 
 fn split_query_mismatch_rows(
@@ -2204,6 +4948,7 @@ fn component_is_conf(variant: &Variant, region_state: &RegionState) -> bool {
 ///   - substitutions / deletions: [start, end] from the post-trim remnant
 ///   - pure insertions (all trimmed alts empty ref): [anchor, anchor+1]
 ///     — the anchor base and the one after it bracket the insertion point
+///
 /// The record then requires `!is_pure_insertion || fully_covered` to land
 /// in a region. Port that rule here so insertion / SNP records get the
 /// same CONF / TS_boundary classification legacy emits.
@@ -2236,7 +4981,8 @@ fn effective_refrange(variant: &Variant) -> Option<(usize, usize, bool)> {
         }
         // trimLeft (refpadding=false): strip common prefix.
         let mut rel_start = 0usize;
-        while rel_start < reflen && rel_start < altlen
+        while rel_start < reflen
+            && rel_start < altlen
             && ref_bytes[rel_start] == alt_bytes[rel_start]
         {
             rel_start += 1;
@@ -2283,15 +5029,64 @@ fn effective_refrange(variant: &Variant) -> Option<(usize, usize, bool)> {
 /// reproduces legacy's TS_boundary behavior for insertions straddling a
 /// CONF edge. Replicate exactly — don't "fix" the legacy merge.
 ///
+/// When `target_bed` is `Some`, mirror legacy's `bcf_sr_set_targets(..,
+/// target.c_str(), 1, 0)` filter on the gvcf2bed call: the htslib synced
+/// reader gates on the **start position only** (single-point overlap of
+/// `pos_0b` against any half-open `[s, e)` target interval), not the
+/// full ref span. Records whose start position falls outside the raw
+/// CONF bed are dropped before emission. This filter is critical for
+/// `Subset.IS_CONF.Size` parity (legacy sums per-file BED lengths
+/// without cross-file merging).
+///
 /// The returned half-open `[start, end)` intervals are later merged with
 /// the raw CONF bed (standard overlap/touching merge) before
-/// `variant_is_conf` consumes them.
-fn gvcf2bed_padding(truth: &[Variant]) -> Vec<vcf::BedInterval> {
+/// `variant_is_conf` consumes them, but the **un-merged sum** is what
+/// feeds `Subset.IS_CONF.Size`.
+fn gvcf2bed_padding(
+    truth: &[Variant],
+    target_bed: Option<&[vcf::BedInterval]>,
+) -> Vec<vcf::BedInterval> {
     struct ActiveInterval {
         chrom: String,
         start: i64,
         end: i64,
     }
+
+    // Build per-chrom sorted target ranges for fast point-in-set lookup.
+    let target_index: Option<BTreeMap<String, Vec<(usize, usize)>>> = target_bed.map(|tb| {
+        let mut by_chrom: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+        for iv in tb {
+            by_chrom
+                .entry(iv.chrom.clone())
+                .or_default()
+                .push((iv.start, iv.end));
+        }
+        for v in by_chrom.values_mut() {
+            v.sort_unstable();
+        }
+        by_chrom
+    });
+
+    let pos_in_target = |chrom: &str, pos_0b: i64| -> bool {
+        let Some(idx) = target_index.as_ref() else {
+            return true;
+        };
+        let Some(ranges) = idx.get(chrom) else {
+            return false;
+        };
+        if pos_0b < 0 {
+            return false;
+        }
+        let p = pos_0b as usize;
+        // Binary search for the first interval with start > p; check the
+        // candidate predecessor for half-open containment [s, e).
+        let idx = ranges.partition_point(|(s, _)| *s <= p);
+        if idx == 0 {
+            return false;
+        }
+        let (s, e) = ranges[idx - 1];
+        s <= p && p < e
+    };
 
     let mut sorted: Vec<&Variant> = truth.iter().collect();
     sorted.sort_by(|a, b| {
@@ -2310,41 +5105,84 @@ fn gvcf2bed_padding(truth: &[Variant]) -> Vec<vcf::BedInterval> {
             continue;
         }
         let pos_0b = variant.key.pos.saturating_sub(1) as i64;
-        let mut rec_start = i64::MAX;
-        let mut rec_end = i64::MIN;
-        let mut has_nuc = false;
-
-        for alt in variant.key.alt_allele.split(',') {
-            if alt.is_empty() || alt == "." || alt.starts_with('<') {
-                continue;
-            }
-            let alt_bytes = alt.as_bytes();
-            let mut reflen = ref_bytes.len();
-            let mut altlen = alt_bytes.len();
-            while reflen > 0 && altlen > 0 && ref_bytes[reflen - 1] == alt_bytes[altlen - 1] {
-                reflen -= 1;
-                altlen -= 1;
-            }
-            let mut rel_start = 0usize;
-            while rel_start < reflen && rel_start < altlen
-                && ref_bytes[rel_start] == alt_bytes[rel_start]
-            {
-                rel_start += 1;
-            }
-            let al_start = pos_0b + rel_start as i64;
-            let al_end = pos_0b + reflen as i64 - 1;
-            has_nuc = true;
-            if al_end >= al_start {
-                rec_start = rec_start.min(al_start);
-                rec_end = rec_end.max(al_end);
-            } else {
-                rec_start = rec_start.min(al_start - 1);
-                rec_end = rec_end.max(al_start);
-            }
-        }
-
-        if !has_nuc {
+        if !pos_in_target(&variant.key.chrom, pos_0b) {
             continue;
+        }
+        // Legacy default refstart/refend (from getLocation): the raw
+        // 0-based-inclusive ref-allele span. These persist when the alt
+        // loop produces no NUC alleles (all symbolic / `<NON_REF>` /
+        // missing) — the record is still emitted with this raw range.
+        let mut rec_start = pos_0b;
+        let mut rec_end = pos_0b + ref_bytes.len() as i64 - 1;
+        let ref_is_nuc = ref_bytes.iter().all(|b| {
+            matches!(
+                *b,
+                b'A' | b'C' | b'G' | b'T' | b'N' | b'a' | b'c' | b'g' | b't' | b'n'
+            )
+        });
+
+        if ref_is_nuc {
+            let mut updated_start = i64::MAX;
+            let mut updated_end = i64::MIN;
+            let mut nuc_alleles = false;
+            // Mirror legacy's behavior: a non-NUC alt **breaks** the
+            // loop (it does not just skip — `break` in the C++ source).
+            // Subsequent NUC alts after a symbolic one are ignored, so
+            // updated_start/end track only alts processed up to the
+            // first symbolic.
+            for alt in variant.key.alt_allele.split(',') {
+                if alt.is_empty() || alt == "." {
+                    // MISSING — legacy treats as NUC with empty alt
+                    // string, which after trim resolves to a full
+                    // ref-deletion span [pos, pos+reflen-1].
+                    nuc_alleles = true;
+                    let al_start = pos_0b;
+                    let al_end = pos_0b + ref_bytes.len() as i64 - 1;
+                    if al_end >= al_start {
+                        updated_start = updated_start.min(al_start);
+                        updated_end = updated_end.max(al_end);
+                    }
+                    continue;
+                }
+                if alt.starts_with('<')
+                    || alt.bytes().any(|b| {
+                        !matches!(
+                            b,
+                            b'A' | b'C' | b'G' | b'T' | b'N' | b'a' | b'c' | b'g' | b't' | b'n'
+                        )
+                    })
+                {
+                    break;
+                }
+                let alt_bytes = alt.as_bytes();
+                let mut reflen = ref_bytes.len();
+                let mut altlen = alt_bytes.len();
+                while reflen > 0 && altlen > 0 && ref_bytes[reflen - 1] == alt_bytes[altlen - 1] {
+                    reflen -= 1;
+                    altlen -= 1;
+                }
+                let mut rel_start = 0usize;
+                while rel_start < reflen
+                    && rel_start < altlen
+                    && ref_bytes[rel_start] == alt_bytes[rel_start]
+                {
+                    rel_start += 1;
+                }
+                let al_start = pos_0b + rel_start as i64;
+                let al_end = pos_0b + reflen as i64 - 1;
+                nuc_alleles = true;
+                if al_end >= al_start {
+                    updated_start = updated_start.min(al_start);
+                    updated_end = updated_end.max(al_end);
+                } else {
+                    updated_start = updated_start.min(al_start - 1);
+                    updated_end = updated_end.max(al_start);
+                }
+            }
+            if nuc_alleles {
+                rec_start = updated_start;
+                rec_end = updated_end;
+            }
         }
 
         let flush = match active.as_ref() {
@@ -2538,39 +5376,16 @@ fn collect_contigs(
     contigs
 }
 
-fn inclusive_region_size(intervals: &[vcf::BedInterval]) -> usize {
-    // Legacy hap.py reports conf_size using end-start+1 (1-based inclusive
-    // interval length), matching Python's IntervalList semantics where each
-    // [start, end) BED interval contributes end-start+1 bases after merging.
-    let mut by_chrom: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
-    for interval in intervals {
-        by_chrom
-            .entry(interval.chrom.clone())
-            .or_default()
-            .push((interval.start, interval.end));
-    }
-
-    let mut total = 0usize;
-    for mut ranges in by_chrom.into_values() {
-        ranges.sort_unstable();
-        let mut current: Option<(usize, usize)> = None;
-        for (start, end) in ranges {
-            match current {
-                Some((cur_start, cur_end)) if start <= cur_end => {
-                    current = Some((cur_start, cur_end.max(end)));
-                }
-                Some((cur_start, cur_end)) => {
-                    total += cur_end.saturating_sub(cur_start) + 1;
-                    current = Some((start, end));
-                }
-                None => current = Some((start, end)),
-            }
-        }
-        if let Some((cur_start, cur_end)) = current {
-            total += cur_end.saturating_sub(cur_start) + 1;
-        }
-    }
-    total
+/// Return the comma-delimited values for one exact INFO key.
+///
+/// `Regions` is normally the final field, but `--preserve-info` appends the
+/// source annotations after it. Parsing the remainder of the INFO string as
+/// region names consequently folds the next `;KEY=value` into the last tag.
+fn info_list_values<'a>(info: &'a str, key: &str) -> Vec<&'a str> {
+    info.split(';')
+        .find_map(|entry| entry.split_once('=').filter(|(name, _)| *name == key))
+        .map(|(_, value)| value.split(',').filter(|value| !value.is_empty()).collect())
+        .unwrap_or_default()
 }
 
 fn derive_subset_counts(
@@ -2583,14 +5398,10 @@ fn derive_subset_counts(
         if fields.len() < 11 {
             continue;
         }
-        let info = fields[7];
-        let Some(region_tail) = info.split(";Regions=").nth(1) else {
-            continue;
-        };
-        let subset_tags: Vec<&str> = region_tail
-            .split(',')
+        let subset_tags = info_list_values(fields[7], "Regions")
+            .into_iter()
             .filter(|tag| *tag != "CONF")
-            .collect();
+            .collect::<Vec<_>>();
         if subset_tags.is_empty() {
             continue;
         }
@@ -2622,10 +5433,7 @@ fn derive_subset_counts(
 /// rows. Rows whose query failed the filter are excluded when `pass_only` is
 /// true. Returns `{variant_type: (fp_gt_count, fp_al_count)}` for every
 /// variant type observed.
-fn derive_fp_classes(
-    rows: &[AnnotatedRow],
-    pass_only: bool,
-) -> BTreeMap<String, (usize, usize)> {
+fn derive_fp_classes(rows: &[AnnotatedRow], pass_only: bool) -> BTreeMap<String, (usize, usize)> {
     let mut out: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for row in rows {
         if pass_only && !row.query_pass {
@@ -2649,6 +5457,152 @@ fn derive_fp_classes(
             bucket.0 += 1;
         } else if class == "al" {
             bucket.1 += 1;
+        }
+    }
+    out
+}
+
+/// Per-subset variant of `derive_fp_classes`. Each row's `Regions=` tail
+/// contributes to every named subset it carries (CONF is filtered out
+/// the same way `derive_subset_counts` does so the keys align with the
+/// subset rows in extended.csv).
+fn derive_subset_fp_classes(
+    rows: &[AnnotatedRow],
+    pass_only: bool,
+) -> BTreeMap<String, BTreeMap<String, (usize, usize)>> {
+    let mut out: BTreeMap<String, BTreeMap<String, (usize, usize)>> = BTreeMap::new();
+    for row in rows {
+        if pass_only && !row.query_pass {
+            continue;
+        }
+        let Some(class) = row.fp_class else {
+            continue;
+        };
+        let fields: Vec<&str> = row.line.split('\t').collect();
+        if fields.len() < 11 {
+            continue;
+        }
+        let subset_tags = info_list_values(fields[7], "Regions")
+            .into_iter()
+            .filter(|tag| *tag != "CONF")
+            .collect::<Vec<_>>();
+        if subset_tags.is_empty() {
+            continue;
+        }
+        let format_keys: Vec<&str> = fields[8].split(':').collect();
+        let query_parts: Vec<&str> = fields[10].split(':').collect();
+        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let Some(variant_type) = query_sample.variant_type() else {
+            continue;
+        };
+        for subset in subset_tags {
+            let bucket = out
+                .entry(subset.to_string())
+                .or_default()
+                .entry(variant_type.to_string())
+                .or_default();
+            if class == "gt" {
+                bucket.0 += 1;
+            } else if class == "al" {
+                bucket.1 += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Per-(variant_type, subtype) FP class tally for INDEL subtype rows in
+/// extended.csv. Legacy emits FP.gt / FP.al at every (INDEL, subtype, *,
+/// filter) row and at every (INDEL, subtype, TS_boundary|TS_contained,
+/// filter) row. Each FP query row contributes to every indel-class token
+/// in its multi-allelic BI (e.g. a hetalt FP with BI `i1_5,i6_15` adds
+/// one to both I1_5 and I6_15 — same fanout rule the truth/query stats
+/// use).
+type SubtypeFpClasses = BTreeMap<String, BTreeMap<String, (usize, usize)>>;
+type SubsetSubtypeFpClasses = BTreeMap<String, SubtypeFpClasses>;
+
+fn derive_subtype_fp_classes(rows: &[AnnotatedRow], pass_only: bool) -> SubtypeFpClasses {
+    let mut out = SubtypeFpClasses::new();
+    for row in rows {
+        if pass_only && !row.query_pass {
+            continue;
+        }
+        let Some(class) = row.fp_class else {
+            continue;
+        };
+        let fields: Vec<&str> = row.line.split('\t').collect();
+        if fields.len() < 11 {
+            continue;
+        }
+        let format_keys: Vec<&str> = fields[8].split(':').collect();
+        let query_parts: Vec<&str> = fields[10].split(':').collect();
+        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let Some((variant_type, subtypes)) = query_sample.variant_type_and_subtypes() else {
+            continue;
+        };
+        for subtype in subtypes {
+            let bucket = out
+                .entry(variant_type.to_string())
+                .or_default()
+                .entry(subtype)
+                .or_default();
+            if class == "gt" {
+                bucket.0 += 1;
+            } else if class == "al" {
+                bucket.1 += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Per-(subset, variant_type, subtype) FP class tally — the cross-product
+/// counterpart of `derive_subtype_fp_classes`, plumbed into the
+/// (INDEL, subtype, TS_*, filter) extended-csv rows.
+fn derive_subset_subtype_fp_classes(
+    rows: &[AnnotatedRow],
+    pass_only: bool,
+) -> SubsetSubtypeFpClasses {
+    let mut out = SubsetSubtypeFpClasses::new();
+    for row in rows {
+        if pass_only && !row.query_pass {
+            continue;
+        }
+        let Some(class) = row.fp_class else {
+            continue;
+        };
+        let fields: Vec<&str> = row.line.split('\t').collect();
+        if fields.len() < 11 {
+            continue;
+        }
+        let subset_tags = info_list_values(fields[7], "Regions")
+            .into_iter()
+            .filter(|tag| *tag != "CONF")
+            .collect::<Vec<_>>();
+        if subset_tags.is_empty() {
+            continue;
+        }
+        let format_keys: Vec<&str> = fields[8].split(':').collect();
+        let query_parts: Vec<&str> = fields[10].split(':').collect();
+        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let Some((variant_type, subtypes)) = query_sample.variant_type_and_subtypes() else {
+            continue;
+        };
+        for subset in subset_tags {
+            for subtype in &subtypes {
+                let bucket = out
+                    .entry(subset.to_string())
+                    .or_default()
+                    .entry(variant_type.to_string())
+                    .or_default()
+                    .entry(subtype.clone())
+                    .or_default();
+                if class == "gt" {
+                    bucket.0 += 1;
+                } else if class == "al" {
+                    bucket.1 += 1;
+                }
+            }
         }
     }
     out
@@ -2690,21 +5644,16 @@ fn derive_subset_subtype_counts(
     rows: &[AnnotatedRow],
     pass_only: bool,
 ) -> BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>> {
-    let mut out: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>> =
-        BTreeMap::new();
+    let mut out: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>> = BTreeMap::new();
     for row in rows {
         let fields: Vec<&str> = row.line.split('\t').collect();
         if fields.len() < 11 {
             continue;
         }
-        let info = fields[7];
-        let Some(region_tail) = info.split(";Regions=").nth(1) else {
-            continue;
-        };
-        let subset_tags: Vec<&str> = region_tail
-            .split(',')
+        let subset_tags = info_list_values(fields[7], "Regions")
+            .into_iter()
             .filter(|tag| *tag != "CONF")
-            .collect();
+            .collect::<Vec<_>>();
         if subset_tags.is_empty() {
             continue;
         }
@@ -2719,23 +5668,27 @@ fn derive_subset_subtype_counts(
 
         for subset in &subset_tags {
             let by_type = out.entry((*subset).to_string()).or_default();
-            if let Some((variant_type, subtype)) = truth_sample.variant_type_and_subtype() {
-                let stats = by_type
-                    .entry(variant_type.to_string())
-                    .or_default()
-                    .entry(subtype)
-                    .or_default();
-                truth_sample.add_truth(stats, filtered_out);
+            if let Some((variant_type, subtypes)) = truth_sample.variant_type_and_subtypes() {
+                for subtype in subtypes {
+                    let stats = by_type
+                        .entry(variant_type.to_string())
+                        .or_default()
+                        .entry(subtype)
+                        .or_default();
+                    truth_sample.add_truth(stats, filtered_out);
+                }
             }
             if !filtered_out
-                && let Some((variant_type, subtype)) = query_sample.variant_type_and_subtype()
+                && let Some((variant_type, subtypes)) = query_sample.variant_type_and_subtypes()
             {
-                let stats = by_type
-                    .entry(variant_type.to_string())
-                    .or_default()
-                    .entry(subtype)
-                    .or_default();
-                query_sample.add_query(stats);
+                for subtype in subtypes {
+                    let stats = by_type
+                        .entry(variant_type.to_string())
+                        .or_default()
+                        .entry(subtype)
+                        .or_default();
+                    query_sample.add_query(stats);
+                }
             }
         }
     }
@@ -2760,23 +5713,27 @@ fn derive_subtype_counts(
         let query_sample = SampleView::new(&format_keys, &query_parts);
         let filtered_out = pass_only && !row.query_pass;
 
-        if let Some((variant_type, subtype)) = truth_sample.variant_type_and_subtype() {
-            let stats = subtypes
-                .entry(variant_type.to_string())
-                .or_default()
-                .entry(subtype)
-                .or_default();
-            truth_sample.add_truth(stats, filtered_out);
+        if let Some((variant_type, sub_list)) = truth_sample.variant_type_and_subtypes() {
+            for subtype in sub_list {
+                let stats = subtypes
+                    .entry(variant_type.to_string())
+                    .or_default()
+                    .entry(subtype)
+                    .or_default();
+                truth_sample.add_truth(stats, filtered_out);
+            }
         }
         if !filtered_out
-            && let Some((variant_type, subtype)) = query_sample.variant_type_and_subtype()
+            && let Some((variant_type, sub_list)) = query_sample.variant_type_and_subtypes()
         {
-            let stats = subtypes
-                .entry(variant_type.to_string())
-                .or_default()
-                .entry(subtype)
-                .or_default();
-            query_sample.add_query(stats);
+            for subtype in sub_list {
+                let stats = subtypes
+                    .entry(variant_type.to_string())
+                    .or_default()
+                    .entry(subtype)
+                    .or_default();
+                query_sample.add_query(stats);
+            }
         }
     }
     subtypes
@@ -2787,7 +5744,6 @@ struct SampleView<'a> {
     bd: Option<&'a str>,
     bi: Option<&'a str>,
     bvt: Option<&'a str>,
-    blt: Option<&'a str>,
 }
 
 impl<'a> SampleView<'a> {
@@ -2803,7 +5759,6 @@ impl<'a> SampleView<'a> {
             bd: lookup("BD"),
             bi: lookup("BI"),
             bvt: lookup("BVT"),
-            blt: lookup("BLT"),
         }
     }
 
@@ -2811,13 +5766,28 @@ impl<'a> SampleView<'a> {
         self.bvt.filter(|value| *value != "NOCALL")
     }
 
-    fn variant_type_and_subtype(&self) -> Option<(&'a str, String)> {
+    /// Per-row subtypes for INDEL aggregation. Multi-allelic INDELs emit
+    /// comma-joined BI strings (e.g. `i1_5,i6_15` for a 1|2 hetalt with one
+    /// primitive in each size bucket). Legacy quantify fans these out per
+    /// token — each indel-class primitive contributes to its own subtype
+    /// bucket. The `ti`/`tv` tokens that decorate complex INDELs (BI like
+    /// `c6_15,tv`) describe the SNP-side of a single complex primitive and
+    /// must NOT spawn an extra bucket here, so we drop them.
+    fn variant_type_and_subtypes(&self) -> Option<(&'a str, Vec<String>)> {
         let variant_type = self.variant_type()?;
         if variant_type != "INDEL" {
             return None;
         }
-        let subtype = self.bi?.to_uppercase();
-        Some((variant_type, subtype))
+        let bi = self.bi?;
+        let subtypes: Vec<String> = bi
+            .split(',')
+            .filter(|tok| !matches!(*tok, "ti" | "tv"))
+            .map(|tok| tok.to_uppercase())
+            .collect();
+        if subtypes.is_empty() {
+            return None;
+        }
+        Some((variant_type, subtypes))
     }
 
     fn add_truth(&self, stats: &mut TypeCounts, demote_tp_to_fn: bool) {
@@ -2858,22 +5828,45 @@ impl<'a> SampleView<'a> {
 fn add_sample_stats(bucket: &mut CountsBucket, sample: &SampleView<'_>) {
     bucket.total += 1;
     if let Some("SNP") = sample.bvt {
-        match sample.bi {
-            Some("ti") => bucket.ti += 1,
-            Some("tv") => bucket.tv += 1,
-            _ => {}
+        // BI on multi-allelic hetalt SNPs is comma-separated (e.g.
+        // `ti,tv` for GT=1|2 with one transition and one transversion
+        // active alt). Legacy fans these out per primitive — one ti
+        // and one tv contribution. Iterate the comma list and count
+        // each tag once so single-allelic rows still increment by 1.
+        if let Some(bi) = sample.bi {
+            for tag in bi.split(',') {
+                match tag {
+                    "ti" => bucket.ti += 1,
+                    "tv" => bucket.tv += 1,
+                    _ => {}
+                }
+            }
         }
     }
-    // Legacy's TRUTH.TOTAL.het / homalt buckets count only the literal GT
-    // strings (0/1, 1/0, 0|1, 1|0 for het; 1/1, 1|1 for homalt). The VCF
-    // BLT column is wider (it resolves multi-allelic GT like 3|0 to "het"
-    // to match legacy's row-level classifier) so counting off BLT would
-    // over-count 50+ multi-allelic truth records per chr21. Parse GT here
-    // so row-derived counts stay byte-equal with legacy's summary.
-    match sample.gt {
-        Some("0/1") | Some("1/0") | Some("0|1") | Some("1|0") => bucket.het += 1,
-        Some("1/1") | Some("1|1") => bucket.homalt += 1,
-        _ => {}
+    // Legacy's summary counts:
+    // * het = exactly one allele is the reference index 0 (covers 0/1,
+    //   1/0, 0|1, 1|0 AND 0|2, 2|0, 0|3, 3|0, …) — anything heterozygous
+    //   with the reference base.
+    // * homalt = both alleles equal AND non-zero (1/1, 1|1, 2|2, 3|3, …).
+    // Hetalt (1|2, 2|1, …) lands in NEITHER bucket. Earlier the
+    // classifier matched only literal `1/1`/`0/1` to mirror QUERY-side
+    // counts (queries are split into per-primitive `0/1`/`1/1` rows),
+    // but TRUTH-side rows preserve their original multi-allelic GT
+    // through bcftools merge so the literal-only rule under-counted
+    // every truth-only multi-allelic record.
+    if let Some(gt) = sample.gt {
+        let alleles: Vec<usize> = gt
+            .split(['/', '|'])
+            .map(|part| part.parse::<usize>().unwrap_or(0))
+            .collect();
+        if alleles.len() == 2 {
+            let zero_count = alleles.iter().filter(|a| **a == 0).count();
+            if zero_count == 1 {
+                bucket.het += 1;
+            } else if alleles[0] != 0 && alleles[0] == alleles[1] {
+                bucket.homalt += 1;
+            }
+        }
     }
 }
 
@@ -2924,11 +5917,55 @@ fn tp_combined_row(
         sort_key: (truth.key.chrom.clone(), truth.key.pos, 1, 0),
         query_pass: filter_is_pass(&query.filter),
         fp_class: None,
+        xcmp_ctype: None,
+        xcmp_hap_match: false,
         line: format!(
             "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:TP:gm:{info}:{type_label}:{truth_loc}:{qq}\t{query_gt}:TP:gm:{info}:{type_label}:{query_loc}:{qq}",
             chrom = truth.key.chrom,
             pos = truth.key.pos,
-            ref = truth.key.ref_allele,
+            ref = display_ref(truth, reference),
+            alt = display_alt(truth),
+            qual = query.qual,
+            filter = filter_for_output(&query.filter),
+            bs = block_start,
+            regions = regions,
+            truth_gt = truth.gt,
+            query_gt = query.gt,
+            info = info,
+            type_label = truth.primary_type(),
+            truth_loc = genotype_label(truth),
+            query_loc = genotype_label(query),
+            qq = query.qual,
+        ),
+    }
+}
+
+/// Combined UNK+UNK row for a same-key truth+query pair where the locus
+/// falls outside the confident region. Legacy emits BD=UNK on both
+/// samples with BK=lm — the locus-match heuristic fires because the two
+/// sides share the variant exactly, and the unconditional non-CONF →
+/// UNK rewrite trumps the gm verdict from xcmp. Truth-side QQ stays `.`
+/// (truth's input qual is always "0") while query-side carries the
+/// query's own qual.
+fn unk_combined_row(
+    truth: &Variant,
+    query: &Variant,
+    reference: &str,
+    block_start: usize,
+    regions: &str,
+) -> AnnotatedRow {
+    let info = comparison_info(truth, reference);
+    AnnotatedRow {
+        sort_key: (truth.key.chrom.clone(), truth.key.pos, 1, 0),
+        query_pass: filter_is_pass(&query.filter),
+        fp_class: None,
+        xcmp_ctype: None,
+        xcmp_hap_match: false,
+        line: format!(
+            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:UNK:lm:{info}:{type_label}:{truth_loc}:.\t{query_gt}:UNK:lm:{info}:{type_label}:{query_loc}:{qq}",
+            chrom = truth.key.chrom,
+            pos = truth.key.pos,
+            ref = display_ref(truth, reference),
             alt = display_alt(truth),
             qual = query.qual,
             filter = filter_for_output(&query.filter),
@@ -2988,6 +6025,13 @@ fn cluster_query_filter(cluster: &Cluster) -> String {
     if tokens.is_empty() {
         ".".to_string()
     } else {
+        // Legacy's bcftools-merged input deterministically orders the
+        // FILTER column when stamping the cluster's union onto truth-side
+        // TP rows: tokens land in byte-wise ascending order regardless of
+        // the source order seen in any single query record. (Single-source
+        // single-record rows preserve their own filter order; this path
+        // only fires when the filter is the cluster aggregate.)
+        tokens.sort();
         tokens.join(";")
     }
 }
@@ -3005,14 +6049,21 @@ fn tp_single_side_row(
     match side {
         Side::Truth => AnnotatedRow {
             sort_key: (variant.key.chrom.clone(), variant.key.pos, 1, 0),
-            // Truth-only rows carry no query variant; count them in both tiers.
-            query_pass: true,
+            // Truth-side TP split rows inherit the cluster's aggregated query
+            // filter (see `cluster_query_filter` and call sites). When the
+            // matching query is non-PASS, legacy demotes the truth-TP to FN
+            // in the PASS-tier rollup; mirror that by deriving query_pass
+            // from the same filter string that already lands in the FILTER
+            // column.
+            query_pass: filter_is_pass(truth_filter),
             fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
             line: format!(
                 "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{gt}:TP:gm:{info}:{type_label}:{loc}:{qq}\t./.:.:.:.:NOCALL:nocall:0",
                 chrom = variant.key.chrom,
                 pos = variant.key.pos,
-                ref = variant.key.ref_allele,
+                ref = display_ref(variant, reference),
                 alt = display_alt(variant),
                 qual = variant.qual,
                 filter = truth_filter,
@@ -3041,11 +6092,13 @@ fn tp_single_side_row(
             ),
             query_pass: filter_is_pass(&variant.filter),
             fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
             line: format!(
                 "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t./.:.:.:.:NOCALL:nocall:.\t{gt}:TP:gm:{info}:{type_label}:{loc}:{qq}",
                 chrom = variant.key.chrom,
                 pos = variant.key.pos,
-                ref = variant.key.ref_allele,
+                ref = display_ref(variant, reference),
                 alt = display_alt(variant),
                 qual = variant.qual,
                 filter = filter_for_output(&variant.filter),
@@ -3066,15 +6119,29 @@ fn tp_single_side_row(
 /// Legacy emits BD=FN on truth, BD=FP on query, BK=am on both. The row
 /// also carries the query's QUAL so downstream ROC enumeration can key
 /// off the actual call quality rather than truth's placeholder zero.
+#[allow(clippy::too_many_arguments)] // Mirrors the two-sample legacy VCF row contract.
 fn fn_fp_combined_row(
     truth: &Variant,
     query: &Variant,
     reference: &str,
     block_start: usize,
     regions: &str,
+    truth_bd: &'static str,
     query_bd: &'static str,
+    bk: &str,
 ) -> AnnotatedRow {
-    let info = comparison_info(truth, reference);
+    // Per-sample BI: legacy emits each sample's `BI` based on the alleles
+    // ITS own GT selects, not the merged record's overall subtype. The
+    // chr21:9922359 fixture (truth `T→A,C 1|0` selects {A}=tv vs query
+    // `T→A,C 1/2` selects {A,C}=ti,tv) demands different BI strings on
+    // the two samples even on a combined fn_fp row.
+    let truth_info = comparison_info(truth, reference);
+    let query_info = comparison_info(query, reference);
+    let fp_class = if query_bd == "FP" {
+        fp_class_from_bk(bk)
+    } else {
+        None
+    };
     AnnotatedRow {
         sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
         // Combined rows inherit the query's PASS status for the ALL vs
@@ -3082,12 +6149,23 @@ fn fn_fp_combined_row(
         // contributes to the PASS-tier summary, consistent with
         // legacy's derived-from-row contract.
         query_pass: filter_is_pass(&query.filter),
-        fp_class: Some("gt"),
+        // FP class follows the same rule as `fp_like_row`: BK=am→gt,
+        // BK=lm→al, otherwise unclassified. Earlier this was hardcoded
+        // to `Some("gt")` on the assumption that combined truth+query
+        // rows are always genotype mismatches; that's true for the
+        // common case but not for hetalt-vs-different-hetalt pairings
+        // where compute_paired_bk returns `lm` (chr21:38861935 truth
+        // `T→TAA,TA` 1|2 vs query `T→TAA` 0/1) — those should land in
+        // FP.al, not FP.gt. Only emit the class when the query side is
+        // actually FP (truth-side UNK pairs leave the row unclassified).
+        fp_class,
+        xcmp_ctype: None,
+        xcmp_hap_match: false,
         line: format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:FN:am:{info}:{type_label}:{truth_loc}:.\t{query_gt}:{query_bd}:am:{info}:{type_label}:{query_loc}:{qq}",
+            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:{truth_bd}:{bk}:{truth_info}:{type_label}:{truth_loc}:.\t{query_gt}:{query_bd}:{bk}:{query_info}:{type_label}:{query_loc}:{qq}",
             chrom = truth.key.chrom,
             pos = truth.key.pos,
-            ref = truth.key.ref_allele,
+            ref = display_ref(truth, reference),
             alt = display_alt(truth),
             qual = query.qual,
             filter = filter_for_output(&query.filter),
@@ -3095,12 +6173,15 @@ fn fn_fp_combined_row(
             regions = regions,
             truth_gt = truth.gt,
             query_gt = query.gt,
-            info = info,
+            truth_info = truth_info,
+            query_info = query_info,
             type_label = truth.primary_type(),
             truth_loc = genotype_label(truth),
             query_loc = genotype_label(query),
             qq = query.qual,
+            truth_bd = truth_bd,
             query_bd = query_bd,
+            bk = bk,
         ),
     }
 }
@@ -3120,11 +6201,13 @@ fn fn_row(
         // condition on truth-side FN counts).
         query_pass: true,
         fp_class: None,
+        xcmp_ctype: None,
+        xcmp_hap_match: false,
         line: format!(
             "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{gt}:FN:{bk}:{info}:{type_label}:{loc}:.\t./.:.:.:.:NOCALL:nocall:0",
             chrom = truth.key.chrom,
             pos = truth.key.pos,
-            ref = truth.key.ref_allele,
+            ref = display_ref(truth, reference),
             alt = display_alt(truth),
             qual = truth.qual,
             bs = block_start,
@@ -3158,11 +6241,13 @@ fn unk_truth_row(
         // semantics as FN rows, per legacy's Counts.cpp treatment).
         query_pass: true,
         fp_class: None,
+        xcmp_ctype: None,
+        xcmp_hap_match: false,
         line: format!(
             "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{gt}:UNK:{bk}:{info}:{type_label}:{loc}:.\t./.:.:.:.:NOCALL:nocall:0",
             chrom = truth.key.chrom,
             pos = truth.key.pos,
-            ref = truth.key.ref_allele,
+            ref = display_ref(truth, reference),
             alt = display_alt(truth),
             qual = truth.qual,
             bs = block_start,
@@ -3184,7 +6269,26 @@ fn unk_truth_row(
 /// for the parent record. Single-allelic variants pass through unchanged.
 /// Legacy emits one VCF row per primitive; without this, rust under-counts
 /// QUERY.TOTAL by ~40 records per chr21 case.
-fn split_query_primitives(variant: &Variant) -> Vec<Variant> {
+/// Variant of `split_query_primitives` that knows about sibling records
+/// in the cluster. The neighbor list lets the per-primitive left-shift
+/// (Class F) avoid sliding onto a position already occupied by another
+/// raw record — sliding chr21:28720259 alt 2 onto 28720258 would
+/// duplicate the raw `28720258 AAAG→A` record because that single-alt
+/// deletion sits at the same locus the slide would target.
+///
+/// `cluster_truth` enables the Class B same-anchor insertion fan-out
+/// (`try_split_same_anchor_via_shift`) — when a multi-allelic insertion's
+/// shifted primitive lands at a position represented in truth, the
+/// fan-out is suppressed so block-level haplotype matching can reconcile
+/// the multi-allelic record (chr21:40096658 case). Pass `&[]` when truth
+/// context is unavailable.
+fn split_query_primitives_with_neighbors(
+    variant: &Variant,
+    reference: &str,
+    cluster_start: usize,
+    cluster_neighbors: &[Variant],
+    cluster_truth: &[Variant],
+) -> Vec<Variant> {
     if !variant.key.alt_allele.contains(',') {
         return vec![variant.clone()];
     }
@@ -3207,6 +6311,16 @@ fn split_query_primitives(variant: &Variant) -> Vec<Variant> {
     // reference position — legacy keeps the record multi-allelic. Only
     // when trimming produces distinct anchor positions does legacy fan
     // the record out into per-primitive rows.
+    //
+    // Class B (left-shift through microsatellites — chr21:21690513) is
+    // INTENTIONALLY OUT OF SCOPE here for INSERTION primitives: applying
+    // `partial_credit::left_shift` per insertion over-shifts microsat
+    // inserts already canonicalized by pre.py (regressed
+    // chr21_passonly_region from 0 → 60 in a prior session). Class F
+    // (chr21:44413761 + chr21:47906004) IS handled by the `apply_slide`
+    // block below for DELETION primitives only, gated on the absence of
+    // a neighboring raw record at the slide target — sliding onto an
+    // already-occupied locus would duplicate that record.
     let mut trimmed: Vec<(usize, String, String)> = Vec::new();
     for allele_idx in &used {
         let Some(alt) = alts.get(*allele_idx - 1).copied() else {
@@ -3223,6 +6337,43 @@ fn split_query_primitives(variant: &Variant) -> Vec<Variant> {
         .iter()
         .all(|(pos, r, _)| (pos, r) == (first_anchor.0, first_anchor.1));
     if all_same_anchor {
+        // Class B same-anchor insertion fan-out. When the multi-allelic
+        // primitives canonicalize to distinct anchors via `partial_credit::
+        // left_shift` AND no shifted alt has truth representation at the
+        // shifted anchor, fan out into per-primitive rows with the slide
+        // applied. chr21:21690513 (`C→CACAC,CACAT`): CACAC slides to
+        // (21690501, T, TACAC), CACAT stays at 21690513 with truth's
+        // exact match → fan out. chr21:40096658 (`T→TAGATAGAG,TAGATAGAT`):
+        // TAGATAGAT slides to (40096650, C, CAGATAGAT), but truth at
+        // 40096650 already declares that allele → keep multi-allelic.
+        let bases_for_class_b = reference.as_bytes();
+        let pos_min_for_class_b = cluster_start.saturating_sub(SPLIT_LEFT_SHIFT_WINDOW).max(1);
+        if let Some(shifted) = try_split_same_anchor_via_shift(
+            &variant.key.chrom,
+            variant.key.pos,
+            &trimmed,
+            bases_for_class_b,
+            pos_min_for_class_b,
+            cluster_truth,
+            cluster_neighbors,
+        ) {
+            let mut sorted = shifted;
+            sorted.sort_by_key(|(p, r, _)| (*p, r.len()));
+            return sorted
+                .into_iter()
+                .map(|(p, r, a)| Variant {
+                    key: VariantKey {
+                        chrom: variant.key.chrom.clone(),
+                        pos: p,
+                        ref_allele: r,
+                        alt_allele: a,
+                    },
+                    qual: variant.qual.clone(),
+                    filter: variant.filter.clone(),
+                    gt: "0/1".to_string(),
+                })
+                .collect();
+        }
         // Keep as multi-allelic; sort alphabetically so query-only
         // records emit `T → TCA,TCACACA` (shorter first) matching the
         // canonical representation legacy pre.py generates. When a
@@ -3255,21 +6406,72 @@ fn split_query_primitives(variant: &Variant) -> Vec<Variant> {
         }];
     }
 
-    trimmed
+    // Class F per-primitive left-shift (deletions only). Sort by start so
+    // the accumulated `local_min` boundary covers siblings left-to-right.
+    // Skip the slide entirely when a neighboring cluster record already
+    // sits at or before the trim anchor — those are the chr21:28720259 /
+    // chr21:30548467 shapes where legacy keeps each raw record at its own
+    // anchor and a per-primitive slide would create duplicates.
+    let bases = reference.as_bytes();
+    let mut sorted = trimmed;
+    sorted.sort_by_key(|(pos, ref_allele, _)| (*pos, ref_allele.len()));
+    let neighbor_anchors: BTreeSet<usize> = cluster_neighbors
+        .iter()
+        .filter(|n| n.key.pos != variant.key.pos)
+        .map(|n| n.key.pos)
+        .collect();
+    let any_neighbor_below = sorted
+        .iter()
+        .any(|(pos, _, _)| neighbor_anchors.iter().any(|&n| n < *pos));
+    let mut local_min = cluster_start.saturating_sub(SPLIT_LEFT_SHIFT_WINDOW).max(1);
+    sorted
         .into_iter()
-        .map(|(pos, ref_allele, alt_allele)| Variant {
-            key: VariantKey {
-                chrom: variant.key.chrom.clone(),
-                pos,
-                ref_allele,
-                alt_allele,
-            },
-            qual: variant.qual.clone(),
-            filter: variant.filter.clone(),
-            // Each split primitive becomes a simple 0/1 het so downstream
-            // is_het / genotype_label / primary_type classify it the same
-            // way legacy does for its decomposed representations.
-            gt: "0/1".to_string(),
+        .map(|(pos, ref_allele, alt_allele)| {
+            let apply_slide = !any_neighbor_below
+                && ref_allele.len() > alt_allele.len()
+                && pos > 0
+                && pos + ref_allele.len() - 1 <= bases.len();
+            let (final_pos, final_ref, final_alt) = if apply_slide {
+                let mut rv = partial_credit::RefVar {
+                    start: pos,
+                    end: pos + ref_allele.len() - 1,
+                    alt: alt_allele.clone(),
+                };
+                partial_credit::left_shift(bases, &mut rv, local_min, true);
+                let ref_start = rv.start.saturating_sub(1);
+                let ref_end = rv.end;
+                if ref_end >= ref_start && ref_end <= bases.len() && rv.start >= 1 {
+                    let new_ref: String = bases[ref_start..ref_end]
+                        .iter()
+                        .map(|&b| b.to_ascii_uppercase() as char)
+                        .collect();
+                    let new_end = rv.start + new_ref.len().max(1) - 1;
+                    local_min = local_min.max(new_end);
+                    (rv.start, new_ref, rv.alt)
+                } else {
+                    let original_end = pos + ref_allele.len().max(1) - 1;
+                    local_min = local_min.max(original_end);
+                    (pos, ref_allele, alt_allele)
+                }
+            } else {
+                let original_end = pos + ref_allele.len().max(1) - 1;
+                local_min = local_min.max(original_end);
+                (pos, ref_allele, alt_allele)
+            };
+            Variant {
+                key: VariantKey {
+                    chrom: variant.key.chrom.clone(),
+                    pos: final_pos,
+                    ref_allele: final_ref,
+                    alt_allele: final_alt,
+                },
+                qual: variant.qual.clone(),
+                filter: variant.filter.clone(),
+                // Each split primitive becomes a simple 0/1 het so downstream
+                // is_het / genotype_label / primary_type classify it the same
+                // way legacy does for its decomposed representations.
+                gt: "0/1".to_string(),
+            }
         })
         .collect()
 }
@@ -3440,11 +6642,13 @@ fn fp_like_row(
         ),
         query_pass: filter_is_pass(&query.filter),
         fp_class,
+        xcmp_ctype: None,
+        xcmp_hap_match: false,
         line: format!(
             "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t./.:.:.:.:NOCALL:nocall:.\t{gt}:{bd}:{bk}:{info}:{type_label}:{loc}:{qq}",
             chrom = query.key.chrom,
             pos = query.key.pos,
-            ref = query.key.ref_allele,
+            ref = display_ref(query, reference),
             alt = display_alt(query),
             qual = query.qual,
             filter = filter_for_output(&query.filter),
@@ -3468,6 +6672,19 @@ fn display_alt(variant: &Variant) -> String {
     // (e.g. `ATCTC,ATC → ATC,ATCTC`) and also invalidate the GT indices that
     // were emitted for the pre-sort allele order.
     variant.key.alt_allele.clone()
+}
+
+fn display_ref(variant: &Variant, reference: &str) -> String {
+    if variant
+        .key
+        .alt_allele
+        .split(',')
+        .any(|alt| alt.starts_with('<') && alt.ends_with('>'))
+        && let Some(base) = reference.as_bytes().get(variant.key.pos.saturating_sub(1))
+    {
+        return (*base as char).to_ascii_uppercase().to_string();
+    }
+    variant.key.ref_allele.clone()
 }
 
 fn query_type_rank(variant: &Variant) -> usize {
@@ -3494,9 +6711,7 @@ fn genotype_label(variant: &Variant) -> &'static str {
     if all_alleles.len() == 2 && all_alleles[0] > 0 && all_alleles[0] == all_alleles[1] {
         return "homalt";
     }
-    if all_alleles.len() == 2
-        && (all_alleles[0] == 0) != (all_alleles[1] == 0)
-    {
+    if all_alleles.len() == 2 && (all_alleles[0] == 0) != (all_alleles[1] == 0) {
         return "het";
     }
     "nocall"
@@ -3506,10 +6721,10 @@ fn comparison_info(variant: &Variant, reference: &str) -> String {
     // Multi-allelic records — SNP or INDEL — go through subtype_label so
     // mixed ti/tv or mixed indel sizes emit the legacy comma-joined BI
     // (e.g. `A → G,T` GT=2/1 must be `ti,tv`, not a single ti/tv token).
-    if variant.key.alt_allele.contains(',') {
-        if let Some(subtype) = subtype_label(variant) {
-            return subtype.to_lowercase();
-        }
+    if variant.key.alt_allele.contains(',')
+        && let Some(subtype) = subtype_label(variant)
+    {
+        return subtype.to_lowercase();
     }
     if variant.primary_type() == "SNP" {
         return snp_bucket_label(variant).unwrap_or("tv").to_string();
@@ -3598,12 +6813,7 @@ fn subtype_label(variant: &Variant) -> Option<String> {
         if subtypes.is_empty() {
             return None;
         }
-        return Some(
-            subtypes
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(","),
-        );
+        return Some(subtypes.into_iter().collect::<Vec<_>>().join(","));
     }
     if variant.primary_type() != "INDEL" {
         return None;
@@ -3645,9 +6855,7 @@ fn subtype_label(variant: &Variant) -> Option<String> {
         .count();
     let max_suffix = (ref_bytes.len() - prefix).min(alt_bytes.len() - prefix);
     let suffix = (0..max_suffix)
-        .take_while(|i| {
-            ref_bytes[ref_bytes.len() - 1 - i] == alt_bytes[alt_bytes.len() - 1 - i]
-        })
+        .take_while(|i| ref_bytes[ref_bytes.len() - 1 - i] == alt_bytes[alt_bytes.len() - 1 - i])
         .count();
     let ref_rem = ref_bytes.len() - prefix - suffix;
     let alt_rem = alt_bytes.len() - prefix - suffix;
@@ -3664,7 +6872,28 @@ fn subtype_label(variant: &Variant) -> Option<String> {
         ("C", ref_rem.max(alt_rem))
     };
     let bucket = bucket_label(size);
-    Some(format!("{class}{bucket}"))
+    let mut label = format!("{class}{bucket}");
+    if class == "C" && ref_rem > 0 && alt_rem > 0 {
+        // Complex variants carry a comma-joined ti/tv tag derived from
+        // the first post-trim ref/alt pair, matching legacy
+        // `VariantStatistics`'s additional Ti/Tv bucket on
+        // substitution-plus-indel records (e.g. chr21:26105569
+        // `T→AAAGAAAA` is `c6_15,tv` because T→A is a transversion;
+        // chr21:32759510 allele 2 `TTTTTTTTT→C` is `c6_15,ti`). The
+        // pair at index `prefix` is guaranteed mismatched — `prefix`
+        // counts shared leading bases and stops on the first
+        // disagreement.
+        let ref_first = ref_bytes[prefix] as char;
+        let alt_first = alt_bytes[prefix] as char;
+        let ti_tv = if is_transition_pair(ref_first, alt_first) {
+            "ti"
+        } else {
+            "tv"
+        };
+        label.push(',');
+        label.push_str(ti_tv);
+    }
+    Some(label)
 }
 
 fn bucket_label(size: usize) -> &'static str {
@@ -3682,9 +6911,766 @@ fn is_transition_pair(ref_base: char, alt_base: char) -> bool {
     )
 }
 
+/// Resolve the parent under which a unique per-invocation scratch directory is
+/// created. `--scratch-prefix` is a caller-selected parent; without it, keep
+/// scratch beside the reports as legacy hap.py does.
+fn scratch_parent(args: &CompareArgs, prefix: &Path) -> PathBuf {
+    if let Some(parent) = args.scratch_prefix.as_deref() {
+        return PathBuf::from(parent);
+    }
+    let base = prefix
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join(".hap_scratch")
+}
+
+fn compact_no_roc_outputs(prefix: &Path) -> Result<()> {
+    let all_path = suffixed_report_path(prefix, "roc.all.csv.gz");
+    let text = vcf::read_text(&all_path)?;
+    let rows = text
+        .lines()
+        .enumerate()
+        .filter(|(index, line)| *index == 0 || line.split(',').nth(6).is_some_and(|qq| qq == "*"))
+        .map(|(_, line)| line.to_string())
+        .collect::<Vec<_>>();
+    let file = fs::File::create(&all_path)
+        .with_context(|| format!("failed to create {}", all_path.display()))?;
+    let mut encoder = GzEncoder::new(file, Compression::default());
+    writeln!(encoder, "{}", rows.join("\n"))?;
+    encoder.finish()?;
+    for suffix in [
+        "roc.Locations.SNP.csv.gz",
+        "roc.Locations.SNP.PASS.csv.gz",
+        "roc.Locations.INDEL.csv.gz",
+        "roc.Locations.INDEL.PASS.csv.gz",
+    ] {
+        let path = suffixed_report_path(prefix, suffix);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Build the `PreprocessArgs` that germline should apply to truth or query
+/// before running xcmp. Preserves the flags germline inherits from pre.py.
+/// `pass_only` is passed through separately so the caller can force truth to
+/// always filter to PASS (matching legacy's `--usefiltered-truth=False`).
+/// `preprocess_enabled` is false for truth by default and true for query,
+/// matching hap.py's asymmetric preprocessing policy.
+fn build_preprocess_args(
+    args: &CompareArgs,
+    input: &str,
+    output: &Path,
+    pass_only: bool,
+    preprocess_enabled: bool,
+) -> PreprocessArgs {
+    let truth_side = input == args.truth;
+    let convert_gvcf = args.convert_gvcf_to_vcf
+        || if truth_side {
+            args.convert_gvcf_truth
+        } else {
+            args.convert_gvcf_query
+        };
+    PreprocessArgs {
+        input: input.to_string(),
+        output: output.to_string_lossy().into_owned(),
+        version: false,
+        reference: Some(args.reference.clone()),
+        locations: args.locations.clone(),
+        pass_only,
+        filters_only: (!truth_side).then(|| args.filters_only.clone()).flatten(),
+        regions_bedfile: args.regions_bedfile.clone(),
+        targets_bedfile: args.targets_bedfile.clone(),
+        // Germline preprocessing inherits legacy's automatic prefix policy:
+        // add `chr` only when the reference uses it and the VCF does not.
+        fixchr: args.fixchr,
+        no_fixchr: args.no_fixchr,
+        somatic: args.somatic,
+        set_gt: args.set_gt,
+        filter_nonref: args.filter_nonref && (!truth_side || preprocess_enabled),
+        convert_gvcf_to_vcf: convert_gvcf,
+        bcf: args.bcf,
+        bcftools_norm: args.bcftools_norm && (!truth_side || preprocess_enabled),
+        leftshift: preprocess_enabled && (args.leftshift || !args.no_leftshift),
+        no_leftshift: false,
+        decompose: preprocess_enabled && effective_decomposition(args),
+        no_decompose: false,
+        gender: args.gender,
+        window_size: args.preprocess_window,
+        threads: args.threads,
+        logfile: None,
+        verbose: args.verbose,
+        quiet: args.quiet,
+        force_interactive: args.force_interactive,
+    }
+}
+
+/// Legacy hap.py disables decomposition for somatic/set-gt preprocessing
+/// unless the user opts back in explicitly with `--decompose`.
+fn effective_decomposition(args: &CompareArgs) -> bool {
+    !args.no_decompose && (!(args.somatic || args.set_gt.is_some()) || args.decompose)
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn comparison_headers_merge_inputs_and_append_legacy_annotations() {
+        let truth = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##INFO=<ID=TRUTH_ONLY,Number=1,Type=String,Description=\"truth\">".to_string(),
+            "##FORMAT=<ID=AD,Number=.,Type=Integer,Description=\"wrong\">".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tT".to_string(),
+        ];
+        let query = vec![
+            "##INFO=<ID=QUERY_ONLY,Number=1,Type=String,Description=\"query\">".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tQ".to_string(),
+        ];
+        let headers = build_vcf_headers(&truth, &query, true, false, false);
+
+        assert!(headers.iter().any(|line| line.contains("ID=TRUTH_ONLY,")));
+        assert!(headers.iter().any(|line| line.contains("ID=QUERY_ONLY,")));
+        assert!(
+            headers
+                .iter()
+                .any(|line| line.starts_with("##INFO=<ID=Q_FILTERED,"))
+        );
+        assert!(headers.iter().any(|line| line == "##FORMAT=<ID=BI,Number=1,Type=String,Description=\"Additional comparison information\">"));
+        assert!(headers.iter().any(|line| line == "##FORMAT=<ID=QQ,Number=1,Type=Float,Description=\"Variant quality for ROC creation.\">"));
+        assert!(
+            !headers
+                .iter()
+                .any(|line| line.contains("Description=\"wrong\""))
+        );
+        assert_eq!(
+            headers.last().unwrap(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTRUTH\tQUERY"
+        );
+    }
+
+    #[test]
+    fn comparison_headers_only_declare_filtered_calls_when_enabled() {
+        let headers = build_vcf_headers(&[], &[], false, false, false);
+        assert!(!headers.iter().any(|line| line.contains("ID=Q_FILTERED,")));
+    }
+
+    fn fixture_path(file: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/synth-snp-match")
+            .join(file)
+    }
+
+    fn test_root(label: &str) -> PathBuf {
+        let id = SCRATCH_RUN_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("hap-compare-{label}-{}-{id}", std::process::id()));
+        fs::create_dir_all(&root).expect("create test root");
+        root
+    }
+
+    fn args(report_prefix: PathBuf, scratch_parent: &Path, keep_scratch: bool) -> CompareArgs {
+        let mut args = CompareArgs::with_paths(
+            fixture_path("truth.vcf").display().to_string(),
+            fixture_path("query.vcf").display().to_string(),
+            fixture_path("ref.fa").display().to_string(),
+            report_prefix.display().to_string(),
+        );
+        args.scratch_prefix = Some(scratch_parent.display().to_string());
+        args.keep_scratch = keep_scratch;
+        args
+    }
+
+    #[test]
+    fn preprocessing_defaults_are_asymmetric_between_truth_and_query() {
+        let root = test_root("preprocessing-defaults");
+        let mut options = args(root.join("result"), &root.join("scratch"), false);
+        options.bcftools_norm = true;
+        let truth = build_preprocess_args(
+            &options,
+            &options.truth,
+            &root.join("truth.vcf.gz"),
+            true,
+            options.preprocess_truth,
+        );
+        let query = build_preprocess_args(
+            &options,
+            &options.query,
+            &root.join("query.vcf.gz"),
+            false,
+            true,
+        );
+
+        assert!(!truth.leftshift);
+        assert!(!truth.decompose);
+        assert!(!truth.bcftools_norm);
+        assert!(query.leftshift);
+        assert!(query.decompose);
+        assert!(query.bcftools_norm);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_roc_regions_retain_the_implicit_aggregate_region() {
+        let mut regions = vec!["CONF".to_string()];
+        ensure_aggregate_roc_region(&mut regions);
+        ensure_aggregate_roc_region(&mut regions);
+        assert_eq!(regions, ["*", "CONF"]);
+    }
+
+    #[test]
+    fn scmp_engines_apply_legacy_preprocessing_defaults() {
+        let root = test_root("scmp-policy");
+        let mut somatic = args(root.join("somatic"), &root, false);
+        somatic.engine = CompareEngine::ScmpSomatic;
+        somatic.preprocess_truth = true;
+        somatic.bcftools_norm = true;
+        normalize_engine_preprocessing(&mut somatic);
+        assert!(somatic.somatic);
+        assert_eq!(somatic.set_gt, None);
+        assert!(!somatic.preprocess_truth);
+        assert!(somatic.no_leftshift);
+        assert!(!somatic.bcftools_norm);
+        assert!(!effective_decomposition(&somatic));
+
+        let mut distance = args(root.join("distance"), &root, false);
+        distance.engine = CompareEngine::ScmpDistance;
+        normalize_engine_preprocessing(&mut distance);
+        assert_eq!(distance.set_gt, Some(crate::cli::SomaticGtMode::First));
+        assert!(!effective_decomposition(&distance));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn comparison_log_honors_verbose_and_quiet_levels() {
+        let root = test_root("comparison-log");
+        let logfile = root.join("comparison.log");
+        let mut options = args(root.join("result"), &root, false);
+        options.logfile = Some(logfile.display().to_string());
+        options.verbose = true;
+        initialize_compare_log(&options).unwrap();
+        log_compare_info(&options, "comparison stage").unwrap();
+        assert_eq!(
+            fs::read_to_string(&logfile).unwrap(),
+            "INFO comparison stage\n"
+        );
+
+        options.quiet = true;
+        log_compare_info(&options, "suppressed").unwrap();
+        assert!(!fs::read_to_string(&logfile).unwrap().contains("suppressed"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preprocess_truth_and_negative_switches_control_both_sides() {
+        let root = test_root("preprocessing-overrides");
+        let mut options = args(root.join("result"), &root.join("scratch"), false);
+        options.preprocess_truth = true;
+
+        let truth = build_preprocess_args(
+            &options,
+            &options.truth,
+            &root.join("truth-enabled.vcf.gz"),
+            true,
+            options.preprocess_truth,
+        );
+        assert!(truth.leftshift);
+        assert!(truth.decompose);
+
+        options.no_leftshift = true;
+        options.no_decompose = true;
+        let truth_disabled = build_preprocess_args(
+            &options,
+            &options.truth,
+            &root.join("truth-disabled.vcf.gz"),
+            true,
+            options.preprocess_truth,
+        );
+        let query_disabled = build_preprocess_args(
+            &options,
+            &options.query,
+            &root.join("query-disabled.vcf.gz"),
+            false,
+            true,
+        );
+        assert!(!truth_disabled.leftshift);
+        assert!(!truth_disabled.decompose);
+        assert!(!query_disabled.leftshift);
+        assert!(!query_disabled.decompose);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remaining_germline_preprocess_controls_propagate_per_side() {
+        let root = test_root("preprocessing-controls");
+        let mut options = args(root.join("result"), &root.join("scratch"), false);
+        options.usefiltered_truth = true;
+        options.filters_only = Some("LowQual,q10".to_string());
+        options.convert_gvcf_truth = true;
+        options.convert_gvcf_query = false;
+        options.filter_nonref = true;
+        options.preprocess_truth = true;
+        options.bcftools_norm = true;
+        options.fixchr = Some(true);
+        options.gender = crate::cli::PreprocessGender::Male;
+        options.preprocess_window = 4096;
+
+        let truth = build_preprocess_args(
+            &options,
+            &options.truth,
+            &root.join("truth.bcf"),
+            !options.usefiltered_truth,
+            options.preprocess_truth,
+        );
+        let query = build_preprocess_args(
+            &options,
+            &options.query,
+            &root.join("query.bcf"),
+            options.pass_only,
+            true,
+        );
+        assert!(!truth.pass_only);
+        assert_eq!(truth.filters_only, None);
+        assert!(truth.convert_gvcf_to_vcf);
+        assert!(truth.filter_nonref);
+        assert_eq!(query.filters_only.as_deref(), Some("LowQual,q10"));
+        assert!(!query.convert_gvcf_to_vcf);
+        assert!(query.filter_nonref);
+        for side in [&truth, &query] {
+            assert!(side.bcftools_norm);
+            assert_eq!(side.fixchr, Some(true));
+            assert_eq!(side.gender, crate::cli::PreprocessGender::Male);
+            assert_eq!(side.window_size, 4096);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_roc_no_counts_no_json_emits_the_legacy_artifact_shape() {
+        let root = test_root("minimal-artifacts");
+        let prefix = root.join("result");
+        let mut options = args(prefix.clone(), &root.join("scratch"), false);
+        options.no_roc = true;
+        options.no_write_counts = true;
+        options.no_json = true;
+        run(options).unwrap();
+
+        for suffix in [
+            "summary.csv",
+            "vcf.gz",
+            "vcf.gz.tbi",
+            "roc.all.csv.gz",
+            "runinfo.json",
+        ] {
+            assert!(suffixed_report_path(&prefix, suffix).is_file(), "{suffix}");
+        }
+        for suffix in [
+            "extended.csv",
+            "metrics.json.gz",
+            "roc.Locations.SNP.csv.gz",
+            "roc.Locations.SNP.PASS.csv.gz",
+            "roc.Locations.INDEL.csv.gz",
+            "roc.Locations.INDEL.PASS.csv.gz",
+        ] {
+            assert!(!suffixed_report_path(&prefix, suffix).exists(), "{suffix}");
+        }
+        let roc = vcf::read_text(&suffixed_report_path(&prefix, "roc.all.csv.gz")).unwrap();
+        for line in roc.lines().skip(1) {
+            let cells = line.split(',').collect::<Vec<_>>();
+            assert_eq!(cells[6], "*");
+            if cells[0] == "INDEL" {
+                for block_start in [16usize, 23, 30, 37, 44, 51, 58] {
+                    assert_eq!(cells[block_start + 1], ".");
+                    assert_eq!(cells[block_start + 2], ".");
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subset_derivation_stops_regions_at_the_next_info_field() {
+        let rows = vec![AnnotatedRow {
+            sort_key: ("chr1".to_string(), 7, 0, 0),
+            line: concat!(
+                "chr1\t7\t.\tA\tC\t30\tPASS\t",
+                "BS=7;Regions=CONF,TS_boundary,TS_contained;AF=0.5;VTC=nuc__s\t",
+                "GT:BD:BK:BVT:BLT:BI\t",
+                "0/1:TP:gm:SNP:het:ti\t0/1:TP:gm:SNP:het:ti"
+            )
+            .to_string(),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+        }];
+
+        let counts = derive_subset_counts(&rows, false);
+        assert_eq!(
+            counts.keys().cloned().collect::<Vec<_>>(),
+            vec!["TS_boundary", "TS_contained"]
+        );
+        for subset in ["TS_boundary", "TS_contained"] {
+            let snp = &counts[subset]["SNP"];
+            assert_eq!(snp.truth_total.total, 1);
+            assert_eq!(snp.query_total.total, 1);
+        }
+    }
+
+    #[test]
+    fn missing_vcfeval_executable_has_a_legacy_style_failure() {
+        let root = test_root("vcfeval-missing");
+        let mut options = CompareArgs::with_paths(
+            fixture_path("truth.vcf").display().to_string(),
+            fixture_path("query.vcf").display().to_string(),
+            fixture_path("ref.fa").display().to_string(),
+            root.join("result").display().to_string(),
+        );
+        options.scratch_prefix = Some(root.join("scratch").display().to_string());
+        options.engine = CompareEngine::Vcfeval;
+        options.engine_vcfeval = "definitely-absent-rtg-for-test".to_string();
+        let error = run(options).unwrap_err().to_string();
+        assert!(error.contains("Error running rtg tools"), "{error}");
+        assert!(error.contains("was not found"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vcfeval_uses_preprocessed_inputs_and_decorates_quantified_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("vcfeval-contract");
+        let ga4gh = root.join("ga4gh.vcf");
+        fs::write(
+            &ga4gh,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=16>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n",
+                "##FORMAT=<ID=BD,Number=1,Type=String,Description=\"Decision\">\n",
+                "##FORMAT=<ID=BK,Number=1,Type=String,Description=\"Kind\">\n",
+                "##FORMAT=<ID=QQ,Number=1,Type=Float,Description=\"Quality\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTRUTH\tQUERY\n",
+                "chr1\t5\t.\tG\tT\t60\tPASS\tBS=5\tGT:BD:BK:QQ\t1/1:TP:gm:60\t1/1:TP:gm:60\n",
+            ),
+        )
+        .unwrap();
+        let captured = root.join("rtg.args");
+        let fake_rtg = root.join("rtg");
+        fs::write(
+            &fake_rtg,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then out=\"$2\"; shift 2; else shift; fi\ndone\nmkdir -p \"$out\"\ngzip -c '{}' > \"$out/output.vcf.gz\"\n",
+                captured.display(),
+                ga4gh.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_rtg, fs::Permissions::from_mode(0o755)).unwrap();
+        let template = root.join("template.sdf");
+        fs::create_dir(&template).unwrap();
+
+        let mut options = args(root.join("result"), &root.join("scratch"), false);
+        options.engine = CompareEngine::Vcfeval;
+        options.engine_vcfeval = fake_rtg.display().to_string();
+        options.engine_vcfeval_template = Some(template.display().to_string());
+        options.output_vtc = true;
+        options.preserve_info = true;
+        run(options).unwrap();
+
+        let invocation = fs::read_to_string(captured).unwrap();
+        assert!(invocation.contains("truth.prep.vcf.gz"), "{invocation}");
+        assert!(invocation.contains("query.prep.vcf.gz"), "{invocation}");
+        let (headers, records) = vcf::load_raw_vcf(&root.join("result.vcf.gz")).unwrap();
+        assert!(headers.iter().any(|line| line.contains("ID=VTC,")));
+        assert!(headers.iter().any(|line| line.contains("ID=XCMP,")));
+        assert!(
+            records[0].info.contains("VTC=nuc__s,al__s,homalt__s"),
+            "{}",
+            records[0].info
+        );
+        assert!(records[0].info.contains("XCMP="), "{}", records[0].info);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scmp_engines_use_non_haplotype_comparison_semantics() {
+        let root = test_root("scmp-engines");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/synth-homopolymer-insertion");
+        let engine_args = |prefix: PathBuf| {
+            let mut options = CompareArgs::with_paths(
+                fixture.join("truth.vcf").display().to_string(),
+                fixture.join("query.vcf").display().to_string(),
+                fixture.join("ref.fa").display().to_string(),
+                prefix.display().to_string(),
+            );
+            options.scratch_prefix = Some(root.join("scratch").display().to_string());
+            options
+        };
+        let mut somatic = engine_args(root.join("somatic"));
+        somatic.engine = CompareEngine::ScmpSomatic;
+        run(somatic).unwrap();
+        let somatic_summary = fs::read_to_string(root.join("somatic.summary.csv")).unwrap();
+
+        let mut distance = engine_args(root.join("distance"));
+        distance.engine = CompareEngine::ScmpDistance;
+        distance.engine_scmp_distance = 30;
+        run(distance).unwrap();
+        let distance_summary = fs::read_to_string(root.join("distance.summary.csv")).unwrap();
+        // Legacy AlleleMatcher's RefVar constructor uses ALT length for the
+        // reference end. Consequently these two ordinary VCF-equivalent
+        // homopolymer insertions do not hash alike in scmp-somatic, while
+        // distance mode still pairs their overlapping intervals.
+        assert_ne!(somatic_summary, distance_summary);
+
+        run(engine_args(root.join("xcmp"))).unwrap();
+        let xcmp_summary = fs::read_to_string(root.join("xcmp.summary.csv")).unwrap();
+        assert_ne!(somatic_summary, xcmp_summary);
+        assert!(distance_summary.contains("INDEL,ALL,1,1,0,1,0,0"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserve_info_and_vtc_decorate_rows_and_headers() {
+        let source = RawVcfRecord::from_line(
+            "chr1\t7\t.\tA\tC\t30\tPASS\tSCORE=9\tGT\t0/1",
+            Path::new("source.vcf"),
+        )
+        .unwrap();
+        let mut rows = vec![AnnotatedRow {
+            sort_key: ("chr1".to_string(), 7, 0, 0),
+            line: concat!(
+                "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
+                "GT:BD:BK:BVT:BLT:QQ\t",
+                "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
+            )
+            .to_string(),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+        }];
+        decorate_output_rows(&mut rows, &[source], &[], true, true, "QUAL").unwrap();
+        assert!(
+            rows[0].line.contains(concat!(
+                "BS=7;IQQ=30;SCORE=9;ctype=simple:match;gtt1=gt_het;",
+                "gtt2=gt_het;kind=match;type=TP;Regions=CONF;RegionsExtent=7-7;",
+                "XCMP=TP:match:gt_het:gt_het:simple:match;",
+                "VTC=nuc__s,al__s,het__rs"
+            )),
+            "{}",
+            rows[0].line
+        );
+        let headers = build_vcf_headers(&[], &[], false, true, true);
+        assert!(
+            headers
+                .iter()
+                .any(|line| line.starts_with("##INFO=<ID=VTC,"))
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|line| line.starts_with("##INFO=<ID=XCMP,"))
+        );
+        let regions = headers
+            .iter()
+            .position(|line| line.starts_with("##INFO=<ID=Regions,"))
+            .unwrap();
+        let extent = headers
+            .iter()
+            .position(|line| line.starts_with("##INFO=<ID=RegionsExtent,"))
+            .unwrap();
+        let vtc = headers
+            .iter()
+            .position(|line| line.starts_with("##INFO=<ID=VTC,"))
+            .unwrap();
+        assert_eq!(extent, regions + 1);
+        assert!(vtc > extent);
+    }
+
+    #[test]
+    fn metadata_helpers_preserve_legacy_multiallelic_contracts() {
+        let record = RawVcfRecord::from_line(
+            concat!(
+                "chr21\t19323424\t.\tCGTGT\tC,CGTGTGTGTGT,CGT\t0\t.\t.\t",
+                "GT:BVT:BLT\t1/2:INDEL:hetalt\t./.:NOCALL:nocall"
+            ),
+            Path::new("metadata.vcf"),
+        )
+        .unwrap();
+        assert_eq!(legacy_regions_extent(&record), "19323424-19323428");
+
+        let mixed = RawVcfRecord::from_line(
+            concat!(
+                "chr21\t10\t.\tAGT\tA,AGTGT\t0\t.\t.\t",
+                "GT:BVT:BLT\t1/2:INDEL:hetalt\t./.:NOCALL:nocall"
+            ),
+            Path::new("metadata.vcf"),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_vtc(&mixed, &mixed.sample_map(0), &mixed.sample_map(1)),
+            "nuc__i,nuc__d,al__i,al__d,hetalt__id,nocall__nc"
+        );
+    }
+
+    #[test]
+    fn semantic_preserve_key_reorders_alts_without_colliding_deletions() {
+        let first = RawVcfRecord::from_line(
+            "chr1\t7\t.\tA\tAT,ATT\t0\t.\t.\tGT\t1/2",
+            Path::new("source.vcf"),
+        )
+        .unwrap();
+        let reordered = RawVcfRecord::from_line(
+            "chr1\t7\t.\tA\tATT,AT\t0\t.\t.\tGT\t1/2",
+            Path::new("source.vcf"),
+        )
+        .unwrap();
+        let other_ref = RawVcfRecord::from_line(
+            "chr1\t7\t.\tAA\tAT,ATT\t0\t.\t.\tGT\t1/2",
+            Path::new("source.vcf"),
+        )
+        .unwrap();
+        assert_eq!(semantic_info_key(&first), semantic_info_key(&reordered));
+        assert_ne!(semantic_info_key(&first), semantic_info_key(&other_ref));
+
+        let symbolic_n = RawVcfRecord::from_line(
+            "chr1\t7\t.\tN\t<DEL>\t0\t.\t.\tGT\t0/1",
+            Path::new("source.vcf"),
+        )
+        .unwrap();
+        let symbolic_a = RawVcfRecord::from_line(
+            "chr1\t7\t.\tA\t<DEL>\t0\t.\t.\tGT\t0/1",
+            Path::new("source.vcf"),
+        )
+        .unwrap();
+        assert_eq!(
+            semantic_info_key(&symbolic_n),
+            semantic_info_key(&symbolic_a)
+        );
+    }
+
+    fn child_directories(parent: &Path) -> Vec<PathBuf> {
+        fs::read_dir(parent)
+            .expect("read scratch parent")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_runs_share_parent_without_colliding_and_cleanup() {
+        let root = test_root("concurrent");
+        let scratch_parent = root.join("scratch");
+        let first = args(root.join("first/result"), &scratch_parent, false);
+        let second = args(root.join("second/result"), &scratch_parent, false);
+
+        let first_run = thread::spawn(move || run(first));
+        let second_run = thread::spawn(move || run(second));
+        first_run.join().expect("first thread panicked").unwrap();
+        second_run.join().expect("second thread panicked").unwrap();
+
+        assert_eq!(
+            fs::read(root.join("first/result.summary.csv")).unwrap(),
+            fs::read(root.join("second/result.summary.csv")).unwrap()
+        );
+        assert!(
+            child_directories(&scratch_parent).is_empty(),
+            "successful invocations must delete only their own run directories"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keep_scratch_retains_run_but_errors_cleanup_by_default() {
+        let root = test_root("lifecycle");
+        let kept_parent = root.join("kept");
+        run(args(root.join("kept-output/result"), &kept_parent, true)).unwrap();
+
+        let kept = child_directories(&kept_parent);
+        assert_eq!(kept.len(), 1, "--keep-scratch retains the unique run");
+        assert!(kept[0].join("truth.prep.vcf.gz").is_file());
+        assert!(kept[0].join("truth.prep.vcf.gz.tbi").is_file());
+        assert!(kept[0].join("query.prep.vcf.gz").is_file());
+        assert!(kept[0].join("query.prep.vcf.gz.tbi").is_file());
+
+        let error_parent = root.join("error");
+        let mut failing = args(root.join("error-output/result"), &error_parent, false);
+        failing.truth = root.join("missing.vcf").display().to_string();
+        assert!(run(failing).is_err());
+        assert!(
+            child_directories(&error_parent).is_empty(),
+            "error paths must delete their invocation directory"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_suffixes_preserve_dotted_prefixes() {
+        let prefix = Path::new("reports/sample.v1");
+        assert_eq!(
+            suffixed_report_path(prefix, "summary.csv"),
+            Path::new("reports/sample.v1.summary.csv")
+        );
+    }
+
+    #[test]
+    fn stratification_tsv_requantifies_reports_and_vcf() {
+        let root = test_root("stratification");
+        let bed = root.join("focus.bed");
+        let tsv = root.join("regions.tsv");
+        fs::write(&bed, "chr1\t4\t5\n").unwrap();
+        fs::write(&tsv, "FOCUS\tfocus.bed\n").unwrap();
+        let mut options = args(root.join("result"), &root.join("scratch"), false);
+        options.strat_tsv = Some(tsv.display().to_string());
+        run(options).unwrap();
+
+        let extended = fs::read_to_string(root.join("result.extended.csv")).unwrap();
+        assert!(extended.lines().any(|line| line.contains(",FOCUS,")));
+        let (_, records) = vcf::load_raw_vcf(&root.join("result.vcf.gz")).unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.info.contains("Regions=FOCUS"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_scratch_cleanup_propagates_removal_errors() {
+        let root = test_root("cleanup-error");
+        let scratch = ScratchRun::create(&root, false).unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        fs::remove_dir_all(&scratch_path).unwrap();
+        fs::write(&scratch_path, "not a directory").unwrap();
+
+        let error = scratch.cleanup().unwrap_err();
+        assert!(error.to_string().contains("failed to remove scratch run"));
+
+        fs::remove_file(scratch_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod memory_guards {
     use super::*;
+
+    // Class 1 pinning helper for ergonomic qual overrides in tests.
+    impl Variant {
+        fn with_qual(mut self, q: &str) -> Self {
+            self.qual = q.to_string();
+            self
+        }
+    }
 
     fn het(gt: &str) -> Variant {
         Variant {
@@ -3728,19 +7714,14 @@ mod memory_guards {
     }
 
     #[test]
+    fn custom_enumeration_threshold_above_default_is_honored() {
+        let variants = (0..15).map(|_| het("0/1")).collect::<Vec<_>>();
+        assert_eq!(estimated_state_count(&variants), usize::MAX);
+        assert_eq!(estimated_state_count_with_limit(&variants, 32_768), 32_768);
+    }
+
+    #[test]
     fn build_clusters_splits_at_variant_cap() {
-        let mk = |pos: usize, side_is_truth: bool| Variant {
-            key: VariantKey {
-                chrom: "chr1".to_string(),
-                pos,
-                ref_allele: "A".to_string(),
-                alt_allele: "G".to_string(),
-            },
-            qual: "30".to_string(),
-            filter: "PASS".to_string(),
-            gt: "0/1".to_string(),
-        };
-        let _ = mk; // silence lint
         // MAX_CLUSTER_VARIANTS + 2 variants packed within 1 bp of each other
         // must yield at least 2 clusters — no single cluster may exceed the
         // cap.
@@ -3768,6 +7749,135 @@ mod memory_guards {
         }
     }
 
+    /// Class D pin: chr21:38861935 INDEL hetalt-vs-homalt-of-shared-allele.
+    /// Truth `T→TAA,TA 1|1` selects {TAA}, query `T→TAA,TA 1/2` selects
+    /// {TAA, TA}. Selected sets differ but overlap on TAA. INDEL → BK=lm.
+    #[test]
+    fn class_d_indel_overlap_emits_lm() {
+        let truth = variant(38861935, "T", "TAA,TA", "1|1");
+        let query = variant(38861935, "T", "TAA,TA", "1/2");
+        assert_eq!(compute_paired_bk(&truth, &query), "lm");
+    }
+
+    /// Class D pin: chr21:9922359 SNP hetalt-vs-het-overlapping. Truth
+    /// `T→A,C 1|0` selects {A}, query `T→A,C 1/2` selects {A, C}. SNP →
+    /// BK=`.` (legacy quirk).
+    #[test]
+    fn class_d_snp_overlap_emits_dot() {
+        let truth = variant(9922359, "T", "A,C", "1|0");
+        let query = variant(9922359, "T", "A,C", "1/2");
+        assert_eq!(compute_paired_bk(&truth, &query), ".");
+    }
+
+    /// Class D pin: same selected set, different multiset (truth het,
+    /// query homalt of same allele) → BK=`am`.
+    #[test]
+    fn class_d_same_set_diff_multiset_emits_am() {
+        let truth = variant(100, "T", "A", "0|1");
+        let query = variant(100, "T", "A", "1/1");
+        assert_eq!(compute_paired_bk(&truth, &query), "am");
+    }
+
+    /// Class C pin (post-#79): chr21:30374431-435 cluster signatures.
+    /// Truth has multi-position multi-allelic (insert + multi-allelic
+    /// G→GT,T) and query has overlapping insert + subst single-allelic
+    /// records. The narrow relaxation (truth's alts cover both query
+    /// alleles at the conflict pos) lets the query enumeration produce
+    /// the truth-matching haplotype pair.
+    #[test]
+    fn class_c_cluster_signatures_match_after_relaxation() {
+        let mut reference = vec![b'N'; 30374450];
+        let window = b"ggccTAATTTGTTTTTTTTTT";
+        for (i, b) in window.iter().enumerate() {
+            reference[30374425 - 1 + i] = *b;
+        }
+        let reference = String::from_utf8(reference).unwrap();
+        let truth = vec![
+            variant(30374431, "A", "AT", "1|0"),
+            variant(30374435, "G", "GT,T", "2|1"),
+        ];
+        let query = vec![
+            variant(30374435, "G", "GT", "1/1"),
+            variant(30374435, "G", "T", "0/1"),
+        ];
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 30374431,
+            end: 30374435,
+            truth: truth.clone(),
+            query: query.clone(),
+        };
+        let relax = compute_class_c_relaxation_positions(&query, &truth);
+        assert_eq!(relax, BTreeSet::from([30374435usize]));
+        let truth_sig =
+            cluster_signature(&cluster, &truth, &reference, None, &BTreeSet::new()).unwrap();
+        let query_sig = cluster_signature(&cluster, &query, &reference, None, &relax).unwrap();
+        assert!(truth_sig.is_some() && query_sig.is_some());
+        assert!(
+            truth_sig
+                .as_ref()
+                .unwrap()
+                .intersection(query_sig.as_ref().unwrap())
+                .next()
+                .is_some()
+        );
+    }
+
+    /// Class C negative pin: chr21:16328989 — truth `G→GA 1|1` (homalt
+    /// insert) vs query `G→GA 1/1 + G→A 0/1`. Truth's alts {GA} do not
+    /// cover the SNP `A` so the relaxation must NOT fire; legacy keeps
+    /// the strict drain semantics → BK=`.` on the FP query record.
+    #[test]
+    fn class_c_relaxation_skips_insert_only_truth_counterpart() {
+        let truth = vec![variant(16328989, "G", "GA", "1|1")];
+        let query = vec![
+            variant(16328989, "G", "GA", "1/1"),
+            variant(16328989, "G", "A", "0/1"),
+        ];
+        let relax = compute_class_c_relaxation_positions(&query, &truth);
+        assert!(
+            relax.is_empty(),
+            "truth must include both Insert and Subst alleles for relaxation"
+        );
+    }
+
+    /// Debug helper retained (and pinned via the test above).
+    /// Reference at chr21:30374425-30374445 = "ggccTAATTTGTTTTTTTTTT".
+    #[test]
+    #[ignore]
+    fn debug_class_c_cluster_signatures() {
+        // Build a synthetic reference exposing the chr21:30374431-435 window.
+        // We need positions 30374431-435 to be "ATTTG" and 30374436-445 = "TTTTTTTTTT".
+        let mut reference = vec![b'N'; 30374450];
+        let window = b"ggccTAATTTGTTTTTTTTTT"; // 30374425-30374445
+        for (i, b) in window.iter().enumerate() {
+            reference[30374425 - 1 + i] = *b;
+        }
+        let reference = String::from_utf8(reference).unwrap();
+        let truth = vec![
+            variant(30374431, "A", "AT", "1|0"),
+            variant(30374435, "G", "GT,T", "2|1"),
+        ];
+        let query = vec![
+            variant(30374435, "G", "GT", "1/1"),
+            variant(30374435, "G", "T", "0/1"),
+        ];
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 30374431,
+            end: 30374435,
+            truth: truth.clone(),
+            query: query.clone(),
+        };
+        let relax = compute_class_c_relaxation_positions(&query, &truth);
+        let truth_sig =
+            cluster_signature(&cluster, &truth, &reference, None, &BTreeSet::new()).unwrap();
+        let query_sig = cluster_signature(&cluster, &query, &reference, None, &relax).unwrap();
+        eprintln!("relax_positions = {:?}", relax);
+        eprintln!("truth_sig = {:?}", truth_sig);
+        eprintln!("query_sig = {:?}", query_sig);
+    }
+
     fn variant(pos: usize, r: &str, alt: &str, gt: &str) -> Variant {
         Variant {
             key: VariantKey {
@@ -3780,6 +7890,131 @@ mod memory_guards {
             filter: "PASS".to_string(),
             gt: gt.to_string(),
         }
+    }
+
+    #[test]
+    fn exact_only_unphased_indel_block_reaches_legacy_hap_match_verdict() {
+        let identical = Cluster {
+            chrom: "chr21".to_string(),
+            start: 15006495,
+            end: 15006495,
+            truth: vec![variant(15006495, "A", "ATCTC", "0/1")],
+            query: vec![variant(15006495, "A", "ATCTC", "0/1")],
+        };
+        assert_eq!(
+            identical_gt_exact_indel_keys(&identical),
+            BTreeSet::from([identical.truth[0].key.clone()])
+        );
+
+        let mut phased_truth = identical.clone();
+        phased_truth.truth[0].gt = "1|0".to_string();
+        assert!(
+            identical_gt_exact_indel_keys(&phased_truth).is_empty(),
+            "the standard phased-truth fixture must retain its legacy lm verdict"
+        );
+    }
+
+    #[test]
+    fn repetitive_indel_block_promotes_legacy_hap_matched_gt_mismatch() {
+        let earlier_truth = variant(15181523, "A", "AT", "0/1");
+        let paired_truth = variant(15181526, "A", "AT", "0/1");
+        let shared_truth_snp = variant(15181526, "A", "T", "0/1");
+        let paired_query = variant(15181526, "A", "AT", "1/1");
+        let shared_query_snp = variant(15181526, "A", "T", "0/1");
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 15181523,
+            end: 15181526,
+            truth: vec![
+                earlier_truth.clone(),
+                paired_truth.clone(),
+                shared_truth_snp.clone(),
+            ],
+            query: vec![paired_query.clone(), shared_query_snp.clone()],
+        };
+        let region_state = RegionState {
+            conf_enabled: true,
+            any_conf: true,
+            any_nonconf: true,
+            covered_truth: BTreeSet::from([paired_truth.key.clone(), shared_truth_snp.key.clone()]),
+            covered_query: BTreeSet::from([paired_query.key.clone(), shared_query_snp.key.clone()]),
+            ..RegionState::default()
+        };
+
+        assert_eq!(
+            legacy_repetitive_indel_hap_promotions(&cluster, &region_state),
+            BTreeSet::from([paired_truth.key])
+        );
+        assert_eq!(
+            legacy_preprocessed_snp_first_positions(&cluster),
+            BTreeSet::from([15181526])
+        );
+
+        let all_conf = RegionState {
+            covered_truth: cluster.truth.iter().map(|v| v.key.clone()).collect(),
+            ..region_state.clone()
+        };
+        assert!(
+            legacy_repetitive_indel_hap_promotions(&cluster, &all_conf).is_empty(),
+            "promotion requires the balancing truth copy outside CONF"
+        );
+
+        let mut phased = cluster.clone();
+        phased.truth[1].gt = "0|1".to_string();
+        assert!(legacy_preprocessed_snp_first_positions(&phased).is_empty());
+    }
+
+    #[test]
+    fn xcmp_excludes_filtered_truth_after_preprocessing() {
+        let pass = variant(100, "A", "G", "1|1");
+        let mut filtered = variant(101, "C", "T", "1|1");
+        filtered.filter = "OverlapConflict".to_string();
+        let mut variants = vec![pass.clone(), filtered];
+
+        retain_xcmp_truth_calls(&mut variants);
+
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].key, pass.key);
+    }
+
+    #[test]
+    fn filtered_truth_counterpart_sorts_first_at_shared_locus() {
+        let row = |alt: &str, side_rank| AnnotatedRow {
+            sort_key: ("chr21".to_string(), 15576177, side_rank, 0),
+            line: format!("chr21\t15576177\t.\tG\t{alt}\t0\t.\tBS=15576177\tGT\t./.\t0/1"),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+        };
+        let mut rows = vec![row("GAAAGAA", 0), row("A", 2)];
+        let keys = BTreeSet::from([VariantKey {
+            chrom: "chr21".to_string(),
+            pos: 15576177,
+            ref_allele: "G".to_string(),
+            alt_allele: "A".to_string(),
+        }]);
+
+        sort_comparison_rows(&mut rows, &keys);
+
+        assert!(rows[0].line.contains("\tG\tA\t"));
+    }
+
+    #[test]
+    fn adjacent_decomposed_indels_are_split_siblings() {
+        let deletion = variant(18757292, "AT", "A", "0/1").with_qual("1110.88");
+        let insertion = variant(18757293, "T", "TT", "0/1").with_qual("1110.88");
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: deletion.key.pos,
+            end: insertion.end_pos(),
+            truth: Vec::new(),
+            query: vec![deletion.clone(), insertion.clone()],
+        };
+        let regions = RegionState::from_cluster(&cluster, "ATTT", Some(&[]));
+
+        assert!(has_nonconf_split_sibling(&deletion, &cluster, &regions));
+        assert!(has_nonconf_split_sibling(&insertion, &cluster, &regions));
     }
 
     #[test]
@@ -3898,7 +8133,10 @@ mod memory_guards {
         // BK=. for both FN and FP rows.
         let truth = variant(15181526, "C", "T", "0|1");
         let query_counterpart = variant(15181526, "C", "G", "0/1");
-        assert_eq!(bk_for_row(&truth, std::slice::from_ref(&query_counterpart), false), ".");
+        assert_eq!(
+            bk_for_row(&truth, std::slice::from_ref(&query_counterpart), false),
+            "."
+        );
     }
 
     #[test]
@@ -3910,7 +8148,10 @@ mod memory_guards {
         // disjoint → BK=lm.
         let truth = variant(15181526, "C", "T,A", "1/1");
         let query_counterpart = variant(15181526, "C", "T,A", "2/2");
-        assert_eq!(bk_for_row(&truth, std::slice::from_ref(&query_counterpart), false), "lm");
+        assert_eq!(
+            bk_for_row(&truth, std::slice::from_ref(&query_counterpart), false),
+            "lm"
+        );
     }
 
     #[test]
@@ -3923,7 +8164,10 @@ mod memory_guards {
         // membership of the counterpart is irrelevant.
         let truth = variant(15313088, "A", "G", "0|1");
         let query_indel = variant(15313079, "C", "CA", "0/1");
-        assert_eq!(bk_for_row(&truth, std::slice::from_ref(&query_indel), true), "lm");
+        assert_eq!(
+            bk_for_row(&truth, std::slice::from_ref(&query_indel), true),
+            "lm"
+        );
     }
 
     #[test]
@@ -3936,7 +8180,10 @@ mod memory_guards {
         // Proximity alone never promotes BK to lm.
         let truth = variant(15200371, "T", "C", "0|1");
         let neighbour_snp = variant(15200378, "T", "C", "0/1");
-        assert_eq!(bk_for_row(&truth, std::slice::from_ref(&neighbour_snp), false), ".");
+        assert_eq!(
+            bk_for_row(&truth, std::slice::from_ref(&neighbour_snp), false),
+            "."
+        );
     }
 
     #[test]
@@ -3949,7 +8196,10 @@ mod memory_guards {
         let truth = variant(15007500, "C", "T", "1|0");
         let mut filtered_query = variant(15007500, "C", "G", "0/1");
         filtered_query.filter = "LowQual".to_string();
-        assert_eq!(bk_for_row(&truth, std::slice::from_ref(&filtered_query), false), ".");
+        assert_eq!(
+            bk_for_row(&truth, std::slice::from_ref(&filtered_query), false),
+            "."
+        );
     }
 
     // Residual #49 — chr21:17566241 exact-match pair with reordered
@@ -3959,15 +8209,106 @@ mod memory_guards {
     // allele-unification table and emits one combined TP:gm row; rust
     // used to fall through to `cluster_signature` and split the pair
     // into truth-only FN + query-only FP. The `simple_compare_pairs_match`
-    // predicate plus `remap_query_gt_to_truth` close this gap.
+    // predicate plus `canonical_hetalt_gt` close this gap.
     #[test]
     fn simple_compare_matches_reordered_multiallelic_hetalt_indel() {
         let truth = variant(17566241, "C", "CA,CAA", "1|2");
         let query = variant(17566241, "C", "CAA,CA", "1/2");
-        assert!(simple_compare_pairs_match(&truth, &query));
+        let reference = "N".repeat(17566250);
+        assert!(simple_compare_pairs_match(
+            &truth,
+            &query,
+            &reference,
+            17566241,
+            std::slice::from_ref(&truth),
+            std::slice::from_ref(&query),
+        ));
         // Query GT must be remapped into truth's ALT index space —
         // `1` (CAA) → truth idx 2, `2` (CA) → truth idx 1, so `1/2` → `2/1`.
-        assert_eq!(remap_query_gt_to_truth(&truth, &query), "2/1");
+        assert_eq!(canonical_hetalt_gt(&truth.key.alt_allele, &query), "2/1");
+    }
+
+    #[test]
+    fn reordered_multiallelic_genotype_mismatch_uses_truth_allele_indices() {
+        // happy:chr21 at 38861935. Legacy unifies the reordered ALT columns
+        // into truth order and emits one combined FN/FP row. Query `2/1`
+        // against `TA,TAA` therefore becomes `1/2` against `TAA,TA`.
+        let truth = variant(38_861_935, "T", "TAA,TA", "1|1");
+        let query = variant(38_861_935, "T", "TA,TAA", "2/1");
+
+        assert!(!query_matches_truth_key(&query, &truth));
+        assert!(query_matches_truth_allele_set(&query, &truth));
+        assert_ne!(
+            selected_alt_sequences(&truth),
+            selected_alt_sequences(&query)
+        );
+        assert_eq!(canonical_hetalt_gt(&truth.key.alt_allele, &query), "1/2");
+        assert_eq!(compute_paired_bk(&truth, &query), "lm");
+    }
+
+    // Class A pin (post-#79): chr21:27249918 truth-subset match. Truth
+    // `CTAAATAAA→C` GT 1|0 selects {C}; query `CTAAATAAA→C,CTAAA` GT 1/2
+    // selects {C, CTAAA}. Truth's {C} ⊊ query's selected, the C allele
+    // matches between sides, and the multi-allelic query primitive-splits
+    // (CTAAA trims to ATAAA→A at pos+4, distinct from the C primitive at
+    // pos). Legacy emits a combined TP/gm row at truth's representation
+    // plus a residual FP at the orphan primitive.
+    #[test]
+    fn truth_subset_match_fires_for_chr21_27249918_shape() {
+        let truth = variant(27249918, "CTAAATAAA", "C", "1|0");
+        let query = variant(27249918, "CTAAATAAA", "C,CTAAA", "1/2");
+        let reference = "N".repeat(27249930);
+        assert!(truth_subset_match(
+            &truth,
+            &query,
+            &reference,
+            27249918,
+            std::slice::from_ref(&truth),
+            std::slice::from_ref(&query),
+        ));
+        // Query GT remap into truth's index space: query allele 1 (C)
+        // matches truth idx 1; query allele 2 (CTAAA) drops to ref 0.
+        // Unphased canonicalisation places the smaller index first.
+        assert_eq!(remap_query_gt_subset(&truth, &query), "0/1");
+    }
+
+    #[test]
+    fn truth_subset_match_rejects_homalt_truth_against_hetalt_query() {
+        // chr21:10716541 shape: truth `C→G` GT 1|1 (homalt, multiset
+        // [G×2]) vs query `C→A,G` GT 2/1 (hetalt, multiset [G×1, A×1]).
+        // Set-subset would match {G} ⊆ {A,G} but the multiset check
+        // rejects: truth needs G twice, query has it once.
+        let truth = variant(10716541, "C", "G", "1|1");
+        let query = variant(10716541, "C", "A,G", "2/1");
+        let reference = "N".repeat(10716550);
+        assert!(!truth_subset_match(
+            &truth,
+            &query,
+            &reference,
+            10716541,
+            std::slice::from_ref(&truth),
+            std::slice::from_ref(&query),
+        ));
+    }
+
+    #[test]
+    fn truth_subset_match_rejects_same_anchor_multiallelic_query() {
+        // chr21:40096658 shape: truth `T→TAGATAGAG` GT 1|0 vs query
+        // `T→TAGATAGAG,TAGATAGAT` GT 1/2. Both query alts trim to the
+        // same anchor (T at pos), so `query_primitive_splits` is false
+        // and legacy keeps two separate rows rather than emitting a
+        // combined TP. The gate must reject this case.
+        let truth = variant(40096658, "T", "TAGATAGAG", "1|0");
+        let query = variant(40096658, "T", "TAGATAGAG,TAGATAGAT", "1/2");
+        let reference = "N".repeat(40096670);
+        assert!(!truth_subset_match(
+            &truth,
+            &query,
+            &reference,
+            40096658,
+            std::slice::from_ref(&truth),
+            std::slice::from_ref(&query),
+        ));
     }
 
     // Residual #50 — chr21:15671076 cluster had a truth `T→TATATA` at
@@ -3997,7 +8338,10 @@ mod memory_guards {
         assert_eq!(events.len(), 1);
         match &events[0] {
             Event::Insert { anchor, seq } => {
-                assert_eq!(*anchor, 15671094, "anchor must not slide for non-homopolymer insert");
+                assert_eq!(
+                    *anchor, 15671094,
+                    "anchor must not slide for non-homopolymer insert"
+                );
                 assert_eq!(seq, "ATATA");
             }
             other => panic!("expected Insert, got {other:?}"),
@@ -4017,17 +8361,26 @@ mod memory_guards {
         // Reference must span the whole cluster — padding with Ns up to
         // position 16997960 and placing the CACA context inline.
         let mut reference = vec![b'N'; 16997960];
-        reference[16997948] = b'G';  // pos 16997949: G
-        reference[16997949] = b'C';  // pos 16997950: C (deleted)
-        reference[16997950] = b'A';  // pos 16997951: A (deleted, insert anchor)
-        reference[16997951] = b'G';  // pos 16997952: G
+        reference[16997948] = b'G'; // pos 16997949: G
+        reference[16997949] = b'C'; // pos 16997950: C (deleted)
+        reference[16997950] = b'A'; // pos 16997951: A (deleted, insert anchor)
+        reference[16997951] = b'G'; // pos 16997952: G
         let reference = String::from_utf8(reference).unwrap();
         let events = vec![
-            Event::Delete { start: 16997950, end: 16997951 },
-            Event::Insert { anchor: 16997951, seq: "CG".to_string() },
+            Event::Delete {
+                start: 16997950,
+                end: 16997951,
+            },
+            Event::Insert {
+                anchor: 16997951,
+                seq: "CG".to_string(),
+            },
         ];
         let result = apply_events(&reference, 16997949, 16997952, &events).unwrap();
-        assert!(result.is_some(), "delete + downstream insert must produce a valid haplotype");
+        assert!(
+            result.is_some(),
+            "delete + downstream insert must produce a valid haplotype"
+        );
     }
 
     // Class 4 pin (rust/PHASE1_BASELINE.md #52): BI (comparison_info)
@@ -4052,6 +8405,29 @@ mod memory_guards {
         assert_eq!(comparison_info(&var, "N"), "ti,tv");
     }
 
+    #[test]
+    fn symbolic_output_ref_uses_the_reference_base() {
+        let variant = Variant {
+            key: VariantKey {
+                chrom: "chr21".to_string(),
+                pos: 2,
+                ref_allele: "N".to_string(),
+                alt_allele: "<DEL>".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: ".".to_string(),
+            gt: "1|0".to_string(),
+        };
+        assert_eq!(display_ref(&variant, "aTg"), "T");
+    }
+
+    #[test]
+    fn fully_nonconf_matched_fanout_uses_local_match_bk() {
+        assert_eq!(matched_query_unk_bk(true, false, "."), "lm");
+        assert_eq!(matched_query_unk_bk(true, true, "."), ".");
+        assert_eq!(matched_query_unk_bk(false, false, "."), ".");
+    }
+
     // Class 3 pin: `variant_is_conf` must apply legacy's
     // `!is_pure_insertion || fully_covered` rule using gvcf2bed-style
     // refrange. A pure insertion at a CONF edge (anchor in, anchor+1
@@ -4072,17 +8448,79 @@ mod memory_guards {
             filter: "PASS".to_string(),
             gt: "1|0".to_string(),
         };
-        let intervals = vec![
-            vcf::BedInterval {
-                chrom: "chr21".to_string(),
-                start: 15859657,
-                end: 15859667,
-            },
-        ];
+        let intervals = vec![vcf::BedInterval {
+            chrom: "chr21".to_string(),
+            start: 15859657,
+            end: 15859667,
+        }];
         // Anchor at 15859667 is in [15859657,15859667)? 15859666 < 15859667 → yes.
         // Anchor+1 at 15859668 is in? 15859667 < 15859667 → NO.
         // Partial → pure insertion → skip CONF.
         assert!(!variant_is_conf(&var, "N", 15859600, 15859700, &intervals));
+    }
+
+    // PHASE1_BASELINE.md #76: per-primitive CONF coverage. A multi-allelic
+    // query whose deletion primitive sits inside CONF but whose insertion
+    // primitive straddles a CONF edge must produce a RegionState where
+    // `covered_query` contains the deletion primitive's key but NOT the
+    // insertion primitive's, and `any_nonconf` is true. Without this,
+    // the cluster collapses to TS_contained on every record and the
+    // insertion primitive incorrectly carries a CONF tag.
+    //
+    // Mirrors chr21:48036437 — query `AGTGTGT → AGTGTGTGT,A` GT=1/2 at
+    // pos 37002776 splits into a deletion at pos 37002776 (in CONF) and
+    // an insertion T→TGT at pos 37002782 (straddles a CONF gap).
+    #[test]
+    fn region_state_marks_multi_allelic_primitives_separately() {
+        let parent = Variant {
+            key: VariantKey {
+                chrom: "chr21".to_string(),
+                pos: 100,
+                ref_allele: "AGT".to_string(),
+                alt_allele: "AGTGT,A".to_string(),
+            },
+            qual: "100".to_string(),
+            filter: "PASS".to_string(),
+            gt: "1/2".to_string(),
+        };
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 100,
+            end: 102,
+            truth: vec![],
+            query: vec![parent.clone()],
+        };
+        // CONF covers 1-based positions 100..101, leaving 102 uncovered.
+        // The deletion primitive's effective ref range
+        // (refstart=101, refend=102, is_pure_insertion=false) overlaps
+        // CONF at position 101 → covered (subst/del has_overlap path).
+        // The insertion primitive after right-anchor canonicalisation
+        // emits at pos 102 with anchor T → bracket [101, 102]. Position
+        // 102 is NOT in CONF → fully_covered=false → primitive must NOT
+        // be marked covered.
+        let intervals = vec![vcf::BedInterval {
+            chrom: "chr21".to_string(),
+            start: 99, // 0-based half-open → covers 1-based 100..101
+            end: 101,
+        }];
+        let state = RegionState::from_cluster(&cluster, "N", Some(&intervals));
+        assert!(state.any_conf, "deletion primitive must register coverage");
+        // The insertion primitive's anchor falls at the CONF edge with
+        // anchor+1 outside coverage — primitive must NOT be in
+        // covered_query, and any_nonconf must be set.
+        let primitives = split_query_primitives_with_neighbors(&parent, "N", 100, &[], &[]);
+        let insertion_primitive = primitives
+            .iter()
+            .find(|p| p.key.alt_allele.len() > p.key.ref_allele.len())
+            .expect("split_query_primitives must produce one insertion");
+        assert!(
+            !state.covered_query.contains(&insertion_primitive.key),
+            "insertion primitive at CONF edge must NOT be in covered_query"
+        );
+        assert!(
+            state.any_nonconf,
+            "presence of an uncovered insertion primitive must mark cluster as non-CONF"
+        );
     }
 
     // Class 3 support: SNPs at a single base inside any CONF interval
@@ -4102,13 +8540,11 @@ mod memory_guards {
             filter: "PASS".to_string(),
             gt: "1|0".to_string(),
         };
-        let intervals = vec![
-            vcf::BedInterval {
-                chrom: "chr21".to_string(),
-                start: 15859480,
-                end: 15859645,
-            },
-        ];
+        let intervals = vec![vcf::BedInterval {
+            chrom: "chr21".to_string(),
+            start: 15859480,
+            end: 15859645,
+        }];
         assert!(variant_is_conf(&var, "N", 15859600, 15859700, &intervals));
     }
 
@@ -4132,12 +8568,86 @@ mod memory_guards {
             filter: "PASS".to_string(),
             gt: "1|1".to_string(),
         }];
-        let padding = gvcf2bed_padding(&truth);
+        let padding = gvcf2bed_padding(&truth, None);
         assert_eq!(padding.len(), 1);
         assert_eq!(padding[0].chrom, "chr21");
         // 0-based half-open: anchor = 17562904 .. anchor+1+1 = 17562906
         assert_eq!(padding[0].start, 17562904);
         assert_eq!(padding[0].end, 17562906);
+    }
+
+    // gvcf2bed `-T <bed>` filter: legacy uses `bcf_sr_set_targets(.., 1, 0)`
+    // which gates on the **start position only** — not the full ref span.
+    // A record whose 1-based pos (→ 0-based start) lies outside every
+    // raw CONF interval is dropped before emission. This is what
+    // `IS_CONF.Size` parity hinges on (legacy sums per-file BED lengths
+    // without cross-file dedup, so dropping out-of-target records keeps
+    // the padding budget honest).
+    #[test]
+    fn gvcf2bed_padding_target_filter_excludes_out_of_target_record() {
+        let truth = vec![
+            // pos 100 → pos_0b 99, INSIDE conf [50, 150)
+            Variant {
+                key: VariantKey {
+                    chrom: "chr1".to_string(),
+                    pos: 100,
+                    ref_allele: "A".to_string(),
+                    alt_allele: "G".to_string(),
+                },
+                qual: ".".to_string(),
+                filter: "PASS".to_string(),
+                gt: "0/1".to_string(),
+            },
+            // pos 200 → pos_0b 199, OUTSIDE conf — should be dropped
+            Variant {
+                key: VariantKey {
+                    chrom: "chr1".to_string(),
+                    pos: 200,
+                    ref_allele: "A".to_string(),
+                    alt_allele: "G".to_string(),
+                },
+                qual: ".".to_string(),
+                filter: "PASS".to_string(),
+                gt: "0/1".to_string(),
+            },
+        ];
+        let conf = vec![vcf::BedInterval {
+            chrom: "chr1".to_string(),
+            start: 50,
+            end: 150,
+        }];
+        let padding = gvcf2bed_padding(&truth, Some(&conf));
+        assert_eq!(padding.len(), 1, "only in-target record should emit");
+        assert_eq!(padding[0].start, 99);
+        assert_eq!(padding[0].end, 100);
+    }
+
+    // Legacy gvcf2bed emits a BED line **per record** unconditionally,
+    // even when every alt is symbolic (`<DEL>`, `<NON_REF>`, etc.). The
+    // alt loop's `break` on the first non-NUC alt leaves
+    // `nuc_alleles=false`, so refstart/refend stay at the raw
+    // [pos, pos+reflen-1] from getLocation — and emission proceeds. Our
+    // truth fixtures contain ~14 such records on chr21 (`<DEL>` calls);
+    // skipping them under-counts IS_CONF.Size by ~14 bp.
+    #[test]
+    fn gvcf2bed_padding_emits_symbolic_only_record_with_raw_ref_span() {
+        let truth = vec![Variant {
+            key: VariantKey {
+                chrom: "chr21".to_string(),
+                pos: 15847471, // 1-based — pos_0b = 15847470
+                ref_allele: "N".to_string(),
+                alt_allele: "<DEL>".to_string(),
+            },
+            qual: ".".to_string(),
+            filter: "PASS".to_string(),
+            gt: "0/1".to_string(),
+        }];
+        let padding = gvcf2bed_padding(&truth, None);
+        assert_eq!(padding.len(), 1, "symbolic-only record must still emit");
+        // Raw refrange [pos_0b, pos_0b + reflen - 1] = [15847470, 15847470].
+        // Half-open BED: [15847470, 15847471) → 1 bp.
+        assert_eq!(padding[0].start, 15847470);
+        assert_eq!(padding[0].end, 15847471);
     }
 
     // Class 2 pin: `canonical_hetalt_gt` renders a query hetalt GT in
@@ -4226,7 +8736,7 @@ mod memory_guards {
     // only row `TA→TAA,T`.
     #[test]
     fn shared_qq_picks_minimum_nonzero_query_qual() {
-        let queries = vec![
+        let queries = [
             variant(15246143, "G", "C", "0/1").with_qual("817.09"),
             variant(15246157, "T", "TA", "0/1").with_qual("174.59"),
         ];
@@ -4289,75 +8799,445 @@ mod memory_guards {
             query: vec![],
         };
         let variants = vec![var1, var2];
-        let result = cluster_signature(&cluster, &variants, &reference).unwrap();
+        let result =
+            cluster_signature(&cluster, &variants, &reference, None, &BTreeSet::new()).unwrap();
         assert!(
             result.is_none(),
             "overlapping homalt deletions must produce Ok(None)"
         );
     }
-}
 
-// Class 1 pinning helper: small extension trait for ergonomic qual
-// overrides in tests. Not used outside the test module.
-#[cfg(test)]
-impl Variant {
-    fn with_qual(mut self, q: &str) -> Self {
-        self.qual = q.to_string();
-        self
+    /// Pin Class G: when `cluster_query_filter` aggregates filter tokens
+    /// across multiple query records (truth-side TP-row stamping path),
+    /// the joined string must be byte-wise sorted to match legacy's
+    /// bcftools-merged ordering. chr21:40875336 cluster sources are:
+    ///   * pos 40875343 T→A: `TruthSensitivityTranche99.90to100.00;LowGQX`
+    ///   * pos 40875344 T→A: `TruthSensitivityTranche99.00to99.90`
+    ///   * pos 40875347 A→G: `TruthSensitivityTranche99.90to100.00`
+    ///
+    /// Source-order union is `T99.90to100.00;LowGQX;T99.00to99.90` (rust
+    /// pre-fix). Legacy emits `LowGQX;T99.00to99.90;T99.90to100.00` —
+    /// alphabetic.
+    #[test]
+    fn cluster_query_filter_sorts_aggregated_tokens() {
+        let mk = |pos: usize, filter: &str| Variant {
+            key: VariantKey {
+                chrom: "chr21".to_string(),
+                pos,
+                ref_allele: "T".to_string(),
+                alt_allele: "A".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: filter.to_string(),
+            gt: "0/1".to_string(),
+        };
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 40875336,
+            end: 40875347,
+            truth: vec![],
+            query: vec![
+                mk(40875343, "TruthSensitivityTranche99.90to100.00;LowGQX"),
+                mk(40875344, "TruthSensitivityTranche99.00to99.90"),
+                mk(40875347, "TruthSensitivityTranche99.90to100.00"),
+            ],
+        };
+        let got = cluster_query_filter(&cluster);
+        assert_eq!(
+            got,
+            "LowGQX;TruthSensitivityTranche99.00to99.90;TruthSensitivityTranche99.90to100.00"
+        );
     }
-}
 
-/// Resolve the scratch directory used to stage preprocessed truth/query VCFs
-/// before xcmp. The legacy pipeline writes these under the task's working
-/// directory; we mirror that by anchoring on the report prefix's parent.
-fn scratch_dir(prefix: &Path) -> Result<PathBuf> {
-    let base = prefix
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = base.join(".hap_scratch");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create scratch dir {}", dir.display()))?;
-    Ok(dir)
-}
+    /// Empty cluster (no PASS-bearing query) must yield ".".
+    #[test]
+    fn cluster_query_filter_empty_returns_dot() {
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 0,
+            end: 0,
+            truth: vec![],
+            query: vec![],
+        };
+        assert_eq!(cluster_query_filter(&cluster), ".");
+    }
 
-/// Build the `PreprocessArgs` that germline should apply to truth or query
-/// before running xcmp. Preserves the flags germline inherits from pre.py.
-/// `pass_only` is passed through separately so the caller can force truth to
-/// always filter to PASS (matching legacy's `--usefiltered-truth=False`).
-fn build_preprocess_args(
-    args: &CompareArgs,
-    input: &str,
-    output: &Path,
-    pass_only: bool,
-    decompose: bool,
-) -> PreprocessArgs {
-    PreprocessArgs {
-        input: input.to_string(),
-        output: output.to_string_lossy().into_owned(),
-        reference: args.reference.clone(),
-        locations: args.locations.clone(),
-        pass_only,
-        regions_bedfile: args.regions_bedfile.clone(),
-        targets_bedfile: args.targets_bedfile.clone(),
-        fixchr: Some(true),
-        no_fixchr: false,
-        somatic: false,
-        set_gt: None,
-        filter_nonref: false,
-        convert_gvcf_to_vcf: false,
-        // Legacy germline runs its internal xcmp preprocess with
-        // side-specific flags: truth stays at decompose=false to avoid
-        // primitive-splitting already-canonical truth VCFs, while query
-        // is decomposed so multi-allelic calls fan out into per-allele
-        // records the xcmp comparator can pair one-to-one with matching
-        // truth primitives. Inflating truth by ~120 rows (what decompose
-        // does to truth) blows the INDEL count delta; leaving query
-        // undecomposed leaves 40+ multi-allelic query rows that never
-        // reach the decomposed representation legacy emits. Caller
-        // decides per side.
-        decompose,
-        threads: args.threads,
+    /// Pin Class E: chr21:44049606 cluster (chr21_passonly shape) — query
+    /// has a homalt deletion AATGATAGATAG→A at 44049606 covering positions
+    /// 44049607..44049617, plus a 1/2 multi-allelic at 44049615 whose
+    /// second alt registers as an "insert" in `query_insert_conflict_…`.
+    /// The deletion blocks the insert anchor on both haplotypes, draining
+    /// query enumeration. Truth's only record (TGATA→T at 44049663) is
+    /// far outside the deletion's claimed range, so legacy treats this as
+    /// an internal query conflict — `BK=.`. Pre-fix the loose
+    /// `!truth_remaining.is_empty()` disjunct made this fire `Some(false)`
+    /// (→ BK=lm); the tightened gate must return `None`.
+    #[test]
+    fn deletion_covers_insert_no_proximate_truth_returns_none() {
+        let q_del = Variant {
+            key: VariantKey {
+                chrom: "chr21".to_string(),
+                pos: 44049606,
+                ref_allele: "AATGATAGATAG".to_string(),
+                alt_allele: "A".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "1/1".to_string(),
+        };
+        let q_multi = Variant {
+            key: VariantKey {
+                chrom: "chr21".to_string(),
+                pos: 44049615,
+                ref_allele: "TAGATGATAGAT".to_string(),
+                alt_allele: "T,TAGACAGATGATAGAT".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "1/2".to_string(),
+        };
+        let truth_far = Variant {
+            key: VariantKey {
+                chrom: "chr21".to_string(),
+                pos: 44049663,
+                ref_allele: "TGATA".to_string(),
+                alt_allele: "T".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "0|1".to_string(),
+        };
+        let query = vec![q_del, q_multi];
+        let truth = vec![truth_far.clone()];
+        // truth_remaining still contains the unmatched 44049663 record.
+        let result = query_insert_conflict_has_truth_counterpart(&query, &truth, &truth);
+        assert_eq!(
+            result, None,
+            "deletion-covers-insert with truth outside the deletion range \
+             must return None so hap_mismatch stays false"
+        );
+    }
+
+    /// Positive pin for Class E gate: when truth has a variant at the
+    /// blocked insert anchor, `Some(false)` must still fire so the BK=lm
+    /// branch keeps working for genuinely truth-anchored mismatches.
+    #[test]
+    fn deletion_covers_insert_truth_at_anchor_returns_some_false() {
+        let q_del = Variant {
+            key: VariantKey {
+                chrom: "chr1".to_string(),
+                pos: 100,
+                ref_allele: "ATGATGATGAT".to_string(),
+                alt_allele: "A".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "1/1".to_string(),
+        };
+        // Multi-allelic with a 16-base alt → registers as `insert` at pos 105.
+        let q_multi = Variant {
+            key: VariantKey {
+                chrom: "chr1".to_string(),
+                pos: 105,
+                ref_allele: "GATGAT".to_string(),
+                alt_allele: "G,GATCATGAT".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "1/2".to_string(),
+        };
+        let truth_at_anchor = Variant {
+            key: VariantKey {
+                chrom: "chr1".to_string(),
+                pos: 105,
+                ref_allele: "G".to_string(),
+                alt_allele: "GATC".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "0|1".to_string(),
+        };
+        let query = vec![q_del, q_multi];
+        let truth = vec![truth_at_anchor];
+        let result = query_insert_conflict_has_truth_counterpart(&query, &truth, &truth);
+        assert_eq!(
+            result,
+            Some(false),
+            "truth at the blocked anchor must keep the BK=lm path firing"
+        );
+    }
+
+    /// Positive pin for Class E gate: when truth_remaining contains a
+    /// variant that overlaps the blocking deletion's claimed range, the
+    /// drain represents a genuine mismatch — `Some(false)` must fire.
+    #[test]
+    fn deletion_covers_insert_truth_in_del_range_returns_some_false() {
+        let q_del = Variant {
+            key: VariantKey {
+                chrom: "chr1".to_string(),
+                pos: 100,
+                ref_allele: "ATGATGATGAT".to_string(),
+                alt_allele: "A".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "1/1".to_string(),
+        };
+        let q_multi = Variant {
+            key: VariantKey {
+                chrom: "chr1".to_string(),
+                pos: 105,
+                ref_allele: "GATGAT".to_string(),
+                alt_allele: "G,GATCATGAT".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "1/2".to_string(),
+        };
+        // Truth variant at pos 107 — inside the deletion's [101, 110] range.
+        let truth_in_range = Variant {
+            key: VariantKey {
+                chrom: "chr1".to_string(),
+                pos: 107,
+                ref_allele: "T".to_string(),
+                alt_allele: "C".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "0|1".to_string(),
+        };
+        let query = vec![q_del, q_multi];
+        let truth = vec![truth_in_range];
+        let result = query_insert_conflict_has_truth_counterpart(&query, &truth, &truth);
+        assert_eq!(
+            result,
+            Some(false),
+            "unmatched truth inside the blocking deletion range must keep \
+             BK=lm firing"
+        );
+    }
+
+    /// Class B (chr21:21690513). Reproduces the chr21 reference window
+    /// `ttatatatatatatatatatatacacacacacacacatacatacatacata` at synthetic
+    /// 1-based positions 1..51 (pos 1 ↔ chr21:21690480). Anchor at pos 34
+    /// corresponds to chr21:21690513 (`C`). The CA-microsat upstream lets
+    /// `partial_credit::left_shift` canonicalize the CACAC primitive at
+    /// pos 22 (`T→TACAC`) — distinct from CACAT's stayed-put pos 34.
+    /// Truth declares `C→CACAT` at pos 34 only, so the shifted CACAC has
+    /// no truth representation → fan out.
+    #[test]
+    fn class_b_same_anchor_insertion_fans_out_when_truth_at_original_only() {
+        let reference = b"ttatatatatatatatatatatacacacacacacacatacatacatacata";
+        let trimmed = vec![
+            (34, "C".to_string(), "CACAC".to_string()),
+            (34, "C".to_string(), "CACAT".to_string()),
+        ];
+        let cluster_truth = vec![variant(34, "C", "CACAT", "0|1")];
+        let result = try_split_same_anchor_via_shift(
+            "chr21",
+            34,
+            &trimmed,
+            reference,
+            1,
+            &cluster_truth,
+            &[],
+        );
+        let shifted = result.expect("must fan out — truth at original, orphan at shifted");
+        assert_eq!(shifted.len(), 2);
+        let cacac = shifted
+            .iter()
+            .find(|(_, _, alt)| alt.ends_with('C'))
+            .expect("CACAC primitive present");
+        let cacat = shifted
+            .iter()
+            .find(|(_, _, alt)| alt.ends_with('T'))
+            .expect("CACAT primitive present");
+        assert_eq!(
+            cacac.0, 22,
+            "CACAC must slide through CA-microsat to pos 22"
+        );
+        assert_eq!(cacac.1, "T", "ref byte at the shifted anchor (pos 22) is T");
+        assert_eq!(cacac.2, "TACAC", "alt rotates to T-prefixed canonical form");
+        assert_eq!(
+            cacat.0, 34,
+            "CACAT must stay at the original anchor (pos 34)"
+        );
+        assert_eq!(cacat.1, "C");
+        assert_eq!(cacat.2, "CACAT");
+    }
+
+    /// Class B negative — chr21:40096658 shape. The TAGATAGAT primitive
+    /// canonicalizes via `left_shift` to a position where truth ALREADY
+    /// declares that allele as part of a multi-allelic. The fan-out
+    /// gate must suppress the split so the block-level haplotype matcher
+    /// can reconcile the multi-allelic record. Reproduces the real chr21
+    /// AGAT-microsat upstream of pos 40096658.
+    #[test]
+    fn class_b_same_anchor_insertion_blocked_when_truth_at_shifted_anchor() {
+        // Synthetic positions 1..50: pos 1 ↔ chr21:40096640. Pos 19 ↔
+        // chr21:40096658 (anchor `T`). Pos 11 ↔ chr21:40096650 (anchor
+        // `C`) where TAGATAGAT shifts to `CAGATAGAT`.
+        let reference = b"ctgaagagttcagatagatagatagatagatagatagatagatagacaga";
+        let trimmed = vec![
+            (19, "T".to_string(), "TAGATAGAG".to_string()),
+            (19, "T".to_string(), "TAGATAGAT".to_string()),
+        ];
+        // Truth declares TAGATAGAG at the original anchor AND
+        // CAGATAGAT,CAGATAGATAGAT at the shifted anchor.
+        let cluster_truth = vec![
+            variant(11, "C", "CAGATAGAT,CAGATAGATAGAT", "0|1"),
+            variant(19, "T", "TAGATAGAG", "1|0"),
+        ];
+        let result = try_split_same_anchor_via_shift(
+            "chr21",
+            19,
+            &trimmed,
+            reference,
+            1,
+            &cluster_truth,
+            &[],
+        );
+        assert!(
+            result.is_none(),
+            "fan-out must be blocked when truth declares the shifted alt"
+        );
+    }
+
+    /// Class B negative — chr21:32767041 shape. No truth records exist in
+    /// the cluster. Even though the primitives shift apart (TCTCTCT slides
+    /// to a CTCT-microsat anchor, TCTCACA stays put), the fan-out must be
+    /// suppressed because no query alt has truth representation at the
+    /// original anchor — there's no truth_subset_match-style emit shape
+    /// to license the split.
+    #[test]
+    fn class_b_same_anchor_insertion_blocked_without_truth_at_original() {
+        let reference = b"ttatatatatatatatatatatacacacacacacacatacatacatacata";
+        let trimmed = vec![
+            (34, "C".to_string(), "CACAC".to_string()),
+            (34, "C".to_string(), "CACAT".to_string()),
+        ];
+        let cluster_truth: Vec<Variant> = vec![];
+        let result = try_split_same_anchor_via_shift(
+            "chr21",
+            34,
+            &trimmed,
+            reference,
+            1,
+            &cluster_truth,
+            &[],
+        );
+        assert!(
+            result.is_none(),
+            "fan-out must be blocked when no query alt has truth at the original anchor"
+        );
+    }
+
+    /// Class B (chr21:21690513 chr21 case). When a neighboring cluster
+    /// query record sits at the natural slide target, the slide must
+    /// stop one position above so the shifted primitive doesn't share
+    /// an anchor with the existing record. Pos 22 holds a SNP neighbor;
+    /// the CACAC primitive must canonicalize at pos 23 (`A→ACACA`) — the
+    /// same legacy verdict reproduced in the chr21 (no --pass-only) case.
+    #[test]
+    fn class_b_same_anchor_neighbor_floor_clamps_slide_target() {
+        let reference = b"ttatatatatatatatatatatacacacacacacacatacatacatacata";
+        let trimmed = vec![
+            (34, "C".to_string(), "CACAC".to_string()),
+            (34, "C".to_string(), "CACAT".to_string()),
+        ];
+        let cluster_truth = vec![variant(34, "C", "CACAT", "0|1")];
+        // Neighboring SNP at pos 22 (`T→C`) — sliding CACAC onto pos 22
+        // would clobber that record's anchor.
+        let cluster_neighbors = vec![variant(22, "T", "C", "0/1")];
+        let result = try_split_same_anchor_via_shift(
+            "chr21",
+            34,
+            &trimmed,
+            reference,
+            1,
+            &cluster_truth,
+            &cluster_neighbors,
+        );
+        let shifted = result.expect("must still fan out — neighbor only clamps slide depth");
+        // The CACAC primitive rotates to (23, A, ACACA) — the slide
+        // reduces start by 1 per iteration, alternating the alt's last
+        // base. With pos_min clamped to 22 (after pure-insertion bump
+        // becomes 23), the slide stops with start = 23 holding 'A' anchor.
+        let stayer = shifted
+            .iter()
+            .find(|(p, _, _)| *p == 34)
+            .expect("CACAT primitive must stay at pos 34");
+        let shifter = shifted
+            .iter()
+            .find(|(p, _, _)| *p != 34)
+            .expect("shifted primitive must land at a distinct anchor");
+        assert_eq!(stayer.1, "C");
+        assert_eq!(stayer.2, "CACAT");
+        assert_eq!(
+            shifter.0, 23,
+            "CACAC slide must stop at pos 23 (one above neighbor at pos 22)"
+        );
+        assert_eq!(shifter.1, "A", "ref byte at pos 23 is A");
+        assert_eq!(
+            shifter.2, "ACACA",
+            "alt rotates to A-prefixed canonical form"
+        );
+    }
+
+    /// Class F (chr21:47906004). A multi-allelic deletion's parent record
+    /// has an `effective_refrange` that reaches into a CONF interval, but
+    /// neither fanned-out primitive's range (after the per-primitive
+    /// left-shift) touches CONF. Legacy emits no Regions tag on the
+    /// per-primitive rows because it operates on post-fan-out records
+    /// only — the parent-path's any_conf vote must be suppressed for
+    /// fanned-out multi-allelics. Without this gate the cluster picks
+    /// up a spurious TS_boundary tag from the parent.
+    ///
+    /// Synthetic layout (mirrors chr21:47906xxx at smaller positions):
+    /// reference `aaaaaaaaaaaaaaaaaaaaagaactaaagt` covers 1-based positions
+    /// 1..31. The variant `AGAACTAAA→A,AAAA` at pos 21 produces
+    /// per-primitive rows at (17, AAAAGAACT, A) and (21, AGAACT, A) after
+    /// the deletion-only slide (range 18..25 and 22..26). The parent's
+    /// effective_refrange is 21..28 (alt A reaches further right than
+    /// either fanned-out primitive does).
+    #[test]
+    fn class_f_region_state_skips_parent_path_for_fanned_out_multiallelic() {
+        let reference = "aaaaaaaaaaaaaaaaaaaaagaactaaagt".to_string();
+        let parent = Variant {
+            key: VariantKey {
+                chrom: "chr21".to_string(),
+                pos: 21,
+                ref_allele: "AGAACTAAA".to_string(),
+                alt_allele: "A,AAAA".to_string(),
+            },
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            gt: "1/2".to_string(),
+        };
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 21,
+            end: 30,
+            truth: vec![],
+            query: vec![parent],
+        };
+        // CONF covers 1-based positions 27..30 — the parent's effective
+        // range reaches into 27..28 but the fanned-out primitives' ranges
+        // (post-slide 18..25 and 22..26) both stop at or before pos 26.
+        let intervals = vec![vcf::BedInterval {
+            chrom: "chr21".to_string(),
+            start: 26,
+            end: 30,
+        }];
+        let state = RegionState::from_cluster(&cluster, &reference, Some(&intervals));
+        assert!(
+            !state.any_conf,
+            "fanned-out multi-allelic with all primitives outside CONF must NOT \
+             register any_conf via the parent path (got any_conf=true)"
+        );
+        assert!(
+            state.any_nonconf,
+            "primitives outside CONF must vote any_nonconf"
+        );
     }
 }

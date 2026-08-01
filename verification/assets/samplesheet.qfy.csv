@@ -1,0 +1,2 @@
+sample_id,truth_vcf,query_vcf,reference,fp_bed,args
+chr21_region,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--type xcmp

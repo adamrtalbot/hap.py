@@ -1,0 +1,9 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=10>
+##ALT=<ID=NON_REF,Description="Represents any non-reference allele">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of reference block">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NORMAL	TUMOR
+chr1	3	.	C	<NON_REF>	.	PASS	END=5	GT	0/0	0/0
+chr1	6	.	G	A,<NON_REF>	.	PASS	.	GT	0/1	0/1
+chr1	9	.	A	C	.	PASS	.	GT	0/1	0/1

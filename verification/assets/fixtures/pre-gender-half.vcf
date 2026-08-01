@@ -1,0 +1,6 @@
+##fileformat=VCFv4.2
+##contig=<ID=X,length=5>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+X	2	x_half_called	A	C	20	PASS	.	GT:AD	./1:1,9

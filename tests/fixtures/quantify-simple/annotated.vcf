@@ -1,0 +1,12 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=10>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=BD,Number=1,Type=String,Description="Decision">
+##FORMAT=<ID=BK,Number=1,Type=String,Description="Subtype">
+##FORMAT=<ID=BI,Number=1,Type=String,Description="Info">
+##FORMAT=<ID=BVT,Number=1,Type=String,Description="Variant type">
+##FORMAT=<ID=BLT,Number=1,Type=String,Description="Genotype label">
+##FORMAT=<ID=QQ,Number=1,Type=String,Description="Score">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TRUTH	QUERY
+chr1	2	.	A	G	60	PASS	BS=2	GT:BD:BK:BI:BVT:BLT:QQ	0/1:TP:gm:ti:SNP:het:60	0/1:TP:gm:ti:SNP:het:60
+chr1	8	.	T	TA	40	PASS	BS=8	GT:BD:BK:BI:BVT:BLT:QQ	0/1:TP:gm:i1_5:INDEL:het:40	0/1:TP:gm:i1_5:INDEL:het:40

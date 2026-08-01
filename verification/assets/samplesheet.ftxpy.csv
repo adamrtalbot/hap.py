@@ -1,0 +1,12 @@
+sample_id,input_vcf,reference,bam,feature_table,args
+chr21,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,generic,
+chr21_includenonpass,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,generic,-P
+chr21_hcc_strelka_snv,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,hcc.strelka.snv,
+chr21_admix_strelka_snv,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,admix.strelka.snv,
+grch38_hcc_strelka_snv,example/sompy/strelka_grch38_admix_pass_snvs.vcf.gz,example/happy/hg38.chr21.fa,,hcc.strelka.snv,
+grch38_hcc_strelka_indel,example/sompy/strelka_grch38_admix_pass_indels.vcf.gz,example/happy/hg38.chr21.fa,,hcc.strelka.indel,
+grch38_admix_strelka_indel,example/sompy/strelka_grch38_admix_pass_indels.vcf.gz,example/happy/hg38.chr21.fa,,admix.strelka.indel,
+chr21_hcc_strelka_snv_tp,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,hcc.strelka.snv,--feature-label TP
+chr21_hcc_strelka_snv_fn,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,hcc.strelka.snv,--feature-label FN
+ftx_bam_depth,local:assets/fixtures/ftx-bam/input.vcf,local:assets/fixtures/ftx-bam/ref.fa,local:assets/fixtures/ftx-bam/reads.bam,hcc.strelka.snv,--feature-label bam-oracle
+ftx_called_nonref,local:assets/fixtures/ftx-nonref.vcf,local:assets/fixtures/tiny.fa,,generic,
