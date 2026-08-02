@@ -25,19 +25,105 @@ fn public_and_legacy_help_surfaces_exit_successfully() {
 
 #[test]
 fn germline_version_exits_before_required_input_validation() {
-    for version_flag in ["-v", "--version"] {
-        let output = hap()
-            .args(["germline", version_flag])
-            .output()
-            .expect("run germline version");
-        assert_eq!(output.status.code(), Some(0), "{version_flag}");
-        assert_eq!(
-            String::from_utf8(output.stdout)
-                .expect("version is UTF-8")
-                .trim(),
-            env!("CARGO_PKG_VERSION")
-        );
+    for command in ["germline", "compare"] {
+        for version_flag in ["-v", "--version"] {
+            let output = hap()
+                .args([command, version_flag])
+                .output()
+                .expect("run germline version");
+            assert_eq!(output.status.code(), Some(0), "{command} {version_flag}");
+            assert_eq!(output.stdout, b"Hap.py \n", "{command} {version_flag}");
+            assert!(output.stderr.is_empty(), "{command} {version_flag}");
+        }
     }
+}
+
+#[test]
+fn pre_and_qfy_versions_require_normal_arguments() {
+    for command in ["pre", "preprocess", "prepy", "quantify", "qfy"] {
+        for version_flag in ["-v", "--version"] {
+            let output = hap()
+                .args([command, version_flag])
+                .output()
+                .expect("run standalone script version");
+            assert_eq!(output.status.code(), Some(2), "{command} {version_flag}");
+            assert!(output.stdout.is_empty(), "{command} {version_flag}");
+        }
+    }
+}
+
+#[test]
+fn pre_and_qfy_versions_match_pinned_script_output_after_validation() {
+    for command in ["pre", "preprocess", "prepy"] {
+        for version_flag in ["-v", "--version"] {
+            let output = hap()
+                .args([command, "input.vcf", "output.vcf", version_flag])
+                .output()
+                .expect("run pre version with required arguments");
+            assert_eq!(output.status.code(), Some(0), "{command} {version_flag}");
+            assert_eq!(output.stdout, b"pre.py \n", "{command} {version_flag}");
+            assert!(output.stderr.is_empty(), "{command} {version_flag}");
+        }
+    }
+
+    for command in ["quantify", "qfy"] {
+        for version_flag in ["-v", "--version"] {
+            let output = hap()
+                .args([
+                    command,
+                    "input.vcf",
+                    "-o",
+                    "report",
+                    "-r",
+                    "ref.fa",
+                    version_flag,
+                ])
+                .output()
+                .expect("run qfy version with required arguments");
+            assert_eq!(output.status.code(), Some(0), "{command} {version_flag}");
+            assert_eq!(output.stdout, b"qfy.py \n", "{command} {version_flag}");
+            assert!(output.stderr.is_empty(), "{command} {version_flag}");
+        }
+    }
+}
+
+#[test]
+fn version_shim_does_not_change_other_subcommand_validation() {
+    for command in ["ftx", "somatic"] {
+        for version_flag in ["-v", "--version"] {
+            let output = hap()
+                .args([command, version_flag])
+                .output()
+                .expect("run unsupported subcommand version");
+            assert_eq!(output.status.code(), Some(2), "{command} {version_flag}");
+            assert!(output.stdout.is_empty(), "{command} {version_flag}");
+        }
+    }
+
+    let output = hap()
+        .args([
+            "germline",
+            "-r",
+            "ref.fa",
+            "-o",
+            "report",
+            "--",
+            "--version",
+            "query.vcf",
+        ])
+        .output()
+        .expect("run germline with a version-like positional input");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a positional --version should reach runtime validation"
+    );
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("error is UTF-8");
+    assert!(
+        !stderr.is_empty(),
+        "runtime validation should explain the failure"
+    );
 }
 
 #[test]

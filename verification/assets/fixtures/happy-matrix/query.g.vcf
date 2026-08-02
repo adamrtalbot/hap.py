@@ -1,0 +1,16 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100>
+##ALT=<ID=NON_REF,Description="Represents any possible alternative allele">
+##FILTER=<ID=LowQual,Description="Low quality">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant block">
+##INFO=<ID=SCORE,Number=1,Type=Float,Description="Synthetic ROC score">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	QUERY
+chr1	1	.	A	<NON_REF>	.	.	END=4	GT:DP	0/0:18
+chr1	5	query-gvcf-snp	A	G,<NON_REF>	55	PASS	SCORE=55	GT:DP	0/1:18
+chr1	6	.	C	<NON_REF>	.	.	END=19	GT:DP	0/0:18
+chr1	20	query-gvcf-filtered	T	C,<NON_REF>	35	LowQual	SCORE=35	GT:DP	0/1:18
+chr1	21	.	A	<NON_REF>	.	.	END=29	GT:DP	0/0:18
+chr1	30	query-called-nonref	C	G,<NON_REF>	25	PASS	SCORE=25	GT:DP	0/2:18
+chr1	31	.	G	<NON_REF>	.	.	END=100	GT:DP	0/0:18

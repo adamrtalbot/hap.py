@@ -10,6 +10,36 @@ use std::path::{Path, PathBuf};
 /// binary — indels can slide at most 1 kbp leftward before the pass stops.
 const LEFT_SHIFT_WINDOW: usize = 1024;
 
+/// `blocksplit` does not create a preprocessing boundary until the candidate
+/// block contains more than its default minimum of 100 called variants.
+const LEGACY_MIN_BLOCK_VARIANTS: usize = 100;
+const LEGACY_MAX_BLOCKS: usize = 40;
+
+#[derive(Clone, Debug)]
+struct BlocksplitObservation {
+    chrom: String,
+    pos: usize,
+    end: usize,
+    called: bool,
+    location_groups: Vec<usize>,
+}
+
+#[derive(Default)]
+struct BlocksplitContigState {
+    total_variants: usize,
+    candidate_variants: usize,
+    last_called_end: Option<usize>,
+    candidates: Vec<(usize, usize)>,
+}
+
+#[derive(Default)]
+struct BlocksplitSelection {
+    resets: HashSet<usize>,
+    /// `None` represents legacy's all-empty fallback, which processes the
+    /// complete prepared stream instead of scheduling no jobs.
+    included_indices: Option<HashSet<usize>>,
+}
+
 pub fn run(args: PreprocessArgs) -> Result<()> {
     if args.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
@@ -61,6 +91,29 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
     let leftshift = args.leftshift && !args.no_leftshift;
     let decompose = args.decompose && !args.no_decompose;
     let normalization_enabled = leftshift || decompose || gender == PreprocessGender::Male;
+    let effective_threads = effective_thread_count(args.threads);
+    let blocksplit_selection = if normalization_enabled && effective_threads > 1 {
+        let observations = collect_blocksplit_observations(
+            &records,
+            &args,
+            fixchr,
+            normalization_enabled,
+            somatic_mode,
+            somatic_sample_names.as_deref(),
+            &reference_sequences,
+            regions.as_deref(),
+            targets.as_deref(),
+            locations.as_deref(),
+        )?;
+        select_blocksplit_resets(
+            &observations,
+            args.window_size,
+            LEGACY_MAX_BLOCKS.min(effective_threads.saturating_mul(4)),
+            locations.is_some(),
+        )
+    } else {
+        BlocksplitSelection::default()
+    };
 
     let mut output = Vec::new();
     let mut normalized_seen = HashSet::new();
@@ -70,6 +123,7 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
     // `pos_min` update in the C++ RefVar.cpp leftShift callers).
     let mut prev_end_by_chrom: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut prepared_record_index = 0usize;
     for mut record in records.drain(..) {
         if fixchr {
             record.chrom = add_legacy_chr_prefix(&record.chrom);
@@ -171,9 +225,22 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                     continue;
                 }
             }
+            let record_index = prepared_record_index;
+            prepared_record_index += 1;
+            if blocksplit_selection
+                .included_indices
+                .as_ref()
+                .is_some_and(|included| !included.contains(&record_index))
+            {
+                continue;
+            }
+            let reset_before_record = blocksplit_selection.resets.contains(&record_index);
             if !normalization_enabled {
                 output.push(record);
                 continue;
+            }
+            if reset_before_record {
+                prev_end_by_chrom.remove(&record.chrom);
             }
             if args.convert_gvcf_to_vcf {
                 ensure_missing_ad(&mut record);
@@ -268,7 +335,7 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
             let record_chrom = record.chrom.clone();
             let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
             let previous_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
-            let prev_end = interaction_floor(previous_end, record.pos, args.window_size);
+            let prev_end = previous_end;
 
             let source_records = if matches!(
                 symbolic_deletion,
@@ -349,6 +416,10 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
         rewrite_header_for_single_sample(&mut headers);
     }
 
+    if fixchr {
+        ensure_emitted_contig_headers(&mut headers, &output);
+    }
+
     if normalization_enabled {
         sort_normalized_records(&mut output);
         headers = canonicalize_legacy_headers(&headers);
@@ -363,6 +434,227 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
         output_path.display()
     ))?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_blocksplit_observations(
+    records: &[vcf::RawVcfRecord],
+    args: &PreprocessArgs,
+    fixchr: bool,
+    normalization_enabled: bool,
+    somatic_mode: Option<SomaticGtMode>,
+    somatic_sample_names: Option<&[String]>,
+    reference_sequences: &std::collections::BTreeMap<String, String>,
+    regions: Option<&[vcf::BedInterval]>,
+    targets: Option<&[vcf::BedInterval]>,
+    locations: Option<&[vcf::LocationFilter]>,
+) -> Result<Vec<BlocksplitObservation>> {
+    let input_path = Path::new(&args.input);
+    let mut observations = Vec::new();
+    let mut normalized_seen = HashSet::new();
+
+    for source in records {
+        let mut record = source.clone();
+        if fixchr {
+            record.chrom = add_legacy_chr_prefix(&record.chrom);
+        }
+        if (args.pass_only && !record.is_pass())
+            || (!args.pass_only
+                && !passes_filters_only(&record.filter, args.filters_only.as_deref()))
+        {
+            continue;
+        }
+        let effective_end = record.effective_end_pos(input_path)?;
+        if !vcf::matches_interval_filters(
+            &record.chrom,
+            record.pos,
+            effective_end,
+            regions,
+            targets,
+            locations,
+        ) {
+            continue;
+        }
+        if args.convert_gvcf_to_vcf {
+            if !convert_gvcf_record(&mut record) {
+                continue;
+            }
+        } else {
+            let drop_record = args.filter_nonref
+                && (calls_non_ref_allele(&record)
+                    || (normalization_enabled
+                        && somatic_mode.is_none()
+                        && !trim_uncalled_non_ref(&mut record)));
+            if drop_record {
+                continue;
+            }
+        }
+
+        let blocksplit_pos = record.pos;
+        let blocksplit_end = effective_end;
+        let symbolic_deletion =
+            normalization_enabled && record.alt_allele.split(',').any(|alt| alt == "<DEL>");
+        if symbolic_deletion {
+            let reference = reference_sequences
+                .get(&record.chrom)
+                .ok_or_else(|| anyhow::anyhow!("reference contig {} not found", record.chrom))?;
+            materialize_symbolic_deletion(&mut record, effective_end, reference.as_bytes())?;
+        }
+
+        if args.bcftools_norm {
+            let Some(reference) = reference_sequences.get(&record.chrom) else {
+                continue;
+            };
+            if !record_reference_matches(&record, reference.as_bytes()) {
+                continue;
+            }
+        } else {
+            validate_record_reference(&record, reference_sequences)?;
+        }
+
+        let converted =
+            if let (Some(mode), Some(sample_names)) = (somatic_mode, somatic_sample_names) {
+                finalize_somatic_for_pipeline(
+                    convert_somatic_record(&record, mode, sample_names),
+                    mode,
+                    normalization_enabled,
+                )
+            } else {
+                vec![record]
+            };
+
+        for mut record in converted {
+            if args.bcftools_norm {
+                let Some(reference) = reference_sequences.get(&record.chrom) else {
+                    continue;
+                };
+                normalize_bcftools_record(&mut record, reference.as_bytes());
+                let key = (
+                    record.chrom.clone(),
+                    record.pos,
+                    record.ref_allele.clone(),
+                    record.alt_allele.clone(),
+                );
+                if !normalized_seen.insert(key) {
+                    continue;
+                }
+            }
+            let (pos, end) = if args.bcftools_norm && !symbolic_deletion {
+                (record.pos, record.end_pos())
+            } else {
+                (blocksplit_pos, blocksplit_end)
+            };
+            let called = has_non_reference_genotype(&record);
+            let location_groups = locations.map_or_else(
+                || vec![0],
+                |filters| {
+                    filters
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, filter)| {
+                            filter.matches(&record.chrom, pos).then_some(index)
+                        })
+                        .collect()
+                },
+            );
+            observations.push(BlocksplitObservation {
+                chrom: record.chrom,
+                pos,
+                end,
+                called,
+                location_groups,
+            });
+        }
+    }
+    Ok(observations)
+}
+
+fn select_blocksplit_resets(
+    observations: &[BlocksplitObservation],
+    window_size: usize,
+    block_count: usize,
+    reset_location_starts: bool,
+) -> BlocksplitSelection {
+    if block_count == 0 {
+        return BlocksplitSelection::default();
+    }
+    let mut states = std::collections::BTreeMap::<(usize, String), BlocksplitContigState>::new();
+    let mut first_index_by_location = std::collections::BTreeMap::new();
+    let mut called_locations = HashSet::new();
+    for (index, observation) in observations.iter().enumerate() {
+        for &location_group in &observation.location_groups {
+            first_index_by_location
+                .entry(location_group)
+                .or_insert(index);
+        }
+        if !observation.called {
+            continue;
+        }
+        for &location_group in &observation.location_groups {
+            called_locations.insert(location_group);
+            let state = states
+                .entry((location_group, observation.chrom.clone()))
+                .or_default();
+            state.total_variants += 1;
+            state.candidate_variants += 1;
+            if state
+                .last_called_end
+                .is_some_and(|last_end| observation.pos > last_end.saturating_add(window_size))
+                && state.candidate_variants > LEGACY_MIN_BLOCK_VARIANTS
+            {
+                state.candidates.push((index, state.candidate_variants));
+                state.candidate_variants = 0;
+            }
+            state.last_called_end = Some(
+                state
+                    .last_called_end
+                    .map_or(observation.end, |last_end| last_end.max(observation.end)),
+            );
+        }
+    }
+
+    if states.is_empty() {
+        return BlocksplitSelection::default();
+    }
+
+    let active_partitions = states.keys().cloned().collect::<HashSet<_>>();
+    let included_indices = observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, observation)| {
+            observation
+                .location_groups
+                .iter()
+                .any(|location_group| {
+                    active_partitions.contains(&(*location_group, observation.chrom.clone()))
+                })
+                .then_some(index)
+        })
+        .collect();
+
+    let mut resets = HashSet::new();
+    if reset_location_starts {
+        for (location_group, index) in first_index_by_location {
+            if index > 0 && called_locations.contains(&location_group) {
+                resets.insert(index);
+            }
+        }
+    }
+    for state in states.values() {
+        let target_variants = LEGACY_MIN_BLOCK_VARIANTS.max(state.total_variants / block_count);
+        let mut accumulated = 0usize;
+        for &(index, candidate_variants) in &state.candidates {
+            accumulated += candidate_variants;
+            if accumulated > target_variants {
+                resets.insert(index);
+                accumulated = 0;
+            }
+        }
+    }
+    BlocksplitSelection {
+        resets,
+        included_indices: Some(included_indices),
+    }
 }
 
 /// Primitive splitting can move one allele to the trailing edge of an
@@ -388,16 +680,35 @@ fn sort_normalized_records(records: &mut [vcf::RawVcfRecord]) {
     });
 }
 
-/// Blocksplit starts a new independent preprocessing block when consecutive
-/// records are farther apart than the configured window. Resetting the
-/// neighbor floor at that boundary makes `--preprocessing-window-size`
-/// behaviorally equivalent even though Rust processes blocks in one stream.
-fn interaction_floor(previous_end: usize, current_pos: usize, window_size: usize) -> usize {
-    if current_pos.saturating_sub(previous_end) > window_size {
-        0
-    } else {
-        previous_end
-    }
+fn effective_thread_count(threads: Option<usize>) -> usize {
+    let available_threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    effective_thread_count_with_available(threads, available_threads)
+}
+
+fn effective_thread_count_with_available(
+    threads: Option<usize>,
+    available_threads: usize,
+) -> usize {
+    threads.unwrap_or_else(|| available_threads.max(1))
+}
+
+fn has_non_reference_genotype(record: &vcf::RawVcfRecord) -> bool {
+    let Some(format) = record.format.as_deref() else {
+        return false;
+    };
+    let Some(gt_index) = format.split(':').position(|field| field == "GT") else {
+        return false;
+    };
+    record.samples.iter().any(|sample| {
+        sample
+            .split(':')
+            .nth(gt_index)
+            .unwrap_or(".")
+            .split(['/', '|'])
+            .any(|allele| allele.parse::<usize>().is_ok_and(|allele| allele > 0))
+    })
 }
 
 struct PreprocessLogger {
@@ -440,6 +751,33 @@ impl PreprocessLogger {
         }
         Ok(())
     }
+}
+
+/// The Perl prefixing stage in legacy `pre.py` changes record CHROM values
+/// without rewriting the input declarations. The following `bcftools view`
+/// pass notices each newly used sequence and appends a length-less contig
+/// declaration. Mirror that repair while leaving existing declarations and
+/// their order untouched.
+fn ensure_emitted_contig_headers(headers: &mut Vec<String>, records: &[vcf::RawVcfRecord]) {
+    let mut declared: BTreeSet<String> = headers
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix("##contig=<ID=")
+                .and_then(|body| body.split([',', '>']).next())
+                .map(str::to_string)
+        })
+        .collect();
+    let mut additions = Vec::new();
+    for record in records {
+        if declared.insert(record.chrom.clone()) {
+            additions.push(format!("##contig=<ID={}>", record.chrom));
+        }
+    }
+    let insert_at = headers
+        .iter()
+        .position(|line| line.starts_with("#CHROM"))
+        .unwrap_or(headers.len());
+    headers.splice(insert_at..insert_at, additions);
 }
 
 fn ensure_pass_filter_header(headers: &mut Vec<String>) {
@@ -2278,6 +2616,43 @@ mod tests {
     }
 
     #[test]
+    fn fixchr_adds_lengthless_headers_for_rewritten_contigs() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">1\nAAAAA\n>chr1\nAAAAA\n>chrX\nAAAAA\n")?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=1,length=5>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "1\t2\trs1\tA\tC\t10\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.fixchr = None;
+        args.leftshift = false;
+        args.no_leftshift = true;
+        args.decompose = false;
+        args.no_decompose = true;
+        args.gender = PreprocessGender::None;
+        run(args)?;
+
+        let (headers, records) = vcf::load_raw_vcf(&output)?;
+        assert_eq!(records[0].chrom, "chr1");
+        assert!(
+            headers
+                .iter()
+                .any(|line| line == "##contig=<ID=1,length=5>")
+        );
+        assert!(headers.iter().any(|line| line == "##contig=<ID=chr1>"));
+        Ok(())
+    }
+
+    #[test]
     fn disabling_leftshift_and_decomposition_preserves_bcftools_view_shape() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
@@ -2512,6 +2887,75 @@ mod tests {
         let unchanged_record = vcf::load_raw_vcf(&unchanged_output)?.1.remove(0);
         assert_eq!(shifted_record.pos, 1);
         assert_eq!(unchanged_record.pos, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_parallel_inputs_do_not_create_window_block_boundaries() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1\nAAAAAAAAAAAAAAAAAAAA\n")?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=20>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "chr1\t3\tbarrier\tA\tC\t30\tPASS\t.\tGT\t0/1\n",
+                "chr1\t5\trepeat\tAA\tA\t30\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.gender = PreprocessGender::None;
+        args.threads = Some(2);
+        args.window_size = 1;
+        run(args)?;
+
+        let (_, records) = vcf::load_raw_vcf(&output)?;
+        assert_eq!(
+            records.iter().map(|record| record.pos).collect::<Vec<_>>(),
+            [3, 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn location_start_reset_survives_a_dropped_homref_record() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, format!(">chr1\n{}\n", "A".repeat(120)))?;
+        fs::write(
+            &input,
+            format!(
+                concat!(
+                    "##fileformat=VCFv4.2\n",
+                    "##contig=<ID=chr1,length=120>\n",
+                    "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                    "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                    "chr1\t2\tbarrier\t{}\tA\t30\tPASS\t.\tGT\t0/1\n",
+                    "chr1\t52\thomref\tA\tC\t30\tPASS\t.\tGT\t0/0\n",
+                    "chr1\t60\trepeat\tAA\tA\t30\tPASS\t.\tGT\t0/1\n",
+                ),
+                "A".repeat(50)
+            ),
+        )?;
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.gender = PreprocessGender::None;
+        args.threads = Some(2);
+        args.locations = Some("chr1:2-2,chr1:52-100".into());
+        run(args)?;
+
+        let (_, records) = vcf::load_raw_vcf(&output)?;
+        let repeat = records
+            .iter()
+            .find(|record| record.ref_allele == "AA")
+            .expect("repeat deletion must survive preprocessing");
+        assert_eq!(repeat.pos, 1);
         Ok(())
     }
 
@@ -2762,12 +3206,165 @@ mod tests {
     }
 
     #[test]
-    fn preprocessing_window_resets_only_distant_neighbor_state() {
-        assert_eq!(interaction_floor(100, 150, 50), 100);
-        assert_eq!(interaction_floor(100, 151, 50), 0);
-        assert_eq!(interaction_floor(0, 10_000, 0), 0);
-        // Overlapping records always remain in the same interaction block.
-        assert_eq!(interaction_floor(110, 105, 1), 110);
+    fn blocksplit_aggregates_candidate_gaps_to_the_target_size() {
+        let observations = (0..404)
+            .map(|index| {
+                let pos = (index / 101) * 10_000 + (index % 101) + 1;
+                BlocksplitObservation {
+                    chrom: "chr1".into(),
+                    pos,
+                    end: pos,
+                    called: true,
+                    location_groups: vec![0],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Four groups produce three candidate gaps, but the second pass only
+        // emits the middle one after cumulative candidate counts exceed the
+        // 404 / 2 target. A naive every-gap reset would emit all three.
+        assert_eq!(
+            select_blocksplit_resets(&observations, 1, 2, false).resets,
+            HashSet::from([202])
+        );
+    }
+
+    #[test]
+    fn blocksplit_ignores_uncalled_records_when_tracking_gaps() {
+        let mut observations = (1..=101)
+            .map(|pos| BlocksplitObservation {
+                chrom: "chr1".into(),
+                pos,
+                end: pos,
+                called: true,
+                location_groups: vec![0],
+            })
+            .collect::<Vec<_>>();
+        observations.push(BlocksplitObservation {
+            chrom: "chr1".into(),
+            pos: 10_000,
+            end: 29_999,
+            called: false,
+            location_groups: vec![0],
+        });
+        observations.push(BlocksplitObservation {
+            chrom: "chr1".into(),
+            pos: 30_000,
+            end: 30_000,
+            called: true,
+            location_groups: vec![0],
+        });
+
+        assert_eq!(
+            select_blocksplit_resets(&observations, 1, 40, false).resets,
+            HashSet::from([102])
+        );
+    }
+
+    #[test]
+    fn blocksplit_uses_effective_end_when_tracking_called_spans() {
+        let mut observations = (1..=101)
+            .map(|pos| BlocksplitObservation {
+                chrom: "chr1".into(),
+                pos,
+                end: pos,
+                called: true,
+                location_groups: vec![0],
+            })
+            .collect::<Vec<_>>();
+        observations.push(BlocksplitObservation {
+            chrom: "chr1".into(),
+            pos: 102,
+            end: 10_000,
+            called: true,
+            location_groups: vec![0],
+        });
+        observations.push(BlocksplitObservation {
+            chrom: "chr1".into(),
+            pos: 10_001,
+            end: 10_001,
+            called: true,
+            location_groups: vec![0],
+        });
+
+        assert!(
+            select_blocksplit_resets(&observations, 1, 40, false)
+                .resets
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn blocksplit_partitions_explicit_locations_on_the_same_contig() {
+        let observations = (0..404)
+            .map(|index| {
+                let location_group = index / 202;
+                let index_within_location = index % 202;
+                let cluster = index_within_location / 101;
+                let pos = location_group * 1_000_000
+                    + cluster * 10_000
+                    + (index_within_location % 101)
+                    + 1;
+                BlocksplitObservation {
+                    chrom: "chr1".into(),
+                    pos,
+                    end: pos,
+                    called: true,
+                    location_groups: vec![location_group],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Legacy invokes blocksplit once per comma-separated location, so
+        // each location computes its own total and target even on one contig.
+        assert_eq!(
+            select_blocksplit_resets(&observations, 1, 2, true).resets,
+            HashSet::from([101, 202, 303])
+        );
+    }
+
+    #[test]
+    fn blocksplit_filters_inactive_partitions_and_preserves_all_empty_fallback() {
+        let mut observations = vec![
+            BlocksplitObservation {
+                chrom: "chr1".into(),
+                pos: 1,
+                end: 1,
+                called: true,
+                location_groups: vec![0],
+            },
+            BlocksplitObservation {
+                chrom: "chr1".into(),
+                pos: 2,
+                end: 2,
+                called: false,
+                location_groups: vec![0],
+            },
+            BlocksplitObservation {
+                chrom: "chr2".into(),
+                pos: 1,
+                end: 1,
+                called: false,
+                location_groups: vec![0],
+            },
+        ];
+
+        let mixed = select_blocksplit_resets(&observations, 1, 2, false);
+        assert_eq!(mixed.included_indices, Some(HashSet::from([0, 1])));
+
+        observations[0].called = false;
+        let all_empty = select_blocksplit_resets(&observations, 1, 2, false);
+        assert_eq!(all_empty.included_indices, None);
+    }
+
+    #[test]
+    fn blocksplit_parallelism_resolves_explicit_and_default_thread_counts() {
+        assert_eq!(effective_thread_count_with_available(Some(0), 8), 0);
+        assert_eq!(effective_thread_count_with_available(Some(1), 8), 1);
+        assert_eq!(effective_thread_count_with_available(Some(2), 1), 2);
+        assert_eq!(effective_thread_count_with_available(None, 0), 1);
+        assert_eq!(effective_thread_count_with_available(None, 1), 1);
+        assert_eq!(effective_thread_count_with_available(None, 2), 2);
     }
 
     #[test]
@@ -3261,5 +3858,71 @@ mod tests {
         assert_eq!(record.alt_allele, ".");
         assert_eq!(record.info, ".");
         assert_eq!(record.samples, ["0/0:12:40"]);
+    }
+
+    #[test]
+    fn parallel_blocksplit_omits_empty_partitions_but_falls_back_when_all_are_empty() -> Result<()>
+    {
+        let directory = tempdir()?;
+        let reference = directory.path().join("ref.fa");
+        let mixed_input = directory.path().join("mixed.vcf");
+        let mixed_output = directory.path().join("mixed.out.vcf");
+        let empty_input = directory.path().join("empty.vcf");
+        let empty_output = directory.path().join("empty.out.vcf");
+        fs::write(&reference, ">chr1\nAAAAA\n>chr2\nAAAAA\n")?;
+        let header = concat!(
+            "##fileformat=VCFv4.2\n",
+            "##contig=<ID=chr1,length=5>\n",
+            "##contig=<ID=chr2,length=5>\n",
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+            "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"DP\">\n",
+            "##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"GQ\">\n",
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+        );
+        fs::write(
+            &mixed_input,
+            format!(
+                "{header}{}{}",
+                "chr1\t2\t.\tA\tC,<NON_REF>\t30\tPASS\t.\tGT:DP:GQ\t0/1:12:40\n",
+                "chr2\t2\t.\tA\tC,<NON_REF>\t30\tPASS\t.\tGT:DP:GQ\t0/0:12:40\n",
+            ),
+        )?;
+        fs::write(
+            &empty_input,
+            format!(
+                "{header}{}{}",
+                "chr1\t2\t.\tA\tC,<NON_REF>\t30\tPASS\t.\tGT:DP:GQ\t0/0:12:40\n",
+                "chr2\t2\t.\tA\tC,<NON_REF>\t30\tPASS\t.\tGT:DP:GQ\t0/0:12:40\n",
+            ),
+        )?;
+
+        let mut mixed_args = interval_args(&mixed_input, &mixed_output, &reference, None, None);
+        mixed_args.gender = PreprocessGender::None;
+        mixed_args.threads = Some(2);
+        mixed_args.convert_gvcf_to_vcf = true;
+        run(mixed_args)?;
+        let mixed_records = vcf::load_raw_vcf(&mixed_output)?.1;
+        assert_eq!(
+            mixed_records
+                .iter()
+                .map(|record| record.chrom.as_str())
+                .collect::<Vec<_>>(),
+            ["chr1"]
+        );
+
+        let mut empty_args = interval_args(&empty_input, &empty_output, &reference, None, None);
+        empty_args.gender = PreprocessGender::None;
+        empty_args.threads = Some(2);
+        empty_args.convert_gvcf_to_vcf = true;
+        run(empty_args)?;
+        let empty_records = vcf::load_raw_vcf(&empty_output)?.1;
+        assert_eq!(
+            empty_records
+                .iter()
+                .map(|record| (record.chrom.as_str(), record.alt_allele.as_str()))
+                .collect::<Vec<_>>(),
+            [("chr1", "."), ("chr2", ".")]
+        );
+        Ok(())
     }
 }

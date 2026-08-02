@@ -51,23 +51,26 @@ This gate is available from a source checkout, not from the published Cargo
 package.
 
 `verification/` runs each governed samplesheet row through both the pinned
-legacy oracle and the local `hap` binary. The default matrix contains 63 rows:
+legacy oracle and the local `hap` binary. The default matrix contains 111 rows:
 
 | Lane | Rust command | Rows |
 |---|---|---:|
-| happy | `hap germline` | 12 |
-| sompy | `hap somatic` | 12 |
-| prepy | `hap pre` | 26 |
-| ftxpy | `hap ftx` | 11 |
-| qfy | `hap quantify` | 1 |
-| vcfcheck | `hap validate` | 1 |
+| happy | `hap germline` | 19 |
+| sompy | `hap somatic` | 23 |
+| prepy | `hap pre` | 37 |
+| ftxpy | `hap ftx` | 24 |
+| qfy | `hap quantify` | 4 |
+| vcfcheck | `hap validate` | 4 |
 
 The gate checks complete samplesheet publication, symmetric legacy/Rust
-artifact sets, and every per-case comparator status. Comparisons preserve
+result-prefix artifact sets, and every per-case comparator status. Comparisons preserve
 ordering and duplicates: stable text is exact, JSON is recursive with a narrow
 runtime-metadata allowlist, and VCF/BCF index checks retrieve source records in
 order through TBI or CSI. The workflow produces reports; nf-test turns failed
 comparison statuses or incomplete coverage into a failed gate.
+`verification/assets/option-coverage.csv` maps every row to a unique coverage
+ID; `verification/OPTION_MATRIX.md` records the constrained-pairwise design and
+the byte-comparison contract.
 
 The evaluation toolchain is pinned to Nextflow 26.04.6 and nf-test 0.9.5:
 
@@ -76,7 +79,7 @@ cargo build --release --features verification --bin hap --bin verify-fixtures
 cd verification
 HAP_BIN="$PWD/../target/release/hap" \
   VERIFY_BIN="$PWD/../target/release/verify-fixtures" \
-  NXF_SYNTAX_PARSER=v2 NXF_VER=26.04.6 nf-test test --ci
+  NXF_SYNTAX_PARSER=v2 NXF_VER=26.04.6 nf-test test tests/main.nf.test --ci
 ```
 
 Two focused scripts exercise option combinations directly against the same

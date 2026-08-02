@@ -1,4 +1,4 @@
-sample_id,input_vcf,reference,regions_bed,args
+sample_id,input_vcf,reference,regions_bed,args,cpus
 chr21,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,
 chr21_passonly,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--pass-only
 chr21_no_fixchr,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--no-fixchr
@@ -25,3 +25,14 @@ tiny_bcftools_norm_default,local:assets/fixtures/pre-norm.vcf,local:assets/fixtu
 tiny_bcf_output,local:assets/fixtures/pre-somatic.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,--bcf
 tiny_verbose_log,local:assets/fixtures/pre-somatic.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,--verbose --logfile pre.log --force-interactive
 tiny_symbolic_del,local:assets/fixtures/pre-symbolic-del.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
+matrix_location_postfix,local:assets/fixtures/pre-matrix/fixchr.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--fixchr -l chr1:2-2 --no-leftshift --no-decompose --gender none
+matrix_fixchr_auto,local:assets/fixtures/pre-matrix/fixchr.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--no-leftshift --no-decompose --gender none
+matrix_fixchr_disabled,local:assets/fixtures/pre-matrix/fixchr.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--no-fixchr --no-leftshift --no-decompose --gender none
+matrix_region_end_overlap,local:assets/fixtures/pre-matrix/end-span.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/end-boundary.bed,--no-leftshift --no-decompose --gender none
+matrix_target_start_only,local:assets/fixtures/pre-matrix/end-span.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/end-boundary.bed,-T end-boundary.bed --no-leftshift --no-decompose --gender none
+matrix_filters_any_unexcluded,local:assets/fixtures/pre-matrix/filters.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--filters-only LowQ --no-leftshift --no-decompose --gender none
+matrix_pass_wins_filters,local:assets/fixtures/pre-matrix/filters.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--filters-only LowQ --pass-only --no-leftshift --no-decompose --gender none
+matrix_window_isolated,local:assets/fixtures/pre-matrix/window.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,-w 1 --gender none
+matrix_window_neighbours,local:assets/fixtures/pre-matrix/window.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,-w 10000 --gender none
+matrix_bcf_input,local:assets/fixtures/pre-matrix/input.bcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--no-leftshift --no-decompose --gender none
+chr21_parallel_blocksplit,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,-w 1,2

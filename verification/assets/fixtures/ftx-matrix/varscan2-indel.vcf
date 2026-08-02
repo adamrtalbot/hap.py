@@ -1,0 +1,13 @@
+##fileformat=VCFv4.1
+##contig=<ID=chr1,length=100>
+##INFO=<ID=SSC,Number=1,Type=Integer,Description="Somatic score">
+##INFO=<ID=GPV,Number=1,Type=Float,Description="Germline p-value">
+##INFO=<ID=SPV,Number=1,Type=Float,Description="Somatic p-value">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype quality">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+##FORMAT=<ID=RD,Number=1,Type=Integer,Description="Reference depth">
+##FORMAT=<ID=AD,Number=1,Type=Integer,Description="Alternate depth">
+##FORMAT=<ID=FREQ,Number=1,Type=String,Description="Variant frequency">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NORMAL	TUMOR
+chr1	13	.	A	AA	.	PASS	SSC=12;GPV=0.2;SPV=0.01	GT:GQ:DP:RD:AD:FREQ	0/0:30:10:9:1:10%	0/1:40:20:5:15:75%

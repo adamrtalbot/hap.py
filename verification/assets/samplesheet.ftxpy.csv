@@ -10,3 +10,16 @@ chr21_hcc_strelka_snv_tp,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.f
 chr21_hcc_strelka_snv_fn,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,hcc.strelka.snv,--feature-label FN
 ftx_bam_depth,local:assets/fixtures/ftx-bam/input.vcf,local:assets/fixtures/ftx-bam/ref.fa,local:assets/fixtures/ftx-bam/reads.bam,hcc.strelka.snv,--feature-label bam-oracle
 ftx_called_nonref,local:assets/fixtures/ftx-nonref.vcf,local:assets/fixtures/tiny.fa,,generic,
+ftx_location,local:assets/fixtures/ftx-bam/options.vcf,local:assets/fixtures/ftx-bam/ref.fa,,generic,-l 1:7-7 --feature-label oracle
+ftx_fix_chr,local:assets/fixtures/ftx-bam/options.vcf,local:assets/fixtures/ftx-bam/ref.fa,,generic,--fix-chr --feature-label oracle
+ftx_normalize,local:assets/fixtures/ftx-bam/normalize.vcf,local:assets/fixtures/ftx-bam/ref.fa,,generic,--normalize --feature-label oracle
+ftx_mutect_snv,local:assets/fixtures/ftx-bam/mutect.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,hcc.mutect.snv,--feature-label oracle
+ftx_varscan2_snv,local:assets/fixtures/ftx-bam/varscan2.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,hcc.varscan2.snv,--feature-label oracle
+ftx_pisces_snv,local:assets/fixtures/ftx-bam/pisces.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,hcc.pisces.snv,--feature-label oracle
+ftx_empty_label,local:assets/fixtures/ftx-bam/options.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,generic,--feature-label ''
+ftx_mutect_indel,local:assets/fixtures/ftx-matrix/mutect-indel.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,hcc.mutect.indel,--feature-label oracle
+ftx_mutect_reversed_samples,local:assets/fixtures/ftx-matrix/mutect-reversed.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,hcc.mutect.snv,--feature-label oracle
+ftx_varscan2_indel,local:assets/fixtures/ftx-matrix/varscan2-indel.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,hcc.varscan2.indel,--feature-label oracle
+ftx_pisces_indel,local:assets/fixtures/ftx-matrix/pisces-indel.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,hcc.pisces.indel,--feature-label oracle
+ftx_selector_normalize,local:assets/fixtures/ftx-matrix/selector-normalize.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,generic,-P --fix-chr -l chr1:5-15 --normalize --feature-label oracle
+ftx_empty_input,local:assets/fixtures/ftx-matrix/empty.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,generic,--feature-label empty-oracle

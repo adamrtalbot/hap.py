@@ -1,0 +1,13 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100>
+##ALT=<ID=NON_REF,Description="Represents any possible alternative allele">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant block">
+##INFO=<ID=SCORE,Number=1,Type=Float,Description="Synthetic ROC score">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TRUTH
+chr1	1	.	A	<NON_REF>	.	.	END=4	GT:DP	0/0:20
+chr1	5	truth-gvcf-snp	A	G,<NON_REF>	60	PASS	SCORE=60	GT:DP	0/1:20
+chr1	6	.	C	<NON_REF>	.	.	END=19	GT:DP	0/0:20
+chr1	20	truth-gvcf-filtered	T	C,<NON_REF>	40	PASS	SCORE=40	GT:DP	0/1:20
+chr1	21	.	A	<NON_REF>	.	.	END=100	GT:DP	0/0:20

@@ -9,7 +9,9 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 const INDEL_SUBTYPES: [&str; 9] = [
@@ -30,21 +32,69 @@ struct ClassifiedVariant {
     status: String,
     passes_filter: bool,
     subsets: Vec<String>,
+    fp_class: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct QuantifyTypeCounts {
+    counts: TypeCounts,
+    fp_gt: usize,
+    fp_al: usize,
+}
+
+impl Deref for QuantifyTypeCounts {
+    type Target = TypeCounts;
+
+    fn deref(&self) -> &Self::Target {
+        &self.counts
+    }
+}
+
+impl DerefMut for QuantifyTypeCounts {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.counts
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct QuantifyCountMaps {
-    by_type: BTreeMap<String, TypeCounts>,
-    by_subset_type: BTreeMap<String, BTreeMap<String, TypeCounts>>,
-    by_subtype: BTreeMap<String, BTreeMap<String, TypeCounts>>,
-    by_subset_subtype: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+    by_type: BTreeMap<String, QuantifyTypeCounts>,
+    by_subset_type: BTreeMap<String, BTreeMap<String, QuantifyTypeCounts>>,
+    by_subtype: BTreeMap<String, BTreeMap<String, QuantifyTypeCounts>>,
+    by_subset_subtype: BTreeMap<String, BTreeMap<String, BTreeMap<String, QuantifyTypeCounts>>>,
+}
+
+struct ExtendedTableOptions<'a> {
+    subset_size: usize,
+    whole_reference_size: usize,
+    stratification_sizes: &'a BTreeMap<String, usize>,
+    stratification_confidence_sizes: &'a BTreeMap<String, usize>,
+    confidence_size: Option<usize>,
+    qq_field: &'a str,
+    ci_alpha: f64,
 }
 
 pub fn run(args: QuantifyArgs) -> Result<()> {
+    run_with_metric_indices(args).map(|_| ())
+}
+
+/// Run qfy and return the legacy table row indices used by metrics JSON.
+///
+/// `hap.py` invokes qfy internally and then rewrites the JSON container with
+/// hap.py metadata. Returning the indices keeps that rewrite from replacing
+/// qfy's unordered-table row identifiers with synthetic `0..N` values.
+pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricIndices> {
     validate_options(&args)?;
+    if let Some(logfile) = args.logfile.as_deref() {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logfile)
+            .with_context(|| format!("failed to open qfy logfile {logfile}"))?;
+    }
     let annotation_type = args.annotation_type.as_deref().unwrap_or("xcmp");
     let prefix = Path::new(&args.report_prefix);
-    let output_vcf = suffixed_report_path(prefix, "vcf.gz");
+    let output_vcf = suffixed_report_path(prefix, if args.bcf { "bcf" } else { "vcf.gz" });
     if args.write_vcf && paths_refer_to_same_file(Path::new(&args.input_vcf), &output_vcf) {
         bail!(
             "cannot overwrite input VCF: {} would be overwritten by output {}",
@@ -70,6 +120,15 @@ pub fn run(args: QuantifyArgs) -> Result<()> {
         }
     }
     propagate_superlocus_annotations(&mut records, annotation_type);
+    for record in &mut records {
+        decorate_quantified_record(
+            record,
+            annotation_type,
+            args.preserve_info,
+            args.output_vtc,
+            confidence.is_some(),
+        );
+    }
     let subset_size = contigs_in_input(&records)
         .into_iter()
         .filter_map(|contig| {
@@ -77,6 +136,10 @@ pub fn run(args: QuantifyArgs) -> Result<()> {
                 .get(&contig)
                 .map(|sequence| n_trimmed_length(sequence))
         })
+        .sum::<usize>();
+    let whole_reference_size = reference
+        .values()
+        .map(|sequence| n_trimmed_length(sequence))
         .sum::<usize>();
 
     let mut all_counts = QuantifyCountMaps::default();
@@ -87,6 +150,20 @@ pub fn run(args: QuantifyArgs) -> Result<()> {
         .map(|(name, intervals)| (name.clone(), region_size(intervals)))
         .collect::<BTreeMap<_, _>>();
     let confidence_size = confidence.as_deref().map(region_size);
+    let stratification_confidence_sizes = confidence
+        .as_deref()
+        .map(|confidence| {
+            stratifications
+                .iter()
+                .map(|(name, intervals)| {
+                    (
+                        name.clone(),
+                        region_intersection_size(intervals, confidence),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
 
     for record in &records {
         let truth = classify_side(record, 0);
@@ -135,20 +212,36 @@ pub fn run(args: QuantifyArgs) -> Result<()> {
             &all_counts,
             &pass_counts,
             &subsets_present,
-            subset_size,
-            &stratification_sizes,
-            confidence_size,
+            &ExtendedTableOptions {
+                subset_size,
+                whole_reference_size,
+                stratification_sizes: &stratification_sizes,
+                stratification_confidence_sizes: &stratification_confidence_sizes,
+                confidence_size,
+                qq_field: &args.roc,
+                ci_alpha: args.ci_alpha,
+            },
         )?;
     }
     if args.write_vcf {
         if annotation_type == "ga4gh" {
             ensure_ga4gh_headers(&mut headers);
         }
-        let lines = records
-            .iter()
-            .map(RawVcfRecord::to_line)
-            .collect::<Vec<_>>();
-        vcf::write_indexed_vcf(&output_vcf, &headers, lines.iter().map(String::as_str))?;
+        if args.output_vtc {
+            ensure_info_header(
+                &mut headers,
+                "VTC",
+                "##INFO=<ID=VTC,Number=.,Type=String,Description=\"Variant types used for counting.\">",
+            );
+            if annotation_type == "xcmp" {
+                ensure_info_header(
+                    &mut headers,
+                    "XCMP",
+                    "##INFO=<ID=XCMP,Number=.,Type=String,Description=\"XCMP extra information.\">",
+                );
+            }
+        }
+        vcf::write_raw_vcf(&output_vcf, &headers, &records)?;
     }
     let mut rows = records
         .iter()
@@ -157,7 +250,7 @@ pub fn run(args: QuantifyArgs) -> Result<()> {
             sort_key: (record.chrom.clone(), record.pos, index, 0),
             line: record.to_line(),
             query_pass: record.is_pass(),
-            fp_class: None,
+            fp_class: query_fp_class(record),
             xcmp_ctype: None,
             xcmp_hap_match: false,
         })
@@ -176,6 +269,11 @@ pub fn run(args: QuantifyArgs) -> Result<()> {
         roc_regions: args.roc_regions.iter().cloned().collect(),
         delta: args.roc_delta,
         ci_alpha: args.ci_alpha,
+        preserve_raw_table: args.verbose,
+        output_rocs: args.do_roc,
+        whole_reference_size: Some(whole_reference_size),
+        subset_sizes: stratification_sizes.clone(),
+        subset_confidence_sizes: stratification_confidence_sizes.clone(),
     };
     let roc_indices = roc::write_roc_files_with_options(
         prefix,
@@ -190,7 +288,7 @@ pub fn run(args: QuantifyArgs) -> Result<()> {
     if !args.no_json {
         write_metrics_json(prefix, args.write_counts, args.do_roc, &roc_indices)?;
     }
-    Ok(())
+    Ok(roc_indices)
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
@@ -235,6 +333,16 @@ fn load_regions(
         .map(|path| load_region_bed(Path::new(path), reference_contigs, args.strat_fixchr))
         .transpose()
         .with_context(|| "failed to load qfy confidence regions")?;
+    if let Some(truth_vcf) = args.adjust_conf_regions.as_deref() {
+        let raw_confidence = confidence.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("qfy --adjust-conf-regions requires --false-positives")
+        })?;
+        let (_, truth_records) = vcf::load_raw_vcf(Path::new(truth_vcf)).with_context(|| {
+            format!("failed to load --adjust-conf-regions truth VCF {truth_vcf}")
+        })?;
+        let padding = truth_confidence_padding(&truth_records, raw_confidence);
+        confidence.get_or_insert_default().extend(padding);
+    }
     let mut paths = BTreeMap::<String, PathBuf>::new();
 
     if let Some(tsv_path) = args.strat_tsv.as_deref() {
@@ -277,6 +385,54 @@ fn load_regions(
         }
     }
     Ok((confidence, regions))
+}
+
+fn truth_confidence_padding(
+    records: &[RawVcfRecord],
+    targets: &[vcf::BedInterval],
+) -> Vec<vcf::BedInterval> {
+    let mut records = records.iter().collect::<Vec<_>>();
+    records.sort_by(|left, right| left.chrom.cmp(&right.chrom).then(left.pos.cmp(&right.pos)));
+    let mut output = Vec::new();
+    let mut active: Option<vcf::BedInterval> = None;
+    for record in records {
+        if !targets
+            .iter()
+            .any(|target| target.matches(&record.chrom, record.pos))
+        {
+            continue;
+        }
+        let (start, end) = effective_reference_range(record)
+            .map(|(start, end, _)| (start.saturating_sub(1), end))
+            .unwrap_or((
+                record.pos.saturating_sub(1),
+                record.pos.saturating_sub(1) + record.ref_allele.len(),
+            ));
+        let overlaps_active = active.as_ref().is_some_and(|interval| {
+            interval.chrom == record.chrom && start < interval.end && end > interval.start
+        });
+        if overlaps_active {
+            if let Some(interval) = active.as_mut() {
+                interval.start = interval.start.min(start);
+                // gvcf2bed intentionally extends with the next record's start,
+                // not its end; qfy relies on this historical under-extension.
+                interval.end = interval.end.max(start + 1);
+            }
+        } else {
+            if let Some(interval) = active.take() {
+                output.push(interval);
+            }
+            active = Some(vcf::BedInterval {
+                chrom: record.chrom.clone(),
+                start,
+                end,
+            });
+        }
+    }
+    if let Some(interval) = active {
+        output.push(interval);
+    }
+    output
 }
 
 fn resolve_stratification_path(raw_path: &str, tsv_path: &Path) -> PathBuf {
@@ -385,11 +541,27 @@ fn annotate_regions(
             .iter()
             .any(|interval| interval.overlaps(&record_chrom, record_pos, record_end)),
     };
-    let mut additions = stratifications
-        .iter()
-        .filter(|(_, intervals)| overlaps(intervals))
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
+    let fully_covered = |intervals: &[vcf::BedInterval]| {
+        let (start, end) = effective_range
+            .map(|(start, end, _)| (start, end))
+            .unwrap_or((record_pos, record_end));
+        (start..=end).all(|pos| {
+            intervals
+                .iter()
+                .any(|interval| interval.matches(&record_chrom, pos))
+        })
+    };
+    let mut additions = Vec::new();
+    let mut crosses_stratification_boundary = false;
+    for (name, intervals) in stratifications {
+        if overlaps(intervals) {
+            additions.push(name.clone());
+            crosses_stratification_boundary |= !fully_covered(intervals);
+        }
+    }
+    if crosses_stratification_boundary {
+        additions.push("TS_boundary".to_string());
+    }
 
     if let Some(confidence) = confidence {
         remove_region_tag(&mut record.info, "CONF");
@@ -406,6 +578,9 @@ fn annotate_regions(
     }
     if !additions.is_empty() {
         merge_region_tags(&mut record.info, &additions);
+    }
+    if has_region(&record.info, "CONF") {
+        move_region_to_front(&mut record.info, "CONF");
     }
 }
 
@@ -431,9 +606,9 @@ fn propagate_superlocus_annotations(records: &mut [RawVcfRecord], annotation_typ
         let has_confident = records[start..end]
             .iter()
             .any(|record| has_region(&record.info, "CONF"));
-        let has_non_confident = records[start..end]
-            .iter()
-            .any(|record| !has_region(&record.info, "CONF"));
+        let has_non_confident = records[start..end].iter().any(|record| {
+            !has_region(&record.info, "CONF") || has_region(&record.info, "TS_boundary")
+        });
         let region = if has_confident && has_non_confident {
             Some("TS_boundary")
         } else if has_confident {
@@ -764,6 +939,20 @@ fn ensure_ga4gh_headers(headers: &mut Vec<String>) {
     }
 }
 
+fn ensure_info_header(headers: &mut Vec<String>, id: &str, declaration: &str) {
+    if headers
+        .iter()
+        .any(|header| header.contains(&format!("INFO=<ID={id},")))
+    {
+        return;
+    }
+    let index = headers
+        .iter()
+        .position(|header| header.starts_with("#CHROM"))
+        .unwrap_or(headers.len());
+    headers.insert(index, declaration.to_string());
+}
+
 fn propagate_ga4gh_superlocus(records: &mut [RawVcfRecord]) {
     let minimum_tp_qq = records
         .iter()
@@ -773,7 +962,7 @@ fn propagate_ga4gh_superlocus(records: &mut [RawVcfRecord]) {
                 .then(|| query.get("QQ").cloned())
                 .flatten()
         })
-        .filter(|score| score != "." && score.parse::<f64>().is_ok())
+        .filter(|score| score != "." && score.parse::<f64>().is_ok_and(|value| value.is_finite()))
         .min_by(|left, right| {
             left.parse::<f64>()
                 .unwrap()
@@ -793,7 +982,9 @@ fn propagate_ga4gh_superlocus(records: &mut [RawVcfRecord]) {
         let direct_query_qq = (query.get("BD").map(String::as_str) == Some("TP"))
             .then(|| query.get("QQ").cloned())
             .flatten()
-            .filter(|score| score != "." && score.parse::<f64>().is_ok());
+            .filter(|score| {
+                score != "." && score.parse::<f64>().is_ok_and(|value| value.is_finite())
+            });
         let truth_qq = if truth_tp {
             direct_query_qq.as_ref().or(minimum_tp_qq.as_ref())
         } else {
@@ -846,10 +1037,18 @@ fn effective_reference_range(record: &RawVcfRecord) -> Option<(usize, usize, boo
     let mut has_nucleotide_alt = false;
 
     for alt in record.alt_allele.split(',') {
-        if alt.is_empty() || alt == "." || alt.starts_with('<') {
-            continue;
-        }
-        let alt_bytes = alt.as_bytes();
+        // classifyAlleleString maps a missing ALT to an empty allele and
+        // processes it as a reference-consuming deletion. Any other
+        // non-nucleotide allele terminates the loop, so later nucleotide
+        // ALTs must not expand the range.
+        let normalized_alt = if alt.is_empty() || alt == "." {
+            String::new()
+        } else if alt.bytes().all(is_legacy_nucleotide_base) {
+            alt.to_ascii_uppercase()
+        } else {
+            break;
+        };
+        let alt_bytes = normalized_alt.as_bytes();
         let mut ref_len = ref_bytes.len();
         let mut alt_len = alt_bytes.len();
         while ref_len > 0 && alt_len > 0 && ref_bytes[ref_len - 1] == alt_bytes[alt_len - 1] {
@@ -886,6 +1085,28 @@ fn effective_reference_range(record: &RawVcfRecord) -> Option<(usize, usize, boo
     ))
 }
 
+fn is_legacy_nucleotide_base(base: u8) -> bool {
+    matches!(
+        base.to_ascii_uppercase(),
+        b'A' | b'C'
+            | b'G'
+            | b'T'
+            | b'U'
+            | b'R'
+            | b'Y'
+            | b'K'
+            | b'M'
+            | b'S'
+            | b'W'
+            | b'B'
+            | b'D'
+            | b'H'
+            | b'V'
+            | b'N'
+            | b'X'
+    )
+}
+
 fn remove_region_tag(info: &mut String, unwanted: &str) {
     let mut fields = Vec::new();
     for field in info
@@ -900,6 +1121,31 @@ fn remove_region_tag(info: &mut String, unwanted: &str) {
             if !retained.is_empty() {
                 fields.push(format!("Regions={}", retained.join(",")));
             }
+        } else {
+            fields.push(field.to_string());
+        }
+    }
+    *info = if fields.is_empty() {
+        ".".to_string()
+    } else {
+        fields.join(";")
+    };
+}
+
+fn move_region_to_front(info: &mut String, wanted: &str) {
+    let mut fields = Vec::new();
+    for field in info
+        .split(';')
+        .filter(|field| !field.is_empty() && *field != ".")
+    {
+        if let Some(regions) = field.strip_prefix("Regions=") {
+            let mut reordered = regions
+                .split(',')
+                .filter(|region| !region.is_empty() && *region != wanted)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            reordered.insert(0, wanted.to_string());
+            fields.push(format!("Regions={}", reordered.join(",")));
         } else {
             fields.push(field.to_string());
         }
@@ -992,6 +1238,198 @@ fn reannotate_xcmp_record(
     }
 }
 
+fn decorate_quantified_record(
+    record: &mut RawVcfRecord,
+    annotation_type: &str,
+    preserve_info: bool,
+    output_vtc: bool,
+    has_confidence_regions: bool,
+) {
+    if output_vtc {
+        if annotation_type == "xcmp" {
+            let mut decision = info_value(&record.info, "type").unwrap_or_default();
+            let mut kind = info_value(&record.info, "kind").unwrap_or_default();
+            let ctype = info_value(&record.info, "ctype").unwrap_or_default();
+            let query_filtered = info_flag(&record.info, "Q_FILTERED");
+            if info_flag(&record.info, "HapMatch") && decision != "TP" && !query_filtered {
+                kind = format!("hapmatch__{decision}__{kind}");
+                decision = "TP".to_string();
+            }
+            if has_confidence_regions && !has_region(&record.info, "CONF") {
+                decision = "UNK".to_string();
+            }
+            if info_flag(&record.info, "IMPORT_FAIL") {
+                decision = "N".to_string();
+                kind = "error".to_string();
+            }
+            let gtt1 = info_value(&record.info, "gtt1").unwrap_or_else(|| ".".to_string());
+            let gtt2 = info_value(&record.info, "gtt2").unwrap_or_else(|| ".".to_string());
+            set_info_value(
+                &mut record.info,
+                "XCMP",
+                &format!("{decision}:{kind}:{gtt1}:{gtt2}:{ctype}"),
+            );
+        }
+        let truth = record.sample_map(0);
+        let query = record.sample_map(1);
+        let vtc = legacy_vtc(record, &truth, &query);
+        if !vtc.is_empty() {
+            set_info_value(&mut record.info, "VTC", &vtc);
+        }
+        if info_value(&record.info, "Regions").as_deref() == Some("TS_boundary") {
+            move_info_field_to_end(&mut record.info, "Regions");
+        }
+    }
+
+    if annotation_type == "xcmp" && !preserve_info {
+        retain_info_fields(
+            &mut record.info,
+            &["END", "VTC", "Regions", "BS", "XCMP", "IMPORT_FAIL"],
+        );
+    }
+}
+
+fn set_info_value(info: &mut String, key: &str, value: &str) {
+    let mut fields = info
+        .split(';')
+        .filter(|field| !field.is_empty() && *field != ".")
+        .filter(|field| field.split_once('=').map_or(*field, |(name, _)| name) != key)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    fields.push(format!("{key}={value}"));
+    *info = fields.join(";");
+}
+
+fn retain_info_fields(info: &mut String, retained: &[&str]) {
+    let fields = info
+        .split(';')
+        .filter(|field| !field.is_empty() && *field != ".")
+        .filter(|field| {
+            let key = field.split_once('=').map_or(*field, |(key, _)| key);
+            retained.contains(&key)
+        })
+        .collect::<Vec<_>>();
+    *info = if fields.is_empty() {
+        ".".to_string()
+    } else {
+        fields.join(";")
+    };
+}
+
+fn move_info_field_to_end(info: &mut String, wanted: &str) {
+    let mut fields = info
+        .split(';')
+        .filter(|field| !field.is_empty() && *field != ".")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let Some(index) = fields
+        .iter()
+        .position(|field| field.split_once('=').map_or(field.as_str(), |(key, _)| key) == wanted)
+    else {
+        return;
+    };
+    let field = fields.remove(index);
+    fields.push(field);
+    *info = fields.join(";");
+}
+
+fn legacy_vtc(
+    record: &RawVcfRecord,
+    truth: &BTreeMap<String, String>,
+    query: &BTreeMap<String, String>,
+) -> String {
+    let mut types = BTreeMap::<u8, String>::new();
+    for sample in [truth, query] {
+        if sample
+            .get("BVT")
+            .is_none_or(|value| matches!(value.as_str(), "" | "." | "NOCALL"))
+        {
+            types.insert(0x80, "nocall__nc".to_string());
+            continue;
+        }
+        let alleles = sample
+            .get("GT")
+            .map(String::as_str)
+            .unwrap_or(".")
+            .split(['/', '|'])
+            .filter_map(|allele| allele.parse::<usize>().ok())
+            .collect::<Vec<_>>();
+        let mut combined = 0u8;
+        for allele in alleles.iter().copied().filter(|allele| *allele > 0) {
+            let Some(alternate) = record.alt_allele.split(',').nth(allele - 1) else {
+                continue;
+            };
+            let bits = allele_edit_bits(&record.ref_allele, alternate);
+            combined |= bits;
+            for bit in [1u8, 2, 4] {
+                if bits & bit != 0 {
+                    types.insert(bit, format!("nuc__{}", legacy_type_bits(bit)));
+                }
+            }
+            if bits != 0 {
+                types.insert(0x10 | bits, format!("al__{}", legacy_type_bits(bits)));
+            }
+        }
+        if combined == 0 {
+            continue;
+        }
+        let location = match sample.get("BLT").map(String::as_str).unwrap_or("") {
+            "het" => 0x30,
+            "hetalt" => 0x40,
+            "hemi" => 0x50,
+            "homalt" => 0x90,
+            _ => 0xa0,
+        };
+        let ref_bit = u8::from(alleles.contains(&0)) * 8;
+        types.insert(
+            location | ref_bit | combined,
+            format!(
+                "{}__{}",
+                sample.get("BLT").map(String::as_str).unwrap_or("unknown"),
+                legacy_type_bits(ref_bit | combined)
+            ),
+        );
+    }
+    types.into_values().collect::<Vec<_>>().join(",")
+}
+
+fn allele_edit_bits(reference: &str, alternate: &str) -> u8 {
+    if alternate.starts_with('<') {
+        return if alternate.starts_with("<DEL") { 4 } else { 2 };
+    }
+    let ref_bytes = reference.as_bytes();
+    let alt_bytes = alternate.as_bytes();
+    let prefix = ref_bytes
+        .iter()
+        .zip(alt_bytes)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix_limit = (ref_bytes.len() - prefix).min(alt_bytes.len() - prefix);
+    let suffix = (0..suffix_limit)
+        .take_while(|offset| {
+            ref_bytes[ref_bytes.len() - 1 - offset] == alt_bytes[alt_bytes.len() - 1 - offset]
+        })
+        .count();
+    let ref_remaining = ref_bytes.len() - prefix - suffix;
+    let alt_remaining = alt_bytes.len() - prefix - suffix;
+    match (ref_remaining, alt_remaining) {
+        (0, 0) => 0,
+        (0, _) => 2,
+        (_, 0) => 4,
+        (left, right) if left == right => 1,
+        (left, right) if left < right => 1 | 2,
+        _ => 1 | 4,
+    }
+}
+
+fn legacy_type_bits(bits: u8) -> &'static str {
+    const NAMES: [&str; 16] = [
+        "nc", "s", "i", "si", "d", "sd", "id", "sid", "r", "rs", "ri", "rsi", "rd", "rsd", "rid",
+        "rsid",
+    ];
+    NAMES[usize::from(bits & 0x0f)]
+}
+
 fn info_value(info: &str, key: &str) -> Option<String> {
     info.split(';').find_map(|field| {
         field
@@ -1048,7 +1486,12 @@ fn merge_region_tags(info: &mut String, additions: &[String]) {
             tags.push(addition.clone());
         }
     }
-    fields.push(format!("Regions={}", tags.join(",")));
+    let regions = format!("Regions={}", tags.join(","));
+    let insertion = fields
+        .iter()
+        .position(|field| field.starts_with("RegionsExtent="))
+        .unwrap_or(fields.len());
+    fields.insert(insertion, regions);
     *info = fields.join(";");
 }
 
@@ -1057,6 +1500,59 @@ fn region_size(intervals: &[vcf::BedInterval]) -> usize {
         .iter()
         .map(|interval| interval.end.saturating_sub(interval.start))
         .sum()
+}
+
+fn merged_regions(intervals: &[vcf::BedInterval]) -> Vec<vcf::BedInterval> {
+    let mut sorted = intervals.to_vec();
+    sorted.sort_by(|left, right| {
+        left.chrom
+            .cmp(&right.chrom)
+            .then(left.start.cmp(&right.start))
+            .then(left.end.cmp(&right.end))
+    });
+    let mut merged: Vec<vcf::BedInterval> = Vec::with_capacity(sorted.len());
+    for interval in sorted {
+        if let Some(last) = merged.last_mut()
+            && last.chrom == interval.chrom
+            && interval.start <= last.end
+        {
+            last.end = last.end.max(interval.end);
+        } else {
+            merged.push(interval);
+        }
+    }
+    merged
+}
+
+fn region_intersection_size(left: &[vcf::BedInterval], right: &[vcf::BedInterval]) -> usize {
+    let left = merged_regions(left);
+    let right = merged_regions(right);
+    let (mut left_index, mut right_index, mut size) = (0, 0, 0usize);
+    while left_index < left.len() && right_index < right.len() {
+        let left_interval = &left[left_index];
+        let right_interval = &right[right_index];
+        match left_interval.chrom.cmp(&right_interval.chrom) {
+            std::cmp::Ordering::Less => {
+                left_index += 1;
+                continue;
+            }
+            std::cmp::Ordering::Greater => {
+                right_index += 1;
+                continue;
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        size += left_interval
+            .end
+            .min(right_interval.end)
+            .saturating_sub(left_interval.start.max(right_interval.start));
+        if left_interval.end <= right_interval.end {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    size
 }
 
 fn compact_no_roc_outputs(prefix: &Path) -> Result<()> {
@@ -1129,6 +1625,7 @@ fn classify_side(record: &RawVcfRecord, sample_index: usize) -> Option<Classifie
     };
     let location_type = fields.get("BLT").map(String::as_str).unwrap_or(".");
     let subsets = parse_subsets(&record.info);
+    let fp_class = fp_class(&bd, fields.get("BK").map(String::as_str));
     Some(ClassifiedVariant {
         variant_type,
         subtypes,
@@ -1139,7 +1636,27 @@ fn classify_side(record: &RawVcfRecord, sample_index: usize) -> Option<Classifie
         status: bd,
         passes_filter: record.filter == "PASS" || record.filter == ".",
         subsets,
+        fp_class,
     })
+}
+
+fn fp_class(decision: &str, match_kind: Option<&str>) -> Option<&'static str> {
+    if decision != "FP" {
+        return None;
+    }
+    match match_kind {
+        Some("am") => Some("gt"),
+        Some("lm") => Some("al"),
+        _ => None,
+    }
+}
+
+fn query_fp_class(record: &RawVcfRecord) -> Option<&'static str> {
+    let fields = record.sample_map(1);
+    fp_class(
+        fields.get("BD").map(String::as_str).unwrap_or("."),
+        fields.get("BK").map(String::as_str),
+    )
 }
 
 fn parse_subsets(info: &str) -> Vec<String> {
@@ -1391,99 +1908,57 @@ fn record_query(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) 
     if !matches!(classified.status.as_str(), "TP" | "FP" | "UNK" | "AMBI") {
         return;
     }
-    add_variant_stats(
-        &mut counts
+    record_query_stats(
+        counts
             .by_type
             .entry(classified.variant_type.clone())
-            .or_default()
-            .query_total,
-        classified,
-    );
-    add_variant_stats(
-        query_bucket(
-            counts
-                .by_type
-                .entry(classified.variant_type.clone())
-                .or_default(),
-            &classified.status,
-        ),
+            .or_default(),
         classified,
     );
     for subtype in &classified.subtypes {
-        add_variant_stats(
-            &mut counts
+        record_query_stats(
+            counts
                 .by_subtype
                 .entry(classified.variant_type.clone())
                 .or_default()
                 .entry(subtype.clone())
-                .or_default()
-                .query_total,
-            classified,
-        );
-        add_variant_stats(
-            query_bucket(
-                counts
-                    .by_subtype
-                    .entry(classified.variant_type.clone())
-                    .or_default()
-                    .entry(subtype.clone())
-                    .or_default(),
-                &classified.status,
-            ),
+                .or_default(),
             classified,
         );
     }
     for subset in &classified.subsets {
-        add_variant_stats(
-            &mut counts
+        record_query_stats(
+            counts
                 .by_subset_type
                 .entry(subset.clone())
                 .or_default()
                 .entry(classified.variant_type.clone())
-                .or_default()
-                .query_total,
-            classified,
-        );
-        add_variant_stats(
-            query_bucket(
-                counts
-                    .by_subset_type
-                    .entry(subset.clone())
-                    .or_default()
-                    .entry(classified.variant_type.clone())
-                    .or_default(),
-                &classified.status,
-            ),
+                .or_default(),
             classified,
         );
         for subtype in &classified.subtypes {
-            add_variant_stats(
-                &mut counts
+            record_query_stats(
+                counts
                     .by_subset_subtype
                     .entry(subset.clone())
                     .or_default()
                     .entry(classified.variant_type.clone())
                     .or_default()
                     .entry(subtype.clone())
-                    .or_default()
-                    .query_total,
-                classified,
-            );
-            add_variant_stats(
-                query_bucket(
-                    counts
-                        .by_subset_subtype
-                        .entry(subset.clone())
-                        .or_default()
-                        .entry(classified.variant_type.clone())
-                        .or_default()
-                        .entry(subtype.clone())
-                        .or_default(),
-                    &classified.status,
-                ),
+                    .or_default(),
                 classified,
             );
         }
+    }
+}
+
+fn record_query_stats(stats: &mut QuantifyTypeCounts, classified: &ClassifiedVariant) {
+    add_variant_stats(&mut stats.query_total, classified);
+    add_variant_stats(query_bucket(stats, &classified.status), classified);
+    match classified.fp_class {
+        Some("gt") => stats.fp_gt += 1,
+        Some("al") => stats.fp_al += 1,
+        _ => {}
     }
 }
 
@@ -1554,8 +2029,8 @@ fn subtract_bucket(total: &CountsBucket, matched: &CountsBucket) -> CountsBucket
 
 fn write_quantify_summary(
     path: &Path,
-    all_counts: &BTreeMap<String, TypeCounts>,
-    pass_counts: &BTreeMap<String, TypeCounts>,
+    all_counts: &BTreeMap<String, QuantifyTypeCounts>,
+    pass_counts: &BTreeMap<String, QuantifyTypeCounts>,
 ) -> Result<()> {
     let mut writer = BufWriter::new(fs::File::create(path)?);
     writeln!(
@@ -1577,17 +2052,29 @@ fn write_summary_row<W: Write>(
     writer: &mut W,
     variant_type: &str,
     filter: &str,
-    stats: &TypeCounts,
+    stats: &QuantifyTypeCounts,
 ) -> Result<()> {
+    let truth_titv = if variant_type == "SNP" {
+        ti_tv_ratio(stats.truth_total.ti, stats.truth_total.tv)
+    } else {
+        String::new()
+    };
+    let query_titv = if variant_type == "SNP" {
+        ti_tv_ratio(stats.query_total.ti, stats.query_total.tv)
+    } else {
+        String::new()
+    };
     writeln!(
         writer,
-        "{variant_type},{filter},{},{},{},{},{},{},0,0,{},{},{},{},{},{},{},{}",
+        "{variant_type},{filter},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         stats.truth_total.total,
         stats.truth_tp.total,
         stats.truth_fn.total,
         stats.query_total.total,
         stats.query_fp.total,
         stats.query_unk.total,
+        stats.fp_gt,
+        stats.fp_al,
         metric_ratio(stats.truth_tp.total, stats.truth_total.total),
         precision_metric(stats),
         metric_ratio(stats.query_unk.total, stats.query_total.total),
@@ -1597,8 +2084,8 @@ fn write_summary_row<W: Write>(
             stats.query_tp.total,
             stats.query_tp.total + stats.query_fp.total
         ),
-        ti_tv_ratio(stats.truth_total.ti, stats.truth_total.tv),
-        ti_tv_ratio(stats.query_total.ti, stats.query_total.tv),
+        truth_titv,
+        query_titv,
         het_hom_ratio(stats.truth_total.het, stats.truth_total.homalt),
         het_hom_ratio(stats.query_total.het, stats.query_total.homalt),
     )?;
@@ -1610,13 +2097,29 @@ fn write_quantify_extended(
     all_counts: &QuantifyCountMaps,
     pass_counts: &QuantifyCountMaps,
     subsets_present: &BTreeMap<String, BTreeSet<String>>,
-    subset_size: usize,
-    stratification_sizes: &BTreeMap<String, usize>,
-    confidence_size: Option<usize>,
+    options: &ExtendedTableOptions<'_>,
 ) -> Result<()> {
     let mut writer = BufWriter::new(fs::File::create(path)?);
-    writeln!(writer, "{}", report::EXTENDED_HEADER.join(","))?;
-    let confidence_size_value = confidence_size;
+    let mut header = report::EXTENDED_HEADER
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    if options.ci_alpha > 0.0 {
+        header.extend(
+            [
+                "METRIC.Recall.Lower",
+                "METRIC.Recall.Upper",
+                "METRIC.Precision.Lower",
+                "METRIC.Precision.Upper",
+                "METRIC.Frac_NA.Lower",
+                "METRIC.Frac_NA.Upper",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
+    writeln!(writer, "{}", header.join(","))?;
+    let confidence_size_value = options.confidence_size;
     let confidence_size = confidence_size_value
         .map(|size| format!("{:.6}", size as f64))
         .unwrap_or_default();
@@ -1655,17 +2158,24 @@ fn write_quantify_extended(
                 .get(variant_type)
                 .cloned()
                 .unwrap_or_default(),
-            subset_size,
+            options.subset_size,
             &confidence_size,
+            options.qq_field,
+            options.ci_alpha,
         )?;
 
         for subset in &subsets {
-            let subset_size_for_row = named_subset_size(
+            let (subset_size_for_row, subset_confidence_size) = named_subset_report_sizes(
                 subset,
-                subset_size,
+                options.subset_size,
+                options.whole_reference_size,
                 confidence_size_value,
-                stratification_sizes,
+                options.stratification_sizes,
+                options.stratification_confidence_sizes,
             );
+            let subset_confidence_size = subset_confidence_size
+                .map(|size| format!("{:.6}", size as f64))
+                .unwrap_or_default();
             let all = all_counts
                 .by_subset_type
                 .get(subset)
@@ -1686,7 +2196,9 @@ fn write_quantify_extended(
                 all,
                 pass,
                 subset_size_for_row,
-                &confidence_size,
+                &subset_confidence_size,
+                options.qq_field,
+                options.ci_alpha,
             )?;
         }
 
@@ -1711,16 +2223,23 @@ fn write_quantify_extended(
                     "*",
                     all,
                     pass,
-                    subset_size,
+                    options.subset_size,
                     &confidence_size,
+                    options.qq_field,
+                    options.ci_alpha,
                 )?;
                 for subset in &subsets {
-                    let subset_size_for_row = named_subset_size(
+                    let (subset_size_for_row, subset_confidence_size) = named_subset_report_sizes(
                         subset,
-                        subset_size,
+                        options.subset_size,
+                        options.whole_reference_size,
                         confidence_size_value,
-                        stratification_sizes,
+                        options.stratification_sizes,
+                        options.stratification_confidence_sizes,
                     );
+                    let subset_confidence_size = subset_confidence_size
+                        .map(|size| format!("{:.6}", size as f64))
+                        .unwrap_or_default();
                     let all = all_counts
                         .by_subset_subtype
                         .get(subset)
@@ -1743,7 +2262,9 @@ fn write_quantify_extended(
                         all,
                         pass,
                         subset_size_for_row,
-                        &confidence_size,
+                        &subset_confidence_size,
+                        options.qq_field,
+                        options.ci_alpha,
                     )?;
                 }
             }
@@ -1753,17 +2274,29 @@ fn write_quantify_extended(
     Ok(())
 }
 
-fn named_subset_size(
+fn named_subset_report_sizes(
     subset: &str,
+    _active_reference_size: usize,
     whole_reference_size: usize,
     confidence_size: Option<usize>,
     stratification_sizes: &BTreeMap<String, usize>,
-) -> usize {
-    match subset {
+    stratification_confidence_sizes: &BTreeMap<String, usize>,
+) -> (usize, Option<usize>) {
+    let subset_size = match subset {
         "TS_boundary" => whole_reference_size,
         "TS_contained" => confidence_size.unwrap_or(0),
         _ => stratification_sizes.get(subset).copied().unwrap_or(0),
-    }
+    };
+    let subset_confidence_size = match subset {
+        "TS_boundary" | "TS_contained" => confidence_size,
+        _ => confidence_size.map(|_| {
+            stratification_confidence_sizes
+                .get(subset)
+                .copied()
+                .unwrap_or(0)
+        }),
+    };
+    (subset_size, subset_confidence_size)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1772,10 +2305,12 @@ fn write_extended_pair<W: Write>(
     variant_type: &str,
     subtype: &str,
     subset: &str,
-    all: TypeCounts,
-    pass: TypeCounts,
+    all: QuantifyTypeCounts,
+    pass: QuantifyTypeCounts,
     subset_size: usize,
     conf_size: &str,
+    qq_field: &str,
+    ci_alpha: f64,
 ) -> Result<()> {
     write_extended_row(
         writer,
@@ -1786,6 +2321,8 @@ fn write_extended_pair<W: Write>(
         &all,
         subset_size,
         conf_size,
+        qq_field,
+        ci_alpha,
     )?;
     write_extended_row(
         writer,
@@ -1796,6 +2333,8 @@ fn write_extended_pair<W: Write>(
         &pass,
         subset_size,
         conf_size,
+        qq_field,
+        ci_alpha,
     )?;
     Ok(())
 }
@@ -1807,9 +2346,11 @@ fn write_extended_row<W: Write>(
     subtype: &str,
     subset: &str,
     filter: &str,
-    stats: &TypeCounts,
+    stats: &QuantifyTypeCounts,
     subset_size: usize,
     conf_size: &str,
+    qq_field: &str,
+    ci_alpha: f64,
 ) -> Result<()> {
     let supports_titv = variant_type == "SNP";
     let mut row = vec![
@@ -1818,7 +2359,7 @@ fn write_extended_row<W: Write>(
         subset.to_string(),
         filter.to_string(),
         "*".to_string(),
-        "QUAL".to_string(),
+        qq_field.to_string(),
         "*".to_string(),
         metric_ratio(stats.truth_tp.total, stats.truth_total.total),
         precision_metric(stats),
@@ -1829,8 +2370,8 @@ fn write_extended_row<W: Write>(
             stats.query_tp.total,
             stats.query_tp.total + stats.query_fp.total,
         ),
-        "0".to_string(),
-        "0".to_string(),
+        stats.fp_gt.to_string(),
+        stats.fp_al.to_string(),
         if subset == "*" {
             subset_size.to_string()
         } else {
@@ -1846,6 +2387,20 @@ fn write_extended_row<W: Write>(
     append_stats(&mut row, &stats.query_tp, supports_titv);
     append_stats(&mut row, &stats.query_fp, supports_titv);
     append_stats(&mut row, &stats.query_unk, supports_titv);
+    if ci_alpha > 0.0 {
+        roc::append_ci_cells(
+            &mut row,
+            [
+                (stats.truth_tp.total, stats.truth_total.total),
+                (
+                    stats.query_tp.total,
+                    stats.query_tp.total + stats.query_fp.total,
+                ),
+                (stats.query_unk.total, stats.query_total.total),
+            ],
+            ci_alpha,
+        );
+    }
     writeln!(writer, "{}", row.join(","))?;
     Ok(())
 }
@@ -2024,6 +2579,15 @@ mod tests {
             strat_fixchr: false,
             write_vcf: false,
             write_counts: true,
+            output_vtc: false,
+            preserve_info: false,
+            adjust_conf_regions: None,
+            threads: None,
+            bcf: false,
+            logfile: None,
+            verbose: false,
+            quiet: false,
+            force_interactive: false,
             roc: "QUAL".to_string(),
             do_roc: false,
             roc_regions: vec!["*".to_string()],
@@ -2056,11 +2620,25 @@ mod tests {
 
         assert!(has_region(&records[0].info, "TS_boundary"));
         assert!(has_region(&records[1].info, "TS_boundary"));
+        assert!(has_region(&records[1].info, "TS_contained"));
         assert!(has_region(&records[2].info, "TS_contained"));
         assert_eq!(
             records[0].sample_map(0).get("QQ").map(String::as_str),
             Some(".")
         );
+    }
+
+    #[test]
+    fn boundary_propagation_preserves_existing_contained_membership() {
+        let mut records = vec![
+            raw_record(2, 7, "CONF,TS_contained", "0/1:TP:gm:ti:SNP:het:50"),
+            raw_record(3, 7, "TS_boundary", "0/1:UNK:.:ti:SNP:het:50"),
+        ];
+
+        propagate_superlocus_annotations(&mut records, "ga4gh");
+
+        assert!(has_region(&records[0].info, "TS_contained"));
+        assert!(has_region(&records[0].info, "TS_boundary"));
     }
 
     #[test]
@@ -2136,6 +2714,130 @@ mod tests {
     }
 
     #[test]
+    fn ga4gh_fp_match_kinds_feed_count_and_roc_classes() {
+        let record = RawVcfRecord::from_line(
+            "chr1\t3\t.\tA\tG\t50\tPASS\tBS=3;Regions=CONF\tGT:BD:BK:BI:BVT:BLT:QQ\t0/1:FN:.:ti:SNP:het:.\t0/1:FP:am:ti:SNP:het:35",
+            Path::new("rtg.vcf"),
+        )
+        .unwrap();
+        let classified = classify_side(&record, 1).unwrap();
+        let mut counts = QuantifyCountMaps::default();
+        record_query(&mut counts, &classified);
+
+        assert_eq!(counts.by_type["SNP"].fp_gt, 1);
+        assert_eq!(counts.by_type["SNP"].fp_al, 0);
+        assert_eq!(query_fp_class(&record), Some("gt"));
+
+        let allele_mismatch = RawVcfRecord::from_line(
+            "chr1\t4\t.\tA\tG\t50\tPASS\tBS=4\tGT:BD:BK:BI:BVT:BLT:QQ\t0/1:FN:.:ti:SNP:het:.\t0/1:FP:lm:ti:SNP:het:30",
+            Path::new("rtg.vcf"),
+        )
+        .unwrap();
+        assert_eq!(query_fp_class(&allele_mismatch), Some("al"));
+    }
+
+    #[test]
+    fn xcmp_vtc_and_preserve_info_follow_legacy_cleaning_controls() {
+        let source = "chr1\t3\t.\tA\tG\t50\tPASS\tBS=3;Regions=CONF;type=TP;kind=match;ctype=simple:match;gtt1=gt_het;gtt2=gt_het;CUSTOM=kept\tGT:BD:BK:BI:BVT:BLT:QQ\t0/1:TP:gm:ti:SNP:het:50\t0/1:TP:gm:ti:SNP:het:50";
+        let mut cleaned = RawVcfRecord::from_line(source, Path::new("xcmp.vcf")).unwrap();
+        decorate_quantified_record(&mut cleaned, "xcmp", false, true, true);
+        assert_eq!(
+            cleaned.info,
+            "BS=3;Regions=CONF;XCMP=TP:match:gt_het:gt_het:simple:match;VTC=nuc__s,al__s,het__rs"
+        );
+
+        let mut preserved = RawVcfRecord::from_line(source, Path::new("xcmp.vcf")).unwrap();
+        decorate_quantified_record(&mut preserved, "xcmp", true, false, true);
+        assert!(preserved.info.contains("CUSTOM=kept"));
+        assert!(preserved.info.contains("type=TP"));
+    }
+
+    #[test]
+    fn adjusted_confidence_padding_uses_truth_records_inside_raw_confidence() {
+        let truth = vec![
+            RawVcfRecord::from_line(
+                "chr1\t3\t.\tA\tAT\t50\tPASS\t.\tGT\t0/1",
+                Path::new("truth.vcf"),
+            )
+            .unwrap(),
+        ];
+        let confidence = [vcf::BedInterval {
+            chrom: "chr1".to_string(),
+            start: 2,
+            end: 3,
+        }];
+
+        let padding = truth_confidence_padding(&truth, &confidence);
+
+        assert_eq!(padding.len(), 1);
+        assert_eq!(padding[0].chrom, "chr1");
+        assert_eq!((padding[0].start, padding[0].end), (2, 4));
+    }
+
+    #[test]
+    fn confidence_region_precedes_existing_containment_tag() {
+        let mut record = RawVcfRecord::from_line(
+            "chr1\t3\t.\tA\tG\t50\tPASS\tBS=3;Regions=TS_contained\tGT:BD\t0/1:TP\t0/1:TP",
+            Path::new("rtg.vcf"),
+        )
+        .unwrap();
+        let confidence = [vcf::BedInterval {
+            chrom: "chr1".to_string(),
+            start: 2,
+            end: 4,
+        }];
+
+        annotate_regions(&mut record, Some(&confidence), &RegionMap::new(), true);
+
+        assert!(record.info.contains("Regions=CONF,TS_contained"));
+    }
+
+    #[test]
+    fn region_updates_stay_before_preserved_extent_metadata() {
+        let mut info = "BS=5;RegionsExtent=5-5;Regions=EXTRA".to_string();
+
+        merge_region_tags(&mut info, &["CONF".to_string()]);
+
+        assert_eq!(info, "BS=5;Regions=EXTRA,CONF;RegionsExtent=5-5");
+    }
+
+    #[test]
+    fn partial_custom_stratification_overlap_marks_the_superlocus_boundary() {
+        let mut record = RawVcfRecord::from_line(
+            "chr1\t8\t.\tTACG\tT\t50\tPASS\tBS=5;Regions=CONF,TS_contained\tGT:BD\t0/1:TP\t0/1:TP",
+            Path::new("xcmp.vcf"),
+        )
+        .unwrap();
+        let mut stratifications = RegionMap::new();
+        stratifications.insert(
+            "EXTRA".to_string(),
+            vec![
+                vcf::BedInterval {
+                    chrom: "chr1".to_string(),
+                    start: 0,
+                    end: 7,
+                },
+                vcf::BedInterval {
+                    chrom: "chr1".to_string(),
+                    start: 9,
+                    end: 100,
+                },
+            ],
+        );
+        let confidence = stratifications["EXTRA"].clone();
+
+        annotate_regions(&mut record, Some(&confidence), &stratifications, false);
+
+        assert!(has_region(&record.info, "EXTRA"));
+        assert!(has_region(&record.info, "TS_boundary"));
+        propagate_superlocus_annotations(std::slice::from_mut(&mut record), "ga4gh");
+        assert!(has_region(&record.info, "CONF"));
+        assert!(has_region(&record.info, "EXTRA"));
+        assert!(has_region(&record.info, "TS_boundary"));
+        assert!(has_region(&record.info, "TS_contained"));
+    }
+
+    #[test]
     fn insertion_requires_both_reference_anchors_in_confidence() {
         let mut record = RawVcfRecord::from_line(
             "chr1\t3\t.\tA\tATC\t50\tPASS\t.\tGT:BD\t0/1:TP\t0/1:TP",
@@ -2208,28 +2910,31 @@ mod tests {
         let mut counts = QuantifyCountMaps::default();
         counts.by_type.insert(
             "SNP".to_string(),
-            TypeCounts {
-                truth_total: CountsBucket {
-                    total: 10,
-                    ti: 7,
-                    tv: 3,
-                    ..CountsBucket::default()
+            QuantifyTypeCounts {
+                counts: TypeCounts {
+                    truth_total: CountsBucket {
+                        total: 10,
+                        ti: 7,
+                        tv: 3,
+                        ..CountsBucket::default()
+                    },
+                    truth_tp: CountsBucket {
+                        total: 6,
+                        ti: 4,
+                        tv: 2,
+                        ..CountsBucket::default()
+                    },
+                    // Explicit FN classification alone misses truth TPs whose
+                    // paired query failed FILTER.
+                    truth_fn: CountsBucket {
+                        total: 2,
+                        ti: 1,
+                        tv: 1,
+                        ..CountsBucket::default()
+                    },
+                    ..TypeCounts::default()
                 },
-                truth_tp: CountsBucket {
-                    total: 6,
-                    ti: 4,
-                    tv: 2,
-                    ..CountsBucket::default()
-                },
-                // Explicit FN classification alone misses truth TPs whose
-                // paired query failed FILTER.
-                truth_fn: CountsBucket {
-                    total: 2,
-                    ti: 1,
-                    tv: 1,
-                    ..CountsBucket::default()
-                },
-                ..TypeCounts::default()
+                ..QuantifyTypeCounts::default()
             },
         );
 
@@ -2277,6 +2982,28 @@ mod tests {
             Some(".")
         );
         assert_eq!(records[1].filter, "LowQual");
+    }
+
+    #[test]
+    fn ga4gh_superlocus_does_not_propagate_nan_query_quality_to_truth() {
+        let mut records = vec![
+            RawVcfRecord::from_line(
+                "chr1\t2\t.\tA\tG\t50\tPASS\tBS=9;Regions=CONF\tGT:BD:BK:BI:BVT:BLT:QQ\t0/1:TP:gm:ti:SNP:het:.\t0/1:TP:gm:ti:SNP:het:nan",
+                Path::new("rtg.vcf"),
+            )
+            .unwrap(),
+        ];
+
+        propagate_superlocus_annotations(&mut records, "ga4gh");
+
+        assert_eq!(
+            records[0].sample_map(0).get("QQ").map(String::as_str),
+            Some(".")
+        );
+        assert_eq!(
+            records[0].sample_map(1).get("QQ").map(String::as_str),
+            Some("nan")
+        );
     }
 
     #[test]
@@ -2422,6 +3149,15 @@ mod tests {
             fields[5] == "SCORE" && fields[6] == "10.000000"
         }));
         assert!(root.join("result.roc.Locations.SNP.SEL.csv.gz").exists());
+        let extended = fs::read_to_string(root.join("result.extended.csv")).unwrap();
+        let mut extended_lines = extended.lines();
+        assert!(
+            extended_lines
+                .next()
+                .unwrap()
+                .ends_with("METRIC.Frac_NA.Lower,METRIC.Frac_NA.Upper")
+        );
+        assert!(extended_lines.all(|line| line.split(',').nth(5) == Some("SCORE")));
         let metrics = read_gzip(&root.join("result.metrics.json.gz"));
         assert!(metrics.contains("\"id\":\"roc.Locations.SNP.SEL\""));
         fs::remove_dir_all(root).unwrap();
@@ -2514,6 +3250,32 @@ mod tests {
             );
         }
         assert!(!root.join("sample.summary.csv").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bcf_logfile_and_verbose_controls_publish_legacy_standalone_artifacts() {
+        let root = test_root("bcf-logfile");
+        let mut options = args(&root);
+        options.write_vcf = true;
+        options.bcf = true;
+        options.logfile = Some(root.join("qfy.log").display().to_string());
+        options.verbose = true;
+        options.do_roc = false;
+        run(options).unwrap();
+
+        assert!(root.join("result.bcf").is_file());
+        assert!(root.join("result.bcf.csi").is_file());
+        assert!(!root.join("result.vcf.gz").exists());
+        assert!(root.join("qfy.log").is_file());
+        let raw_roc = fs::read_to_string(root.join("result.roc.tsv")).unwrap();
+        let mut lines = raw_roc.lines();
+        let header = lines.next().unwrap();
+        assert!(header.starts_with("FP.al\tFP.gt\tFilter\tGenotype\tMETRIC.F1_Score"));
+        let columns = header.split('\t').collect::<Vec<_>>();
+        let qq = columns.iter().position(|column| *column == "QQ").unwrap();
+        assert!(lines.all(|line| line.split('\t').nth(qq) == Some("*")));
+        assert!(header.contains("QUERY.TOTAL.hetalt"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2686,5 +3448,95 @@ mod tests {
         )
         .unwrap();
         assert_eq!(effective_reference_range(&record), None);
+    }
+
+    #[test]
+    fn reference_range_stops_at_first_symbolic_alt() {
+        let parse = |alt: &str| {
+            RawVcfRecord::from_line(
+                &format!("chr1\t3\t.\tA\t{alt}\t40\tPASS\t.\tGT\t0/1"),
+                Path::new("mixed.vcf"),
+            )
+            .unwrap()
+        };
+
+        // A leading symbolic allele prevents the later insertion from being
+        // considered at all.
+        assert_eq!(effective_reference_range(&parse("<DEL>,AT")), None);
+        // A preceding nucleotide allele is retained, while nucleotide alleles
+        // after the symbolic one are ignored.
+        assert_eq!(
+            effective_reference_range(&parse("AT,<DEL>,AG")),
+            effective_reference_range(&parse("AT"))
+        );
+        assert_eq!(effective_reference_range(&parse("AT")), Some((3, 4, true)));
+    }
+
+    #[test]
+    fn missing_alt_is_processed_as_an_empty_allele() {
+        let parse = |alt: &str| {
+            RawVcfRecord::from_line(
+                &format!("chr1\t3\t.\tAT\t{alt}\t40\tPASS\t.\tGT\t0/1"),
+                Path::new("missing.vcf"),
+            )
+            .unwrap()
+        };
+
+        let reference_span = Some((3, 4, false));
+        assert_eq!(effective_reference_range(&parse(".")), reference_span);
+        assert_eq!(effective_reference_range(&parse("")), reference_span);
+        // Missing is retained before the symbolic ALT terminates processing;
+        // the later nucleotide ALT cannot narrow that reference span.
+        assert_eq!(
+            effective_reference_range(&parse(".,<DEL>,A")),
+            reference_span
+        );
+    }
+
+    #[test]
+    fn named_subset_report_sizes_distinguish_boundary_and_confidence_intersection() {
+        let stratification_sizes = BTreeMap::from([("EXTRA".to_string(), 138)]);
+        let stratification_confidence_sizes = BTreeMap::from([("EXTRA".to_string(), 138)]);
+
+        assert_eq!(
+            named_subset_report_sizes(
+                "TS_boundary",
+                100,
+                140,
+                Some(141),
+                &stratification_sizes,
+                &stratification_confidence_sizes,
+            ),
+            (140, Some(141))
+        );
+        assert_eq!(
+            named_subset_report_sizes(
+                "EXTRA",
+                100,
+                140,
+                Some(141),
+                &stratification_sizes,
+                &stratification_confidence_sizes,
+            ),
+            (138, Some(138))
+        );
+    }
+
+    #[test]
+    fn confidence_intersection_uses_unique_interval_union() {
+        let interval = |chrom: &str, start, end| vcf::BedInterval {
+            chrom: chrom.to_string(),
+            start,
+            end,
+        };
+        let subset = vec![interval("chr1", 0, 98), interval("chrX", 0, 40)];
+        let confidence = vec![
+            interval("chr1", 0, 98),
+            interval("chrX", 0, 40),
+            interval("chr1", 1, 4),
+        ];
+
+        assert_eq!(region_size(&confidence), 141);
+        assert_eq!(region_intersection_size(&subset, &confidence), 138);
     }
 }

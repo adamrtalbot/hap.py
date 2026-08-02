@@ -78,13 +78,7 @@ impl Drop for ScratchRun {
 }
 
 pub fn run(args: FtxArgs) -> Result<()> {
-    let label = args.label.clone().unwrap_or_else(|| {
-        Path::new(&args.input)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
+    let label = legacy_feature_label(&args.input, args.label.as_deref());
 
     // Legacy passes the reference only to `bcftools norm`; ordinary feature
     // extraction never opens or validates it. Preserve that lazy behavior so
@@ -135,6 +129,19 @@ pub fn run(args: FtxArgs) -> Result<()> {
 
     scratch.cleanup()?;
     Ok(())
+}
+
+fn legacy_feature_label(input: &str, label: Option<&str>) -> String {
+    label
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            Path::new(input)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
 }
 
 /// Emit a feature table from records already filtered by the caller.
@@ -513,6 +520,23 @@ mod tests {
 
         assert!(!first_path.exists());
         assert!(!second_path.exists());
+    }
+
+    #[test]
+    fn empty_feature_label_falls_back_to_input_basename() {
+        assert_eq!(
+            legacy_feature_label("fixtures/options.vcf", None),
+            "options.vcf"
+        );
+        assert_eq!(
+            legacy_feature_label("fixtures/options.vcf", Some("")),
+            "options.vcf"
+        );
+        assert_eq!(
+            legacy_feature_label("fixtures/options.vcf", Some(" ")),
+            " ",
+            "non-empty labels remain truthy in Python"
+        );
     }
 
     #[test]

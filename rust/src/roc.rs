@@ -17,14 +17,14 @@
 use crate::compare::{AnnotatedRow, suffixed_report_path};
 use crate::report::{
     CountsBucket, EXTENDED_HEADER, append_stats, f1_score, format_count, het_hom_ratio,
-    metric_ratio, ti_tv_ratio,
+    metric_ratio, python_repr_float, ti_tv_ratio,
 };
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::io::Write;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 const INDEL_SUBTYPES: [&str; 9] = [
@@ -46,6 +46,20 @@ pub struct RocOptions {
     pub roc_regions: HashSet<String>,
     pub delta: f64,
     pub ci_alpha: f64,
+    /// Preserve qfy's private C++ quantifier table. Legacy qfy removes this
+    /// intermediate unless `--verbose` is active.
+    pub preserve_raw_table: bool,
+    /// Include threshold rows in the private table. This follows qfy's
+    /// `--roc`/`--no-roc` switch independently of the public compacting pass.
+    pub output_rocs: bool,
+    /// Full N-trimmed FASTA size used by the legacy TS_boundary lane.
+    /// `None` preserves the historical caller contract where `subset_size`
+    /// is also the complete reference size.
+    pub whole_reference_size: Option<usize>,
+    /// Per-user-named stratification interval-union sizes.
+    pub subset_sizes: BTreeMap<String, usize>,
+    /// Per-named-subset intersection with the confidence regions.
+    pub subset_confidence_sizes: BTreeMap<String, usize>,
 }
 
 impl Default for RocOptions {
@@ -56,6 +70,11 @@ impl Default for RocOptions {
             roc_regions: HashSet::from(["*".to_string()]),
             delta: 0.5,
             ci_alpha: 0.0,
+            preserve_raw_table: false,
+            output_rocs: true,
+            whole_reference_size: None,
+            subset_sizes: BTreeMap::new(),
+            subset_confidence_sizes: BTreeMap::new(),
         }
     }
 }
@@ -92,6 +111,10 @@ pub fn write_roc_files_with_options(
     }
     let groups = accumulate_with_options(rows, options);
 
+    if options.preserve_raw_table {
+        write_legacy_roc_table(prefix, &groups, subset_size, conf_size, options)?;
+    }
+
     // Compute per-subtype star_sorted snapshots ONCE (heavy operation: up to
     // 10×4 sorts × full obs vector clone for INDEL groups). Pass by reference
     // to render_rows so the cost isn't paid 5 times.
@@ -100,7 +123,10 @@ pub fn write_roc_files_with_options(
     let header = roc_header(options.ci_alpha);
     let render_config = RenderConfig {
         subset_size,
+        whole_reference_size: options.whole_reference_size.unwrap_or(subset_size),
         conf_size,
+        subset_sizes: &options.subset_sizes,
+        subset_confidence_sizes: &options.subset_confidence_sizes,
         delta: options.delta,
         ci_alpha: options.ci_alpha,
         filter_counts_only: options.roc_regions.contains("*"),
@@ -222,8 +248,13 @@ fn build_metric_indices(
     delta: f64,
 ) -> MetricIndices {
     let mut rocs = BTreeMap::<String, (&RowKey, &GroupAccum)>::new();
+    let active_types = groups
+        .iter()
+        .filter(|(_, accum)| !accum.obs.is_empty())
+        .map(|(key, _)| key.ty.as_str())
+        .collect::<HashSet<_>>();
     for (key, accum) in groups {
-        if key.subtype != "*" {
+        if key.subtype != "*" || !active_types.contains(key.ty.as_str()) {
             continue;
         }
         let name = if key.subset != "*" {
@@ -468,7 +499,7 @@ impl LegacyUnorderedRows {
             self.rehash(next_legacy_bucket(self.bucket_count, self.seen.len() + 1));
         }
         self.seen.insert(key.clone());
-        let bucket = legacy_string_hash(&key) as usize % self.bucket_count;
+        let bucket = (legacy_string_hash(&key) % self.bucket_count as u64) as usize;
         if let Some(entries) = self.buckets.get_mut(&bucket) {
             entries.push_front(key);
         } else {
@@ -483,7 +514,7 @@ impl LegacyUnorderedRows {
         self.buckets.clear();
         self.bucket_order.clear();
         for key in old {
-            let bucket = legacy_string_hash(&key) as usize % bucket_count;
+            let bucket = (legacy_string_hash(&key) % bucket_count as u64) as usize;
             if let Some(entries) = self.buckets.get_mut(&bucket) {
                 entries.push_front(key);
             } else {
@@ -546,6 +577,371 @@ fn legacy_string_hash(value: &str) -> u64 {
     hash ^= hash >> SHIFT;
     hash = hash.wrapping_mul(MULTIPLIER);
     hash ^ (hash >> SHIFT)
+}
+
+/// The tab-separated table emitted by the legacy C++ quantifier before
+/// happyroc turns it into the public CSV reports. qfy normally unlinks this
+/// intermediate; `--verbose` deliberately leaves it behind.
+#[derive(Default)]
+struct LegacyRawTable {
+    order: LegacyUnorderedRows,
+    rows: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl LegacyRawTable {
+    fn set(&mut self, row: &str, column: &str, value: String, has_type: bool) {
+        self.order.set(row.to_string(), has_type);
+        self.rows
+            .entry(row.to_string())
+            .or_default()
+            .insert(column.to_string(), value);
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        let retained = self.order.retained_order();
+        let columns = retained
+            .iter()
+            .filter_map(|key| self.rows.get(key))
+            .flat_map(|row| row.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        let mut writer = BufWriter::new(
+            std::fs::File::create(path)
+                .with_context(|| format!("failed to create {}", path.display()))?,
+        );
+        writeln!(
+            writer,
+            "{}",
+            columns.iter().cloned().collect::<Vec<_>>().join("\t")
+        )?;
+        for key in retained {
+            let row = &self.rows[&key];
+            writeln!(
+                writer,
+                "{}",
+                columns
+                    .iter()
+                    .map(|column| row.get(column).map(String::as_str).unwrap_or("."))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn write_legacy_roc_table(
+    prefix: &Path,
+    groups: &BTreeMap<RowKey, GroupAccum>,
+    subset_size: usize,
+    conf_size: usize,
+    options: &RocOptions,
+) -> Result<()> {
+    // ROCOutput iterates a std::map keyed by its internal ROC name, not by
+    // the final report axes. Recreate those names so insertion/rehash order
+    // in LegacyUnorderedRows is byte-identical to libstdc++.
+    let mut rocs = BTreeMap::<String, (&RowKey, &GroupAccum)>::new();
+    for (key, accum) in groups {
+        if key.subtype != "*" {
+            continue;
+        }
+        let name = if key.subset != "*" {
+            format!("s|{}:{}:{}", key.subset, key.ty, key.filter)
+        } else if is_aggregate_filter(&key.filter) {
+            format!("a:{}:{}", key.ty, key.filter)
+        } else {
+            format!("f:{}:{}", key.ty, key.filter)
+        };
+        rocs.insert(name, (key, accum));
+    }
+
+    let mut table = LegacyRawTable::default();
+    for (_, (key, accum)) in rocs {
+        let subtypes: &[&str] = if key.ty == "SNP" {
+            &["*", "ti", "tv"]
+        } else {
+            &[
+                "*", "I1_5", "I6_15", "I16_PLUS", "D1_5", "D6_15", "D16_PLUS", "C1_5", "C6_15",
+                "C16_PLUS",
+            ]
+        };
+        let counts_only =
+            !is_aggregate_filter(&key.filter) && options.roc_regions.contains(key.subset.as_str());
+        // getLevels sorts the shared observation vector in-place on every
+        // subtype/genotype call. Preserve that progressive tied-level order.
+        let mut sorted_obs = accum.obs.clone();
+        for subtype in subtypes {
+            for genotype in ["het", "hetalt", "homalt", "*"] {
+                let totals = legacy_totals(&accum.obs, subtype, genotype);
+                add_legacy_level(
+                    &mut table,
+                    key,
+                    subtype,
+                    genotype,
+                    "*",
+                    &totals,
+                    counts_only,
+                    subset_size,
+                    options.whole_reference_size.unwrap_or(subset_size),
+                    conf_size,
+                    &options.subset_sizes,
+                    &options.subset_confidence_sizes,
+                );
+                if !counts_only && options.output_rocs {
+                    introsort_libstdcpp(&mut sorted_obs);
+                    for (qq, level) in legacy_levels(&sorted_obs, subtype, genotype, options.delta)
+                    {
+                        add_legacy_level(
+                            &mut table,
+                            key,
+                            subtype,
+                            genotype,
+                            &qq,
+                            &level,
+                            false,
+                            subset_size,
+                            options.whole_reference_size.unwrap_or(subset_size),
+                            conf_size,
+                            &options.subset_sizes,
+                            &options.subset_confidence_sizes,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    table.write(&suffixed_report_path(prefix, "roc.tsv"))
+}
+
+fn legacy_obs_matches(record: &ObsRecord, subtype: &str, genotype: &str) -> bool {
+    let subtype_matches = match subtype {
+        "*" => true,
+        "ti" => record.ti_flag,
+        "tv" => record.tv_flag,
+        value => record.subtypes.iter().any(|candidate| candidate == value),
+    };
+    subtype_matches && (genotype == "*" || record.blt.as_deref() == Some(genotype))
+}
+
+fn legacy_totals(obs: &[ObsRecord], subtype: &str, genotype: &str) -> Cumul {
+    let mut totals = Cumul::default();
+    for record in obs
+        .iter()
+        .filter(|record| legacy_obs_matches(record, subtype, genotype))
+    {
+        totals.add(&record.counts);
+    }
+    totals
+}
+
+fn legacy_levels(
+    sorted_obs: &[ObsRecord],
+    subtype: &str,
+    genotype: &str,
+    delta: f64,
+) -> Vec<(String, Cumul)> {
+    let mut running = Cumul::default();
+    let mut prefixes = Vec::new();
+    for record in sorted_obs
+        .iter()
+        .filter(|record| legacy_obs_matches(record, subtype, genotype))
+    {
+        running.add(&record.counts);
+        prefixes.push((record.level, running.clone()));
+    }
+    let Some((_, final_counts)) = prefixes.last().cloned() else {
+        return Vec::new();
+    };
+    let mut candidates = prefixes
+        .into_iter()
+        .map(|(level, below)| {
+            let above = Cumul {
+                truth_tp: sub_buckets(&final_counts.truth_tp, &below.truth_tp),
+                truth_fn: add_buckets_total(&final_counts.truth_fn, &below.truth_tp),
+                query_tp: sub_buckets(&final_counts.query_tp, &below.query_tp),
+                query_fp: sub_buckets(&final_counts.query_fp, &below.query_fp),
+                query_unk: sub_buckets(&final_counts.query_unk, &below.query_unk),
+                fp_gt: final_counts.fp_gt.saturating_sub(below.fp_gt),
+                fp_al: final_counts.fp_al.saturating_sub(below.fp_al),
+            };
+            (level, above)
+        })
+        .collect::<Vec<_>>();
+    let first = candidates[0].0;
+    let mut previous = first;
+    let mut is_first = true;
+    candidates.retain(|(level, _)| {
+        let keep = if delta < f64::EPSILON {
+            format!("{level:.6}") != format!("{previous:.6}")
+        } else if is_first {
+            is_first = false;
+            true
+        } else {
+            (*level - previous).abs() > delta
+        };
+        if keep {
+            previous = *level;
+        }
+        keep
+    });
+    candidates
+        .into_iter()
+        .map(|(level, counts)| (format!("{level:.6}"), counts))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_legacy_level(
+    table: &mut LegacyRawTable,
+    key: &RowKey,
+    subtype: &str,
+    genotype: &str,
+    qq: &str,
+    counts: &Cumul,
+    counts_only: bool,
+    subset_size: usize,
+    whole_reference_size: usize,
+    conf_size: usize,
+    subset_sizes: &BTreeMap<String, usize>,
+    subset_confidence_sizes: &BTreeMap<String, usize>,
+) {
+    let is_baseline = qq == "*";
+    let row_key = if is_baseline || genotype == "*" {
+        legacy_row_key(&key.ty, subtype, &key.filter, &key.subset, qq)
+    } else {
+        // Retain ROCOutput.cpp's historical extra-tab bug. These rows are
+        // later dropped for lacking Type, but can trigger a table rehash.
+        format!(
+            "{}\t{}\t*\t\t{}\t{}\t{}",
+            key.ty, subtype, key.filter, key.subset, qq
+        )
+    };
+
+    if !matches!(subtype, "ti" | "tv") && genotype == "*" {
+        table.set(&row_key, "QQ", qq.to_string(), true);
+        for (column, value) in [
+            ("Type", key.ty.as_str()),
+            ("Subtype", subtype),
+            ("Genotype", genotype),
+            ("Subset", key.subset.as_str()),
+            ("Filter", key.filter.as_str()),
+            ("QQ.Field", key.qq_field.as_str()),
+        ] {
+            table.set(&row_key, column, value.to_string(), true);
+        }
+        for (column, value) in legacy_primary_counts(counts, counts_only) {
+            table.set(&row_key, column, value, true);
+        }
+        let (size, conf) = subset_size_cells(
+            &key.subset,
+            subtype,
+            subset_size,
+            whole_reference_size,
+            conf_size,
+            subset_sizes,
+            subset_confidence_sizes,
+        );
+        table.set(&row_key, "Subset.Size", legacy_count_string(&size), true);
+        table.set(
+            &row_key,
+            "Subset.IS_CONF.Size",
+            legacy_count_string(&conf),
+            true,
+        );
+        table.set(&row_key, "Subset.Level", "0.000000".to_string(), true);
+    } else if genotype == "*" && matches!(subtype, "ti" | "tv") {
+        let aggregate = legacy_row_key(&key.ty, "*", &key.filter, &key.subset, qq);
+        for (metric, count) in legacy_count_buckets(counts, counts_only) {
+            table.set(
+                &aggregate,
+                &format!("{metric}.{subtype}"),
+                legacy_usize(count),
+                false,
+            );
+        }
+    } else if genotype != "*" && !matches!(subtype, "ti" | "tv") {
+        for (metric, count) in legacy_count_buckets(counts, counts_only) {
+            table.set(
+                &row_key,
+                &format!("{metric}.{genotype}"),
+                legacy_usize(count),
+                false,
+            );
+        }
+    }
+}
+
+fn legacy_count_buckets(counts: &Cumul, counts_only: bool) -> Vec<(&'static str, usize)> {
+    let mut values = vec![
+        ("TRUTH.TP", counts.truth_tp.total),
+        ("QUERY.TP", counts.query_tp.total),
+        ("QUERY.FP", counts.query_fp.total),
+        ("QUERY.UNK", counts.query_unk.total),
+    ];
+    if !counts_only {
+        values.extend([
+            ("TRUTH.FN", counts.truth_fn.total),
+            ("TRUTH.TOTAL", counts.truth_total().total),
+            ("QUERY.TOTAL", counts.query_total().total),
+        ]);
+    }
+    values
+}
+
+fn legacy_primary_counts(counts: &Cumul, counts_only: bool) -> Vec<(&'static str, String)> {
+    let mut values = legacy_count_buckets(counts, counts_only)
+        .into_iter()
+        .map(|(column, value)| (column, legacy_usize(value)))
+        .collect::<Vec<_>>();
+    values.extend([
+        ("FP.al", legacy_usize(counts.fp_al)),
+        ("FP.gt", legacy_usize(counts.fp_gt)),
+    ]);
+    if !counts_only {
+        let truth_total = counts.truth_total().total;
+        let query_total = counts.query_total().total;
+        let recall = if truth_total == 0 {
+            0.0
+        } else {
+            counts.truth_tp.total as f64 / truth_total as f64
+        };
+        let precision = if query_total == 0 {
+            0.0
+        } else {
+            counts.query_tp.total as f64 / (counts.query_tp.total + counts.query_fp.total) as f64
+        };
+        let frac_na = if query_total == 0 {
+            0.0
+        } else {
+            counts.query_unk.total as f64 / query_total as f64
+        };
+        let f1 = 2.0 * precision * recall / (precision + recall);
+        values.extend([
+            ("METRIC.Recall", legacy_f64(recall)),
+            ("METRIC.Precision", legacy_f64(precision)),
+            ("METRIC.F1_Score", legacy_f64(f1)),
+            ("METRIC.Frac_NA", legacy_f64(frac_na)),
+        ]);
+    }
+    values
+}
+
+fn legacy_usize(value: usize) -> String {
+    format!("{:.6}", value as f64)
+}
+
+fn legacy_count_string(value: &str) -> String {
+    value
+        .parse::<f64>()
+        .map(legacy_f64)
+        .unwrap_or_else(|_| "0.000000".to_string())
+}
+
+fn legacy_f64(value: f64) -> String {
+    if value.is_nan() {
+        "-nan".to_string()
+    } else {
+        format!("{value:.6}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,7 +1640,7 @@ fn lg_floor(n: usize) -> usize {
     if n <= 1 {
         0
     } else {
-        (usize::BITS - 1 - (n as u64).leading_zeros()) as usize
+        (usize::BITS - 1 - n.leading_zeros()) as usize
     }
 }
 
@@ -1930,7 +2326,7 @@ fn extract_subsets(info: &str) -> Vec<String> {
         // against future INFO tags after Regions= by stopping at ';').
         let tag_str = tail.split(';').next().unwrap_or("");
         for tag in tag_str.split(',') {
-            if tag == "TS_boundary" || tag == "TS_contained" {
+            if !tag.is_empty() && tag != "CONF" && !out.iter().any(|value| value == tag) {
                 out.push(tag.to_string());
             }
         }
@@ -1953,9 +2349,12 @@ enum RowFilter<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RenderConfig {
+struct RenderConfig<'a> {
     subset_size: usize,
+    whole_reference_size: usize,
     conf_size: usize,
+    subset_sizes: &'a BTreeMap<String, usize>,
+    subset_confidence_sizes: &'a BTreeMap<String, usize>,
     delta: f64,
     ci_alpha: f64,
     filter_counts_only: bool,
@@ -1983,7 +2382,7 @@ fn build_star_sorted(
     let mut star_sorted: BTreeMap<(String, String, String, String), Vec<ObsRecord>> =
         BTreeMap::new();
     for (key, accum) in groups {
-        if key.subtype == "*" && key.genotype == "*" && key.qq_field == "QUAL" {
+        if key.subtype == "*" && key.genotype == "*" {
             let max_count = match key.ty.as_str() {
                 "SNP" => 12,
                 "INDEL" => 40,
@@ -2033,7 +2432,7 @@ fn render_rows(
     groups: &BTreeMap<RowKey, GroupAccum>,
     star_sorted: &BTreeMap<(String, String, String, String), Vec<ObsRecord>>,
     row_filter: RowFilter<'_>,
-    config: RenderConfig,
+    config: RenderConfig<'_>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     // `accumulate` pre-seeds empty subtype buckets for types that are present,
@@ -2091,7 +2490,10 @@ fn render_rows(
                 key,
                 &emitted,
                 config.subset_size,
+                config.whole_reference_size,
                 config.conf_size,
+                config.subset_sizes,
+                config.subset_confidence_sizes,
                 is_filter_tier && config.filter_counts_only,
                 config.ci_alpha,
             ));
@@ -2100,11 +2502,15 @@ fn render_rows(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     key: &RowKey,
     emitted: &EmittedRow,
     subset_size: usize,
+    whole_reference_size: usize,
     conf_size: usize,
+    subset_sizes: &BTreeMap<String, usize>,
+    subset_confidence_sizes: &BTreeMap<String, usize>,
     counts_only: bool,
     ci_alpha: f64,
 ) -> String {
@@ -2172,7 +2578,15 @@ fn render_row(
 
     // Subset.Size / Subset.IS_CONF.Size / Subset.Level — match the per-row
     // convention of write_extended exactly.
-    let (sz, conf) = subset_size_cells(&key.subset, &key.subtype, subset_size, conf_size);
+    let (sz, conf) = subset_size_cells(
+        &key.subset,
+        &key.subtype,
+        subset_size,
+        whole_reference_size,
+        conf_size,
+        subset_sizes,
+        subset_confidence_sizes,
+    );
     row.push(sz);
     row.push(conf);
     row.push("0.000000".to_string());
@@ -2239,29 +2653,41 @@ fn render_row(
     }
 
     if ci_alpha > 0.0 {
-        for (successes, trials) in [
+        let observations = [
             (counts.truth_tp.total, truth_total.total),
             (
                 counts.query_tp.total,
                 counts.query_tp.total + counts.query_fp.total,
             ),
-            (counts.query_unk.total, query_total.total),
-        ] {
-            let (lower, upper) = jeffreys_interval(successes, trials, ci_alpha);
-            row.push(format_ci(lower));
-            row.push(format_ci(upper));
-        }
+            if is_filter_tier {
+                // Filter-tier projection zeroes QUERY.TOTAL before the
+                // unknown-fraction CI is calculated. Recall and precision
+                // still use the retained TP/FN/FP counts above.
+                (0, 0)
+            } else {
+                (counts.query_unk.total, query_total.total)
+            },
+        ];
+        append_ci_cells(&mut row, observations, ci_alpha);
     }
 
     row.join(",")
 }
 
-fn format_ci(value: f64) -> String {
-    if value == 0.0 || value == 1.0 {
-        format!("{value:.1}")
-    } else {
-        value.to_string()
+pub(crate) fn append_ci_cells(
+    row: &mut Vec<String>,
+    observations: [(usize, usize); 3],
+    alpha: f64,
+) {
+    for (successes, trials) in observations {
+        let (lower, upper) = jeffreys_interval(successes, trials, alpha);
+        row.push(format_ci(lower));
+        row.push(format_ci(upper));
     }
+}
+
+fn format_ci(value: f64) -> String {
+    python_repr_float(value)
 }
 
 /// Modified Jeffreys interval used by legacy Tools/ci.py.
@@ -2270,123 +2696,20 @@ fn jeffreys_interval(x: usize, n: usize, alpha: f64) -> (f64, f64) {
         return (0.0, 1.0);
     }
     let lower = if x == n {
-        (alpha / 2.0).powf(1.0 / n as f64)
+        crate::cephes::legacy_pow(alpha / 2.0, 1.0 / n as f64)
     } else if x <= 1 {
         0.0
     } else {
-        inverse_regularized_beta(alpha / 2.0, x as f64 + 0.5, (n - x) as f64 + 0.5)
+        crate::cephes::incbi(x as f64 + 0.5, (n - x) as f64 + 0.5, alpha / 2.0)
     };
     let upper = if x == 0 {
-        1.0 - (alpha / 2.0).powf(1.0 / n as f64)
+        1.0 - crate::cephes::legacy_pow(alpha / 2.0, 1.0 / n as f64)
     } else if x >= n - 1 {
         1.0
     } else {
-        inverse_regularized_beta(1.0 - alpha / 2.0, x as f64 + 0.5, (n - x) as f64 + 0.5)
+        crate::cephes::incbi(x as f64 + 0.5, (n - x) as f64 + 0.5, 1.0 - alpha / 2.0)
     };
     (lower.max(0.0), upper.min(1.0))
-}
-
-fn inverse_regularized_beta(probability: f64, a: f64, b: f64) -> f64 {
-    let mut low = 0.0;
-    let mut high = 1.0;
-    for _ in 0..80 {
-        let middle = (low + high) / 2.0;
-        if regularized_beta(middle, a, b) < probability {
-            low = middle;
-        } else {
-            high = middle;
-        }
-    }
-    (low + high) / 2.0
-}
-
-fn regularized_beta(x: f64, a: f64, b: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    if x >= 1.0 {
-        return 1.0;
-    }
-    let front =
-        (log_gamma(a + b) - log_gamma(a) - log_gamma(b) + a * x.ln() + b * (-x).ln_1p()).exp();
-    if x < (a + 1.0) / (a + b + 2.0) {
-        front * beta_continued_fraction(x, a, b) / a
-    } else {
-        1.0 - front * beta_continued_fraction(1.0 - x, b, a) / b
-    }
-}
-
-fn beta_continued_fraction(x: f64, a: f64, b: f64) -> f64 {
-    const EPSILON: f64 = 3.0e-14;
-    const FLOOR: f64 = 1.0e-300;
-    let qab = a + b;
-    let qap = a + 1.0;
-    let qam = a - 1.0;
-    let mut c = 1.0;
-    let mut d = 1.0 - qab * x / qap;
-    if d.abs() < FLOOR {
-        d = FLOOR;
-    }
-    d = 1.0 / d;
-    let mut result = d;
-    for m in 1..=200 {
-        let m = m as f64;
-        let m2 = 2.0 * m;
-        let mut aa = m * (b - m) * x / ((qam + m2) * (a + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < FLOOR {
-            d = FLOOR;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < FLOOR {
-            c = FLOOR;
-        }
-        d = 1.0 / d;
-        result *= d * c;
-
-        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < FLOOR {
-            d = FLOOR;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < FLOOR {
-            c = FLOOR;
-        }
-        d = 1.0 / d;
-        let delta = d * c;
-        result *= delta;
-        if (delta - 1.0).abs() < EPSILON {
-            break;
-        }
-    }
-    result
-}
-
-fn log_gamma(value: f64) -> f64 {
-    const COEFFICIENTS: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    if value < 0.5 {
-        return std::f64::consts::PI.ln()
-            - (std::f64::consts::PI * value).sin().ln()
-            - log_gamma(1.0 - value);
-    }
-    let z = value - 1.0;
-    let mut sum = COEFFICIENTS[0];
-    for (index, coefficient) in COEFFICIENTS.iter().enumerate().skip(1) {
-        sum += coefficient / (z + index as f64);
-    }
-    let t = z + 7.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + sum.ln()
 }
 
 fn emit_substat_cell(row: &mut Vec<String>, value: usize, kept: bool, supported: bool) {
@@ -2420,32 +2743,39 @@ fn append_roc_stats(row: &mut Vec<String>, bucket: &CountsBucket, supports_titv:
 
 fn subset_size_cells(
     subset: &str,
-    subtype: &str,
+    _subtype: &str,
     subset_size: usize,
+    whole_reference_size: usize,
     conf_size: usize,
+    subset_sizes: &BTreeMap<String, usize>,
+    subset_confidence_sizes: &BTreeMap<String, usize>,
 ) -> (String, String) {
     // Derived from the four branches in report::write_extended. Kept in
     // lockstep — if write_extended changes its Subset.Size/IS_CONF.Size
     // convention, this function must follow.
     let is_base_subset = subset == "*";
-    let is_base_subtype = subtype == "*";
     let size_cell = if is_base_subset {
         // Subset="*": always the raw subset_size integer, regardless of
         // subtype.
         subset_size.to_string()
     } else if subset == "TS_contained" {
         format_count(conf_size)
+    } else if subset == "TS_boundary" {
+        format_count(whole_reference_size)
     } else {
-        // TS_boundary
-        format_count(subset_size)
+        // User-named stratification.
+        format_count(subset_sizes.get(subset).copied().unwrap_or(0))
     };
-    // Legacy emits Subset.IS_CONF.Size as format_count(conf_size)
-    // on every row when conf_size > 0 — independent of subtype or
-    // subset selection. Empty cell only when conf_size==0.
-    let _ = is_base_subset;
-    let _ = is_base_subtype;
+    // The built-in confidence subsets carry the global confidence size.
+    // User-named subsets instead carry their interval-union intersection
+    // with the confidence regions. Empty cell only when confidence is absent.
     let conf_cell = if conf_size > 0 {
-        format_count(conf_size)
+        let size = if matches!(subset, "*" | "TS_boundary" | "TS_contained") {
+            conf_size
+        } else {
+            subset_confidence_sizes.get(subset).copied().unwrap_or(0)
+        };
+        format_count(size)
     } else {
         String::new()
     };
@@ -2505,6 +2835,16 @@ mod tests {
         let key = "SNP\t*\t*\tPASS\tTS_contained\t379.290009";
         assert_eq!(legacy_string_hash(key), 0x1dac_92aa_2553_6c1f);
         assert_eq!(legacy_string_hash(key) % 10_273, 5_747);
+    }
+
+    #[test]
+    fn introsort_depth_floor_uses_target_pointer_width() {
+        assert_eq!(lg_floor(0), 0);
+        assert_eq!(lg_floor(1), 0);
+        assert_eq!(lg_floor(2), 1);
+        assert_eq!(lg_floor(3), 1);
+        assert_eq!(lg_floor(16), 4);
+        assert_eq!(lg_floor(usize::MAX), usize::BITS as usize - 1);
     }
 
     #[allow(clippy::too_many_arguments)] // Keeps row fixtures legible at each call site.
@@ -2667,16 +3007,15 @@ mod tests {
 
     #[test]
     fn splits_contributions_across_axes_for_pass_snp_with_region() {
-        // One SNP PASS row in region=TS_contained → contributions to (ALL,
-        // PASS) × (*, TS_contained) × (Subtype="*" only, since SNP has no
-        // non-* subtype) = 4 keys.
+        // One SNP PASS row in built-in and named regions contributes to every
+        // non-CONF region axis.
         let rows = vec![annotated(
             "chr1",
             100,
             "42",
             "0/1:TP:gm:tv:SNP:het:42",
             "0/1:TP:gm:tv:SNP:het:42",
-            "CONF,TS_contained",
+            "CONF,TS_contained,EXTRA",
             true,
             None,
         )];
@@ -2697,6 +3036,8 @@ mod tests {
             ("*", "PASS", "*"),
             ("TS_contained", "ALL", "*"),
             ("TS_contained", "PASS", "*"),
+            ("EXTRA", "ALL", "*"),
+            ("EXTRA", "PASS", "*"),
         ]
         .into_iter()
         .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
@@ -2716,7 +3057,19 @@ mod tests {
             cum: Cumul::default(),
             substats: None,
         };
-        let rendered = render_row(&key, &emitted, 100, 50, false, 0.0);
+        let subset_confidence_sizes = BTreeMap::new();
+        let subset_sizes = BTreeMap::new();
+        let rendered = render_row(
+            &key,
+            &emitted,
+            100,
+            140,
+            50,
+            &subset_sizes,
+            &subset_confidence_sizes,
+            false,
+            0.0,
+        );
         let cells: Vec<&str> = rendered.split(',').collect();
         assert_eq!(cells.len(), 65, "expected 65 columns, got {}", cells.len());
         assert_eq!(cells[0], "INDEL");
@@ -2738,6 +3091,49 @@ mod tests {
         // Het/hom ratio: both zero → empty.
         let het_hom = het_hom_ratio(0, 0);
         assert_eq!(het_hom, "");
+    }
+
+    #[test]
+    fn subset_size_cells_use_boundary_reference_and_named_confidence_intersection() {
+        let subset_sizes = BTreeMap::from([("EXTRA".to_string(), 138)]);
+        let subset_confidence_sizes = BTreeMap::from([("EXTRA".to_string(), 138)]);
+
+        assert_eq!(
+            subset_size_cells(
+                "TS_boundary",
+                "*",
+                100,
+                140,
+                141,
+                &subset_sizes,
+                &subset_confidence_sizes,
+            ),
+            ("140.000000".to_string(), "141.000000".to_string())
+        );
+        assert_eq!(
+            subset_size_cells(
+                "EXTRA",
+                "*",
+                100,
+                140,
+                141,
+                &subset_sizes,
+                &subset_confidence_sizes,
+            ),
+            ("138.000000".to_string(), "138.000000".to_string())
+        );
+        assert_eq!(
+            subset_size_cells(
+                "*",
+                "*",
+                100,
+                140,
+                141,
+                &subset_sizes,
+                &subset_confidence_sizes,
+            ),
+            ("100".to_string(), "141.000000".to_string())
+        );
     }
 
     #[test]
@@ -3076,6 +3472,18 @@ mod tests {
             vec!["*", "10.000000", "10.400000"]
         );
         assert!(!groups[&key].numeric_buckets.contains_key("90.000000"));
+        let sorted = build_star_sorted(&groups);
+        for subtype in ["*", "ti", "tv"] {
+            assert!(
+                sorted.contains_key(&(
+                    "SNP".to_string(),
+                    subtype.to_string(),
+                    "*".to_string(),
+                    "ALL".to_string(),
+                )),
+                "custom ROC fields need the same subtype sort snapshots as QUAL"
+            );
+        }
     }
 
     #[test]
@@ -3132,7 +3540,10 @@ mod tests {
             RowFilter::All,
             RenderConfig {
                 subset_size: 100,
+                whole_reference_size: 100,
                 conf_size: 0,
+                subset_sizes: &BTreeMap::new(),
+                subset_confidence_sizes: &BTreeMap::new(),
                 delta: 0.5,
                 ci_alpha: 0.0,
                 filter_counts_only: options.roc_regions.contains("*"),
@@ -3156,5 +3567,76 @@ mod tests {
         let (lower, upper) = jeffreys_interval(5, 10, 0.05);
         assert!((lower - 0.223_528_670_252_705_2).abs() < 1e-12);
         assert!((upper - 0.776_471_329_747_294_7).abs() < 1e-12);
+        let (lower, upper) = jeffreys_interval(1037, 1156, 0.05);
+        assert_eq!(lower.to_bits(), 0x3fec_1d15_8e8d_75af);
+        assert_eq!(upper.to_bits(), 0x3fed_3c11_2b31_7194);
+
+        let (lower, _) = jeffreys_interval(1233, 1233, 0.05);
+        assert_eq!(lower.to_bits(), 0x3fef_e787_2242_48a7);
+        let (_, upper) = jeffreys_interval(0, 136, 0.05);
+        assert_eq!(upper.to_bits(), 0x3f9b_66db_9060_1320);
+    }
+
+    #[test]
+    fn confidence_interval_csv_uses_python_scientific_notation() {
+        assert_eq!(format_ci(5.280_579_842_943_484e-5), "5.280579842943484e-05");
+        assert_eq!(
+            format_ci(0.000_814_921_550_822_522_7),
+            "0.0008149215508225227"
+        );
+    }
+
+    #[test]
+    fn filter_tier_unknown_fraction_ci_uses_zero_query_total() {
+        let key = RowKey::new("SNP", "*", "*", "LowMQ");
+        let emitted = EmittedRow {
+            qq_str: "*".to_string(),
+            cum: Cumul {
+                truth_tp: CountsBucket {
+                    total: 2,
+                    ..CountsBucket::default()
+                },
+                query_tp: CountsBucket {
+                    total: 1,
+                    ..CountsBucket::default()
+                },
+                query_fp: CountsBucket {
+                    total: 3,
+                    ..CountsBucket::default()
+                },
+                query_unk: CountsBucket {
+                    total: 4,
+                    ..CountsBucket::default()
+                },
+                ..Cumul::default()
+            },
+            substats: None,
+        };
+
+        let subset_confidence_sizes = BTreeMap::new();
+        let subset_sizes = BTreeMap::new();
+        let rendered = render_row(
+            &key,
+            &emitted,
+            100,
+            140,
+            50,
+            &subset_sizes,
+            &subset_confidence_sizes,
+            true,
+            0.05,
+        );
+        let cells = rendered.split(',').collect::<Vec<_>>();
+        assert_eq!(
+            &cells[cells.len() - 6..],
+            [
+                "0.15811388300841897",
+                "1.0",
+                "0.0",
+                "0.7162483204365873",
+                "0.0",
+                "1.0",
+            ]
+        );
     }
 }

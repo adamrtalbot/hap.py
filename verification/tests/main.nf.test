@@ -20,6 +20,7 @@ nextflow_pipeline {
                 ftxpy_samplesheet = new File('assets/samplesheet.ftxpy.csv').canonicalPath
                 qfy_samplesheet = new File('assets/samplesheet.qfy.csv').canonicalPath
                 vcfcheck_samplesheet = new File('assets/samplesheet.vcfcheck.csv').canonicalPath
+                option_coverage = new File('assets/option-coverage.csv').canonicalPath
             }
         }
 
@@ -46,45 +47,75 @@ nextflow_pipeline {
             def parityFailures = []
             def checked = 0
 
-            selectedCases.each { caseName ->
-                if (!caseSamplesheets.containsKey(caseName)) {
-                    coverageFailures << "$caseName (selected case has no samplesheet contract)"
-                    return
-                }
+            def duplicateCases = selectedCases.groupBy { it }
+                .findAll { _case, occurrences -> occurrences.size() > 1 }
+                .keySet()
+                .sort()
+            if (!duplicateCases.isEmpty()) {
+                coverageFailures << "duplicate selected cases: ${duplicateCases.join(', ')}"
+            }
 
-                def samplesheet = new File(caseSamplesheets[caseName].toString())
+            // A focused HAP_TEST_CASES run may select a subset for local
+            // diagnosis. Without that explicit override, the release gate is
+            // required to execute every wrapper lane.
+            def expectedReleaseCounts = [
+                happy: 19,
+                sompy: 23,
+                prepy: 37,
+                ftxpy: 24,
+                qfy: 4,
+                vcfcheck: 4,
+            ]
+            def expectedReleaseTotal = expectedReleaseCounts.values().sum()
+            def requiredReleaseCases = expectedReleaseCounts.keySet().toSet()
+            if (caseSamplesheets.keySet().toSet() != requiredReleaseCases) {
+                coverageFailures << 'samplesheet contract must define exactly happy, sompy, prepy, ftxpy, qfy, and vcfcheck'
+            }
+            if (!System.getenv('HAP_TEST_CASES') && selectedCases.toSet() != requiredReleaseCases) {
+                def missingCases = (requiredReleaseCases - selectedCases.toSet()).sort()
+                def unexpectedCases = (selectedCases.toSet() - requiredReleaseCases).sort()
+                coverageFailures << "default release cases differ from the six-lane contract " +
+                    "(missing: ${missingCases ?: 'none'}; unexpected: ${unexpectedCases ?: 'none'})"
+            }
+
+            // sample_id is the first CSV column. Quoted IDs are accepted;
+            // embedded commas are decoded without needing a Groovy CSV
+            // dependency in the nf-test runtime.
+            def parseSampleId = { line ->
+                if (!line.startsWith('"')) {
+                    return line.split(',', 2)[0].trim()
+                }
+                def value = new StringBuilder()
+                def offset = 1
+                while (offset < line.length()) {
+                    def character = line.charAt(offset)
+                    if (character == '"' && offset + 1 < line.length() && line.charAt(offset + 1) == '"') {
+                        value.append('"')
+                        offset += 2
+                    } else if (character == '"') {
+                        break
+                    } else {
+                        value.append(character)
+                        offset++
+                    }
+                }
+                return value.toString()
+            }
+
+            // Load all six samplesheets even for a focused run. The option
+            // manifest is a repository-wide governance contract, not merely
+            // a description of the lanes selected for this invocation.
+            def sampleIdsByCase = [:]
+            caseSamplesheets.each { caseName, samplesheetPath ->
+                def samplesheet = new File(samplesheetPath.toString())
                 if (!samplesheet.isFile()) {
                     coverageFailures << "$caseName (samplesheet absent: $samplesheet)"
                     return
                 }
-
-                // sample_id is the first CSV column. Quoted IDs are accepted;
-                // embedded commas are decoded without needing a Groovy CSV
-                // dependency in the nf-test runtime.
                 def sampleIds = samplesheet.readLines('UTF-8')
                     .drop(1)
                     .findAll { it.trim() && !it.trim().startsWith('#') }
-                    .collect { line ->
-                        if (!line.startsWith('"')) {
-                            return line.split(',', 2)[0].trim()
-                        }
-                        def value = new StringBuilder()
-                        def offset = 1
-                        while (offset < line.length()) {
-                            def character = line.charAt(offset)
-                            if (character == '"' && offset + 1 < line.length() && line.charAt(offset + 1) == '"') {
-                                value.append('"')
-                                offset += 2
-                            } else if (character == '"') {
-                                break
-                            } else {
-                                value.append(character)
-                                offset++
-                            }
-                        }
-                        return value.toString()
-                    }
-
+                    .collect(parseSampleId)
                 def duplicateIds = sampleIds.groupBy { it }
                     .findAll { _id, occurrences -> occurrences.size() > 1 }
                     .keySet()
@@ -92,8 +123,88 @@ nextflow_pipeline {
                 if (!duplicateIds.isEmpty()) {
                     coverageFailures << "$caseName (duplicate sample_id values: ${duplicateIds.join(', ')})"
                 }
+                if (sampleIds.size() != expectedReleaseCounts[caseName]) {
+                    coverageFailures << "$caseName (samplesheet has ${sampleIds.size()} rows; expected ${expectedReleaseCounts[caseName]})"
+                }
+                sampleIdsByCase[caseName] = sampleIds.toSet()
+            }
 
-                def expectedIds = sampleIds.toSet()
+            def coverageFile = new File(params.option_coverage.toString())
+            def coverageRows = []
+            if (!coverageFile.isFile()) {
+                coverageFailures << "option coverage manifest absent: $coverageFile"
+            } else {
+                def coverageLines = coverageFile.readLines('UTF-8')
+                def expectedHeader = 'coverage_id,lane,sample_id,factor_family,interaction_class'
+                if (coverageLines.isEmpty() || coverageLines.first() != expectedHeader) {
+                    coverageFailures << "option coverage manifest header must be: $expectedHeader"
+                } else {
+                    coverageLines.drop(1)
+                        .findAll { it.trim() && !it.trim().startsWith('#') }
+                        .eachWithIndex { line, rowIndex ->
+                            def fields = line.split(',', -1).collect { it.trim() }
+                            if (fields.size() != 5 || fields.any { !it }) {
+                                coverageFailures << "option coverage row ${rowIndex + 2} must contain five non-empty fields"
+                            } else {
+                                coverageRows << [
+                                    coverageId: fields[0],
+                                    lane: fields[1],
+                                    sampleId: fields[2],
+                                ]
+                            }
+                        }
+                }
+            }
+
+            def duplicateCoverageIds = coverageRows.groupBy { it.coverageId }
+                .findAll { _id, occurrences -> occurrences.size() > 1 }
+                .keySet()
+                .sort()
+            if (!duplicateCoverageIds.isEmpty()) {
+                coverageFailures << "duplicate option coverage IDs: ${duplicateCoverageIds.join(', ')}"
+            }
+            if (coverageRows.size() != expectedReleaseTotal) {
+                coverageFailures << "option coverage manifest has ${coverageRows.size()} rows; expected $expectedReleaseTotal"
+            }
+            def duplicateCoverageMappings = coverageRows.groupBy { [it.lane, it.sampleId] }
+                .findAll { _mapping, occurrences -> occurrences.size() > 1 }
+                .keySet()
+                .sort { mapping -> "${mapping[0]}:${mapping[1]}" }
+            duplicateCoverageMappings.each { mapping ->
+                coverageFailures << "duplicate option coverage mapping: ${mapping[0]}:${mapping[1]}"
+            }
+            coverageRows.each { coverageRow ->
+                if (!caseSamplesheets.containsKey(coverageRow.lane)) {
+                    coverageFailures << "${coverageRow.coverageId} (unknown lane: ${coverageRow.lane})"
+                } else if (!sampleIdsByCase[coverageRow.lane]?.contains(coverageRow.sampleId)) {
+                    coverageFailures << "${coverageRow.coverageId} (${coverageRow.lane}:${coverageRow.sampleId} does not resolve to a samplesheet row)"
+                }
+            }
+            requiredReleaseCases.each { caseName ->
+                def laneCoverageRows = coverageRows.findAll { it.lane == caseName }
+                if (laneCoverageRows.size() != expectedReleaseCounts[caseName]) {
+                    coverageFailures << "$caseName (option coverage manifest has ${laneCoverageRows.size()} rows; expected ${expectedReleaseCounts[caseName]})"
+                }
+                def coveredIds = laneCoverageRows
+                    .collect { it.sampleId }
+                    .toSet()
+                if (coveredIds.isEmpty()) {
+                    coverageFailures << "$caseName (option coverage manifest has no rows)"
+                }
+                ((sampleIdsByCase[caseName] ?: [] as Set) - coveredIds).sort().each { sampleId ->
+                    coverageFailures << "$caseName:$sampleId (samplesheet row has no option coverage ID)"
+                }
+            }
+
+            selectedCases.each { caseName ->
+                if (!caseSamplesheets.containsKey(caseName)) {
+                    coverageFailures << "$caseName (selected case has no samplesheet contract)"
+                    return
+                }
+                def expectedIds = sampleIdsByCase[caseName]
+                if (expectedIds == null) {
+                    return
+                }
                 def caseRoot = new File("$outputDir/$caseName")
                 if (!caseRoot.isDirectory()) {
                     coverageFailures << "$caseName (case directory not published)"
@@ -175,6 +286,23 @@ nextflow_pipeline {
                 "${parityFailures.size()} case/sample parity failure(s):\n  " + parityFailures.join('\n  ')
             assert path("$outputDir/report.md").exists()
             assert path("$outputDir/report.csv").exists()
+
+            def expectedReportRows = selectedCases
+                .findAll { sampleIdsByCase.containsKey(it) }
+                .collect { sampleIdsByCase[it].size() }
+                .sum() ?: 0
+            def reportRows = new File("$outputDir/report.csv")
+                .readLines('UTF-8')
+                .drop(1)
+                .findAll { it.trim() }
+            def reportIdentities = reportRows.collect { line ->
+                def fields = line.split(',', 3)
+                fields.size() >= 2 ? "${fields[0]}:${fields[1]}" : line
+            }
+            assert reportRows.size() == expectedReportRows :
+                "aggregate report has ${reportRows.size()} rows; expected $expectedReportRows"
+            assert reportIdentities.toSet().size() == expectedReportRows :
+                'aggregate report contains duplicate case/sample identities'
             assert workflow.success
         }
     }

@@ -324,6 +324,17 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         .transpose()?;
     let ambiguous_regions =
         load_ambiguous_beds(&args.ambiguous_beds, &reference_contigs, fixchr_truth)?;
+    let mut explanation_regions = ambiguous_regions.clone();
+    if args.explain_ambiguous
+        && !args.ambiguous_beds.is_empty()
+        && let Some(path) = args.fp_bedfile.as_deref()
+    {
+        explanation_regions.extend(load_fp_explanation_bed(
+            Path::new(path),
+            &reference_contigs,
+            fixchr_truth,
+        )?);
+    }
     let locations = args
         .location
         .as_deref()
@@ -514,7 +525,7 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
                 &query_record.key.chrom,
                 query_record.key.pos,
                 query_record.record.end_pos(),
-                &ambiguous_regions,
+                &explanation_regions,
                 ambi_fp,
                 &mut ambiguous_classes,
                 &mut ambiguous_reasons,
@@ -612,6 +623,7 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     if fp_region_size_requires_reference(
         args.fp_region_size.as_deref(),
         fp_regions.as_deref().unwrap_or(&[]),
+        &ambiguous_regions,
     ) && reference_sequences.is_none()
     {
         reference_sequences = Some(fasta::read_sequences(Path::new(&args.reference))?);
@@ -620,10 +632,10 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     let fp_region_size = calculate_fp_region_size(
         args.fp_region_size.as_deref(),
         fp_regions.as_deref().unwrap_or(&[]),
+        &ambiguous_regions,
         locations.as_deref(),
         reference_sequences.as_ref().unwrap_or(&empty_reference),
         &truth_raw_filtered,
-        &query_raw_filtered,
     );
 
     let commandline = legacy_som_commandline(&args);
@@ -1627,7 +1639,7 @@ fn write_happy_style_extended(
     query_af_field: &str,
 ) -> Result<()> {
     let mut lines = vec![
-        ",Type,Subtype,Subset,Filter,TRUTH.TOTAL,TRUTH.TP,TRUTH.FN,QUERY.TOTAL,QUERY.FP,QUERY.UNK,FP.gt,METRIC.Recall,METRIC.Precision,METRIC.Frac_NA,METRIC.F1_Score,TRUTH.TOTAL.TiTv_ratio,QUERY.TOTAL.TiTv_ratio,TRUTH.TOTAL.het_hom_ratio,QUERY.TOTAL.het_hom_ratio".to_string()
+        "Type,Subtype,Subset,Filter,TRUTH.TOTAL,TRUTH.TP,TRUTH.FN,QUERY.TOTAL,QUERY.FP,QUERY.UNK,FP.gt,METRIC.Recall,METRIC.Precision,METRIC.Frac_NA,METRIC.F1_Score,TRUTH.TOTAL.TiTv_ratio,QUERY.TOTAL.TiTv_ratio,TRUTH.TOTAL.het_hom_ratio,QUERY.TOTAL.het_hom_ratio".to_string()
     ];
     let headers = parse_csv_line(feature_header);
     let truth_af_index = headers
@@ -1657,7 +1669,6 @@ fn write_happy_style_extended(
         _ => "NA",
     };
 
-    let mut row_index = 0usize;
     for (start, end) in parse_af_bins(bin_sizes) {
         let inclusive_last = end >= 1.0;
         let subset = if inclusive_last {
@@ -1681,6 +1692,7 @@ fn write_happy_style_extended(
         let truth_tp = truth_tags.iter().filter(|tag| **tag == "TP").count();
         let truth_fn = truth_tags.iter().filter(|tag| **tag == "FN").count();
 
+        // Preserve the legacy bin-major PASS, ALL append order.
         for filter in ["PASS", "ALL"] {
             let query_rows = rows.iter().filter(|row| {
                 nonempty_csv_field(row, ref_index)
@@ -1710,7 +1722,6 @@ fn write_happy_style_extended(
                 _ => None,
             };
             lines.push(csv_join([
-                row_index.to_string(),
                 happy_type.to_string(),
                 "*".to_string(),
                 subset.clone(),
@@ -1722,19 +1733,22 @@ fn write_happy_style_extended(
                 query_fp.to_string(),
                 query_unk.to_string(),
                 "NA".to_string(),
-                render_summary_metric(recall),
-                render_summary_metric(precision),
-                render_summary_metric(frac_na),
-                render_summary_metric(f1),
+                render_extended_metric(recall),
+                render_extended_metric(precision),
+                render_extended_metric(frac_na),
+                render_extended_metric(f1),
                 "NA".to_string(),
                 "NA".to_string(),
                 "NA".to_string(),
                 "NA".to_string(),
             ]));
-            row_index += 1;
         }
     }
     write_simple_table(path, &format!("{}\n", lines.join("\n")))
+}
+
+fn render_extended_metric(value: Option<f64>) -> String {
+    value.map_or_else(|| "NA".to_string(), py_float)
 }
 
 fn csv_column_index(headers: &[String], name: &str) -> Result<usize> {
@@ -1992,6 +2006,12 @@ fn write_somatic_roc(
     let integer_scores = roc_rows
         .iter()
         .all(|(score, ..)| score.parse::<i64>().is_ok());
+    let integer_precision = roc_rows
+        .iter()
+        .all(|(_, _, _, _, precision, _)| precision.parse::<i64>().is_ok());
+    let integer_recall = roc_rows
+        .iter()
+        .all(|(_, _, _, _, _, recall)| recall.parse::<i64>().is_ok());
     let mut lines = vec![format!(",{},tp,fp,fn,precision,recall", config.score)];
     for (row_index, (score, tp, fp, fn_count, precision, recall)) in
         roc_rows.into_iter().enumerate()
@@ -2004,14 +2024,22 @@ fn write_somatic_roc(
                 .map(|value| format!("{value:.8}"))
                 .unwrap_or(score)
         };
-        let precision = precision
-            .parse::<f64>()
-            .map(|value| format!("{value:.8}"))
-            .unwrap_or(precision);
-        let recall = recall
-            .parse::<f64>()
-            .map(|value| format!("{value:.8}"))
-            .unwrap_or(recall);
+        let precision = if integer_precision {
+            precision
+        } else {
+            precision
+                .parse::<f64>()
+                .map(|value| format!("{value:.8}"))
+                .unwrap_or(precision)
+        };
+        let recall = if integer_recall {
+            recall
+        } else {
+            recall
+                .parse::<f64>()
+                .map(|value| format!("{value:.8}"))
+                .unwrap_or(recall)
+        };
         lines.push(format!(
             "{row_index},{score},{tp},{fp},{fn_count},{precision},{recall}"
         ));
@@ -2101,60 +2129,66 @@ fn raw_type_label(record: &vcf::RawVcfRecord) -> Option<&'static str> {
     }
 }
 
-fn contigs_in_play(truth: &[FilteredRawRecord], query: &[FilteredRawRecord]) -> BTreeSet<String> {
+fn contigs_in_truth(truth: &[FilteredRawRecord]) -> BTreeSet<String> {
     truth
         .iter()
-        .chain(query.iter())
         .map(|record| record.key.chrom.clone())
         .collect()
+}
+
+fn automatic_fp_intervals<'a>(
+    fp_regions: &'a [vcf::BedInterval],
+    ambiguous_regions: &'a [AmbiguousInterval],
+) -> impl Iterator<Item = &'a vcf::BedInterval> {
+    fp_regions.iter().chain(
+        ambiguous_regions
+            .iter()
+            .filter(|entry| entry.label == "FP")
+            .map(|entry| &entry.interval),
+    )
+}
+
+fn has_automatic_fp_bases(
+    fp_regions: &[vcf::BedInterval],
+    ambiguous_regions: &[AmbiguousInterval],
+) -> bool {
+    automatic_fp_intervals(fp_regions, ambiguous_regions)
+        .any(|interval| interval.end > interval.start)
 }
 
 fn fp_region_size_requires_reference(
     requested: Option<&str>,
     fp_regions: &[vcf::BedInterval],
+    ambiguous_regions: &[AmbiguousInterval],
 ) -> bool {
     requested
         .and_then(|value| value.parse::<usize>().ok())
         .is_none()
-        && fp_regions.is_empty()
+        && !has_automatic_fp_bases(fp_regions, ambiguous_regions)
 }
 
 fn calculate_fp_region_size(
     requested: Option<&str>,
     fp_regions: &[vcf::BedInterval],
+    ambiguous_regions: &[AmbiguousInterval],
     locations: Option<&[vcf::LocationFilter]>,
     reference_sequences: &BTreeMap<String, String>,
     truth: &[FilteredRawRecord],
-    query: &[FilteredRawRecord],
 ) -> usize {
     if let Some(size) = requested.and_then(|value| value.parse::<usize>().ok()) {
         return size;
     }
 
-    if !fp_regions.is_empty() {
-        return fp_regions
-            .iter()
-            .map(|interval| match locations {
-                None => interval.end.saturating_sub(interval.start),
-                Some(locations) => locations
-                    .iter()
-                    .map(|location| match location {
-                        vcf::LocationFilter::Contig(chrom) if chrom == &interval.chrom => {
-                            interval.end.saturating_sub(interval.start)
-                        }
-                        vcf::LocationFilter::Range { chrom, start, end }
-                            if chrom == &interval.chrom =>
-                        {
-                            let location_start = start.saturating_sub(1);
-                            interval
-                                .end
-                                .min(*end)
-                                .saturating_sub(interval.start.max(location_start))
-                        }
-                        _ => 0,
-                    })
-                    .sum(),
-            })
+    if has_automatic_fp_bases(fp_regions, ambiguous_regions) {
+        // BedIntervalTree stores each value as a list (`[label, ...]`), but
+        // legacy som.py's location branch compares that list directly with
+        // the string "FP". The comparison never succeeds, so any `-l` used
+        // with labeled FP bases produces the historical zero denominator.
+        if locations.is_some() {
+            return 0;
+        }
+        return automatic_fp_intervals(fp_regions, ambiguous_regions)
+            .map(|interval| interval.end.saturating_sub(interval.start))
             .sum();
     }
 
@@ -2175,7 +2209,7 @@ fn calculate_fp_region_size(
             .sum();
     }
 
-    contigs_in_play(truth, query)
+    contigs_in_truth(truth)
         .into_iter()
         .filter_map(|contig| {
             reference_sequences
@@ -2222,11 +2256,6 @@ fn render_row(
         jeffreys_ci(counts.tp, counts.tp + counts.fn_count, context.ci_alpha);
     let (precision, precision_lower, precision_upper) =
         jeffreys_ci(counts.tp, counts.tp + counts.fp, context.ci_alpha);
-    let fp_rate = if context.fp_region_size == 0 {
-        0.0
-    } else {
-        1_000_000.0 * counts.fp as f64 / context.fp_region_size as f64
-    };
     let version = SOM_VERSION;
     let mut columns = vec![
         index.to_string(),
@@ -2262,7 +2291,7 @@ fn render_row(
         py_float(ratio(counts.unk, counts.query_total)),
         py_float(ratio(counts.ambi, counts.query_total)),
         context.fp_region_size.to_string(),
-        py_float(fp_rate),
+        fp_rate_or_blank(counts.fp, context.fp_region_size),
     ]);
     if context.include_filtered_columns {
         if let Some(filtered) = context.filtered {
@@ -2271,11 +2300,7 @@ fn render_row(
             columns.extend([
                 py_float(ratio(unfiltered_tp, counts.tp + counts.fn_count)),
                 py_float(ratio(unfiltered_tp, unfiltered_tp + unfiltered_fp)),
-                py_float(if context.fp_region_size == 0 {
-                    0.0
-                } else {
-                    1_000_000.0 * unfiltered_fp as f64 / context.fp_region_size as f64
-                }),
+                fp_rate_or_blank(unfiltered_fp, context.fp_region_size),
                 py_float(ratio(
                     counts.unk.saturating_sub(filtered.unk),
                     counts.query_total,
@@ -2315,11 +2340,6 @@ fn render_row_af(
         jeffreys_ci(counts.tp, counts.tp + counts.fn_count, context.ci_alpha);
     let (precision, precision_lower, precision_upper) =
         jeffreys_ci(counts.tp, counts.tp + counts.fp, context.ci_alpha);
-    let fp_rate = if context.fp_region_size == 0 {
-        0.0
-    } else {
-        1_000_000.0 * counts.fp as f64 / context.fp_region_size as f64
-    };
     let mut columns = vec![index.to_string(), counts.ambi.to_string()];
     if context.include_filtered_columns {
         columns.push(
@@ -2367,7 +2387,7 @@ fn render_row_af(
         ratio_or_blank(counts.unk, counts.query_total),
         ratio_or_blank(counts.ambi, counts.query_total),
         context.fp_region_size.to_string(),
-        py_float(fp_rate),
+        fp_rate_or_blank(counts.fp, context.fp_region_size),
     ]);
     if context.include_filtered_columns {
         if let Some(filtered) = context.filtered {
@@ -2376,11 +2396,7 @@ fn render_row_af(
             columns.extend([
                 ratio_or_blank(unfiltered_tp, counts.tp + counts.fn_count),
                 ratio_or_blank(unfiltered_tp, unfiltered_tp + unfiltered_fp),
-                py_float(if context.fp_region_size == 0 {
-                    0.0
-                } else {
-                    1_000_000.0 * unfiltered_fp as f64 / context.fp_region_size as f64
-                }),
+                fp_rate_or_blank(unfiltered_fp, context.fp_region_size),
                 ratio_or_blank(counts.unk.saturating_sub(filtered.unk), counts.query_total),
                 ratio_or_blank(
                     counts.ambi.saturating_sub(filtered.ambi),
@@ -2401,6 +2417,18 @@ fn ratio_or_blank(numerator: usize, denominator: usize) -> String {
         String::new()
     } else {
         py_float(numerator as f64 / denominator as f64)
+    }
+}
+
+fn fp_rate_or_blank(false_positives: usize, region_size: usize) -> String {
+    if region_size == 0 {
+        if false_positives == 0 {
+            String::new()
+        } else {
+            "inf".to_string()
+        }
+    } else {
+        py_float(1_000_000.0 * false_positives as f64 / region_size as f64)
     }
 }
 
@@ -2590,6 +2618,58 @@ fn load_classification_bed(
     let mut intervals = vcf::load_bed(path, &BTreeSet::new())?;
     for interval in &mut intervals {
         interval.chrom = classification_bed_chrom(&interval.chrom, reference_contigs, fixchr_truth);
+    }
+    Ok(intervals)
+}
+
+fn load_fp_explanation_bed(
+    path: &Path,
+    reference_contigs: &BTreeSet<String>,
+    fixchr_truth: bool,
+) -> Result<Vec<AmbiguousInterval>> {
+    let text = vcf::read_text(path)
+        .with_context(|| format!("failed to read false-positive BED {}", path.display()))?;
+    let mut intervals = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 3 {
+            bail!(
+                "false-positive BED line {} has fewer than 3 columns in {}",
+                line_index + 1,
+                path.display()
+            );
+        }
+        let start = fields[1].parse::<usize>().with_context(|| {
+            format!(
+                "invalid BED start '{}' on line {} in {}",
+                fields[1],
+                line_index + 1,
+                path.display()
+            )
+        })?;
+        let end = fields[2].parse::<usize>().with_context(|| {
+            format!(
+                "invalid BED end '{}' on line {} in {}",
+                fields[2],
+                line_index + 1,
+                path.display()
+            )
+        })?;
+        intervals.push(AmbiguousInterval {
+            interval: vcf::BedInterval {
+                chrom: classification_bed_chrom(fields[0], reference_contigs, fixchr_truth),
+                start,
+                end,
+            },
+            label: "FP".to_string(),
+            details: fields[3..]
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        });
     }
     Ok(intervals)
 }
@@ -3147,6 +3227,9 @@ fn column_json(
         .iter()
         .map(|value| match kind {
             "int64" | "double" if value.is_empty() || value == "." => "null".to_string(),
+            "int64" | "double" if value.parse::<f64>().is_ok_and(|number| !number.is_finite()) => {
+                "null".to_string()
+            }
             "int64" | "double" => value.to_string(),
             _ if numeric_strings && value.parse::<i64>().is_ok() => value.to_string(),
             _ => json_string(value),
@@ -3647,6 +3730,115 @@ mod tests {
     }
 
     #[test]
+    fn explicit_fp_bed_participates_in_explanations_and_uppercase_ambiguous_denominator() {
+        let root = unique_test_dir("fp-explanation-denominator");
+        let truth = root.join("truth.vcf");
+        let query = root.join("query.vcf");
+        let fp = root.join("fp.bed");
+        let ambiguous = root.join("ambiguous.bed");
+        fs::create_dir_all(&root).expect("create FP explanation test root");
+        write_test_vcf(&truth, 2);
+        fs::write(
+            &query,
+            concat!(
+                "##fileformat=VCFv4.1\n",
+                "##contig=<ID=chr1,length=20>\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+                "chr1\t2\t.\tA\tC\t.\tPASS\t.\n",
+                "chr1\t5\t.\tA\tG\t.\tPASS\t.\n",
+                "chr1\t8\t.\tA\tT\t.\tPASS\t.\n",
+            ),
+        )
+        .expect("write FP explanation query VCF");
+        fs::write(&fp, "chr1\t4\t5\t2\tFP\tsource=upper\n").expect("write FP BED");
+        fs::write(
+            &ambiguous,
+            concat!(
+                "chr1\t4\t5\t2\tFP\tsource=upper\n",
+                "chr1\t7\t8\t3\tfp\tsource=lower\n",
+            ),
+        )
+        .expect("write ambiguity BED");
+
+        let mut args = parsed_somatic(&[]);
+        args.truth = truth.display().to_string();
+        args.query = query.display().to_string();
+        args.output = root.join("result").display().to_string();
+        args.reference = root.join("missing.fa").display().to_string();
+        args.fp_bedfile = Some(fp.display().to_string());
+        args.ambiguous_beds = vec![ambiguous.display().to_string()];
+        args.explain_ambiguous = true;
+        args.quiet = true;
+        run(args).expect("labeled FP regions must supply the automatic denominator");
+
+        let stats = fs::read_to_string(root.join("result.stats.csv")).expect("read stats");
+        assert!(
+            stats
+                .lines()
+                .any(|line| line.starts_with("5,records,") && line.contains(",2,500000.0,")),
+            "explicit and uppercase ambiguous FP intervals both count toward the denominator"
+        );
+        let classes =
+            fs::read_to_string(root.join("result.ambiclasses.csv")).expect("read classes");
+        assert!(classes.contains(",FP,1\n"));
+        assert!(classes.contains(",ambi-fp,1\n"));
+        let reasons =
+            fs::read_to_string(root.join("result.ambireasons.csv")).expect("read reasons");
+        assert!(
+            reasons.contains(",FP: rep. count 2,2\n"),
+            "the explicit and ambiguous FP entries both contribute reasons"
+        );
+        assert!(reasons.contains(",ambi-fp: rep. count 3,1\n"));
+
+        fs::remove_dir_all(&root).expect("remove FP explanation test root");
+    }
+
+    #[test]
+    fn automatic_reference_denominator_uses_truth_contigs_only() {
+        let root = unique_test_dir("truth-only-denominator");
+        let truth = root.join("truth.vcf");
+        let query = root.join("query.vcf");
+        let reference = root.join("reference.fa");
+        fs::create_dir_all(&root).expect("create truth denominator test root");
+        write_test_vcf(&truth, 2);
+        fs::write(
+            &query,
+            concat!(
+                "##fileformat=VCFv4.1\n",
+                "##contig=<ID=chr1,length=10>\n",
+                "##contig=<ID=chr2,length=20>\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+                "chr1\t2\t.\tA\tC\t.\tPASS\t.\n",
+                "chr2\t5\t.\tC\tG\t.\tPASS\t.\n",
+            ),
+        )
+        .expect("write query-only contig VCF");
+        fs::write(
+            &reference,
+            ">chr1\nAAAAAAAAAA\n>chr2\nCCCCCCCCCCCCCCCCCCCC\n",
+        )
+        .expect("write reference");
+
+        let mut args = parsed_somatic(&[]);
+        args.truth = truth.display().to_string();
+        args.query = query.display().to_string();
+        args.output = root.join("result").display().to_string();
+        args.reference = reference.display().to_string();
+        args.quiet = true;
+        run(args).expect("run truth-only automatic denominator comparison");
+
+        let stats = fs::read_to_string(root.join("result.stats.csv")).expect("read stats");
+        assert!(
+            stats
+                .lines()
+                .any(|line| line.starts_with("5,records,") && line.contains(",10,100000.0,")),
+            "the query-only chr2 contig must not enlarge the reference denominator"
+        );
+
+        fs::remove_dir_all(&root).expect("remove truth denominator test root");
+    }
+
+    #[test]
     fn usable_fp_bed_avoids_loading_a_missing_reference() {
         let root = unique_test_dir("lazy-reference-fp-bed");
         let truth = root.join("truth.vcf");
@@ -3964,7 +4156,7 @@ mod tests {
     }
 
     #[test]
-    fn fp_region_size_is_restricted_by_location() {
+    fn fp_region_size_with_regions_and_location_preserves_legacy_zero_bug() {
         let fp_regions = vec![vcf::BedInterval {
             chrom: "chr1".to_string(),
             start: 0,
@@ -3979,25 +4171,33 @@ mod tests {
         let contig = [vcf::LocationFilter::Contig("chr1".to_string())];
 
         assert_eq!(
-            calculate_fp_region_size(None, &fp_regions, Some(&range), &references, &[], &[]),
+            calculate_fp_region_size(None, &fp_regions, &[], Some(&range), &references, &[]),
+            0
+        );
+        assert_eq!(
+            calculate_fp_region_size(None, &fp_regions, &[], Some(&contig), &references, &[]),
+            0
+        );
+        assert_eq!(
+            calculate_fp_region_size(None, &[], &[], Some(&range), &references, &[]),
             10
         );
         assert_eq!(
-            calculate_fp_region_size(None, &fp_regions, Some(&contig), &references, &[], &[]),
-            50
-        );
-        assert_eq!(
-            calculate_fp_region_size(None, &[], Some(&range), &references, &[], &[]),
-            10
-        );
-        assert_eq!(
-            calculate_fp_region_size(Some("7"), &fp_regions, Some(&range), &references, &[], &[],),
+            calculate_fp_region_size(Some("7"), &fp_regions, &[], Some(&range), &references, &[],),
             7
         );
-        assert!(!fp_region_size_requires_reference(Some("7"), &[]));
-        assert!(!fp_region_size_requires_reference(None, &fp_regions));
-        assert!(fp_region_size_requires_reference(None, &[]));
-        assert!(fp_region_size_requires_reference(Some("auto"), &[]));
+        assert!(!fp_region_size_requires_reference(Some("7"), &[], &[]));
+        assert!(!fp_region_size_requires_reference(None, &fp_regions, &[]));
+        assert!(fp_region_size_requires_reference(None, &[], &[]));
+        assert!(fp_region_size_requires_reference(Some("auto"), &[], &[]));
+        assert_eq!(fp_rate_or_blank(1, 0), "inf");
+        assert_eq!(fp_rate_or_blank(0, 0), "");
+        let rates = vec!["inf".to_string(), String::new()];
+        assert_eq!(infer_type(&rates), "double");
+        assert_eq!(
+            column_json("fp.rate", "fp.rate", "double", &rates, false),
+            "{\"values\": [null, null], \"type\": \"double\", \"id\": \"fp.rate\", \"label\": \"fp.rate\"}"
+        );
     }
 
     #[test]
@@ -4374,8 +4574,12 @@ mod tests {
         )
         .expect("extended output");
         let text = fs::read_to_string(output.path()).expect("read extended output");
-        assert!(text.contains("SNP,*,\"[0.00,0.50)\",PASS,1,1,0,2,1,0"));
-        assert!(text.contains("SNP,*,\"[0.50,1.00]\",PASS,1,0,1,0,0,0"));
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(lines[0].starts_with("Type,Subtype,Subset,Filter,"));
+        assert!(lines[1].starts_with("SNP,*,\"[0.00,0.50)\",PASS,1,1,0,2,1,0"));
+        assert!(lines[2].starts_with("SNP,*,\"[0.00,0.50)\",ALL,1,1,0,2,1,0"));
+        assert!(lines[3].contains("SNP,*,\"[0.50,1.00]\",PASS,1,0,1,0,0,0,NA,0.0,NA,NA,NA"));
+        assert!(lines[4].contains("SNP,*,\"[0.50,1.00]\",ALL,1,0,1,0,0,0,NA,0.0,NA,NA,NA"));
     }
 
     #[test]
@@ -4481,6 +4685,19 @@ mod tests {
                 "1,5,1,1,1,0.50000000,0.50000000\n",
                 "2,10,1,0,1,1.00000000,0.50000000\n"
             )
+        );
+    }
+
+    #[test]
+    fn caller_specific_roc_preserves_integer_rate_columns() {
+        let output = tempfile::NamedTempFile::new().expect("temporary ROC");
+        let header = ",CHROM,POS,tag,QSS_NT,FILTER,NT";
+        let rows = vec!["0,chr1,10,TP,10.00000000,,ref".to_string()];
+        write_somatic_roc(output.path(), header, &rows, "strelka.snv.qss")
+            .expect("write integer-rate somatic ROC");
+        assert_eq!(
+            fs::read_to_string(output.path()).expect("read ROC"),
+            concat!(",QSS_NT,tp,fp,fn,precision,recall\n", "0,10,1,0,0,1,1\n")
         );
     }
 

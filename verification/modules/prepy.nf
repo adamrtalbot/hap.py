@@ -6,6 +6,7 @@
 
 process PREPY_LEGACY {
     tag { "${meta.id}" }
+    cpus { meta.cpus ?: 1 }
     publishDir { "${params.outdir}/prepy/${meta.id}/legacy" }, mode: 'copy', pattern: 'result*'
 
     input:
@@ -26,6 +27,7 @@ process PREPY_LEGACY {
 
 process PREPY_RUST {
     tag { "${meta.id}" }
+    cpus { meta.cpus ?: 1 }
     publishDir { "${params.outdir}/prepy/${meta.id}/rust" }, mode: 'copy', pattern: 'result*'
 
     input:

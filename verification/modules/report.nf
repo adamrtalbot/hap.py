@@ -10,7 +10,7 @@ process REPORT {
     publishDir "${params.outdir}", mode: 'copy'
 
     input:
-    path status_files, stageAs: 'status??.json'
+    path status_files, stageAs: 'status???.json'
     path verifier_bin, stageAs: 'verify-fixtures'
 
     output:
@@ -24,6 +24,6 @@ process REPORT {
         --hap-bin '${params.hap_bin}' \\
         --markdown report.md \\
         --csv report.csv \\
-        status??.json
+        status???.json
     """
 }

@@ -179,9 +179,11 @@ fn mutect_sample_indices(headers: &[String]) -> (usize, usize) {
     let find_option = |name: &str| -> Option<usize> {
         let command = command?;
         let start = command.find(name)? + name.len();
-        let value = command[start..]
-            .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '>' | ','))
-            .next()?;
+        // The Python regex captures every non-whitespace character. In
+        // particular, it retains the closing quote when an option is last in
+        // CommandLineOptions, causing that sample lookup to fall back to its
+        // legacy default. Do not trim VCF-header delimiters here.
+        let value = command[start..].split_whitespace().next()?;
         samples.iter().position(|sample| *sample == value)
     };
     (
@@ -368,5 +370,47 @@ mod tests {
         assert!(lines[1].contains("\"[9, 1]\",\"[5, 15]\""));
         let cells: Vec<&str> = lines[1].split(',').collect();
         assert_eq!(&cells[11..13], &["0", "0"]);
+    }
+
+    #[test]
+    fn mutect_header_sample_order_preserves_legacy_token_boundaries() {
+        let samples = "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNORMAL\tTUMOR";
+        let trailing_normal = concat!(
+            "##GATKCommandLine=<ID=MuTect,Version=1.1.7,",
+            "CommandLineOptions=\"tumor_sample_name=TUMOR normal_sample_name=NORMAL\">"
+        );
+        let trailing_headers = [trailing_normal.to_string(), samples.to_string()];
+        assert_eq!(
+            mutect_sample_indices(&trailing_headers),
+            (1, 1),
+            "legacy retains the closing quote on the final normal-sample token"
+        );
+        let lines = emit_mutect_with_depths(
+            &[record(
+                "DB;TLOD=17.4;NLOD=2.1",
+                "GT:DP:AD:QSS",
+                &["0/0:12:11,1:7,1", "0/1:24:6,18:2,8"],
+            )],
+            &trailing_headers,
+            "oracle",
+            None,
+        );
+        assert!(
+            lines[1].contains(
+                ",24.0,24.0,0,0,-1,-1,\"[6, 18]\",\"[6, 18]\",\"[2, 8]\",\"[2, 8]\",0.75,0.75,oracle"
+            ),
+            "both legacy prefixes resolve to the second sample: {}",
+            lines[1]
+        );
+
+        let followed_normal = concat!(
+            "##GATKCommandLine=<ID=MuTect,Version=1.1.7,",
+            "CommandLineOptions=\"tumor_sample_name=TUMOR normal_sample_name=NORMAL emit_mode=VCF\">"
+        );
+        assert_eq!(
+            mutect_sample_indices(&[followed_normal.to_string(), samples.to_string()]),
+            (1, 0),
+            "a following option terminates the normal-sample token with whitespace"
+        );
     }
 }

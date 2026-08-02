@@ -227,14 +227,12 @@ pub fn write_extended(
                 let subset = *subset;
                 let is_base_subset = subset == "*";
                 // Legacy emission gates:
-                //   • base subtype + base subset: always.
-                //   • base subtype + non-base subset: only if the subset
-                //     actually carries data for this Type.
-                //   • non-base subtype + base subset: always (subtype rows
-                //     are seeded for every INDEL_SUBTYPE).
-                //   • non-base subtype + non-base subset: always
-                //     (cross-product rows are seeded zero-counts).
-                if is_base_subtype && !is_base_subset {
+                //   • base subset: always (INDEL subtype rows are seeded for
+                //     every INDEL_SUBTYPE).
+                //   • named subset: only if that subset carries this Type.
+                //     Once the Type axis exists, every INDEL subtype/filter
+                //     row is seeded, including zero-count subtype rows.
+                if !is_base_subset {
                     let has_any = all_subset
                         .get(subset)
                         .and_then(|m| m.get(variant_type.as_str()))
@@ -637,7 +635,9 @@ pub(crate) fn python_repr_float(value: f64) -> String {
 
 #[cfg(test)]
 mod format_tests {
-    use super::python_repr_float;
+    use super::{SubsetSubtypeFpCounts, python_repr_float, write_extended};
+    use crate::compare::TypeCounts;
+    use std::collections::BTreeMap;
 
     #[test]
     fn integer_valued_float_keeps_trailing_zero() {
@@ -706,5 +706,75 @@ mod format_tests {
         assert_eq!(format_metric(f1), "0.9160790000000001");
         // Frac_NA = 3520/11812 → "0.298002" → exact f64 → "0.298002"
         assert_eq!(format_metric(3520.0 / 11812.0), "0.298002");
+    }
+
+    #[test]
+    fn extended_omits_indel_subtype_rows_for_subsets_without_indels() {
+        let output = tempfile::NamedTempFile::new().expect("temporary extended output");
+        let counts = BTreeMap::from([
+            ("INDEL".to_string(), TypeCounts::default()),
+            ("SNP".to_string(), TypeCounts::default()),
+        ]);
+        let subset_counts = BTreeMap::from([
+            (
+                "TS_boundary".to_string(),
+                BTreeMap::from([("SNP".to_string(), TypeCounts::default())]),
+            ),
+            (
+                "TS_contained".to_string(),
+                BTreeMap::from([("INDEL".to_string(), TypeCounts::default())]),
+            ),
+        ]);
+        let nested_counts = BTreeMap::<String, BTreeMap<String, TypeCounts>>::new();
+        let subset_subtype_counts =
+            BTreeMap::<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>::new();
+        let fp_counts = BTreeMap::<String, (usize, usize)>::new();
+        let nested_fp_counts = BTreeMap::<String, BTreeMap<String, (usize, usize)>>::new();
+        let subset_subtype_fp_counts = SubsetSubtypeFpCounts::new();
+
+        write_extended(
+            output.path(),
+            &counts,
+            &counts,
+            &nested_counts,
+            &nested_counts,
+            100,
+            80,
+            true,
+            &subset_counts,
+            &subset_counts,
+            &subset_subtype_counts,
+            &subset_subtype_counts,
+            &fp_counts,
+            &fp_counts,
+            &nested_fp_counts,
+            &nested_fp_counts,
+            &nested_fp_counts,
+            &nested_fp_counts,
+            &subset_subtype_fp_counts,
+            &subset_subtype_fp_counts,
+        )
+        .expect("write extended report");
+
+        let output = std::fs::read_to_string(output.path()).expect("read extended report");
+        let indel_subtype_rows = output
+            .lines()
+            .skip(1)
+            .filter(|line| line.starts_with("INDEL,") && !line.starts_with("INDEL,*,"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indel_subtype_rows
+                .iter()
+                .filter(|line| line.split(',').nth(2) == Some("TS_contained"))
+                .count(),
+            18,
+            "present INDEL subsets retain their seeded subtype/filter rows"
+        );
+        assert!(
+            indel_subtype_rows
+                .iter()
+                .all(|line| line.split(',').nth(2) != Some("TS_boundary")),
+            "a SNP-only subset must not seed empty INDEL subtype rows"
+        );
     }
 }

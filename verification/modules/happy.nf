@@ -29,12 +29,16 @@ process HAPPY_LEGACY {
     # the retry policy in nextflow.config regenerates the oracle artifacts.
     gzip -cd result.roc.all.csv.gz | awk -F',' '
         NR == 1 {
+            expected_fields = NF
+            if (expected_fields != 65 && expected_fields != 71) exit 1
             if (\$1 != "Type" || \$2 != "Subtype" || \$3 != "Subset" ||
                 \$4 != "Filter" || \$5 != "Genotype" || \$6 != "QQ.Field" ||
                 \$7 != "QQ") exit 1
             next
         }
         {
+            if (NF != expected_fields) exit 1
+            if (\$1 != "SNP" && \$1 != "INDEL") exit 1
             if (\$1 == "" || \$2 == "" || \$3 == "" || \$4 == "" ||
                 \$5 == "" || \$6 == "" || \$7 == "") exit 1
             rows++

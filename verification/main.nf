@@ -149,7 +149,7 @@ workflow {
     // -----------------------------------------------------------------------
     if (cases.contains('prepy')) {
         prepy_in = samples(params.prepy_samplesheet) { row ->
-            def meta = [id: row.sample_id, case_name: 'prepy']
+            def meta = [id: row.sample_id, case_name: 'prepy', cpus: (row.cpus ?: 1).toString().toInteger()]
             tuple(
                 meta,
                 fixture(row.input_vcf),

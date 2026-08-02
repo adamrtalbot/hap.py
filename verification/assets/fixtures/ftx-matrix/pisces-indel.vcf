@@ -1,0 +1,16 @@
+##fileformat=VCFv4.1
+##contig=<ID=chr1,length=100>
+##MaxDepth_chr1=60
+##INFO=<ID=EVS,Number=1,Type=Float,Description="Empirical variant score">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype quality">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+##FORMAT=<ID=VF,Number=1,Type=Float,Description="Variant frequency">
+##FORMAT=<ID=NL,Number=1,Type=Integer,Description="Noise level">
+##FORMAT=<ID=SB,Number=1,Type=Float,Description="Strand bias">
+##FORMAT=<ID=NC,Number=1,Type=Float,Description="Noise contribution">
+##FORMAT=<ID=AQ,Number=1,Type=Float,Description="Allele quality">
+##FORMAT=<ID=GQX,Number=1,Type=Float,Description="Genotype quality score">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TUMOR
+chr1	15	.	A	AA	.	PASS	EVS=2.5	GT:GQ:AD:DP:VF:NL:SB:NC:AQ:GQX	0/1:40:15,5:20:0.25:1:0.1:0:30:35

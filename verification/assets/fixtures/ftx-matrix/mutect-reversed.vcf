@@ -1,0 +1,12 @@
+##fileformat=VCFv4.1
+##contig=<ID=chr1,length=100>
+##GATKCommandLine=<ID=MuTect,Version=1.1.7,CommandLineOptions="analysis_type=MuTect tumor_sample_name=TUMOR normal_sample_name=NORMAL">
+##INFO=<ID=DB,Number=0,Type=Flag,Description="dbSNP membership">
+##INFO=<ID=TLOD,Number=1,Type=Float,Description="Tumor LOD">
+##INFO=<ID=NLOD,Number=1,Type=Float,Description="Normal LOD">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+##FORMAT=<ID=QSS,Number=R,Type=Integer,Description="Quality score sums">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NORMAL	TUMOR
+chr1	11	.	A	C	.	PASS	DB;TLOD=17.4;NLOD=2.1	GT:DP:AD:QSS	0/0:12:11,1:7,1	0/1:24:6,18:2,8

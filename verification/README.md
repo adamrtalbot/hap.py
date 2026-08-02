@@ -9,25 +9,28 @@ Each samplesheet row runs twice:
 
 The row supplies the same inputs and arguments to both sides. A staged Rust
 verifier compares their output trees and writes one `status.json`; nf-test
-checks every selected row was published exactly once and requires every status
-to pass.
+checks every unique selected row has a published result and requires every
+status to pass.
 
 ## Governed matrix
 
 | Lane | Legacy tool | Rust command | Default rows |
 |---|---|---|---:|
-| happy | `hap.py` | `hap germline` | 12 |
-| sompy | `som.py` | `hap somatic` | 12 |
-| prepy | `pre.py` | `hap pre` | 26 |
-| ftxpy | `ftx.py` | `hap ftx` | 11 |
-| qfy | `qfy.py` | `hap quantify` | 1 |
-| vcfcheck | `vcfcheck` | `hap validate` | 1 |
-| **Total** | | | **63** |
+| happy | `hap.py` | `hap germline` | 19 |
+| sompy | `som.py` | `hap somatic` | 23 |
+| prepy | `pre.py` | `hap pre` | 37 |
+| ftxpy | `ftx.py` | `hap ftx` | 24 |
+| qfy | `qfy.py` | `hap quantify` | 4 |
+| vcfcheck | `vcfcheck` | `hap validate` | 4 |
+| **Total** | | | **111** |
 
-The qfy lane generates one bounded chr21 xcmp-annotated VCF from pinned
+The qfy lane generates bounded chr21 xcmp-annotated VCFs from pinned
 truth/query/reference fixtures, then gives the same generated VCF and index to
-both quantifiers. The default `cases` setting selects all six lanes; `--cases`
-narrows a diagnostic run without changing the release matrix definition.
+both quantifiers. The default `cases` setting selects all six lanes;
+`HAP_TEST_CASES` narrows a diagnostic run without changing the release matrix
+definition. `OPTION_MATRIX.md` defines the constrained-pairwise selection
+method, while `assets/option-coverage.csv` gives every samplesheet row a unique
+coverage ID and records the options exercised.
 
 ## Layout
 
@@ -42,11 +45,14 @@ verification/
 │   ├── samplesheet.prepy.csv
 │   ├── samplesheet.ftxpy.csv
 │   ├── samplesheet.qfy.csv
-│   └── samplesheet.vcfcheck.csv
+│   ├── samplesheet.vcfcheck.csv
+│   ├── option-coverage.csv
+│   └── fixtures/                    compact option-matrix fixtures
 ├── modules/                      legacy/Rust lane processes and reports
 ├── scripts/
 │   ├── verify-ftx-options.sh
 │   └── verify-somatic-options.sh
+├── OPTION_MATRIX.md              matrix design and comparison contract
 └── tests/main.nf.test            coverage and parity assertions
 ```
 
@@ -85,7 +91,7 @@ Then run the clean default matrix from this directory:
 cd verification
 HAP_BIN="$PWD/../target/release/hap" \
   VERIFY_BIN="$PWD/../target/release/verify-fixtures" \
-  NXF_SYNTAX_PARSER=v2 NXF_VER=26.04.6 nf-test test --ci
+  NXF_SYNTAX_PARSER=v2 NXF_VER=26.04.6 nf-test test tests/main.nf.test --ci
 ```
 
 For a focused or resumable diagnostic:
@@ -93,7 +99,7 @@ For a focused or resumable diagnostic:
 ```bash
 HAP_TEST_CASES=happy,prepy \
   NF_TEST_NEXTFLOW_OPTIONS=-resume \
-  NXF_SYNTAX_PARSER=v2 NXF_VER=26.04.6 nf-test test
+  NXF_SYNTAX_PARSER=v2 NXF_VER=26.04.6 nf-test test tests/main.nf.test
 ```
 
 To inspect workflow output without the nf-test assertion layer, run from the

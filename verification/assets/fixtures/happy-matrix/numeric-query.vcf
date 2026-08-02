@@ -1,0 +1,10 @@
+##fileformat=VCFv4.2
+##contig=<ID=1,length=100>
+##contig=<ID=chr1,length=100>
+##INFO=<ID=SCORE,Number=1,Type=Float,Description="Synthetic ROC score">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TUMOR	NORMAL
+1	25	query-snp-1	A	G	55	PASS	SCORE=55	GT	0/1	0/0
+1	26	query-snp-2	C	T	54	PASS	SCORE=54	GT	0/1	0/0
+1	27	query-snp-3	G	A	53	PASS	SCORE=53	GT	0/1	0/0
+1	44	query-indel	TAC	T	45	PASS	SCORE=45	GT	0/1	0/0

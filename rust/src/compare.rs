@@ -406,15 +406,20 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     let scratch_parent = scratch_parent(&args, prefix);
     let scratch = ScratchRun::create(&scratch_parent, args.keep_scratch)?;
     let mut preprocessing_args = args.clone();
+    // Legacy keeps vcfeval handoff files as VCF even when `--bcf` requests a
+    // BCF report. The built-in xcmp and SCMP engines can consume BCF
+    // intermediates directly.
+    let bcf_intermediates = args.bcf && args.engine != CompareEngine::Vcfeval;
+    preprocessing_args.bcf = bcf_intermediates;
     if preprocessing_args.gender == crate::cli::PreprocessGender::Auto {
         preprocessing_args.gender = preprocess::infer_gender(Path::new(&args.truth))?;
     }
-    let truth_prep = scratch.path().join(if args.bcf {
+    let truth_prep = scratch.path().join(if bcf_intermediates {
         "truth.prep.bcf"
     } else {
         "truth.prep.vcf.gz"
     });
-    let query_prep = scratch.path().join(if args.bcf {
+    let query_prep = scratch.path().join(if bcf_intermediates {
         "query.prep.bcf"
     } else {
         "query.prep.vcf.gz"
@@ -453,8 +458,12 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     let (truth_headers, truth_raw) = vcf::load_raw_vcf(&truth_prep)?;
     let (query_headers, query_raw) = vcf::load_raw_vcf(&query_prep)?;
 
+    let truth_variant_input =
+        materialize_variant_input(&truth_prep, scratch.path(), "truth.variants.vcf.gz")?;
+    let query_variant_input =
+        materialize_variant_input(&query_prep, scratch.path(), "query.variants.vcf.gz")?;
     let mut truth = vcf::load_variants(
-        &truth_prep,
+        &truth_variant_input,
         &contig_set,
         false,
         regions.as_deref(),
@@ -479,7 +488,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     // PASS-only truth-call contract at the comparison boundary.
     retain_xcmp_truth_calls(&mut truth);
     let query = vcf::load_variants(
-        &query_prep,
+        &query_variant_input,
         &contig_set,
         false,
         regions.as_deref(),
@@ -488,10 +497,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     )?;
 
     let contigs_in_play = collect_contigs(&truth, &query, locations.as_deref());
-    let subset_size = contigs_in_play
-        .iter()
-        .filter_map(|contig| contig_non_n_lengths.get(contig))
-        .sum::<usize>();
+    let subset_size = report_subset_size(&contig_non_n_lengths, &contigs_in_play, args.bcf);
     if subset_size == 0 {
         bail!("no reference contigs selected for analysis");
     }
@@ -675,6 +681,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         args.pass_only,
         args.output_vtc,
         args.preserve_info,
+        &args.roc,
     );
     let requantify = args.strat_tsv.is_some()
         || !args.strat_regions.is_empty()
@@ -689,9 +696,14 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     } else {
         suffixed_report_path(prefix, "vcf.gz")
     };
-    report::write_vcf(&comparison_vcf, &vcf_headers, &rows)?;
-    if requantify {
-        crate::quantify::run(crate::cli::QuantifyArgs {
+    let requantify_rows = requantify.then(|| sanitize_requantify_handoff_rows(&rows));
+    report::write_vcf(
+        &comparison_vcf,
+        &vcf_headers,
+        requantify_rows.as_deref().unwrap_or(&rows),
+    )?;
+    let roc_indices = if requantify {
+        crate::quantify::run_with_metric_indices(crate::cli::QuantifyArgs {
             input_vcf: comparison_vcf.display().to_string(),
             report_prefix: args.report_prefix.clone(),
             reference: args.reference.clone(),
@@ -706,6 +718,20 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
             strat_fixchr: args.strat_fixchr,
             write_vcf: true,
             write_counts,
+            output_vtc: false,
+            preserve_info: false,
+            // `--adjust-conf-regions` is a no-op when no confidence BED was
+            // supplied. Passing the truth VCF through to qfy in that case
+            // incorrectly turns the default happy setting into qfy's
+            // standalone argument error.
+            adjust_conf_regions: (adjust_conf && conf_bed.is_some())
+                .then(|| truth_variant_input.display().to_string()),
+            threads: None,
+            bcf: false,
+            logfile: None,
+            verbose: false,
+            quiet: false,
+            force_interactive: false,
             roc: args.roc.clone(),
             do_roc: !args.no_roc,
             roc_regions: args.roc_regions.clone(),
@@ -713,13 +739,14 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
             roc_delta: args.roc_delta,
             ci_alpha: args.ci_alpha,
             no_json: args.no_json,
-        })?;
+        })?
     } else {
-        crate::roc::write_roc_files(prefix, &rows, subset_size, conf_size)?;
+        let indices = crate::roc::write_roc_files(prefix, &rows, subset_size, conf_size)?;
         if args.no_roc {
             compact_no_roc_outputs(prefix)?;
         }
-    }
+        indices
+    };
     let commandline = std::env::args().collect::<Vec<_>>().join(" ");
     let run_args = metrics_json::CompareRunArgs {
         truth: &args.truth,
@@ -823,9 +850,11 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     // omitting absent variant types entirely.
     for id in [
         "roc.Locations.INDEL",
+        "roc.Locations.SNP.PASS",
         "roc.Locations.SNP",
         "roc.Locations.INDEL.PASS",
-        "roc.Locations.SNP.PASS",
+        "roc.Locations.SNP.SEL",
+        "roc.Locations.INDEL.SEL",
     ] {
         let path = suffixed_report_path(prefix, &format!("{id}.csv.gz"));
         if !args.no_roc && path.exists() {
@@ -837,15 +866,51 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         .map(|(id, label, path)| (*id, *label, path.as_path()))
         .collect::<Vec<_>>();
     if !args.no_json {
-        metrics_json::write_metrics_gz(
+        metrics_json::write_metrics_gz_for_module_with_indices(
             &suffixed_report_path(prefix, "metrics.json.gz"),
             "hap.py.comparison",
+            "hap.py",
             &commandline,
             &metric_table_refs,
+            Some(&roc_indices.tables),
         )?;
     }
+    publish_bcf_output(&args, prefix)?;
     log_compare_info(&args, "Germline comparison completed successfully")?;
     scratch.cleanup()?;
+    Ok(())
+}
+
+/// `vcf::load_variants` is intentionally a text-VCF reader. Preserve BCF as
+/// the preprocessing format, then materialize a private VCF view only for the
+/// xcmp/SCMP variant-selection layer that still consumes textual records.
+fn materialize_variant_input(source: &Path, scratch: &Path, name: &str) -> Result<PathBuf> {
+    if source.extension().and_then(|value| value.to_str()) != Some("bcf") {
+        return Ok(source.to_path_buf());
+    }
+    let (headers, records) = vcf::load_raw_vcf(source)?;
+    let output = scratch.join(name);
+    vcf::write_raw_vcf(&output, &headers, &records)?;
+    Ok(output)
+}
+
+/// Quantification always produces its annotated report as indexed VCF. In
+/// legacy `--bcf` mode that report is subsequently published as BCF+CSI and
+/// the temporary VCF pair is not part of the final artifact family.
+fn publish_bcf_output(args: &CompareArgs, prefix: &Path) -> Result<()> {
+    if !args.bcf {
+        return Ok(());
+    }
+    let vcf_path = suffixed_report_path(prefix, "vcf.gz");
+    let vcf_index = suffixed_report_path(prefix, "vcf.gz.tbi");
+    let bcf_path = suffixed_report_path(prefix, "bcf");
+    let (headers, records) = vcf::load_raw_vcf(&vcf_path)
+        .with_context(|| format!("failed to prepare BCF report from {}", vcf_path.display()))?;
+    vcf::write_raw_vcf(&bcf_path, &headers, &records)?;
+    fs::remove_file(&vcf_path)?;
+    if vcf_index.exists() {
+        fs::remove_file(&vcf_index)?;
+    }
     Ok(())
 }
 
@@ -1006,7 +1071,7 @@ fn run_vcfeval(
             vcfeval_vcf.display()
         );
     }
-    crate::quantify::run(crate::cli::QuantifyArgs {
+    let roc_indices = crate::quantify::run_with_metric_indices(crate::cli::QuantifyArgs {
         input_vcf: vcfeval_vcf.display().to_string(),
         report_prefix: args.report_prefix.clone(),
         reference: args.reference.clone(),
@@ -1017,6 +1082,15 @@ fn run_vcfeval(
         strat_fixchr: args.strat_fixchr,
         write_vcf: true,
         write_counts: args.write_counts && !args.no_write_counts,
+        output_vtc: false,
+        preserve_info: false,
+        adjust_conf_regions: None,
+        threads: None,
+        bcf: false,
+        logfile: None,
+        verbose: false,
+        quiet: false,
+        force_interactive: false,
         roc: args.roc.clone(),
         do_roc: !args.no_roc,
         roc_regions: args.roc_regions.clone(),
@@ -1036,7 +1110,8 @@ fn run_vcfeval(
     }
     let commandline = std::env::args().collect::<Vec<_>>().join(" ");
     write_runinfo_for_args(args, prefix, &commandline)?;
-    rewrite_compare_metrics(args, prefix, &commandline)?;
+    rewrite_compare_metrics(args, prefix, &commandline, &roc_indices)?;
+    publish_bcf_output(args, prefix)?;
     log_compare_info(args, "Germline comparison completed successfully")?;
     scratch.cleanup()?;
     Ok(())
@@ -1058,7 +1133,9 @@ fn run_scmp(
         let reference = fasta::read_sequences(Path::new(&args.reference))?;
         let contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
         let raw_conf = vcf::load_bed(Path::new(conf_path), &contigs)?;
-        let truth = vcf::load_variants(truth_prep, &contigs, false, None, None, None)?;
+        let truth_variant_input =
+            materialize_variant_input(truth_prep, scratch.path(), "truth.scmp-variants.vcf.gz")?;
+        let truth = vcf::load_variants(&truth_variant_input, &contigs, false, None, None, None)?;
         let padding = gvcf2bed_padding(&truth, Some(&raw_conf));
         let padding_path = scratch.path().join("truth.conf-vars.bed");
         let mut output = fs::File::create(&padding_path)
@@ -1092,7 +1169,7 @@ fn run_scmp(
         &comparison_vcf,
     )?;
     let write_counts = args.write_counts && !args.no_write_counts;
-    crate::quantify::run(crate::cli::QuantifyArgs {
+    let roc_indices = crate::quantify::run_with_metric_indices(crate::cli::QuantifyArgs {
         input_vcf: comparison_vcf.display().to_string(),
         report_prefix: args.report_prefix.clone(),
         reference: args.reference.clone(),
@@ -1103,6 +1180,15 @@ fn run_scmp(
         strat_fixchr: args.strat_fixchr,
         write_vcf: true,
         write_counts,
+        output_vtc: args.output_vtc,
+        preserve_info: false,
+        adjust_conf_regions: None,
+        threads: None,
+        bcf: false,
+        logfile: None,
+        verbose: false,
+        quiet: false,
+        force_interactive: false,
         roc: args.roc.clone(),
         do_roc: !args.no_roc,
         roc_regions: args.roc_regions.clone(),
@@ -1113,7 +1199,8 @@ fn run_scmp(
     })?;
     let commandline = std::env::args().collect::<Vec<_>>().join(" ");
     write_runinfo_for_args(args, prefix, &commandline)?;
-    rewrite_compare_metrics(args, prefix, &commandline)?;
+    rewrite_compare_metrics(args, prefix, &commandline, &roc_indices)?;
+    publish_bcf_output(args, prefix)?;
     log_compare_info(args, "Germline comparison completed successfully")?;
     scratch.cleanup()?;
     Ok(())
@@ -1270,7 +1357,12 @@ fn write_runinfo_for_args(args: &CompareArgs, prefix: &Path, commandline: &str) 
     )
 }
 
-fn rewrite_compare_metrics(args: &CompareArgs, prefix: &Path, commandline: &str) -> Result<()> {
+fn rewrite_compare_metrics(
+    args: &CompareArgs,
+    prefix: &Path,
+    commandline: &str,
+    roc_indices: &crate::roc::MetricIndices,
+) -> Result<()> {
     if args.no_json {
         return Ok(());
     }
@@ -1293,9 +1385,11 @@ fn rewrite_compare_metrics(args: &CompareArgs, prefix: &Path, commandline: &str)
     ));
     for id in [
         "roc.Locations.INDEL",
+        "roc.Locations.SNP.PASS",
         "roc.Locations.SNP",
         "roc.Locations.INDEL.PASS",
-        "roc.Locations.SNP.PASS",
+        "roc.Locations.SNP.SEL",
+        "roc.Locations.INDEL.SEL",
     ] {
         let path = suffixed_report_path(prefix, &format!("{id}.csv.gz"));
         if !args.no_roc && path.is_file() {
@@ -1306,11 +1400,13 @@ fn rewrite_compare_metrics(args: &CompareArgs, prefix: &Path, commandline: &str)
         .iter()
         .map(|(id, label, path)| (*id, *label, path.as_path()))
         .collect::<Vec<_>>();
-    metrics_json::write_metrics_gz(
+    metrics_json::write_metrics_gz_for_module_with_indices(
         &suffixed_report_path(prefix, "metrics.json.gz"),
         "hap.py.comparison",
+        "hap.py",
         commandline,
         &refs,
+        Some(&roc_indices.tables),
     )
 }
 
@@ -1372,12 +1468,6 @@ fn decorate_output_rows(
             }
         }
     }
-    let normalized_roc_field = roc_field
-        .strip_prefix("INFO.")
-        .or_else(|| roc_field.strip_prefix("FORMAT."))
-        .or_else(|| roc_field.strip_prefix("I."))
-        .or_else(|| roc_field.strip_prefix("F."))
-        .unwrap_or(roc_field);
     let mut roc_values = BTreeMap::<InfoKey, String>::new();
     if !matches!(roc_field, "QUAL" | "QQ" | ".") {
         for record in truth.iter().chain(query) {
@@ -1387,10 +1477,12 @@ fn decorate_output_rows(
                 .find_map(|entry| {
                     entry
                         .split_once('=')
-                        .filter(|(key, _)| *key == normalized_roc_field)
+                        // Pinned xcmp looks up the --qq argument literally.
+                        // Prefixes such as INFO. and FORMAT. are not parsed.
+                        .filter(|(key, _)| *key == roc_field)
                         .map(|(_, value)| value.to_string())
                 })
-                .or_else(|| record.sample_map(0).get(normalized_roc_field).cloned());
+                .or_else(|| record.sample_map(0).get(roc_field).cloned());
             if let Some(value) = value {
                 roc_values.insert(
                     (
@@ -1432,10 +1524,6 @@ fn decorate_output_rows(
         if let Some(bs) = current.get("BS") {
             base.insert("BS".to_string(), bs.clone());
         }
-        if let Some(value) = roc_values.get(&key) {
-            base.insert(roc_field.to_string(), format!("{roc_field}={value}"));
-        }
-
         let truth_fields = record.sample_map(0);
         let query_fields = record.sample_map(1);
         let comparison = legacy_comparison_fields(
@@ -1448,6 +1536,31 @@ fn decorate_output_rows(
             for (name, value) in comparison.preserved_fields(row.xcmp_hap_match) {
                 base.insert(name.to_string(), value);
             }
+            let iqq = if roc_field == "QUAL" {
+                Some(comparison.iqq.as_str())
+            } else {
+                roc_values.get(&key).map(String::as_str)
+            };
+            if let Some(iqq) = iqq {
+                base.insert("IQQ".to_string(), format!("IQQ={iqq}"));
+            }
+        }
+
+        if !matches!(roc_field, "QUAL" | "QQ" | ".") && !roc_values.contains_key(&key) {
+            // When xcmp's literal custom-field lookup misses, quantify reads
+            // an absent IQQ: called query samples receive NaN, truth samples
+            // remain missing, and no-call queries retain the zero sentinel.
+            set_comparison_format_value(&mut record, 0, "QQ", ".");
+            let query_called = record
+                .sample_map(1)
+                .get("BVT")
+                .is_some_and(|value| !matches!(value.as_str(), "" | "." | "NOCALL"));
+            set_comparison_format_value(
+                &mut record,
+                1,
+                "QQ",
+                if query_called { "nan" } else { "0" },
+            );
         }
 
         let mut info = base.into_values().collect::<Vec<_>>();
@@ -1500,6 +1613,60 @@ fn info_fields_by_key(info: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Internal compare rows have already received synthetic truth-set membership
+/// tags. Legacy hands qfy the pre-quantification stream instead, so remove
+/// those provisional tags from the private re-quantification handoff and let
+/// qfy derive them from the final confidence and stratification inputs.
+fn sanitize_requantify_handoff_rows(rows: &[AnnotatedRow]) -> Vec<AnnotatedRow> {
+    rows.iter()
+        .cloned()
+        .map(|mut row| {
+            let mut fields = row.line.split('\t').map(str::to_string).collect::<Vec<_>>();
+            if let Some(info) = fields.get_mut(7) {
+                let entries = info
+                    .split(';')
+                    .filter_map(|entry| {
+                        let Some(regions) = entry.strip_prefix("Regions=") else {
+                            return Some(entry.to_string());
+                        };
+                        let retained = regions
+                            .split(',')
+                            .filter(|tag| !matches!(*tag, "TS_boundary" | "TS_contained"))
+                            .collect::<Vec<_>>();
+                        (!retained.is_empty()).then(|| format!("Regions={}", retained.join(",")))
+                    })
+                    .collect::<Vec<_>>();
+                *info = if entries.is_empty() {
+                    ".".to_string()
+                } else {
+                    entries.join(";")
+                };
+                row.line = fields.join("\t");
+            }
+            row
+        })
+        .collect()
+}
+
+fn set_comparison_format_value(
+    record: &mut RawVcfRecord,
+    sample_index: usize,
+    key: &str,
+    value: &str,
+) {
+    let Some(index) = record.format_keys().iter().position(|field| *field == key) else {
+        return;
+    };
+    let Some(sample) = record.samples.get_mut(sample_index) else {
+        return;
+    };
+    let mut fields = sample.split(':').map(str::to_string).collect::<Vec<_>>();
+    if let Some(field) = fields.get_mut(index) {
+        *field = value.to_string();
+        *sample = fields.join(":");
+    }
+}
+
 struct LegacyComparison {
     decision: String,
     kind: String,
@@ -1512,7 +1679,6 @@ struct LegacyComparison {
 impl LegacyComparison {
     fn preserved_fields(&self, hap_match: bool) -> Vec<(&'static str, String)> {
         let mut fields = vec![
-            ("IQQ", format!("IQQ={}", self.iqq)),
             ("ctype", format!("ctype={}", self.ctype)),
             ("kind", format!("kind={}", self.kind)),
             ("type", format!("type={}", self.decision)),
@@ -1805,6 +1971,7 @@ fn build_vcf_headers(
     apply_filters_query: bool,
     output_vtc: bool,
     preserve_info: bool,
+    roc_field: &str,
 ) -> Vec<String> {
     let mut supplied: Vec<String> = truth_headers
         .iter()
@@ -1820,7 +1987,7 @@ fn build_vcf_headers(
         "##INFO=<ID=ctype,Number=1,Type=String,Description=\"Type of comparison performed\">".to_string(),
         "##INFO=<ID=HapMatch,Number=0,Type=Flag,Description=\"Variant is in matching haplotype block\">".to_string(),
         "##INFO=<ID=BS,Number=1,Type=Integer,Description=\"Start position of the benchmarking superlocus on current chromosome\">".to_string(),
-        "##INFO=<ID=IQQ,Number=1,Type=Float,Description=\"Quality value for query variants (QUAL).\">".to_string(),
+        format!("##INFO=<ID=IQQ,Number=1,Type=Float,Description=\"Quality value for query variants ({roc_field}).\">")
     ]);
     if apply_filters_query {
         supplied.push(
@@ -5376,6 +5543,25 @@ fn collect_contigs(
     contigs
 }
 
+fn report_subset_size(
+    contig_non_n_lengths: &BTreeMap<String, usize>,
+    contigs_in_play: &BTreeSet<String>,
+    bcf_output: bool,
+) -> usize {
+    if bcf_output {
+        // The legacy BCF path initializes its aggregate region from the
+        // complete FASTA dictionary, while the VCF path restricts it to the
+        // contigs participating in the comparison. Preserve that observable
+        // reporter quirk even though output encoding does not change calls.
+        contig_non_n_lengths.values().sum()
+    } else {
+        contigs_in_play
+            .iter()
+            .filter_map(|contig| contig_non_n_lengths.get(contig))
+            .sum()
+    }
+}
+
 /// Return the comma-delimited values for one exact INFO key.
 ///
 /// `Regions` is normally the final field, but `--preserve-info` appends the
@@ -5905,6 +6091,23 @@ fn add_variant_stats_subtype<F>(
     }
 }
 
+/// Legacy `VariantWriter` assigns the record-level QUAL as the maximum QUAL
+/// across every sample call on the merged record. Keep per-sample QQ sourced
+/// from the query, but select the combined VCF column independently.
+fn combined_record_qual<'a>(truth: &'a Variant, query: &'a Variant) -> &'a str {
+    let numeric = |qual: &str| {
+        qual.parse::<f32>()
+            .ok()
+            .filter(|value| !value.is_nan())
+            .unwrap_or(0.0)
+    };
+    if numeric(&truth.qual) >= numeric(&query.qual) {
+        &truth.qual
+    } else {
+        &query.qual
+    }
+}
+
 fn tp_combined_row(
     truth: &Variant,
     query: &Variant,
@@ -5925,7 +6128,7 @@ fn tp_combined_row(
             pos = truth.key.pos,
             ref = display_ref(truth, reference),
             alt = display_alt(truth),
-            qual = query.qual,
+            qual = combined_record_qual(truth, query),
             filter = filter_for_output(&query.filter),
             bs = block_start,
             regions = regions,
@@ -5967,7 +6170,7 @@ fn unk_combined_row(
             pos = truth.key.pos,
             ref = display_ref(truth, reference),
             alt = display_alt(truth),
-            qual = query.qual,
+            qual = combined_record_qual(truth, query),
             filter = filter_for_output(&query.filter),
             bs = block_start,
             regions = regions,
@@ -6116,9 +6319,9 @@ fn tp_single_side_row(
 
 /// Combined FN+FP row for a truth+query pair that share chrom/pos/ref/alt
 /// as a set but disagree on GT (e.g. truth 0|1 het vs query 1/1 homalt).
-/// Legacy emits BD=FN on truth, BD=FP on query, BK=am on both. The row
-/// also carries the query's QUAL so downstream ROC enumeration can key
-/// off the actual call quality rather than truth's placeholder zero.
+/// Legacy emits BD=FN on truth, BD=FP on query, BK=am on both. Record QUAL
+/// is the maximum call QUAL, while query QQ retains the query's own score
+/// for downstream ROC enumeration.
 #[allow(clippy::too_many_arguments)] // Mirrors the two-sample legacy VCF row contract.
 fn fn_fp_combined_row(
     truth: &Variant,
@@ -6167,7 +6370,7 @@ fn fn_fp_combined_row(
             pos = truth.key.pos,
             ref = display_ref(truth, reference),
             alt = display_alt(truth),
-            qual = query.qual,
+            qual = combined_record_qual(truth, query),
             filter = filter_for_output(&query.filter),
             bs = block_start,
             regions = regions,
@@ -7032,7 +7235,7 @@ mod scratch_tests {
             "##INFO=<ID=QUERY_ONLY,Number=1,Type=String,Description=\"query\">".to_string(),
             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tQ".to_string(),
         ];
-        let headers = build_vcf_headers(&truth, &query, true, false, false);
+        let headers = build_vcf_headers(&truth, &query, true, false, false, "QUAL");
 
         assert!(headers.iter().any(|line| line.contains("ID=TRUTH_ONLY,")));
         assert!(headers.iter().any(|line| line.contains("ID=QUERY_ONLY,")));
@@ -7056,7 +7259,7 @@ mod scratch_tests {
 
     #[test]
     fn comparison_headers_only_declare_filtered_calls_when_enabled() {
-        let headers = build_vcf_headers(&[], &[], false, false, false);
+        let headers = build_vcf_headers(&[], &[], false, false, false, "QUAL");
         assert!(!headers.iter().any(|line| line.contains("ID=Q_FILTERED,")));
     }
 
@@ -7294,6 +7497,92 @@ mod scratch_tests {
     }
 
     #[test]
+    fn bcf_mode_keeps_bcf_intermediates_and_publishes_only_the_bcf_report_pair() {
+        let root = test_root("bcf-artifacts");
+        let prefix = root.join("result");
+        let scratch_parent = root.join("scratch");
+        let mut options = args(prefix.clone(), &scratch_parent, true);
+        options.bcf = true;
+        run(options).unwrap();
+
+        let bcf_report = suffixed_report_path(&prefix, "bcf");
+        assert!(bcf_report.is_file());
+        assert!(suffixed_report_path(&prefix, "bcf.csi").is_file());
+        assert!(!suffixed_report_path(&prefix, "vcf.gz").exists());
+        assert!(!suffixed_report_path(&prefix, "vcf.gz.tbi").exists());
+        let (_, records) = vcf::load_raw_vcf(&bcf_report).unwrap();
+        assert!(!records.is_empty());
+
+        let scratch_runs = fs::read_dir(&scratch_parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(scratch_runs.len(), 1);
+        let scratch = &scratch_runs[0];
+        for name in [
+            "truth.prep.bcf",
+            "truth.prep.bcf.csi",
+            "query.prep.bcf",
+            "query.prep.bcf.csi",
+        ] {
+            assert!(scratch.join(name).is_file(), "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bcf_report_size_spans_the_full_reference() {
+        let contig_lengths = BTreeMap::from([("chr1".to_string(), 100), ("chrX".to_string(), 40)]);
+        let contigs_in_play = BTreeSet::from(["chr1".to_string()]);
+
+        assert_eq!(
+            report_subset_size(&contig_lengths, &contigs_in_play, false),
+            100,
+            "ordinary reports retain their active-contig size"
+        );
+        assert_eq!(
+            report_subset_size(&contig_lengths, &contigs_in_play, true),
+            140,
+            "legacy BCF reports size the complete reference dictionary"
+        );
+    }
+
+    #[test]
+    fn scmp_bcf_mode_materializes_confidence_padding_without_exposing_vcf() {
+        let root = test_root("scmp-bcf-artifacts");
+        let prefix = root.join("result");
+        let confidence = root.join("confident.bed");
+        fs::write(&confidence, "chr1\t0\t16\n").unwrap();
+        let mut options = args(prefix.clone(), &root.join("scratch"), false);
+        options.engine = CompareEngine::ScmpDistance;
+        options.bcf = true;
+        options.fp_bedfile = Some(confidence.display().to_string());
+        run(options).unwrap();
+
+        assert!(suffixed_report_path(&prefix, "bcf").is_file());
+        assert!(suffixed_report_path(&prefix, "bcf.csi").is_file());
+        assert!(!suffixed_report_path(&prefix, "vcf.gz").exists());
+        assert!(!suffixed_report_path(&prefix, "vcf.gz.tbi").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scmp_output_vtc_is_forwarded_to_ga4gh_quantification() {
+        let root = test_root("scmp-output-vtc");
+        let prefix = root.join("result");
+        let mut options = args(prefix.clone(), &root.join("scratch"), false);
+        options.engine = CompareEngine::ScmpDistance;
+        options.output_vtc = true;
+        run(options).unwrap();
+
+        let (headers, records) =
+            vcf::load_raw_vcf(&suffixed_report_path(&prefix, "vcf.gz")).unwrap();
+        assert!(headers.iter().any(|line| line.contains("##INFO=<ID=VTC,")));
+        assert!(records.iter().any(|record| record.info.contains("VTC=")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn subset_derivation_stops_regions_at_the_next_info_field() {
         let rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
@@ -7320,6 +7609,38 @@ mod scratch_tests {
             assert_eq!(snp.truth_total.total, 1);
             assert_eq!(snp.query_total.total, 1);
         }
+    }
+
+    #[test]
+    fn requantify_handoff_drops_only_provisional_truth_set_membership() {
+        let rows = vec![AnnotatedRow {
+            sort_key: ("chr1".to_string(), 7, 0, 0),
+            line: concat!(
+                "chr1\t7\t.\tA\tC\t30\tPASS\t",
+                "BS=7;Regions=CONF,TS_boundary,EXTRA,TS_contained;RegionsExtent=7-7\t",
+                "GT:BD\t0/1:TP\t0/1:TP"
+            )
+            .to_string(),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+        }];
+
+        let sanitized = sanitize_requantify_handoff_rows(&rows);
+
+        assert!(
+            rows[0]
+                .line
+                .contains("Regions=CONF,TS_boundary,EXTRA,TS_contained")
+        );
+        assert!(
+            sanitized[0]
+                .line
+                .contains("BS=7;Regions=CONF,EXTRA;RegionsExtent=7-7")
+        );
+        assert!(!sanitized[0].line.contains("TS_boundary"));
+        assert!(!sanitized[0].line.contains("TS_contained"));
     }
 
     #[test]
@@ -7468,7 +7789,7 @@ mod scratch_tests {
             "{}",
             rows[0].line
         );
-        let headers = build_vcf_headers(&[], &[], false, true, true);
+        let headers = build_vcf_headers(&[], &[], false, true, true, "QUAL");
         assert!(
             headers
                 .iter()
@@ -7493,6 +7814,48 @@ mod scratch_tests {
             .unwrap();
         assert_eq!(extent, regions + 1);
         assert!(vtc > extent);
+    }
+
+    #[test]
+    fn prefixed_custom_roc_field_preserves_xcmp_literal_lookup_miss() {
+        let source = RawVcfRecord::from_line(
+            "chr1\t7\t.\tA\tC\t30\tPASS\tSCORE=9\tGT\t0/1",
+            Path::new("source.vcf"),
+        )
+        .unwrap();
+        let mut rows = vec![AnnotatedRow {
+            sort_key: ("chr1".to_string(), 7, 0, 0),
+            line: concat!(
+                "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
+                "GT:BD:BK:BVT:BLT:QQ\t",
+                "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
+            )
+            .to_string(),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+        }];
+
+        decorate_output_rows(&mut rows, &[source], &[], true, false, "INFO.SCORE").unwrap();
+
+        let record = RawVcfRecord::from_line(&rows[0].line, Path::new("output.vcf")).unwrap();
+        assert!(record.info.contains("SCORE=9"));
+        assert!(!record.info.contains("INFO.SCORE="));
+        assert!(!record.info.contains("IQQ="));
+        assert_eq!(
+            record.sample_map(0).get("QQ").map(String::as_str),
+            Some(".")
+        );
+        assert_eq!(
+            record.sample_map(1).get("QQ").map(String::as_str),
+            Some("nan")
+        );
+
+        let headers = build_vcf_headers(&[], &[], false, false, true, "INFO.SCORE");
+        assert!(headers.iter().any(|line| {
+            line == "##INFO=<ID=IQQ,Number=1,Type=Float,Description=\"Quality value for query variants (INFO.SCORE).\">"
+        }));
     }
 
     #[test]
@@ -7890,6 +8253,21 @@ mod memory_guards {
             filter: "PASS".to_string(),
             gt: gt.to_string(),
         }
+    }
+
+    #[test]
+    fn combined_tp_uses_max_call_qual_while_qq_stays_query_sourced() {
+        let truth = variant(25, "A", "G", "1/1").with_qual("60");
+        let query = variant(25, "A", "G", "1/1").with_qual("55");
+        let row = tp_combined_row(&truth, &query, "A", 25, "");
+        let fields = row.line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields[5], "60");
+        assert!(fields[9].ends_with(":55"));
+        assert!(fields[10].ends_with(":55"));
+
+        let higher_query = query.with_qual("65");
+        let row = tp_combined_row(&truth, &higher_query, "A", 25, "");
+        assert_eq!(row.line.split('\t').nth(5), Some("65"));
     }
 
     #[test]

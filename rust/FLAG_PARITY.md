@@ -48,8 +48,10 @@ subcommands while retaining discoverable legacy aliases.
 | `vcfcheck` | `hap validate` (`vcfcheck` visible alias) | compatible wrapper form | parser + live/saved fixture |
 
 `hap --version` is supported by clap. Germline also accepts the legacy
-`-v/--version` spelling before required-input validation; `pre` retains the
-legacy requirement that its input/output positionals parse first.
+`-v/--version` spelling before required-input validation; `pre` and `qfy`
+retain the legacy requirement that their normal required arguments parse
+first. The wrapper spellings reproduce the pinned oracle's empty-version
+lines (`Hap.py `, `pre.py `, and `qfy.py `).
 
 ## Germline: `hap.py` → `hap germline`
 
@@ -126,7 +128,7 @@ whole-chromosome vcfeval parity.
 
 The somatic surface now routes every accepted legacy control into comparison,
 reporting, normalization, or operational behavior. The governed matrix contains
-12 byte-parity cases, including a deterministic BAM-depth row.
+23 byte-parity cases, including a deterministic BAM-depth row.
 
 ## Preprocess: `pre.py` → `hap pre`
 
@@ -141,11 +143,12 @@ reporting, normalization, or operational behavior. The governed matrix contains
 | `--decompose`, `--no-decompose`, `-D`, `--leftshift`, `--no-leftshift`, `-L` | same | exact | default-on with legacy last-option-wins overrides; both disabled preserves the bcftools-view record shape | nf-test + oracle + unit |
 | `--filters-only` | same | exact | selected FILTER labels are excluded, with `--pass-only` taking precedence | nf-test + oracle + unit |
 | `--gender male/female/auto/none` | same | exact | vcfcheck-compatible chrX inference and male chrX/chrY haploid expansion | nf-test + oracle + unit |
-| `-w/--window-size` | same | exact | accepted as preprocessing partition tuning; the single-process Rust engine has no partition boundary | nf-test + parser |
+| `-w/--window-size` | same | exact | controls legacy-compatible block-boundary resets when parallel splitting is eligible; inputs below the legacy 100-variant minimum remain unsplit | live option matrix + unit |
 | `--bcftools-norm` | same | exact | built-in `norm -f REF -c x -D` equivalent: left-align, exclude REF mismatches, remove exact duplicates | nf-test + oracle + unit |
 | `--bcf` and `.bcf` input/output | same | exact semantic BCF2 | dependency-free BCF2 reader/writer with BGZF and CSI output; `--bcf` appends `.bcf` like legacy | nf-test + oracle + round-trip unit |
-| `--threads` | same | exact | inert | nf-test parses it |
-| `--logfile`, `--verbose`, `--quiet` | same | exact operational controls | logfile creation/redirection and mutually-exclusive verbosity are wired | nf-test + unit |
+| `--threads` | same | exact | controls whether eligible inputs use legacy-compatible preprocessing block boundaries | live option matrix + unit |
+| `--logfile` | same | compatible diagnostic output | creates the requested path and redirects diagnostics; dynamic Python log text is outside the result-prefix byte contract | live acceptance + unit |
+| `--verbose`, `--quiet` | same | exact control flow | diagnostic routing and mutually-exclusive verbosity are wired; diagnostic stream bytes are not report artifacts | live acceptance + unit |
 | `--force-interactive` | same | exact | accepted no-op; the standalone Rust process has no SGE dispatch path to override | parser + nf-test |
 
 ## Feature extraction: `ftx.py` → `hap ftx`
@@ -155,7 +158,7 @@ reporting, normalization, or operational behavior. The governed matrix contains
 | VCF, VCF.gz, or BCF input | same | exact | shared dependency-free VCF/BCF loader; FTX preprocessing and feature dispatch are format-independent | pinned FTX BCF oracle + shared BCF oracle + unit |
 | input positional, `-o/--output`, `-r/--reference` | same | exact | explicit path or legacy `HG19` → `HGREF` → `/opt/hap.py-data/hg19.fa` lookup; matching legacy, even an explicitly missing reference is ignored unless `--normalize` needs it | pinned oracle + nf-test + unit + parser |
 | `-l/--location`, `-R/--restrict-regions`, `-T/--target-regions` | same | exact | wired | pinned option oracles + unit |
-| `-P/--include-nonpass` | same | exact | wired | none |
+| `-P/--include-nonpass` | same | exact | wired | live option matrix |
 | `--feature-table`, `--feature-label` | same | exact | wired for generic TP/FN schemas, Strelka SNV/indel (HCC + admix), MuTect, VarScan2, and Pisces tables | nf-test + unit |
 | `--fix-chr` | same | exact | wired; opt-in legacy prefix rewrite | pinned option oracle + unit |
 | repeatable `--bam` | same | exact | pure-Rust BGZF/BAM depth extraction; per-reference mapped count × sampled mean query length, averaged across BAMs and tripled like legacy | pinned single- and multi-BAM byte oracles + nf-test + unit + parser |
@@ -168,18 +171,23 @@ Python logging is internal, so there is no missing FTX logging surface.
 
 | Legacy spelling | Rust spelling | Spelling | Behaviour | Oracle coverage |
 |---|---|---|---|---|
-| input positional, `-o/--report-prefix`, `-r/--reference` | same | exact; Rust requires reference where legacy allowed omission | wired | fixture |
-| `-V/--write-vcf` | same | exact | wired | none |
-| `-X/--write-counts` | same | exact | wired; default remains true | parser + fixture default |
-| `--no-write-counts` | same | exact; conflicts with positive switch | wired | parser |
-| `--no-json` | same | exact | wired | fixture construction |
-| `-t/--type` | same | exact; accepts legacy `xcmp`/`ga4gh` values | `xcmp` wired; `ga4gh` rejected explicitly because that annotation schema is not implemented | parser + runtime rejection |
-| `-f/--false-positives` | same | exact | wired; records outside confidence are excluded on truth and counted as query UNK; confidence size is reported | unit |
-| `--stratification`, `--stratification-region`, `--stratification-fixchr` | same | exact; direct regions repeatable | wired for TSV-relative and `NAME:BED` inputs, overlap counts, region sizes, and optional chr normalization | parser + unit |
-| `--output-vtc`, `--preserve-info` | absent | missing | missing | none |
-| `--roc`, `--no-roc` | same | exact | default `QUAL` ROC and disable switch wired; non-QUAL fields rejected explicitly | parser + unit |
-| `--roc-regions`, `--roc-filter`, `--roc-delta`, `--ci-alpha` | same | exact | aggregate `*`, no filter, delta `0.5`, and CI alpha `0.0` wired; unsupported non-defaults rejected explicitly | parser + unit |
-| `--adjust-conf-regions`, `--threads`, `--bcf`, `--logfile`, `--verbose`, `--quiet`, `--force-interactive` | absent | missing | missing | none |
+| input positional, `-o/--report-prefix`, `-r/--reference` | same | exact; Rust requires reference where legacy allowed omission | wired | live xcmp + GA4GH matrix |
+| `-V/--write-vcf` | same | exact | wired, including indexed VCF publication | live option matrix + unit |
+| `-X/--write-counts` | same | exact | wired; default remains true | parser + live option matrix |
+| `--no-write-counts` | same | exact; conflicts with positive switch | wired | parser + live option matrix |
+| `--no-json` | same | exact | wired | live option matrix |
+| `-t/--type` | same | exact; accepts legacy `xcmp`/`ga4gh` values | both xcmp and GA4GH annotation schemas wired | parser + live xcmp/GA4GH matrix + unit |
+| `-f/--false-positives` | same | exact | wired; records outside confidence are excluded on truth and counted as query UNK; confidence size is reported | live option matrix + unit |
+| `--stratification`, `--stratification-region`, `--stratification-fixchr` | same | exact; direct regions repeatable | wired for TSV-relative and `NAME:BED` inputs, overlap counts, region sizes, and optional chr normalization | live option matrix + unit |
+| `--output-vtc`, `--preserve-info` | same | exact | VTC/XCMP publication and XCMP clean-INFO/preserve split wired | direct live oracle + unit |
+| `--roc`, `--no-roc` | same | exact | default `QUAL`, custom INFO/FORMAT fields, and disable switch wired | parser + live option matrix + unit |
+| `--roc-regions`, `--roc-filter`, `--roc-delta`, `--ci-alpha` | same | exact | wired, including named ROC regions, filter tiers, custom deltas, and legacy bit-exact Jeffreys intervals | parser + live option matrix + unit |
+| `--adjust-conf-regions` | same | exact | truth-derived confidence padding wired | unit |
+| `--bcf` | same | exact | BCF/CSI report publication wired | direct live oracle + unit |
+| `--threads` | same | exact | accepted; the dependency-free Rust quantifier remains deterministic and serial | parser |
+| `--logfile` | same | compatible | validates and creates the requested file; Python logging text is not reproduced | unit |
+| `--verbose` | same | exact report artifacts | retains the private Python-compatible `.roc.tsv` intermediate | live option matrix + unit |
+| `--quiet`, `--force-interactive` | same | compatible | accepted no-ops because the standalone Rust process has no default interactive summary or SGE dispatch path | parser |
 
 ## Validation: `vcfcheck` → `hap validate` / `hap vcfcheck`
 
@@ -198,10 +206,10 @@ Python logging is internal, so there is no missing FTX logging surface.
 
 ## Current compatibility priorities
 
-1. Extend qfy beyond its implemented xcmp/QUAL ROC surface only with oracle
-   fixtures for GA4GH annotations, alternate ROC fields/filters, and CI columns.
-2. Add live oracle coverage for vcfcheck boolean/record-limit controls, and
-   implement htslib-compatible BCF translation checks only if BCF inputs are a
-   required compatibility boundary.
+1. Extend vcfcheck BCF translation checks only if htslib-compatible validation
+   is a required compatibility boundary; the boolean and record-limit controls
+   now have live matrix coverage.
+2. Reproduce qfy's Python logging text only if diagnostic log contents become
+   a compatibility requirement; verbose report artifacts are byte-compared.
 3. Add focused oracle cases for every currently wired flag labelled `none`;
    parser acceptance alone is not byte-for-byte evidence.

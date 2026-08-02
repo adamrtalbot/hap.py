@@ -1,2 +1,5 @@
 sample_id,truth_vcf,query_vcf,reference,fp_bed,args
 chr21_region,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--type xcmp
+chr21_ga4gh,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--type ga4gh
+chr21_ga4gh_roc_controls,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--type ga4gh --roc QQ --roc-regions CONF --roc-filter LowGQX --roc-delta 10 --ci-alpha 0.05
+chr21_ga4gh_artifacts,example/happy/PG_NA12878_chr21.vcf.gz,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,--type ga4gh -V --output-vtc --bcf --threads 1 --force-interactive --logfile qfy.log --verbose --no-write-counts --no-roc --no-json

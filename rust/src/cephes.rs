@@ -5,20 +5,23 @@
 //! `cephes_incbi`. To produce identical f64 LSBs as the legacy
 //! container's scipy 1.2.1 we port the exact algorithm.
 //!
-//! Source: scipy/special/cephes/{incbi,incbet,ndtri,polevl}.c at tag
+//! Source: scipy/special/cephes/{beta,gamma,incbi,incbet,ndtri,polevl}.c at tag
 //! v1.2.1 (commits c98ef99..). The functions below mirror the C
 //! source line-by-line with identical magic constants, polynomial
 //! coefficients, and convergence thresholds — only translated into
-//! Rust syntax and idiomatic arithmetic. Bit-exact behavior depends
-//! on these constants and the floating-point operation order.
+//! Rust syntax and idiomatic arithmetic. Logarithm, exponential, and power
+//! operations use an internal port of the AVX2/FMA scalar math selected by the
+//! Ubuntu glibc 2.39 oracle so their last bits do not depend on the host libc.
 
 // Preserve the original Cephes decimal constants for source and bit-level parity.
 #![allow(clippy::excessive_precision)]
 #![allow(clippy::needless_range_loop)]
 
+mod glibc239;
+
 const MACHEP: f64 = f64::EPSILON / 2.0; // exactly 2^-53, matches cephes MACHEP
 const MAXLOG: f64 = 7.097_827_128_933_840e2;
-const MINLOG: f64 = -7.451_332_191_019_411e2;
+const MINLOG: f64 = -7.451_332_191_019_412_076_235e2;
 const MAXGAM: f64 = 171.624_376_956_302_725;
 
 const BIG: f64 = 4.503_599_627_370_496e15;
@@ -85,6 +88,39 @@ const LGAM_C: [f64; 6] = [
 
 const LS2PI: f64 = 0.918_938_533_204_672_741_78;
 
+// Gamma rational approximation between 2 and 3 — cephes gamma.c P[]/Q[].
+const GAMMA_P: [f64; 7] = [
+    1.601_195_224_767_518_614_07e-4,
+    1.191_351_470_065_863_849_13e-3,
+    1.042_137_975_617_615_699_35e-2,
+    4.763_678_004_571_372_314_64e-2,
+    2.074_482_276_484_359_751_50e-1,
+    4.942_148_268_014_971_007_53e-1,
+    9.999_999_999_999_999_967_96e-1,
+];
+
+const GAMMA_Q: [f64; 8] = [
+    -2.315_818_733_241_201_298_19e-5,
+    5.396_055_804_933_033_978_42e-4,
+    -4.456_419_138_517_972_404_94e-3,
+    1.181_397_852_220_604_355_52e-2,
+    3.582_363_986_054_986_533_73e-2,
+    -2.345_917_957_182_433_485_68e-1,
+    7.143_049_170_302_730_740_85e-2,
+    1.000_000_000_000_000_003_20,
+];
+
+const GAMMA_STIR: [f64; 5] = [
+    7.873_113_957_930_936_283_97e-4,
+    -2.295_499_616_133_781_263_80e-4,
+    -2.681_326_178_057_812_328_25e-3,
+    3.472_222_216_054_586_673_10e-3,
+    8.333_333_333_334_822_571_26e-2,
+];
+
+const MAXSTIR: f64 = 143.016_08;
+const ASYMP_FACTOR: f64 = 1.0e6;
+
 fn lgam(x: f64) -> f64 {
     // Mirror scipy/special/cephes/gamma.c::lgam_sgn for positive x only.
     // Our use cases (lgam(a), lgam(b), lgam(a+b) with a,b>0) don't hit
@@ -113,17 +149,17 @@ fn lgam(x: f64) -> f64 {
             z = -z;
         }
         if u == 2.0 {
-            return z.ln();
+            return glibc239::log(z);
         }
         let p2 = u - 2.0;
         // Note: numerator coefficients (B) have 6 entries → polevl with degree 5.
         // Denominator (C) has 6 entries with leading 1.0 omitted → p1evl with N=6.
         let p_val = p2 * polevl(p2, &LGAM_B);
         let q_val = p1evl(p2, &LGAM_C);
-        return (z.ln()) + p_val / q_val;
+        return glibc239::log(z) + p_val / q_val;
     }
     // Stirling for large x.
-    let mut q = (x - 0.5) * x.ln() - x + LS2PI;
+    let mut q = (x - 0.5) * glibc239::log(x) - x + LS2PI;
     if x > 1.0e8 {
         return q;
     }
@@ -139,26 +175,142 @@ fn lgam(x: f64) -> f64 {
     q
 }
 
-#[inline]
-fn lbeta(a: f64, b: f64) -> f64 {
-    // Match scipy 1.2.1 cephes/beta.c::lbeta operation order EXACTLY for the
-    // |a+b|>MAXGAM path (the only path our germline/somatic CIs exercise).
-    // Scipy swaps so |a| >= |b|, then computes:
-    //   y = lgam_sgn(a+b)
-    //   y = lgam_sgn(b) - y
-    //   y = lgam_sgn(a) + y
-    // i.e. lbeta = lgam(a) + (lgam(b) - lgam(a+b))
-    // The order matters for f64 LSBs.
-    let (a_ord, b_ord) = if a.abs() < b.abs() { (b, a) } else { (a, b) };
-    let lgab = lgam(a_ord + b_ord);
-    let lgb = lgam(b_ord);
-    let lga = lgam(a_ord);
-    lga + (lgb - lgab)
+fn stirf(x: f64) -> f64 {
+    if x >= MAXGAM {
+        return f64::INFINITY;
+    }
+    let mut w = 1.0 / x;
+    w = 1.0 + w * polevl(w, &GAMMA_STIR);
+    let mut y = glibc239::exp(x);
+    if x > MAXSTIR {
+        let v = glibc239::pow(x, 0.5 * x - 0.25);
+        y = v * (v / y);
+    } else {
+        y = glibc239::pow(x, x - 0.5) / y;
+    }
+    y = S2PI * y * w;
+    y
+}
+
+/// Positive-argument path of scipy 1.2.1 cephes/gamma.c::Gamma.
+/// incbet rejects non-positive shape parameters before reaching this helper.
+fn gamma_fn(mut x: f64) -> f64 {
+    if !x.is_finite() {
+        return x;
+    }
+    if x.abs() > 33.0 {
+        return stirf(x);
+    }
+
+    let mut z = 1.0;
+    while x >= 3.0 {
+        x -= 1.0;
+        z *= x;
+    }
+    while x < 2.0 {
+        if x < 1.0e-9 {
+            if x == 0.0 {
+                return f64::INFINITY;
+            }
+            return z / ((1.0 + 0.577_215_664_901_532_9 * x) * x);
+        }
+        z /= x;
+        x += 1.0;
+    }
+    if x == 2.0 {
+        return z;
+    }
+
+    x -= 2.0;
+    let p = polevl(x, &GAMMA_P);
+    let q = polevl(x, &GAMMA_Q);
+    z * p / q
+}
+
+fn lbeta_asymp(a: f64, b: f64) -> f64 {
+    let mut r = lgam(b);
+    r -= b * glibc239::log(a);
+    r += b * (1.0 - b) / (2.0 * a);
+    r += b * (1.0 - b) * (1.0 - 2.0 * b) / (12.0 * a * a);
+    r += -b * b * (1.0 - b) * (1.0 - b) / (12.0 * a * a * a);
+    r
 }
 
 #[inline]
+#[allow(clippy::assign_op_pattern)] // Preserve cephes operand order exactly.
+fn lbeta(a: f64, b: f64) -> f64 {
+    // Match scipy 1.2.1 cephes/beta.c::lbeta decision and operation order.
+    let (mut a, mut b) = (a, b);
+    if a.abs() < b.abs() {
+        std::mem::swap(&mut a, &mut b);
+    }
+    if a.abs() > ASYMP_FACTOR * b.abs() && a > ASYMP_FACTOR {
+        return lbeta_asymp(a, b);
+    }
+
+    let mut y = a + b;
+    if y.abs() > MAXGAM || a.abs() > MAXGAM || b.abs() > MAXGAM {
+        y = lgam(y);
+        y = lgam(b) - y;
+        y = lgam(a) + y;
+        return y;
+    }
+
+    y = gamma_fn(y);
+    a = gamma_fn(a);
+    b = gamma_fn(b);
+    if y == 0.0 {
+        return f64::INFINITY;
+    }
+    if (a.abs() - y.abs()).abs() > (b.abs() - y.abs()).abs() {
+        y = b / y;
+        y *= a;
+    } else {
+        y = a / y;
+        y *= b;
+    }
+    glibc239::log(y.abs())
+}
+
+#[inline]
+#[allow(clippy::assign_op_pattern)] // Preserve cephes operand order exactly.
 fn beta_fn(a: f64, b: f64) -> f64 {
-    lbeta(a, b).exp()
+    // Match scipy 1.2.1 cephes/beta.c::beta. In particular, small shape
+    // parameters use Gamma products rather than exp(lbeta); those paths
+    // differ by several ULPs and feed directly into incbi's Newton steps.
+    let (mut a, mut b) = (a, b);
+    if a.abs() < b.abs() {
+        std::mem::swap(&mut a, &mut b);
+    }
+    if a.abs() > ASYMP_FACTOR * b.abs() && a > ASYMP_FACTOR {
+        return glibc239::exp(lbeta_asymp(a, b));
+    }
+
+    let mut y = a + b;
+    if y.abs() > MAXGAM || a.abs() > MAXGAM || b.abs() > MAXGAM {
+        y = lgam(y);
+        y = lgam(b) - y;
+        y = lgam(a) + y;
+        if y > MAXLOG {
+            return f64::INFINITY;
+        }
+        return glibc239::exp(y);
+    }
+
+    y = gamma_fn(y);
+    a = gamma_fn(a);
+    b = gamma_fn(b);
+    if y == 0.0 {
+        return f64::INFINITY;
+    }
+    if (a.abs() - y.abs()).abs() > (b.abs() - y.abs()).abs() {
+        y = b / y;
+        y *= a;
+    } else {
+        y = a / y;
+        y *= b;
+    }
+    y
 }
 
 // ---------------------------------------------------------------------------
@@ -251,8 +403,8 @@ pub fn ndtri(y0: f64) -> f64 {
         x *= S2PI;
         return x;
     }
-    let x = (-2.0 * y.ln()).sqrt();
-    let x0 = x - x.ln() / x;
+    let x = (-2.0 * glibc239::log(y)).sqrt();
+    let x0 = x - glibc239::log(x) / x;
     let z = 1.0 / x;
     let x1 = if x < 8.0 {
         z * polevl(z, &NDTRI_P1) / p1evl(z, &NDTRI_Q1)
@@ -421,16 +573,16 @@ fn pseries(a: f64, b: f64, x: f64) -> f64 {
     }
     s += t1;
     s += ai;
-    let u3 = a * x.ln();
+    let u3 = a * glibc239::log(x);
     if (a + b) < MAXGAM && u3.abs() < MAXLOG {
         let t = 1.0 / beta_fn(a, b);
-        s = s * t * x.powf(a)
+        s = s * t * glibc239::pow(x, a)
     } else {
-        let t = -lbeta(a, b) + u3 + s.ln();
+        let t = -lbeta(a, b) + u3 + glibc239::log(s);
         if t < MINLOG {
             s = 0.0;
         } else {
-            s = t.exp();
+            s = glibc239::exp(t);
         }
     }
     s
@@ -482,12 +634,12 @@ pub fn incbet(aa: f64, bb: f64, xx: f64) -> f64 {
         incbd(a, b, x) / xc
     };
     // Multiply w by x^a (1-x)^b * gamma(a+b) / (a * gamma(a) * gamma(b)).
-    let y_log = a * x.ln();
-    let t_log = b * xc.ln();
+    let y_log = a * glibc239::log(x);
+    let t_log = b * glibc239::log(xc);
     let mut t;
     if (a + b) < MAXGAM && y_log.abs() < MAXLOG && t_log.abs() < MAXLOG {
-        t = xc.powf(b);
-        t *= x.powf(a);
+        t = glibc239::pow(xc, b);
+        t *= glibc239::pow(x, a);
         t /= a;
         t *= w_cf;
         t *= 1.0 / beta_fn(a, b);
@@ -499,11 +651,11 @@ pub fn incbet(aa: f64, bb: f64, xx: f64) -> f64 {
         // computed inline; scipy's lbeta has a specific operation order that
         // produces different f64 LSBs).
         let mut log_y = y_log + (t_log - lbeta(a, b));
-        log_y += (w_cf / a).ln();
+        log_y += glibc239::log(w_cf / a);
         if log_y < MINLOG {
             t = 0.0;
         } else {
-            t = log_y.exp();
+            t = glibc239::exp(log_y);
         }
     }
     if flag == 1 {
@@ -578,7 +730,7 @@ pub fn incbi(aa: f64, bb: f64, yy0: f64) -> f64 {
         if d < MINLOG {
             return apply_rflg(0.0, rflg);
         }
-        x = a / (a + b * d.exp());
+        x = a / (a + b * glibc239::exp(d));
         y = incbet(a, b, x);
         yp = (y - y0) / y0;
         if yp.abs() < 0.2 {
@@ -767,26 +919,29 @@ fn newton_then_maybe_ihalve(
         if x == 1.0 || x == 0.0 {
             break;
         }
-        let d_log = (a - 1.0) * x.ln() + (b - 1.0) * (1.0 - x).ln() + lgm;
+        let d_log = (a - 1.0) * glibc239::log(x) + (b - 1.0) * glibc239::log(1.0 - x) + lgm;
         if d_log < MINLOG {
             return apply_rflg(x, rflg);
         }
         if d_log > MAXLOG {
             break;
         }
-        let d_val = d_log.exp();
+        let d_val = glibc239::exp(d_log);
         let d_step = (y - y0) / d_val;
         let mut xt = x - d_step;
         if xt <= x0 {
-            let yp = (x - x0) / (x1 - x0);
-            xt = x0 + 0.5 * yp * (x - x0);
+            // cephes reuses `y` for this interpolation fraction. If the
+            // corrected step still leaves the bracket and breaks, that value
+            // deliberately becomes the first y seen after `goto ihalve`.
+            y = (x - x0) / (x1 - x0);
+            xt = x0 + 0.5 * y * (x - x0);
             if xt <= 0.0 {
                 break;
             }
         }
         if xt >= x1 {
-            let yp = (x1 - x) / (x1 - x0);
-            xt = x1 - 0.5 * yp * (x1 - x);
+            y = (x1 - x) / (x1 - x0);
+            xt = x1 - 0.5 * y * (x1 - x);
             if xt >= 1.0 {
                 break;
             }
@@ -806,6 +961,13 @@ fn newton_then_maybe_ihalve(
 // Public entry: matches scipy.special.btdtri(a, b, p).
 pub fn btdtri(a: f64, b: f64, p: f64) -> f64 {
     incbi(a, b, p)
+}
+
+/// Deterministic positive-finite power used by legacy confidence-interval
+/// edge formulas. This follows the same glibc 2.39 FMA path as the elementary
+/// operations used internally by the Cephes port.
+pub(crate) fn legacy_pow(base: f64, exponent: f64) -> f64 {
+    glibc239::pow(base, exponent)
 }
 
 #[cfg(test)]
@@ -839,6 +1001,12 @@ mod tests {
             "ndtri(0.025)={}",
             r
         );
+    }
+
+    #[test]
+    fn beta_uses_legacy_gamma_product_for_small_shapes() {
+        // scipy 1.2.1 cephes beta(1.5, 3.5). exp(lbeta) is two ULPs higher.
+        assert_eq!(beta_fn(1.5, 3.5).to_bits(), 0x3fbf_6a7a_2955_385e);
     }
 
     #[test]
@@ -890,5 +1058,66 @@ mod tests {
             r, expected, diff, ulps
         );
         assert!(ulps <= 0, "Not bit-exact: ULPs apart = {}", ulps);
+    }
+
+    #[test]
+    fn incbi_matches_legacy_low_count_jeffreys_upper_bound() {
+        // scipy 1.2.1: beta.ppf(0.975, 1.5, 3.5)
+        assert_eq!(incbi(1.5, 3.5, 0.975).to_bits(), 0x3fe6_eb81_9902_e1dc);
+    }
+
+    #[test]
+    fn incbi_matches_legacy_qfy_confidence_bounds() {
+        // Bit patterns captured from the pinned scipy 1.2.1 legacy image.
+        let cases = [
+            // Exercises Cephes' intentional reuse of `y` when Newton leaves
+            // its bracket before returning to the interval-halving loop.
+            (12.5, 7_859.5, 0.025, 0x3f4b_5170_e301_0cca),
+            (1037.5, 119.5, 0.025, 0x3fec_1d15_8e8d_75af),
+            (1037.5, 119.5, 0.975, 0x3fed_3c11_2b31_7194),
+            (1061.5, 42.5, 0.025, 0x3fee_616b_7590_dd7c),
+            (386.5, 1103.5, 0.975, 0x3fd2_0b62_1815_9064),
+        ];
+        for (a, b, p, expected_bits) in cases {
+            println!(
+                "incbi({a}, {b}, {p}) = {:#018x}, expected {expected_bits:#018x}",
+                incbi(a, b, p).to_bits()
+            );
+            assert_eq!(
+                incbi(a, b, p).to_bits(),
+                expected_bits,
+                "incbi({a}, {b}, {p})"
+            );
+        }
+    }
+
+    #[test]
+    fn incbi_matches_legacy_qfy_small_mid_and_high_counts() {
+        // Representative bit patterns from the pinned scipy 1.2.1 qfy row.
+        let cases = [
+            (12.5, 7_859.5, 0.025, 0x3f4b_5170_e301_0cca),
+            (315.5, 1_071.5, 0.025, 0x3fca_5775_399a_4209),
+            (983.5, 173.5, 0.025, 0x3fea_867b_bd42_39eb),
+            (2_405.5, 5_466.5, 0.025, 0x3fd2_e8a0_ce86_2c1b),
+        ];
+        for (a, b, p, expected_bits) in cases {
+            assert_eq!(
+                incbi(a, b, p).to_bits(),
+                expected_bits,
+                "incbi({a}, {b}, {p})"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_pow_matches_modified_jeffreys_edges() {
+        assert_eq!(
+            legacy_pow(0.025, 1.0 / 1_233.0).to_bits(),
+            0.997_012_679_016_070_6_f64.to_bits()
+        );
+        assert_eq!(
+            (1.0 - legacy_pow(0.025, 1.0 / 136.0)).to_bits(),
+            0.026_759_558_379_143_233_f64.to_bits()
+        );
     }
 }

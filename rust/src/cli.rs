@@ -516,6 +516,15 @@ pub struct QuantifyArgs {
     pub strat_fixchr: bool,
     pub write_vcf: bool,
     pub write_counts: bool,
+    pub output_vtc: bool,
+    pub preserve_info: bool,
+    pub adjust_conf_regions: Option<String>,
+    pub threads: Option<usize>,
+    pub bcf: bool,
+    pub logfile: Option<String>,
+    pub verbose: bool,
+    pub quiet: bool,
+    pub force_interactive: bool,
     pub roc: String,
     pub do_roc: bool,
     pub roc_regions: Vec<String>,
@@ -552,6 +561,15 @@ impl FromArgMatches for QuantifyArgs {
             strat_fixchr: matches.get_flag("strat_fixchr"),
             write_vcf: matches.get_flag("write_vcf"),
             write_counts: !matches.get_flag("no_write_counts"),
+            output_vtc: matches.get_flag("output_vtc"),
+            preserve_info: matches.get_flag("preserve_info"),
+            adjust_conf_regions: matches.remove_one::<String>("adjust_conf_regions"),
+            threads: matches.remove_one::<usize>("threads"),
+            bcf: matches.get_flag("bcf"),
+            logfile: matches.remove_one::<String>("logfile"),
+            verbose: matches.get_flag("verbose"),
+            quiet: matches.get_flag("quiet"),
+            force_interactive: matches.get_flag("force_interactive"),
             roc: matches
                 .remove_one::<String>("roc")
                 .unwrap_or_else(|| "QUAL".to_string()),
@@ -608,6 +626,21 @@ impl FromArgMatches for QuantifyArgs {
         if matches.get_flag("no_write_counts") {
             self.write_counts = false;
         }
+        self.output_vtc |= matches.get_flag("output_vtc");
+        self.preserve_info |= matches.get_flag("preserve_info");
+        if let Some(adjust_conf_regions) = matches.remove_one::<String>("adjust_conf_regions") {
+            self.adjust_conf_regions = Some(adjust_conf_regions);
+        }
+        if let Some(threads) = matches.remove_one::<usize>("threads") {
+            self.threads = Some(threads);
+        }
+        self.bcf |= matches.get_flag("bcf");
+        if let Some(logfile) = matches.remove_one::<String>("logfile") {
+            self.logfile = Some(logfile);
+        }
+        self.verbose |= matches.get_flag("verbose");
+        self.quiet |= matches.get_flag("quiet");
+        self.force_interactive |= matches.get_flag("force_interactive");
         if let Some(roc) = matches.remove_one::<String>("roc") {
             self.roc = roc;
         }
@@ -657,6 +690,12 @@ fn augment_quantify_args(command: ClapCommand, required: bool) -> ClapCommand {
                 .required(required),
         )
         .arg(
+            Arg::new("version")
+                .short('v')
+                .long("version")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("annotation_type")
                 .short('t')
                 .long("type")
@@ -692,6 +731,41 @@ fn augment_quantify_args(command: ClapCommand, required: bool) -> ClapCommand {
                 .long("no-write-counts")
                 .action(ArgAction::SetTrue)
                 .conflicts_with("write_counts"),
+        )
+        .arg(
+            Arg::new("output_vtc")
+                .long("output-vtc")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("preserve_info")
+                .long("preserve-info")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(Arg::new("adjust_conf_regions").long("adjust-conf-regions"))
+        .arg(
+            Arg::new("threads")
+                .long("threads")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(Arg::new("bcf").long("bcf").action(ArgAction::SetTrue))
+        .arg(Arg::new("logfile").long("logfile"))
+        .arg(
+            Arg::new("verbose")
+                .long("verbose")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("quiet"),
+        )
+        .arg(
+            Arg::new("quiet")
+                .long("quiet")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("verbose"),
+        )
+        .arg(
+            Arg::new("force_interactive")
+                .long("force-interactive")
+                .action(ArgAction::SetTrue),
         )
         .arg(Arg::new("roc").long("roc").default_value("QUAL"))
         .arg(Arg::new("no_roc").long("no-roc").action(ArgAction::SetTrue))
@@ -987,6 +1061,39 @@ pub fn process_args_with_legacy_somatic_aliases() -> Vec<std::ffi::OsString> {
         }
     }
     arguments
+}
+
+/// hap.py handled its version flag before validating required arguments.
+/// Stop at the option terminator so a positional file named `--version`
+/// remains reachable.
+pub fn requests_legacy_subcommand_version(arguments: &[std::ffi::OsString]) -> bool {
+    let supports_version = arguments
+        .get(1)
+        .and_then(|value| value.to_str())
+        .is_some_and(|command| matches!(command, "germline" | "compare"));
+
+    supports_version
+        && arguments
+            .iter()
+            .skip(2)
+            .take_while(|argument| *argument != "--")
+            .any(|argument| argument == "-v" || argument == "--version")
+}
+
+/// qfy.py validates its required arguments before honoring its version flag.
+/// This predicate is therefore consumed only after clap parsing succeeds.
+pub fn requests_quantify_version(arguments: &[std::ffi::OsString]) -> bool {
+    let supports_version = arguments
+        .get(1)
+        .and_then(|value| value.to_str())
+        .is_some_and(|command| matches!(command, "quantify" | "qfy"));
+
+    supports_version
+        && arguments
+            .iter()
+            .skip(2)
+            .take_while(|argument| *argument != "--")
+            .any(|argument| argument == "-v" || argument == "--version")
 }
 
 #[derive(Debug, Clone)]
@@ -1317,6 +1424,57 @@ mod tests {
             panic!("quantify should parse");
         };
         assert!(!args.do_roc);
+    }
+
+    #[test]
+    fn qfy_accepts_standalone_legacy_runtime_controls() {
+        let cli = Cli::try_parse_from([
+            "hap",
+            "qfy",
+            "annotated.vcf.gz",
+            "-o",
+            "report",
+            "-r",
+            "ref.fa",
+            "--output-vtc",
+            "--preserve-info",
+            "--adjust-conf-regions",
+            "truth.vcf.gz",
+            "--threads",
+            "3",
+            "--bcf",
+            "--logfile",
+            "qfy.log",
+            "--verbose",
+            "--force-interactive",
+        ])
+        .expect("standalone qfy compatibility controls should parse");
+        let Command::Quantify(args) = cli.command else {
+            panic!("qfy should resolve to quantify");
+        };
+        assert!(args.output_vtc);
+        assert!(args.preserve_info);
+        assert_eq!(args.adjust_conf_regions.as_deref(), Some("truth.vcf.gz"));
+        assert_eq!(args.threads, Some(3));
+        assert!(args.bcf);
+        assert_eq!(args.logfile.as_deref(), Some("qfy.log"));
+        assert!(args.verbose);
+        assert!(!args.quiet);
+        assert!(args.force_interactive);
+
+        let conflict = Cli::try_parse_from([
+            "hap",
+            "qfy",
+            "annotated.vcf.gz",
+            "-o",
+            "report",
+            "-r",
+            "ref.fa",
+            "--verbose",
+            "--quiet",
+        ])
+        .expect_err("legacy verbosity controls are mutually exclusive");
+        assert_eq!(conflict.kind(), ErrorKind::ArgumentConflict);
     }
 
     #[test]

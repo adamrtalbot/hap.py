@@ -1,0 +1,10 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100>
+##FILTER=<ID=LowQual,Description="Low quality">
+##INFO=<ID=SCORE,Number=1,Type=Float,Description="Synthetic ROC score">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	QUERY
+chr1	5	query-snp	A	G	55	PASS	SCORE=55	GT	0/1
+chr1	8	query-overlap	TACG	T	45	PASS	SCORE=45	GT	0/1
+chr1	20	query-filtered	T	C	35	LowQual	SCORE=35	GT	0/1
+chr1	32	query-only	T	A	25	PASS	SCORE=25	GT	0/1

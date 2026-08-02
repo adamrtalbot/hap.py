@@ -1,0 +1,13 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=40>
+##FILTER=<ID=PASS,Description="All filters passed">
+##FILTER=<ID=LowQ,Description="Synthetic filtered record">
+##ALT=<ID=DEL,Description="Synthetic symbolic deletion">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+chr1	2	.	AAA	A	10	LowQ	.	GT	0/1
+chr1	5	.	AAA	A	20	PASS	.	GT	0/1
+chr1	5	.	AAA	A	30	PASS	.	GT	0/1
+chr1	10	.	AAA	AAG	40	PASS	.	GT	0/1
+chr1	14	.	A	<DEL>	50	PASS	END=18	GT	0/1

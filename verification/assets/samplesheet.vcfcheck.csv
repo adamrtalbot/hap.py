@@ -1,2 +1,5 @@
 sample_id,input_vcf,args
 formats,src/data/test_formats.vcf,
+warning_controls,local:assets/fixtures/vcfcheck-matrix/warning-controls.vcf,--apply-filters true --limit-records 4 --message-every 1 --strict-homref true --all-warnings true --check-bcf-errors false
+ploidy,local:assets/fixtures/vcfcheck-matrix/ploidy.vcf,--limit-records=-1
+negative_limit,local:assets/fixtures/vcfcheck-matrix/ploidy.vcf,--limit-records=-2
