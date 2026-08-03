@@ -16,13 +16,13 @@ status to pass.
 
 | Lane | Legacy tool | Rust command | Default rows |
 |---|---|---|---:|
-| happy | `hap.py` | `hap germline` | 19 |
+| happy | `hap.py` | `hap germline` | 20 |
 | sompy | `som.py` | `hap somatic` | 23 |
 | prepy | `pre.py` | `hap pre` | 37 |
 | ftxpy | `ftx.py` | `hap ftx` | 24 |
-| qfy | `qfy.py` | `hap quantify` | 4 |
-| vcfcheck | `vcfcheck` | `hap validate` | 4 |
-| **Total** | | | **111** |
+| qfy | `qfy.py` | `hap quantify` | 7 |
+| vcfcheck | `vcfcheck` | `hap validate` | 9 |
+| **Total** | | | **120** |
 
 The qfy lane generates bounded chr21 xcmp-annotated VCFs from pinned
 truth/query/reference fixtures, then gives the same generated VCF and index to
@@ -30,7 +30,9 @@ both quantifiers. The default `cases` setting selects all six lanes;
 `HAP_TEST_CASES` narrows a diagnostic run without changing the release matrix
 definition. `OPTION_MATRIX.md` defines the constrained-pairwise selection
 method, while `assets/option-coverage.csv` gives every samplesheet row a unique
-coverage ID and records the options exercised.
+coverage ID and records the options exercised. The independent
+`assets/expected-artifacts.csv` manifest declares the exact legacy-observed
+output set for every row: 436 artifacts across the 120-row release matrix.
 
 ## Layout
 
@@ -47,11 +49,14 @@ verification/
 │   ├── samplesheet.qfy.csv
 │   ├── samplesheet.vcfcheck.csv
 │   ├── option-coverage.csv
+│   ├── expected-artifacts.csv       exact per-row output contract
 │   └── fixtures/                    compact option-matrix fixtures
 ├── modules/                      legacy/Rust lane processes and reports
 ├── scripts/
 │   ├── verify-ftx-options.sh
 │   └── verify-somatic-options.sh
+├── BEHAVIOR_AUDIT.csv            source-to-test parity inventory
+├── EXTERNAL_EVIDENCE.md          imported-fixture provenance and licensing
 ├── OPTION_MATRIX.md              matrix design and comparison contract
 └── tests/main.nf.test            coverage and parity assertions
 ```
@@ -59,6 +64,10 @@ verification/
 `rust/src/parity_verifier.rs` owns the file-type-aware comparator used by the
 workflow. `rust/src/verify_fixtures.rs` is the feature-gated helper binary
 staged into comparison tasks.
+
+`BEHAVIOR_AUDIT.csv` is the machine-readable legacy/source/test gap inventory.
+`EXTERNAL_EVIDENCE.md` records immutable provenance, checksums, licensing, and
+import decisions for third-party adversarial fixtures.
 
 ## Prerequisites
 
@@ -165,7 +174,9 @@ results/
 
 The nf-test contract rejects missing or extra samples, duplicate IDs, absent
 artifact trees, stale/incomplete status payloads, empty comparisons, and any
-file verdict whose `ok` value is false.
+file verdict whose `ok` value is false. It also requires both published trees
+and the status artifact identities to equal `expected-artifacts.csv`; two sides
+that agree on the same wrong output set cannot pass.
 
 ## Comparison rules
 
@@ -174,14 +185,15 @@ file verdict whose `ok` value is false.
 | `*.summary.csv`, `*.extended.csv`, `*.stats.csv`, `*.features.csv` | Compare decoded text in emitted order. |
 | `*.roc.*.csv.gz`, `*.csv.gz` | Decompress, then compare text in emitted order. |
 | `*.vcf`, `*.vcf.gz` | Compare records and nonvolatile headers in emitted order; only the explicit producer/time/command/reference allowlist is excluded. |
-| `*.metrics.json*`, `*.runinfo.json*` | Compare recursively; exclude only governed runtime identity, environment, timestamp, and representational metadata. |
+| `*.metrics.json*`, `*.runinfo.json*` | Compare recursively in emitted array order, including metric index values; exclude only governed runtime identity, environment, timestamp, and command-line text. |
 | VCF `*.tbi`, `*.csi` | `tabix` must retrieve every companion VCF record in source order. |
 | BCF `*.csi` | The built-in CSI reader follows indexed BGZF chunks and must retrieve every BCF record in source order. |
 | `*.fai` | Byte exact. |
 | Everything else | Byte exact. |
 
-Artifact comparison is symmetric and preserves ordering and duplicates. A file
-present on only one side fails, as does an empty matching artifact set.
+Artifact comparison preserves ordering and duplicates. Each invocation receives
+the row's non-empty exact artifact set from `expected-artifacts.csv`; a missing
+or extra file on either side fails, including an extra file shared by both.
 
 ## Saved and real-world fixture helper
 

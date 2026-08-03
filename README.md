@@ -51,26 +51,29 @@ This gate is available from a source checkout, not from the published Cargo
 package.
 
 `verification/` runs each governed samplesheet row through both the pinned
-legacy oracle and the local `hap` binary. The default matrix contains 111 rows:
+legacy oracle and the local `hap` binary. The default matrix contains 120 rows:
 
 | Lane | Rust command | Rows |
 |---|---|---:|
-| happy | `hap germline` | 19 |
+| happy | `hap germline` | 20 |
 | sompy | `hap somatic` | 23 |
 | prepy | `hap pre` | 37 |
 | ftxpy | `hap ftx` | 24 |
-| qfy | `hap quantify` | 4 |
-| vcfcheck | `hap validate` | 4 |
+| qfy | `hap quantify` | 7 |
+| vcfcheck | `hap validate` | 9 |
 
-The gate checks complete samplesheet publication, symmetric legacy/Rust
-result-prefix artifact sets, and every per-case comparator status. Comparisons preserve
-ordering and duplicates: stable text is exact, JSON is recursive with a narrow
-runtime-metadata allowlist, and VCF/BCF index checks retrieve source records in
-order through TBI or CSI. The workflow produces reports; nf-test turns failed
+The gate checks complete samplesheet publication, 436 row-specific artifacts
+against the independent `verification/assets/expected-artifacts.csv` contract,
+and every per-case comparator status. Both legacy and Rust must publish exactly
+the declared set; matching extra or missing files fail. Comparisons preserve
+ordering and duplicates: stable text is exact, JSON metric order and index
+values are semantic under a narrow runtime-metadata allowlist, and VCF/BCF
+index checks retrieve source records in order through TBI or CSI. The workflow produces reports; nf-test turns failed
 comparison statuses or incomplete coverage into a failed gate.
 `verification/assets/option-coverage.csv` maps every row to a unique coverage
-ID; `verification/OPTION_MATRIX.md` records the constrained-pairwise design and
-the byte-comparison contract.
+ID; `verification/assets/expected-artifacts.csv` maps every row to its exact
+legacy-observed output set. `verification/OPTION_MATRIX.md` records the
+constrained-pairwise design and byte-comparison contract.
 
 The evaluation toolchain is pinned to Nextflow 26.04.6 and nf-test 0.9.5:
 

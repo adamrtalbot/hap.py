@@ -19,7 +19,26 @@ const INDEL_SUBTYPES: [&str; 9] = [
 ];
 
 type RegionMap = BTreeMap<String, Vec<vcf::BedInterval>>;
-type LoadedRegions = (Option<Vec<vcf::BedInterval>>, RegionMap);
+type RegionLevels = BTreeMap<String, usize>;
+type LoadedRegions = (Option<Vec<vcf::BedInterval>>, RegionMap, RegionLevels);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BenchmarkSamples {
+    truth: Option<usize>,
+    query: Option<usize>,
+}
+
+impl BenchmarkSamples {
+    #[cfg(test)]
+    const POSITIONAL: Self = Self {
+        truth: Some(0),
+        query: Some(1),
+    };
+
+    fn has_both(self) -> bool {
+        self.truth.is_some() && self.query.is_some()
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ClassifiedVariant {
@@ -69,6 +88,7 @@ struct ExtendedTableOptions<'a> {
     whole_reference_size: usize,
     stratification_sizes: &'a BTreeMap<String, usize>,
     stratification_confidence_sizes: &'a BTreeMap<String, usize>,
+    stratification_levels: &'a RegionLevels,
     confidence_size: Option<usize>,
     qq_field: &'a str,
     ci_alpha: f64,
@@ -102,31 +122,46 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
             output_vcf.display()
         );
     }
+    require_quantifier_index(Path::new(&args.input_vcf))?;
     let (mut headers, mut records) = vcf::load_raw_vcf(Path::new(&args.input_vcf))?;
+    let benchmark_samples = benchmark_sample_indices(&headers);
+    let do_roc = args.do_roc && benchmark_samples.has_both();
     let reference = crate::fasta::read_sequences(Path::new(&args.reference))?;
     let reference_contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
-    let (confidence, stratifications) = load_regions(&args, &reference_contigs)?;
+    let (confidence, stratifications, stratification_levels) =
+        load_regions(&args, &reference_contigs)?;
     for record in &mut records {
-        annotate_regions(
+        if args.preserve_info {
+            let extent = legacy_regions_extent(record);
+            set_info_value(&mut record.info, "RegionsExtent", &extent);
+        }
+        annotate_regions_for_samples(
             record,
             confidence.as_deref(),
             &stratifications,
             annotation_type == "ga4gh",
+            benchmark_samples,
         );
         if annotation_type == "xcmp" {
-            reannotate_xcmp_record(record, confidence.is_some(), &args.roc);
+            reannotate_xcmp_record_for_samples(
+                record,
+                confidence.is_some(),
+                &args.roc,
+                benchmark_samples,
+            );
         } else {
             reannotate_ga4gh_record(record);
         }
     }
-    propagate_superlocus_annotations(&mut records, annotation_type);
+    propagate_superlocus_annotations_for_samples(&mut records, annotation_type, benchmark_samples);
     for record in &mut records {
-        decorate_quantified_record(
+        decorate_quantified_record_for_samples(
             record,
             annotation_type,
             args.preserve_info,
             args.output_vtc,
             confidence.is_some(),
+            benchmark_samples,
         );
     }
     let subset_size = contigs_in_input(&records)
@@ -166,8 +201,12 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
         .unwrap_or_default();
 
     for record in &records {
-        let truth = classify_side(record, 0);
-        let query = classify_side(record, 1);
+        let truth = benchmark_samples
+            .truth
+            .and_then(|sample_index| classify_side(record, sample_index));
+        let query = benchmark_samples
+            .query
+            .and_then(|sample_index| classify_side(record, sample_index));
 
         if let Some(classified) = truth {
             record_truth(&mut all_counts, &classified);
@@ -191,6 +230,18 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
     // ceased to be a TP because its paired query record was filtered becomes
     // a PASS-level FN. Legacy qfy derives this lane algebraically.
     derive_pass_truth_false_negatives(&mut pass_counts);
+    let reported_types = all_counts
+        .by_type
+        .keys()
+        .chain(pass_counts.by_type.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for variant_type in reported_types {
+        subsets_present
+            .entry(variant_type)
+            .or_default()
+            .extend(stratifications.keys().cloned());
+    }
 
     if let Some(parent) = prefix.parent()
         && !parent.as_os_str().is_empty()
@@ -217,6 +268,7 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
                 whole_reference_size,
                 stratification_sizes: &stratification_sizes,
                 stratification_confidence_sizes: &stratification_confidence_sizes,
+                stratification_levels: &stratification_levels,
                 confidence_size,
                 qq_field: &args.roc,
                 ci_alpha: args.ci_alpha,
@@ -224,6 +276,13 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
         )?;
     }
     if args.write_vcf {
+        if args.preserve_info {
+            ensure_info_header(
+                &mut headers,
+                "RegionsExtent",
+                "##INFO=<ID=RegionsExtent,Number=.,Type=String,Description=\"Trimmed reference coordinates matched to regions for this record.\">",
+            );
+        }
         if annotation_type == "ga4gh" {
             ensure_ga4gh_headers(&mut headers);
         }
@@ -246,13 +305,17 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
     let mut rows = records
         .iter()
         .enumerate()
-        .map(|(index, record)| AnnotatedRow {
-            sort_key: (record.chrom.clone(), record.pos, index, 0),
-            line: record.to_line(),
-            query_pass: record.is_pass(),
-            fp_class: query_fp_class(record),
-            xcmp_ctype: None,
-            xcmp_hap_match: false,
+        .filter_map(|(index, record)| {
+            Some(AnnotatedRow {
+                sort_key: (record.chrom.clone(), record.pos, index, 0),
+                line: roc_record_line(record, benchmark_samples)?,
+                query_pass: record.is_pass(),
+                fp_class: benchmark_samples
+                    .query
+                    .and_then(|sample_index| query_fp_class_for_sample(record, sample_index)),
+                xcmp_ctype: None,
+                xcmp_hap_match: false,
+            })
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
@@ -267,10 +330,10 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
             .map(str::to_string)
             .collect(),
         roc_regions: args.roc_regions.iter().cloned().collect(),
-        delta: args.roc_delta,
+        delta: legacy_roc_delta(args.roc_delta),
         ci_alpha: args.ci_alpha,
         preserve_raw_table: args.verbose,
-        output_rocs: args.do_roc,
+        output_rocs: do_roc,
         whole_reference_size: Some(whole_reference_size),
         subset_sizes: stratification_sizes.clone(),
         subset_confidence_sizes: stratification_confidence_sizes.clone(),
@@ -282,11 +345,12 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
         confidence_size.unwrap_or(0),
         &roc_options,
     )?;
-    if !args.do_roc {
+    apply_stratification_levels(prefix, &stratification_levels, args.verbose)?;
+    if !do_roc {
         compact_no_roc_outputs(prefix)?;
     }
     if !args.no_json {
-        write_metrics_json(prefix, args.write_counts, args.do_roc, &roc_indices)?;
+        write_metrics_json(prefix, args.write_counts, &roc_indices)?;
     }
     Ok(roc_indices)
 }
@@ -299,6 +363,62 @@ fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
+}
+
+fn require_quantifier_index(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    if !matches!(extension, Some("gz" | "bgz" | "bgzf" | "bcf")) {
+        bail!(
+            "quantifier input {} must be compressed and indexed",
+            path.display()
+        );
+    }
+
+    let index_suffixes = if extension == Some("bcf") {
+        &["csi"][..]
+    } else {
+        &["tbi", "csi"][..]
+    };
+    let has_index = index_suffixes
+        .iter()
+        .map(|suffix| PathBuf::from(format!("{}.{suffix}", path.display())))
+        .any(|index| index.is_file());
+    if !has_index {
+        bail!(
+            "quantifier input {} requires a companion .tbi or .csi index",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn benchmark_sample_indices(headers: &[String]) -> BenchmarkSamples {
+    let sample_names = headers
+        .iter()
+        .rev()
+        .find(|header| header.starts_with("#CHROM"))
+        .map(|header| header.split('\t').skip(9).collect::<Vec<_>>())
+        .unwrap_or_default();
+    BenchmarkSamples {
+        truth: sample_names.iter().rposition(|name| *name == "TRUTH"),
+        query: sample_names.iter().rposition(|name| *name == "QUERY"),
+    }
+}
+
+fn roc_record_line(record: &RawVcfRecord, samples: BenchmarkSamples) -> Option<String> {
+    let mut normalized = record.clone();
+    normalized.samples = vec![
+        record.samples.get(samples.truth?)?.clone(),
+        record.samples.get(samples.query?)?.clone(),
+    ];
+    Some(normalized.to_line())
+}
+
+fn legacy_roc_delta(delta: f64) -> f64 {
+    if delta == 0.0 { 0.1 } else { delta }
 }
 
 fn validate_options(args: &QuantifyArgs) -> Result<()> {
@@ -371,20 +491,41 @@ fn load_regions(
         insert_region_path(&mut paths, name.trim(), PathBuf::from(path.trim()))?;
     }
 
-    let mut regions = BTreeMap::new();
-    for (name, path) in paths {
-        let intervals = load_region_bed(&path, reference_contigs, args.strat_fixchr)
-            .with_context(|| format!("failed to load stratification region {name}"))?;
+    let mut regions = BTreeMap::<String, Vec<vcf::BedInterval>>::new();
+    let mut levels = BTreeMap::new();
+    for (raw_name, path) in paths {
+        let (name, fixed_label) = dynamic_region_label(&raw_name);
         // QuantifyRegions::load collapses every lane whose label begins
         // with CONF into the reserved confidence lane. hap.py relies on
         // that behavior for its generated CONF_VARS truth padding.
         if name.starts_with("CONF") {
+            let intervals = load_region_bed(&path, reference_contigs, args.strat_fixchr)
+                .with_context(|| format!("failed to load stratification region {name}"))?;
             confidence.get_or_insert_default().extend(intervals);
         } else {
-            regions.insert(name, intervals);
+            let (loaded, loaded_levels) = load_stratification_bed(
+                &path,
+                &name,
+                fixed_label,
+                reference_contigs,
+                args.strat_fixchr,
+            )
+            .with_context(|| format!("failed to load stratification region {name}"))?;
+            for (label, intervals) in loaded {
+                regions.entry(label).or_default().extend(intervals);
+            }
+            levels.extend(loaded_levels);
         }
     }
-    Ok((confidence, regions))
+    Ok((confidence, regions, levels))
+}
+
+fn dynamic_region_label(raw_name: &str) -> (String, bool) {
+    if let Some(name) = raw_name.strip_prefix('=') {
+        (name.to_string(), true)
+    } else {
+        (raw_name.to_string(), raw_name.starts_with("CONF"))
+    }
 }
 
 fn truth_confidence_padding(
@@ -452,7 +593,7 @@ fn insert_region_path(
     name: &str,
     path: PathBuf,
 ) -> Result<()> {
-    if name.is_empty() {
+    if name.is_empty() || name == "=" {
         bail!("stratification region name cannot be empty");
     }
     if name == "CONF" {
@@ -472,6 +613,46 @@ fn load_region_bed(
     reference_contigs: &BTreeSet<String>,
     fixchr: bool,
 ) -> Result<Vec<vcf::BedInterval>> {
+    Ok(load_region_bed_rows(path, reference_contigs, fixchr)?
+        .into_iter()
+        .map(|(interval, _)| interval)
+        .collect())
+}
+
+fn load_stratification_bed(
+    path: &Path,
+    parent_label: &str,
+    fixed_label: bool,
+    reference_contigs: &BTreeSet<String>,
+    fixchr: bool,
+) -> Result<(RegionMap, RegionLevels)> {
+    let mut regions = RegionMap::new();
+    let mut levels = RegionLevels::from([(parent_label.to_string(), 0)]);
+    for (interval, dynamic_label) in load_region_bed_rows(path, reference_contigs, fixchr)? {
+        regions
+            .entry(parent_label.to_string())
+            .or_default()
+            .push(interval.clone());
+        if !fixed_label && let Some(dynamic_label) = dynamic_label {
+            // Pinned QuantifyRegions adds the complete fourth-column value
+            // as one level-1 child. Its apparent trailing-number hierarchy
+            // branch starts at string[size] and is therefore unreachable:
+            // `coding_1` is EXTRA_coding_1, never EXTRA_coding + child.
+            let label = format!("{parent_label}_{dynamic_label}");
+            regions.entry(label.clone()).or_default().push(interval);
+            levels.insert(label, 1);
+        }
+    }
+    // Empty BEDs still register their parent lane in legacy QuantifyRegions.
+    regions.entry(parent_label.to_string()).or_default();
+    Ok((regions, levels))
+}
+
+fn load_region_bed_rows(
+    path: &Path,
+    reference_contigs: &BTreeSet<String>,
+    fixchr: bool,
+) -> Result<Vec<(vcf::BedInterval, Option<String>)>> {
     let text =
         vcf::read_text(path).with_context(|| format!("failed to read BED {}", path.display()))?;
     let mut intervals = Vec::new();
@@ -505,16 +686,36 @@ fn load_region_bed(
                 path.display()
             );
         }
-        intervals.push(vcf::BedInterval { chrom, start, end });
+        intervals.push((
+            vcf::BedInterval { chrom, start, end },
+            fields.get(3).map(|label| (*label).to_string()),
+        ));
     }
     Ok(intervals)
 }
 
+#[cfg(test)]
 fn annotate_regions(
     record: &mut RawVcfRecord,
     confidence: Option<&[vcf::BedInterval]>,
     stratifications: &RegionMap,
     rewrite_ga4gh_decisions: bool,
+) {
+    annotate_regions_for_samples(
+        record,
+        confidence,
+        stratifications,
+        rewrite_ga4gh_decisions,
+        BenchmarkSamples::POSITIONAL,
+    );
+}
+
+fn annotate_regions_for_samples(
+    record: &mut RawVcfRecord,
+    confidence: Option<&[vcf::BedInterval]>,
+    stratifications: &RegionMap,
+    rewrite_ga4gh_decisions: bool,
+    samples: BenchmarkSamples,
 ) {
     let effective_range = effective_reference_range(record);
     let record_chrom = record.chrom.clone();
@@ -572,8 +773,12 @@ fn annotate_regions(
             // GA4GHQuantify's `count_unk` rule rewrites both samples outside
             // CONF. Truth-side UNK is omitted from truth counts; query-side
             // UNK supplies QUERY.UNK and ROC unknown counts.
-            replace_existing_decision(record, 0, "UNK");
-            replace_existing_decision(record, 1, "UNK");
+            if let Some(truth) = samples.truth {
+                replace_existing_decision(record, truth, "UNK");
+            }
+            if let Some(query) = samples.query {
+                replace_existing_decision(record, query, "UNK");
+            }
         }
     }
     if !additions.is_empty() {
@@ -588,7 +793,20 @@ fn annotate_regions(
 /// A block crossing the recomputed CONF boundary marks every member as
 /// `TS_boundary`; a wholly confident block marks every member `TS_contained`.
 /// Records without a non-negative BS value form singleton blocks.
+#[cfg(test)]
 fn propagate_superlocus_annotations(records: &mut [RawVcfRecord], annotation_type: &str) {
+    propagate_superlocus_annotations_for_samples(
+        records,
+        annotation_type,
+        BenchmarkSamples::POSITIONAL,
+    );
+}
+
+fn propagate_superlocus_annotations_for_samples(
+    records: &mut [RawVcfRecord],
+    annotation_type: &str,
+    samples: BenchmarkSamples,
+) {
     let mut start = 0usize;
     while start < records.len() {
         let chrom = records[start].chrom.clone();
@@ -625,13 +843,15 @@ fn propagate_superlocus_annotations(records: &mut [RawVcfRecord], annotation_typ
         // XCMP has no truth TP in the compatibility lane, so the legacy
         // post-pass clears truth QQ rather than retaining record QUAL.
         if annotation_type == "xcmp" {
-            for record in &mut records[start..end] {
-                if record.sample_map(0).get("BD").map(String::as_str) != Some("TP") {
-                    set_format_value(record, 0, "QQ", ".");
+            if let Some(truth) = samples.truth {
+                for record in &mut records[start..end] {
+                    if record.sample_map(truth).get("BD").map(String::as_str) != Some("TP") {
+                        set_format_value(record, truth, "QQ", ".");
+                    }
                 }
             }
         } else {
-            propagate_ga4gh_superlocus(&mut records[start..end]);
+            propagate_ga4gh_superlocus_for_samples(&mut records[start..end], samples);
         }
         start = end;
     }
@@ -953,11 +1173,11 @@ fn ensure_info_header(headers: &mut Vec<String>, id: &str, declaration: &str) {
     headers.insert(index, declaration.to_string());
 }
 
-fn propagate_ga4gh_superlocus(records: &mut [RawVcfRecord]) {
+fn propagate_ga4gh_superlocus_for_samples(records: &mut [RawVcfRecord], samples: BenchmarkSamples) {
     let minimum_tp_qq = records
         .iter()
         .filter_map(|record| {
-            let query = record.sample_map(1);
+            let query = record.sample_map(samples.query?);
             (query.get("BD").map(String::as_str) == Some("TP"))
                 .then(|| query.get("QQ").cloned())
                 .flatten()
@@ -977,8 +1197,13 @@ fn propagate_ga4gh_superlocus(records: &mut [RawVcfRecord]) {
         .collect::<BTreeSet<_>>();
 
     for record in records {
-        let truth_tp = record.sample_map(0).get("BD").map(String::as_str) == Some("TP");
-        let query = record.sample_map(1);
+        let truth_tp = samples.truth.is_some_and(|truth| {
+            record.sample_map(truth).get("BD").map(String::as_str) == Some("TP")
+        });
+        let query = samples
+            .query
+            .map(|query| record.sample_map(query))
+            .unwrap_or_default();
         let direct_query_qq = (query.get("BD").map(String::as_str) == Some("TP"))
             .then(|| query.get("QQ").cloned())
             .flatten()
@@ -990,7 +1215,14 @@ fn propagate_ga4gh_superlocus(records: &mut [RawVcfRecord]) {
         } else {
             None
         };
-        set_format_value(record, 0, "QQ", truth_qq.map(String::as_str).unwrap_or("."));
+        if let Some(truth) = samples.truth {
+            set_format_value(
+                record,
+                truth,
+                "QQ",
+                truth_qq.map(String::as_str).unwrap_or("."),
+            );
+        }
 
         if truth_tp
             && query.get("BVT").map(String::as_str) == Some("NOCALL")
@@ -1022,6 +1254,12 @@ fn n_trimmed_length(sequence: &str) -> usize {
         .take_while(|byte| matches!(**byte, b'N' | b'n'))
         .count();
     bytes.len().saturating_sub(leading + trailing)
+}
+
+fn legacy_regions_extent(record: &RawVcfRecord) -> String {
+    effective_reference_range(record)
+        .map(|(start, end, _)| format!("{start}-{end}"))
+        .unwrap_or_else(|| format!("{}-{}", record.pos, record.end_pos()))
 }
 
 /// Port `QuantifyRegions::annotate`'s per-allele reference span. Coordinates
@@ -1161,10 +1399,25 @@ fn move_region_to_front(info: &mut String, wanted: &str) {
 /// XCMP decisions live in record-level `INFO/type`, `kind`, and `ctype`; a
 /// finalized hap.py VCF intentionally lacks them, which is why the legacy qfy
 /// lane ignores calls inside CONF and labels calls outside CONF as UNK.
+#[cfg(test)]
 fn reannotate_xcmp_record(
     record: &mut RawVcfRecord,
     has_confidence_regions: bool,
     roc_field: &str,
+) {
+    reannotate_xcmp_record_for_samples(
+        record,
+        has_confidence_regions,
+        roc_field,
+        BenchmarkSamples::POSITIONAL,
+    );
+}
+
+fn reannotate_xcmp_record_for_samples(
+    record: &mut RawVcfRecord,
+    has_confidence_regions: bool,
+    roc_field: &str,
+    samples: BenchmarkSamples,
 ) {
     let mut decision = info_value(&record.info, "type").unwrap_or_default();
     let mismatch_kind = info_value(&record.info, "kind").unwrap_or_default();
@@ -1208,12 +1461,13 @@ fn reannotate_xcmp_record(
         let no_call = gt
             .split(['/', '|'])
             .all(|allele| allele.is_empty() || allele == ".");
-        let suppressed = import_fail || no_call || (sample_index == 1 && query_filtered);
+        let suppressed =
+            import_fail || no_call || (samples.query == Some(sample_index) && query_filtered);
         let sample_decision = if import_fail {
             "N"
         } else if suppressed || decision.is_empty() {
             "."
-        } else if sample_index == 0 && decision == "FP" {
+        } else if samples.truth == Some(sample_index) && decision == "FP" {
             "FN"
         } else {
             decision.as_str()
@@ -1238,12 +1492,31 @@ fn reannotate_xcmp_record(
     }
 }
 
+#[cfg(test)]
 fn decorate_quantified_record(
     record: &mut RawVcfRecord,
     annotation_type: &str,
     preserve_info: bool,
     output_vtc: bool,
     has_confidence_regions: bool,
+) {
+    decorate_quantified_record_for_samples(
+        record,
+        annotation_type,
+        preserve_info,
+        output_vtc,
+        has_confidence_regions,
+        BenchmarkSamples::POSITIONAL,
+    );
+}
+
+fn decorate_quantified_record_for_samples(
+    record: &mut RawVcfRecord,
+    annotation_type: &str,
+    preserve_info: bool,
+    output_vtc: bool,
+    has_confidence_regions: bool,
+    samples: BenchmarkSamples,
 ) {
     if output_vtc {
         if annotation_type == "xcmp" {
@@ -1270,8 +1543,14 @@ fn decorate_quantified_record(
                 &format!("{decision}:{kind}:{gtt1}:{gtt2}:{ctype}"),
             );
         }
-        let truth = record.sample_map(0);
-        let query = record.sample_map(1);
+        let truth = samples
+            .truth
+            .map(|sample_index| record.sample_map(sample_index))
+            .unwrap_or_default();
+        let query = samples
+            .query
+            .map(|sample_index| record.sample_map(sample_index))
+            .unwrap_or_default();
         let vtc = legacy_vtc(record, &truth, &query);
         if !vtc.is_empty() {
             set_info_value(&mut record.info, "VTC", &vtc);
@@ -1585,6 +1864,71 @@ fn compact_no_roc_outputs(prefix: &Path) -> Result<()> {
     Ok(())
 }
 
+fn apply_stratification_levels(
+    prefix: &Path,
+    levels: &RegionLevels,
+    preserve_raw_table: bool,
+) -> Result<()> {
+    if !levels.values().any(|level| *level > 0) {
+        return Ok(());
+    }
+
+    let csv_path = suffixed_report_path(prefix, "roc.all.csv.gz");
+    let csv = vcf::read_text(&csv_path)?;
+    let csv = rewrite_subset_levels(&csv, ',', levels);
+    let csv_file = fs::File::create(&csv_path)
+        .with_context(|| format!("failed to create {}", csv_path.display()))?;
+    let mut encoder = GzEncoder::new(csv_file, Compression::default());
+    encoder.write_all(csv.as_bytes())?;
+    encoder.finish()?;
+
+    if preserve_raw_table {
+        let raw_path = suffixed_report_path(prefix, "roc.tsv");
+        if raw_path.exists() {
+            let raw = fs::read_to_string(&raw_path)
+                .with_context(|| format!("failed to read {}", raw_path.display()))?;
+            fs::write(&raw_path, rewrite_subset_levels(&raw, '\t', levels))
+                .with_context(|| format!("failed to write {}", raw_path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_subset_levels(text: &str, delimiter: char, levels: &RegionLevels) -> String {
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return String::new();
+    };
+    let header_fields = header.split(delimiter).collect::<Vec<_>>();
+    let Some(subset_index) = header_fields.iter().position(|field| *field == "Subset") else {
+        return text.to_string();
+    };
+    let Some(level_index) = header_fields
+        .iter()
+        .position(|field| *field == "Subset.Level")
+    else {
+        return text.to_string();
+    };
+
+    let separator = delimiter.to_string();
+    let mut output = vec![header.to_string()];
+    for line in lines {
+        let mut fields = line
+            .split(delimiter)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if let Some(level) = fields
+            .get(subset_index)
+            .and_then(|subset| levels.get(subset))
+            && let Some(field) = fields.get_mut(level_index)
+        {
+            *field = format!("{:.6}", *level as f64);
+        }
+        output.push(fields.join(&separator));
+    }
+    output.join("\n") + "\n"
+}
+
 fn contigs_in_input(records: &[RawVcfRecord]) -> BTreeSet<String> {
     records.iter().map(|record| record.chrom.clone()).collect()
 }
@@ -1651,8 +1995,13 @@ fn fp_class(decision: &str, match_kind: Option<&str>) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn query_fp_class(record: &RawVcfRecord) -> Option<&'static str> {
-    let fields = record.sample_map(1);
+    query_fp_class_for_sample(record, 1)
+}
+
+fn query_fp_class_for_sample(record: &RawVcfRecord, sample_index: usize) -> Option<&'static str> {
+    let fields = record.sample_map(sample_index);
     fp_class(
         fields.get("BD").map(String::as_str).unwrap_or("."),
         fields.get("BK").map(String::as_str),
@@ -2159,6 +2508,7 @@ fn write_quantify_extended(
                 .cloned()
                 .unwrap_or_default(),
             options.subset_size,
+            0,
             &confidence_size,
             options.qq_field,
             options.ci_alpha,
@@ -2196,6 +2546,11 @@ fn write_quantify_extended(
                 all,
                 pass,
                 subset_size_for_row,
+                options
+                    .stratification_levels
+                    .get(subset)
+                    .copied()
+                    .unwrap_or(0),
                 &subset_confidence_size,
                 options.qq_field,
                 options.ci_alpha,
@@ -2224,6 +2579,7 @@ fn write_quantify_extended(
                     all,
                     pass,
                     options.subset_size,
+                    0,
                     &confidence_size,
                     options.qq_field,
                     options.ci_alpha,
@@ -2262,6 +2618,11 @@ fn write_quantify_extended(
                         all,
                         pass,
                         subset_size_for_row,
+                        options
+                            .stratification_levels
+                            .get(subset)
+                            .copied()
+                            .unwrap_or(0),
                         &subset_confidence_size,
                         options.qq_field,
                         options.ci_alpha,
@@ -2308,6 +2669,7 @@ fn write_extended_pair<W: Write>(
     all: QuantifyTypeCounts,
     pass: QuantifyTypeCounts,
     subset_size: usize,
+    subset_level: usize,
     conf_size: &str,
     qq_field: &str,
     ci_alpha: f64,
@@ -2320,6 +2682,7 @@ fn write_extended_pair<W: Write>(
         "ALL",
         &all,
         subset_size,
+        subset_level,
         conf_size,
         qq_field,
         ci_alpha,
@@ -2332,6 +2695,7 @@ fn write_extended_pair<W: Write>(
         "PASS",
         &pass,
         subset_size,
+        subset_level,
         conf_size,
         qq_field,
         ci_alpha,
@@ -2348,6 +2712,7 @@ fn write_extended_row<W: Write>(
     filter: &str,
     stats: &QuantifyTypeCounts,
     subset_size: usize,
+    subset_level: usize,
     conf_size: &str,
     qq_field: &str,
     ci_alpha: f64,
@@ -2378,7 +2743,7 @@ fn write_extended_row<W: Write>(
             format!("{:.6}", subset_size as f64)
         },
         conf_size.to_string(),
-        "0.000000".to_string(),
+        format!("{:.6}", subset_level as f64),
     ];
     append_stats(&mut row, &stats.truth_total, supports_titv);
     append_stats(&mut row, &stats.truth_tp, supports_titv);
@@ -2490,7 +2855,6 @@ fn format_ratio(value: f64) -> String {
 fn write_metrics_json(
     prefix: &Path,
     write_counts: bool,
-    do_roc: bool,
     roc_indices: &roc::MetricIndices,
 ) -> Result<()> {
     let mut tables = vec![(
@@ -2505,28 +2869,10 @@ fn write_metrics_json(
             suffixed_report_path(prefix, "extended.csv"),
         ));
     }
-    tables.push((
-        "roc.all",
-        "roc.all",
-        suffixed_report_path(prefix, "roc.all.csv.gz"),
-    ));
-    if do_roc {
-        for id in [
-            "roc.Locations.INDEL",
-            "roc.Locations.SNP.PASS",
-            "roc.Locations.SNP",
-            "roc.Locations.INDEL.PASS",
-        ] {
-            let path = suffixed_report_path(prefix, &format!("{id}.csv.gz"));
-            if path.is_file() {
-                tables.push((id, id, path));
-            }
-        }
-        for id in ["roc.Locations.INDEL.SEL", "roc.Locations.SNP.SEL"] {
-            let path = suffixed_report_path(prefix, &format!("{id}.csv.gz"));
-            if path.exists() {
-                tables.push((id, id, path));
-            }
+    for id in &roc_indices.table_order {
+        let path = suffixed_report_path(prefix, &format!("{id}.csv.gz"));
+        if path.is_file() {
+            tables.push((id.as_str(), id.as_str(), path));
         }
     }
     let table_refs = tables
@@ -2567,9 +2913,26 @@ mod tests {
         root
     }
 
+    fn write_indexed_vcf_text(path: &Path, text: &str) {
+        let source = path.with_extension("source.vcf");
+        fs::write(&source, text).unwrap();
+        let (headers, records) = vcf::load_raw_vcf(&source).unwrap();
+        vcf::write_raw_vcf(path, &headers, &records).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    fn indexed_fixture(root: &Path) -> PathBuf {
+        let input = root.join("input.vcf.gz");
+        if !input.exists() {
+            let (headers, records) = vcf::load_raw_vcf(&fixture("annotated.vcf")).unwrap();
+            vcf::write_raw_vcf(&input, &headers, &records).unwrap();
+        }
+        input
+    }
+
     fn args(root: &Path) -> QuantifyArgs {
         QuantifyArgs {
-            input_vcf: fixture("annotated.vcf").display().to_string(),
+            input_vcf: indexed_fixture(root).display().to_string(),
             report_prefix: root.join("result").display().to_string(),
             reference: fixture("ref.fa").display().to_string(),
             annotation_type: Some("ga4gh".to_string()),
@@ -2897,7 +3260,7 @@ mod tests {
         options.strat_regions = vec![format!("CONF_VARS:{}", vars.display())];
         let contigs = ["chr1".to_string()].into_iter().collect();
 
-        let (confidence, regions) = load_regions(&options, &contigs).unwrap();
+        let (confidence, regions, _) = load_regions(&options, &contigs).unwrap();
 
         let confidence = confidence.expect("combined CONF lane");
         assert_eq!(confidence.len(), 2);
@@ -3037,6 +3400,223 @@ mod tests {
         text
     }
 
+    fn write_named_sample_vcf(path: &Path, sample_names: &[&str], samples: &[Vec<&str>]) {
+        let mut text = concat!(
+            "##fileformat=VCFv4.2\n",
+            "##contig=<ID=chr1,length=10>\n",
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n",
+            "##FORMAT=<ID=BD,Number=1,Type=String,Description=\"Decision\">\n",
+            "##FORMAT=<ID=BK,Number=1,Type=String,Description=\"Kind\">\n",
+            "##FORMAT=<ID=BI,Number=1,Type=String,Description=\"Info\">\n",
+            "##FORMAT=<ID=BVT,Number=1,Type=String,Description=\"Type\">\n",
+            "##FORMAT=<ID=BLT,Number=1,Type=String,Description=\"Location\">\n",
+            "##FORMAT=<ID=QQ,Number=1,Type=Float,Description=\"Quality\">\n",
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
+        )
+        .to_string();
+        for name in sample_names {
+            text.push('\t');
+            text.push_str(name);
+        }
+        text.push('\n');
+        for (record_index, record_samples) in samples.iter().enumerate() {
+            let pos = record_index + 2;
+            let qual = 30 + record_index * 10;
+            text.push_str(&format!(
+                "chr1\t{pos}\t.\tA\tG\t{qual}\tPASS\tBS={pos}\tGT:BD:BK:BI:BVT:BLT:QQ"
+            ));
+            for sample in record_samples {
+                text.push('\t');
+                text.push_str(sample);
+            }
+            text.push('\n');
+        }
+        write_indexed_vcf_text(path, &text);
+    }
+
+    fn summary_snp_all(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("SNP,ALL,"))
+            .unwrap()
+            .split(',')
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn compressed_quantifier_inputs_require_their_index() {
+        let root = test_root("input-index");
+        let (mut headers, records) = vcf::load_raw_vcf(&fixture("annotated.vcf")).unwrap();
+        let chrom_header = headers
+            .iter()
+            .position(|header| header.starts_with("#CHROM"))
+            .unwrap();
+        headers.insert(
+            chrom_header,
+            "##INFO=<ID=BS,Number=1,Type=Integer,Description=\"Benchmark superlocus\">".to_string(),
+        );
+        for (name, index_suffix) in [("input.vcf.gz", ".tbi"), ("input.bcf", ".csi")] {
+            let input = root.join(name);
+            vcf::write_raw_vcf(&input, &headers, &records).unwrap();
+            let index = PathBuf::from(format!("{}{}", input.display(), index_suffix));
+            assert!(index.is_file());
+            fs::remove_file(index).unwrap();
+
+            let case_root = root.join(format!("case-{name}"));
+            let mut options = args(&case_root);
+            options.input_vcf = input.display().to_string();
+            let error = run(options).unwrap_err();
+            assert!(
+                error.to_string().contains("index"),
+                "unexpected missing-index error: {error:#}"
+            );
+        }
+
+        let plain_root = root.join("plain");
+        let plain_input = plain_root.join("input.vcf");
+        fs::create_dir_all(&plain_root).unwrap();
+        fs::copy(fixture("annotated.vcf"), &plain_input).unwrap();
+        let mut options = args(&plain_root);
+        options.input_vcf = plain_input.display().to_string();
+        let error = run(options).unwrap_err();
+        assert!(error.to_string().contains("compressed and indexed"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn named_truth_and_query_samples_drive_counts_and_rocs_in_any_column() {
+        let root = test_root("named-samples");
+        let cases = [
+            (
+                "reversed",
+                vec!["QUERY", "TRUTH"],
+                vec![
+                    vec!["0/1:FP:lm:ti:SNP:het:30", "0/1:FN:lm:ti:SNP:het:30"],
+                    vec!["0/1:TP:gm:ti:SNP:het:40", "0/1:TP:gm:ti:SNP:het:40"],
+                ],
+            ),
+            (
+                "extra",
+                vec!["NOISE", "QUERY", "AUX", "TRUTH"],
+                vec![
+                    vec![
+                        "0/1:TP:gm:ti:SNP:het:99",
+                        "0/1:FP:lm:ti:SNP:het:30",
+                        "0/1:TP:gm:ti:SNP:het:98",
+                        "0/1:FN:lm:ti:SNP:het:30",
+                    ],
+                    vec![
+                        "0/1:TP:gm:ti:SNP:het:99",
+                        "0/1:TP:gm:ti:SNP:het:40",
+                        "0/1:TP:gm:ti:SNP:het:98",
+                        "0/1:TP:gm:ti:SNP:het:40",
+                    ],
+                ],
+            ),
+        ];
+
+        for (label, names, samples) in cases {
+            let case_root = root.join(label);
+            fs::create_dir_all(&case_root).unwrap();
+            let input = case_root.join("input.vcf.gz");
+            write_named_sample_vcf(&input, &names, &samples);
+            let mut options = args(&case_root);
+            options.input_vcf = input.display().to_string();
+            options.do_roc = true;
+            run(options).unwrap();
+
+            let fields = summary_snp_all(&case_root.join("result.summary.csv"));
+            assert_eq!(&fields[2..10], ["2", "1", "1", "2", "1", "0", "0", "1"]);
+            let roc = read_gzip(&case_root.join("result.roc.all.csv.gz"));
+            assert!(roc.lines().any(|line| {
+                let fields = line.split(',').collect::<Vec<_>>();
+                fields.first() == Some(&"SNP")
+                    && fields.get(6) == Some(&"*")
+                    && fields.get(51) == Some(&"1")
+            }));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_truth_or_query_names_disable_rocs_without_positional_counts() {
+        let root = test_root("missing-named-samples");
+        let input = root.join("named.vcf.gz");
+        write_named_sample_vcf(
+            &input,
+            &["FIRST", "SECOND"],
+            &[vec!["0/1:TP:gm:ti:SNP:het:30", "0/1:FP:lm:ti:SNP:het:30"]],
+        );
+        let mut options = args(&root);
+        options.input_vcf = input.display().to_string();
+        options.do_roc = true;
+        run(options).unwrap();
+
+        let summary = fs::read_to_string(root.join("result.summary.csv")).unwrap();
+        assert_eq!(summary.lines().count(), 1);
+        assert!(!root.join("result.roc.Locations.SNP.csv.gz").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_zero_roc_delta_uses_the_low_level_default() {
+        let root = test_root("zero-roc-delta");
+        let input = root.join("named.vcf.gz");
+        write_named_sample_vcf(
+            &input,
+            &["TRUTH", "QUERY"],
+            &[
+                vec!["0/1:TP:gm:ti:SNP:het:10", "0/1:TP:gm:ti:SNP:het:10"],
+                vec!["0/1:TP:gm:ti:SNP:het:10.05", "0/1:TP:gm:ti:SNP:het:10.05"],
+            ],
+        );
+        let mut options = args(&root);
+        options.input_vcf = input.display().to_string();
+        options.do_roc = true;
+        options.roc_delta = 0.0;
+        run(options).unwrap();
+
+        let roc = read_gzip(&root.join("result.roc.Locations.SNP.csv.gz"));
+        let levels = roc
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split(',').nth(6))
+            .filter(|level| *level != "*")
+            .collect::<Vec<_>>();
+        assert_eq!(levels, ["10.000000"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserve_info_output_declares_and_populates_regions_extent() {
+        let root = test_root("regions-extent");
+        let mut options = args(&root);
+        options.annotation_type = Some("xcmp".to_string());
+        options.write_vcf = true;
+        options.preserve_info = true;
+        run(options).unwrap();
+
+        let (headers, records) =
+            vcf::load_raw_vcf(&root.join("result.vcf.gz")).expect("quantified VCF");
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|line| line.contains("INFO=<ID=RegionsExtent,"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| info_value(&record.info, "RegionsExtent").unwrap())
+                .collect::<Vec<_>>(),
+            ["2-2", "8-9"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn confidence_and_named_stratifications_drive_counts_and_sizes() {
         let root = test_root("regions");
@@ -3081,6 +3661,115 @@ mod tests {
     }
 
     #[test]
+    fn four_column_stratifications_add_dynamic_child_lanes_and_parent_membership() {
+        let root = test_root("four-column-regions");
+        let regions = root.join("hierarchy.bed");
+        fs::write(
+            &regions,
+            "chr1\t1\t2\tcoding_1\nchr1\t4\t5\tunused\nchr1\t7\t9\tcoding_2\n",
+        )
+        .unwrap();
+
+        let dynamic_root = root.join("dynamic");
+        let mut dynamic = args(&dynamic_root);
+        dynamic.strat_regions = vec![format!("EXTRA:{}", regions.display())];
+        dynamic.write_vcf = true;
+        run(dynamic).unwrap();
+
+        let (_, records) = vcf::load_raw_vcf(&dynamic_root.join("result.vcf.gz")).unwrap();
+        assert!(has_region(&records[0].info, "EXTRA"));
+        assert!(has_region(&records[0].info, "EXTRA_coding_1"));
+        assert!(has_region(&records[1].info, "EXTRA"));
+        assert!(has_region(&records[1].info, "EXTRA_coding_2"));
+        assert!(
+            records
+                .iter()
+                .all(|record| !has_region(&record.info, "EXTRA_unused"))
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| has_region(&record.info, "EXTRA_coding"))
+        );
+
+        let extended = fs::read_to_string(dynamic_root.join("result.extended.csv")).unwrap();
+        for (variant_type, subset, size, level) in [
+            ("SNP", "EXTRA", "4.000000", "0.000000"),
+            ("SNP", "EXTRA_coding_1", "1.000000", "1.000000"),
+            ("SNP", "EXTRA_coding_2", "2.000000", "1.000000"),
+            ("SNP", "EXTRA_unused", "1.000000", "1.000000"),
+            ("INDEL", "EXTRA", "4.000000", "0.000000"),
+            ("INDEL", "EXTRA_coding_1", "1.000000", "1.000000"),
+            ("INDEL", "EXTRA_coding_2", "2.000000", "1.000000"),
+            ("INDEL", "EXTRA_unused", "1.000000", "1.000000"),
+        ] {
+            let row = extended
+                .lines()
+                .find(|line| line.starts_with(&format!("{variant_type},*,{subset},ALL,")))
+                .unwrap_or_else(|| panic!("missing dynamic subset row {variant_type}/{subset}"));
+            let fields = row.split(',').collect::<Vec<_>>();
+            assert_eq!(fields[13], size, "wrong size for {variant_type}/{subset}");
+            assert_eq!(fields[15], level, "wrong level for {variant_type}/{subset}");
+        }
+        assert!(
+            !extended
+                .lines()
+                .any(|line| { line.split(',').nth(2) == Some("EXTRA_coding") })
+        );
+        let roc = read_gzip(&dynamic_root.join("result.roc.all.csv.gz"));
+        let dynamic_roc = roc
+            .lines()
+            .find(|line| {
+                let fields = line.split(',').collect::<Vec<_>>();
+                fields.first() == Some(&"SNP")
+                    && fields.get(2) == Some(&"EXTRA_coding_1")
+                    && fields.get(6) == Some(&"*")
+            })
+            .expect("dynamic child ROC row");
+        assert_eq!(dynamic_roc.split(',').nth(15), Some("1.000000"));
+        for variant_type in ["SNP", "INDEL"] {
+            for filter in ["ALL", "PASS"] {
+                let empty_roc = roc
+                    .lines()
+                    .find(|line| {
+                        let fields = line.split(',').collect::<Vec<_>>();
+                        fields.first() == Some(&variant_type)
+                            && fields.get(1) == Some(&"*")
+                            && fields.get(2) == Some(&"EXTRA_unused")
+                            && fields.get(3) == Some(&filter)
+                            && fields.get(6) == Some(&"*")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("missing empty dynamic ROC row {variant_type}/{filter}")
+                    });
+                let fields = empty_roc.split(',').collect::<Vec<_>>();
+                assert_eq!(fields[13], "1.000000");
+                assert_eq!(fields[15], "1.000000");
+                assert_eq!(fields[16], "0");
+            }
+        }
+
+        let fixed_root = root.join("fixed");
+        let mut fixed = args(&fixed_root);
+        fixed.strat_regions = vec![format!("=EXTRA:{}", regions.display())];
+        fixed.write_vcf = true;
+        run(fixed).unwrap();
+        let (_, fixed_records) = vcf::load_raw_vcf(&fixed_root.join("result.vcf.gz")).unwrap();
+        assert!(
+            fixed_records
+                .iter()
+                .all(|record| has_region(&record.info, "EXTRA"))
+        );
+        assert!(fixed_records.iter().all(|record| {
+            !parse_subsets(&record.info)
+                .iter()
+                .any(|subset| subset.starts_with("EXTRA_"))
+        }));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn default_qual_roc_preserves_count_tables_and_writes_roc_files() {
         let root = test_root("roc");
         let baseline_root = root.join("baseline");
@@ -3119,7 +3808,7 @@ mod tests {
     #[test]
     fn inherited_roc_controls_flow_through_quantify_outputs() {
         let root = test_root("roc-controls");
-        let input = root.join("annotated.vcf");
+        let input = root.join("annotated.vcf.gz");
         let source = fs::read_to_string(fixture("annotated.vcf")).unwrap();
         let source = source
             .replace(
@@ -3128,7 +3817,7 @@ mod tests {
             )
             .replace("PASS\tBS=2", "LowQual\tBS=2;SCORE=10.0")
             .replace("PASS\tBS=8", "PASS\tBS=8;SCORE=10.4");
-        fs::write(&input, source).unwrap();
+        write_indexed_vcf_text(&input, &source);
 
         let mut options = args(&root);
         options.input_vcf = input.display().to_string();
@@ -3299,12 +3988,12 @@ mod tests {
     #[test]
     fn xcmp_mode_rederives_decisions_instead_of_consuming_final_bd_fields() {
         let root = test_root("xcmp-reannotation");
-        let input = root.join("annotated.vcf");
+        let input = root.join("annotated.vcf.gz");
         let reference = root.join("ref.fa");
         let confidence = root.join("confidence.bed");
         fs::write(&reference, ">chr1\nNNACGTNN\n").unwrap();
         fs::write(&confidence, "chr1\t0\t3\n").unwrap();
-        fs::write(
+        write_indexed_vcf_text(
             &input,
             concat!(
                 "##fileformat=VCFv4.2\n",
@@ -3323,8 +4012,7 @@ mod tests {
                 // decision with UNK for both samples; only QUERY contributes.
                 "chr1\t5\t.\tG\tA\t50\tPASS\t.\tGT:BD:BK:BI:BVT:BLT:QQ\t0/1:TP:gm:ti:SNP:het:50\t0/1:TP:gm:ti:SNP:het:50\n",
             ),
-        )
-        .unwrap();
+        );
 
         let mut options = args(&root);
         options.input_vcf = input.display().to_string();

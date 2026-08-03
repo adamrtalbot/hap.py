@@ -35,6 +35,10 @@ const INDEL_SUBTYPES: [&str; 9] = [
 #[derive(Clone, Debug, Default)]
 pub struct MetricIndices {
     pub tables: BTreeMap<String, Vec<usize>>,
+    /// Table order produced by Python 2.7's insertion-ordered hash table
+    /// iteration in `happyroc.roc`. This is data-dependent because location
+    /// tables are inserted when their first raw ROC row is encountered.
+    pub table_order: Vec<String>,
 }
 
 /// Controls inherited from qfy's ROC command line.  The default deliberately
@@ -230,6 +234,7 @@ pub fn write_roc_files_with_options(
             selective: &selective,
         },
         options.delta,
+        options.output_rocs,
     ))
 }
 
@@ -246,6 +251,7 @@ fn build_metric_indices(
     groups: &BTreeMap<RowKey, GroupAccum>,
     rows: MetricRows<'_>,
     delta: f64,
+    output_rocs: bool,
 ) -> MetricIndices {
     let mut rocs = BTreeMap::<String, (&RowKey, &GroupAccum)>::new();
     let active_types = groups
@@ -285,7 +291,7 @@ fn build_metric_indices(
                 ("C16_PLUS", Some("C16_PLUS")),
             ]
         };
-        let counts_only = !is_aggregate_filter(&key.filter);
+        let counts_only = !output_rocs || !is_aggregate_filter(&key.filter);
         for (subtype, subtype_flag) in subtype_flags {
             for (genotype, genotype_flag) in [
                 ("het", Some("het")),
@@ -342,13 +348,43 @@ fn build_metric_indices(
         .enumerate()
         .map(|(index, key)| (key.as_str(), index))
         .collect::<BTreeMap<_, _>>();
-    let all_indices = indices_for_lines(rows.all, &raw_positions);
+    // qfy's `--no-roc` prevents C++ from placing threshold rows in the raw
+    // table. The public CSV is compacted to the same baseline-only set before
+    // JSON serialization, so its retained pandas indices must be computed
+    // against that compact set rather than falling back to 0..N.
+    let compact_all = (!output_rocs).then(|| {
+        rows.all
+            .iter()
+            .filter(|line| line.split(',').nth(6) == Some("*"))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let metric_all = compact_all.as_deref().unwrap_or(rows.all);
+    let all_indices = indices_for_lines(metric_all, &raw_positions);
+
+    let mut available_tables = BTreeSet::from(["roc.all"]);
+    for (id, lines) in [
+        ("roc.Locations.SNP", rows.snp),
+        ("roc.Locations.SNP.PASS", rows.snp_pass),
+        ("roc.Locations.INDEL", rows.indel),
+        ("roc.Locations.INDEL.PASS", rows.indel_pass),
+    ] {
+        if !lines.is_empty() {
+            available_tables.insert(id);
+        }
+    }
+    for (id, lines, _) in rows.selective {
+        if !lines.is_empty() {
+            available_tables.insert(id.as_str());
+        }
+    }
+    let table_order = legacy_python_table_order(&raw, &available_tables);
 
     let mut tables = BTreeMap::new();
     tables.insert("roc.all".to_string(), all_indices.clone());
     tables.insert(
         "all.metrics".to_string(),
-        rows.all
+        metric_all
             .iter()
             .zip(&all_indices)
             .filter(|(line, _)| {
@@ -360,7 +396,7 @@ fn build_metric_indices(
     );
     tables.insert(
         "summary.metrics".to_string(),
-        rows.all
+        metric_all
             .iter()
             .zip(&all_indices)
             .filter(|(line, _)| {
@@ -417,7 +453,119 @@ fn build_metric_indices(
         }
         tables.insert(id.clone(), indices_for_lines(lines, &local));
     }
-    MetricIndices { tables }
+    MetricIndices {
+        tables,
+        table_order,
+    }
+}
+
+/// Reproduce the iteration order of the pinned Python 2.7 dictionary used by
+/// `qfy.py` to append `res` tables to metrics JSON. The dictionary keys and
+/// hashes are fixed by the oracle (`hash_randomization=0`); insertion order is
+/// determined by the first matching row in the C++ unordered ROC table.
+fn legacy_python_table_order(raw: &[String], available_tables: &BTreeSet<&str>) -> Vec<String> {
+    let mut insertions = Vec::new();
+    for raw_key in raw {
+        let fields = raw_key.split('\t').collect::<Vec<_>>();
+        if fields.len() == 6
+            && matches!(fields[0], "SNP" | "INDEL")
+            && fields[1] == "*"
+            && fields[2] == "*"
+            && fields[4] == "*"
+            && fields[5] != "*"
+        {
+            let suffix = match fields[3] {
+                "ALL" => "",
+                "PASS" => ".PASS",
+                "SEL" => ".SEL",
+                _ => "",
+            };
+            if matches!(fields[3], "ALL" | "PASS" | "SEL") {
+                let table = format!("roc.Locations.{}{suffix}", fields[0]);
+                if available_tables.contains(table.as_str()) {
+                    insertions.push(table);
+                }
+            }
+        }
+        insertions.push("roc.all".to_string());
+    }
+
+    python27_dict_iteration_order(&insertions)
+}
+
+fn python27_dict_iteration_order(insertions: &[String]) -> Vec<String> {
+    #[derive(Clone)]
+    struct Entry {
+        key: String,
+        hash: u64,
+    }
+
+    fn python_key(table: &str) -> &str {
+        table.strip_prefix("roc.").unwrap_or(table)
+    }
+
+    fn hash(table: &str) -> u64 {
+        match python_key(table) {
+            "all" => 1_453_079_729_202_098_178,
+            "Locations.SNP" => 14_809_960_256_853_955_918,
+            "Locations.INDEL" => 8_577_287_029_120_378_309,
+            "Locations.SNP.PASS" => 15_867_700_624_972_327_818,
+            "Locations.INDEL.PASS" => 9_569_443_920_230_493_239,
+            "Locations.SNP.SEL" => 2_407_900_041_572_956_280,
+            "Locations.INDEL.SEL" => 15_566_398_430_702_022_267,
+            key => panic!("unsupported legacy metrics table key: {key}"),
+        }
+    }
+
+    fn insert(slots: &mut [Option<Entry>], entry: Entry) {
+        let mask = slots.len() - 1;
+        let mut index = entry.hash as usize & mask;
+        let mut perturb = entry.hash;
+        loop {
+            if slots[index].is_none() {
+                slots[index] = Some(entry);
+                return;
+            }
+            index = index
+                .wrapping_mul(5)
+                .wrapping_add(perturb as usize)
+                .wrapping_add(1)
+                & mask;
+            perturb >>= 5;
+        }
+    }
+
+    let mut slots: Vec<Option<Entry>> = vec![None; 8];
+    let mut used = 0usize;
+    for key in insertions {
+        if slots.iter().flatten().any(|entry| entry.key == *key) {
+            continue;
+        }
+        insert(
+            &mut slots,
+            Entry {
+                key: key.clone(),
+                hash: hash(key),
+            },
+        );
+        used += 1;
+
+        // CPython 2.7 resizes once the table reaches two-thirds full and,
+        // below 50k keys, asks for four times the number of live entries.
+        if used * 3 >= slots.len() * 2 {
+            let minimum = used * 4;
+            let mut size = 8usize;
+            while size <= minimum {
+                size *= 2;
+            }
+            let old = std::mem::replace(&mut slots, vec![None; size]);
+            for entry in old.into_iter().flatten() {
+                insert(&mut slots, entry);
+            }
+        }
+    }
+
+    slots.into_iter().flatten().map(|entry| entry.key).collect()
 }
 
 fn legacy_row_key(ty: &str, subtype: &str, filter: &str, subset: &str, qq: &str) -> String {
@@ -1792,10 +1940,15 @@ fn accumulate(rows: &[AnnotatedRow]) -> BTreeMap<RowKey, GroupAccum> {
 fn accumulate_impl(rows: &[AnnotatedRow], options: &RocOptions) -> BTreeMap<RowKey, GroupAccum> {
     let mut groups: BTreeMap<RowKey, GroupAccum> = BTreeMap::new();
 
-    // Populate first from actual contributions so we learn which subsets
-    // (TS_boundary, TS_contained) the dataset has any records in.
-    let mut observed_subsets: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    // Named stratifications are configured lanes, not merely observed axes.
+    // QuantifyRegions registers each one when it loads the BED, so an empty
+    // fourth-column child still receives zero-valued baseline ROC rows for
+    // every active variant type. Built-in TS_* lanes remain observation-led.
+    let mut observed_subsets = options
+        .subset_sizes
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     // Track which non-PASS filter tags appeared per variant Type so we
     // pre-seed empty subtype rows only for filters that variant type
     // actually carries (e.g. SB filter is SNP-only in our chr21 data —
@@ -2838,6 +2991,53 @@ mod tests {
     }
 
     #[test]
+    fn python27_metrics_dictionary_preserves_pinned_iteration_order() {
+        let five_table_insertion = [
+            "roc.all",
+            "roc.Locations.SNP",
+            "roc.Locations.INDEL.PASS",
+            "roc.Locations.INDEL",
+            "roc.Locations.SNP.PASS",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            python27_dict_iteration_order(&five_table_insertion),
+            [
+                "roc.Locations.SNP.PASS",
+                "roc.all",
+                "roc.Locations.INDEL",
+                "roc.Locations.SNP",
+                "roc.Locations.INDEL.PASS",
+            ]
+        );
+
+        // The sixth insertion crosses CPython 2.7's two-thirds load factor,
+        // so this also pins the resize and rehash path used by SEL reports.
+        let seven_table_insertion = [
+            "roc.all",
+            "roc.Locations.INDEL.SEL",
+            "roc.Locations.SNP",
+            "roc.Locations.SNP.SEL",
+            "roc.Locations.INDEL.PASS",
+            "roc.Locations.SNP.PASS",
+            "roc.Locations.INDEL",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            python27_dict_iteration_order(&seven_table_insertion),
+            [
+                "roc.all",
+                "roc.Locations.INDEL",
+                "roc.Locations.SNP.PASS",
+                "roc.Locations.SNP",
+                "roc.Locations.INDEL.PASS",
+                "roc.Locations.SNP.SEL",
+                "roc.Locations.INDEL.SEL",
+            ]
+        );
+    }
+
+    #[test]
     fn introsort_depth_floor_uses_target_pointer_width() {
         assert_eq!(lg_floor(0), 0);
         assert_eq!(lg_floor(1), 0);
@@ -3158,6 +3358,64 @@ mod tests {
         assert!(suffixed_report_path(&prefix, "roc.Locations.INDEL.PASS.csv.gz").exists());
         assert!(!suffixed_report_path(&prefix, "roc.Locations.SNP.csv.gz").exists());
         assert!(!suffixed_report_path(&prefix, "roc.Locations.SNP.PASS.csv.gz").exists());
+    }
+
+    #[test]
+    fn configured_unobserved_subset_has_zero_baselines_for_each_active_type() {
+        let rows = vec![
+            annotated(
+                "chr1",
+                100,
+                "42",
+                "0/1:TP:gm:tv:SNP:het:42",
+                "0/1:TP:gm:tv:SNP:het:42",
+                "",
+                true,
+                None,
+            ),
+            annotated(
+                "chr1",
+                200,
+                "41",
+                "0/1:TP:gm:i1_5:INDEL:het:41",
+                "0/1:TP:gm:i1_5:INDEL:het:41",
+                "",
+                true,
+                None,
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("result");
+        let options = RocOptions {
+            subset_sizes: BTreeMap::from([("EXTRA_unused".to_string(), 7)]),
+            ..RocOptions::default()
+        };
+        write_roc_files_with_options(&prefix, &rows, 100, 0, &options).unwrap();
+
+        let all = crate::vcf::read_text(&suffixed_report_path(&prefix, "roc.all.csv.gz")).unwrap();
+        let unused = all
+            .lines()
+            .skip(1)
+            .filter(|line| line.split(',').nth(2) == Some("EXTRA_unused"))
+            .map(|line| line.split(',').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        let actual_axes = unused
+            .iter()
+            .map(|fields| (fields[0], fields[1], fields[3], fields[6]))
+            .collect::<BTreeSet<_>>();
+        let mut expected_axes = BTreeSet::new();
+        for filter in ["ALL", "PASS"] {
+            expected_axes.insert(("SNP", "*", filter, "*"));
+            expected_axes.insert(("INDEL", "*", filter, "*"));
+            for subtype in INDEL_SUBTYPES {
+                expected_axes.insert(("INDEL", subtype, filter, "*"));
+            }
+        }
+        assert_eq!(actual_axes, expected_axes);
+        assert!(unused.iter().all(|fields| fields[6] == "*"));
+        assert!(unused.iter().all(|fields| fields[13] == "7.000000"));
+        assert!(unused.iter().all(|fields| fields[16] == "0"));
     }
 
     #[test]

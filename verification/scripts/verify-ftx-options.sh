@@ -38,7 +38,7 @@ run_case() {
 }
 
 run_case location "$fixture_dir/options.vcf" \
-    --feature-table generic --reference "$fixture_dir/missing.fa" -l 1:7-7
+    --feature-table generic --reference "$fixture_dir/missing.fa" -l 1:7
 run_case restrict_regions "$fixture_dir/options.vcf" \
     --feature-table generic --reference "$fixture_dir/missing.fa" -R "$fixture_dir/select.bed"
 run_case target_regions "$fixture_dir/options.vcf" \

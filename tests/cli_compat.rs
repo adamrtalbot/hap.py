@@ -233,3 +233,107 @@ fn legacy_aliases_keep_parser_and_runtime_exit_codes_distinct() {
     let stderr = String::from_utf8(output.stderr).expect("error is UTF-8");
     assert!(stderr.contains("does-not-exist.vcf.gz"), "{stderr}");
 }
+
+#[test]
+fn legacy_unknown_arguments_keep_wrapper_specific_exit_codes() {
+    let germline = hap()
+        .args([
+            "germline",
+            "truth.vcf",
+            "query.vcf",
+            "-o",
+            "result",
+            "--definitely-unknown",
+        ])
+        .output()
+        .expect("run germline unknown option");
+    assert_eq!(germline.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&germline.stdout).contains("Usage:"));
+
+    let version = hap()
+        .args(["germline", "--version", "--definitely-unknown"])
+        .output()
+        .expect("run germline version with unknown option");
+    assert_eq!(version.status.code(), Some(1));
+    assert!(!version.stdout.starts_with(b"Hap.py "));
+
+    for command in [
+        vec!["pre", "input.vcf", "output.vcf", "--definitely-unknown"],
+        vec![
+            "qfy",
+            "input.vcf",
+            "-o",
+            "result",
+            "-r",
+            "ref.fa",
+            "--definitely-unknown",
+        ],
+    ] {
+        let output = hap()
+            .args(command)
+            .output()
+            .expect("run legacy wrapper unknown option");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+    }
+
+    let ftx = hap()
+        .args(["ftx", "input.vcf", "-o", "result", "--definitely-unknown"])
+        .output()
+        .expect("run ftx unknown option");
+    assert_eq!(ftx.status.code(), Some(2));
+}
+
+#[test]
+fn germline_missing_required_arguments_use_legacy_runtime_exit_code() {
+    for arguments in [
+        vec!["germline", "truth.vcf", "query.vcf"],
+        vec!["compare", "truth.vcf", "-o", "result"],
+    ] {
+        let output = hap()
+            .args(arguments)
+            .output()
+            .expect("run incomplete germline command");
+        assert_eq!(output.status.code(), Some(1));
+    }
+}
+
+#[test]
+fn legacy_store_true_switches_reject_following_boolean_tokens() {
+    for (arguments, expected_code) in [
+        (
+            vec![
+                "germline",
+                "truth.vcf",
+                "query.vcf",
+                "-o",
+                "result",
+                "--fixchr",
+                "false",
+            ],
+            1,
+        ),
+        (
+            vec!["pre", "input.vcf", "output.vcf", "--fixchr", "false"],
+            0,
+        ),
+        (
+            vec![
+                "somatic",
+                "truth.vcf",
+                "query.vcf",
+                "-o",
+                "result",
+                "--fixchr-truth",
+                "false",
+            ],
+            2,
+        ),
+    ] {
+        let output = hap()
+            .args(arguments)
+            .output()
+            .expect("run store_true switch followed by a Boolean token");
+        assert_eq!(output.status.code(), Some(expected_code));
+    }
+}

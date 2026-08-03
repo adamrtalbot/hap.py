@@ -327,11 +327,79 @@ impl RegionState {
     }
 }
 
+fn validate_report_parent(prefix: &Path) -> Result<()> {
+    let parent = prefix
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        bail!(
+            "The output path does not exist. Please specify a valid output path and prefix using -o"
+        );
+    }
+    Ok(())
+}
+
+fn comparison_requests_bcf(args: &CompareArgs) -> bool {
+    args.bcf || (args.truth.ends_with(".bcf") && args.query.ends_with(".bcf"))
+}
+
+/// Preserve the pinned HAP-57 guard, including its allowance for a one-base
+/// overlap (`previous_end - 1 == next_start`). Target BEDs intentionally skip
+/// this check because legacy accepts the same interval layout with `-T`.
+fn validate_regions_bed(path: &Path) -> Result<()> {
+    let text = vcf::read_text(path)
+        .with_context(|| format!("failed to inspect regions BED {}", path.display()))?;
+    let mut previous_chrom: Option<&str> = None;
+    let mut previous_end: Option<usize> = None;
+
+    for (line_index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 3 {
+            continue;
+        }
+        let start = fields[1].parse::<usize>().with_context(|| {
+            format!(
+                "invalid BED start '{}' in {} at line {}",
+                fields[1],
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        let end = fields[2].parse::<usize>().with_context(|| {
+            format!(
+                "invalid BED end '{}' in {} at line {}",
+                fields[2],
+                path.display(),
+                line_index + 1
+            )
+        })?;
+
+        if previous_chrom != Some(fields[0]) {
+            previous_end = None;
+        }
+        if previous_end.is_some_and(|last| last.saturating_sub(1) > start) {
+            bail!(
+                "The regions bed file (specified using -R) has overlaps, this will not work with xcmp. You can either use -T, or run the file through bedtools merge"
+            );
+        }
+        previous_chrom = Some(fields[0]);
+        previous_end = Some(end);
+    }
+    Ok(())
+}
+
 pub fn run(mut args: CompareArgs) -> Result<()> {
     if args.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    validate_report_parent(Path::new(&args.report_prefix))?;
+    let explicit_bcf = args.bcf;
+    args.bcf = comparison_requests_bcf(&args);
     if args.reference.is_empty() {
         args.reference = resolve_default_reference()?;
     }
@@ -370,6 +438,9 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         })
         .collect();
     let contig_set: BTreeSet<String> = contig_lengths.keys().cloned().collect();
+    if let Some(path) = args.regions_bedfile.as_deref() {
+        validate_regions_bed(Path::new(path))?;
+    }
     let regions = args
         .regions_bedfile
         .as_ref()
@@ -432,6 +503,15 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         !args.usefiltered_truth,
         args.preprocess_truth,
     ))?;
+    if args.locations.is_none() {
+        let (_, preprocessed_truth) = vcf::load_raw_vcf(&truth_prep)?;
+        if !preprocessed_truth
+            .iter()
+            .any(|record| contig_set.contains(&record.chrom))
+        {
+            bail!("Truth and reference have no chromosomes in common!");
+        }
+    }
     log_compare_info(&args, "Preprocessing query")?;
     preprocess::run(build_preprocess_args(
         &preprocessing_args,
@@ -443,14 +523,28 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
 
     if args.engine == CompareEngine::Vcfeval {
         log_compare_info(&args, "Running vcfeval comparison")?;
-        return run_vcfeval(&args, &truth_prep, &query_prep, prefix, scratch);
+        return run_vcfeval(
+            &args,
+            explicit_bcf,
+            &truth_prep,
+            &query_prep,
+            prefix,
+            scratch,
+        );
     }
     if matches!(
         args.engine,
         CompareEngine::ScmpSomatic | CompareEngine::ScmpDistance
     ) {
         log_compare_info(&args, "Running SCMP comparison")?;
-        return run_scmp(&args, &truth_prep, &query_prep, prefix, scratch);
+        return run_scmp(
+            &args,
+            explicit_bcf,
+            &truth_prep,
+            &query_prep,
+            prefix,
+            scratch,
+        );
     }
 
     log_compare_info(&args, "Running Rust comparison")?;
@@ -497,7 +591,12 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     )?;
 
     let contigs_in_play = collect_contigs(&truth, &query, locations.as_deref());
-    let subset_size = report_subset_size(&contig_non_n_lengths, &contigs_in_play, args.bcf);
+    let subset_size = report_subset_size(
+        &contig_non_n_lengths,
+        &contigs_in_play,
+        explicit_bcf,
+        args.bcf && !explicit_bcf,
+    );
     if subset_size == 0 {
         bail!("no reference contigs selected for analysis");
     }
@@ -619,13 +718,6 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         args.output_vtc,
         &args.roc,
     )?;
-
-    if let Some(parent) = prefix.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
 
     let all_counts = derive_total_counts(&rows, false);
     let pass_counts = derive_total_counts(&rows, true);
@@ -770,7 +862,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         strat_tsv: args.strat_tsv.as_deref(),
         scratch_prefix: args.scratch_prefix.as_deref(),
         keep_scratch: args.keep_scratch,
-        bcf: args.bcf,
+        bcf: explicit_bcf,
         ci_alpha: args.ci_alpha,
         convert_gvcf_query: args.convert_gvcf_query,
         convert_gvcf_to_vcf: args.convert_gvcf_to_vcf,
@@ -823,42 +915,22 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         &commandline,
         &run_args,
     )?;
-    let mut metric_tables = vec![
-        (
-            "summary.metrics",
-            "summary.metrics",
-            suffixed_report_path(prefix, "summary.csv"),
-        ),
-        (
-            "roc.all",
-            "roc.all",
-            suffixed_report_path(prefix, "roc.all.csv.gz"),
-        ),
-    ];
+    let mut metric_tables = vec![(
+        "summary.metrics",
+        "summary.metrics",
+        suffixed_report_path(prefix, "summary.csv"),
+    )];
     if write_counts {
-        metric_tables.insert(
-            1,
-            (
-                "all.metrics",
-                "all.metrics",
-                suffixed_report_path(prefix, "extended.csv"),
-            ),
-        );
+        metric_tables.push((
+            "all.metrics",
+            "all.metrics",
+            suffixed_report_path(prefix, "extended.csv"),
+        ));
     }
-    // Legacy only adds Locations metrics for tables produced by happyroc.
-    // Keep the observed legacy ordering for the per-type table family while
-    // omitting absent variant types entirely.
-    for id in [
-        "roc.Locations.INDEL",
-        "roc.Locations.SNP.PASS",
-        "roc.Locations.SNP",
-        "roc.Locations.INDEL.PASS",
-        "roc.Locations.SNP.SEL",
-        "roc.Locations.INDEL.SEL",
-    ] {
+    for id in &roc_indices.table_order {
         let path = suffixed_report_path(prefix, &format!("{id}.csv.gz"));
-        if !args.no_roc && path.exists() {
-            metric_tables.push((id, id, path));
+        if path.exists() {
+            metric_tables.push((id.as_str(), id.as_str(), path));
         }
     }
     let metric_table_refs = metric_tables
@@ -963,18 +1035,12 @@ fn row_matches_variant_key(row: &AnnotatedRow, keys: &BTreeSet<VariantKey>) -> b
 
 fn run_vcfeval(
     args: &CompareArgs,
+    explicit_bcf: bool,
     truth_prep: &Path,
     query_prep: &Path,
     prefix: &Path,
     scratch: ScratchRun,
 ) -> Result<()> {
-    if let Some(parent) = prefix
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let inferred_template = args
         .reference
         .strip_suffix(".fa")
@@ -1071,6 +1137,17 @@ fn run_vcfeval(
             vcfeval_vcf.display()
         );
     }
+    if args.preserve_info {
+        // Pinned hap.py writes runinfo before preprocessing, reaches this
+        // point after RTG succeeds, then crashes while merging the original
+        // INFO fields back into the vcfeval output. The compact oracle fails
+        // in the first bcftools merge; inputs that pass it hit the subsequent
+        // undefined `output_vcf` variable. Preserve that unconditional
+        // failure and its final pre-quantification artifact set.
+        let commandline = std::env::args().collect::<Vec<_>>().join(" ");
+        write_runinfo_for_args(args, explicit_bcf, prefix, &commandline)?;
+        bail!("vcfeval --preserve-info failed while restoring input INFO fields");
+    }
     let roc_indices = crate::quantify::run_with_metric_indices(crate::cli::QuantifyArgs {
         input_vcf: vcfeval_vcf.display().to_string(),
         report_prefix: args.report_prefix.clone(),
@@ -1109,7 +1186,7 @@ fn run_vcfeval(
         )?;
     }
     let commandline = std::env::args().collect::<Vec<_>>().join(" ");
-    write_runinfo_for_args(args, prefix, &commandline)?;
+    write_runinfo_for_args(args, explicit_bcf, prefix, &commandline)?;
     rewrite_compare_metrics(args, prefix, &commandline, &roc_indices)?;
     publish_bcf_output(args, prefix)?;
     log_compare_info(args, "Germline comparison completed successfully")?;
@@ -1119,6 +1196,7 @@ fn run_vcfeval(
 
 fn run_scmp(
     args: &CompareArgs,
+    explicit_bcf: bool,
     truth_prep: &Path,
     query_prep: &Path,
     prefix: &Path,
@@ -1198,7 +1276,7 @@ fn run_scmp(
         no_json: args.no_json,
     })?;
     let commandline = std::env::args().collect::<Vec<_>>().join(" ");
-    write_runinfo_for_args(args, prefix, &commandline)?;
+    write_runinfo_for_args(args, explicit_bcf, prefix, &commandline)?;
     rewrite_compare_metrics(args, prefix, &commandline, &roc_indices)?;
     publish_bcf_output(args, prefix)?;
     log_compare_info(args, "Germline comparison completed successfully")?;
@@ -1278,7 +1356,12 @@ fn log_compare_info(args: &CompareArgs, message: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_runinfo_for_args(args: &CompareArgs, prefix: &Path, commandline: &str) -> Result<()> {
+fn write_runinfo_for_args(
+    args: &CompareArgs,
+    explicit_bcf: bool,
+    prefix: &Path,
+    commandline: &str,
+) -> Result<()> {
     let write_counts = args.write_counts && !args.no_write_counts;
     let run_args = metrics_json::CompareRunArgs {
         truth: &args.truth,
@@ -1302,7 +1385,7 @@ fn write_runinfo_for_args(args: &CompareArgs, prefix: &Path, commandline: &str) 
         strat_tsv: args.strat_tsv.as_deref(),
         scratch_prefix: args.scratch_prefix.as_deref(),
         keep_scratch: args.keep_scratch,
-        bcf: args.bcf,
+        bcf: explicit_bcf,
         ci_alpha: args.ci_alpha,
         convert_gvcf_query: args.convert_gvcf_query,
         convert_gvcf_to_vcf: args.convert_gvcf_to_vcf,
@@ -1378,22 +1461,10 @@ fn rewrite_compare_metrics(
             suffixed_report_path(prefix, "extended.csv"),
         ));
     }
-    tables.push((
-        "roc.all",
-        "roc.all",
-        suffixed_report_path(prefix, "roc.all.csv.gz"),
-    ));
-    for id in [
-        "roc.Locations.INDEL",
-        "roc.Locations.SNP.PASS",
-        "roc.Locations.SNP",
-        "roc.Locations.INDEL.PASS",
-        "roc.Locations.SNP.SEL",
-        "roc.Locations.INDEL.SEL",
-    ] {
+    for id in &roc_indices.table_order {
         let path = suffixed_report_path(prefix, &format!("{id}.csv.gz"));
-        if !args.no_roc && path.is_file() {
-            tables.push((id, id, path));
+        if path.is_file() {
+            tables.push((id.as_str(), id.as_str(), path));
         }
     }
     let refs = tables
@@ -5546,16 +5617,33 @@ fn collect_contigs(
 fn report_subset_size(
     contig_non_n_lengths: &BTreeMap<String, usize>,
     contigs_in_play: &BTreeSet<String>,
-    bcf_output: bool,
+    explicit_bcf: bool,
+    implicit_bcf: bool,
 ) -> usize {
-    if bcf_output {
+    if explicit_bcf {
         // The legacy BCF path initializes its aggregate region from the
         // complete FASTA dictionary, while the VCF path restricts it to the
         // contigs participating in the comparison. Preserve that observable
         // reporter quirk even though output encoding does not change calls.
         contig_non_n_lengths.values().sum()
     } else {
-        contigs_in_play
+        let mut selected = contigs_in_play.clone();
+        if implicit_bcf {
+            // Paired BCF inputs select BCF intermediates and reports, but do
+            // not set argparse's explicit `bcf` value. The pinned wrapper's
+            // default chromosome discovery consequently retains both aliases
+            // when the FASTA declares, for example, `1` and `chr1`.
+            for contig in contigs_in_play {
+                let alias = contig
+                    .strip_prefix("chr")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("chr{contig}"));
+                if contig_non_n_lengths.contains_key(&alias) {
+                    selected.insert(alias);
+                }
+            }
+        }
+        selected
             .iter()
             .filter_map(|contig| contig_non_n_lengths.get(contig))
             .sum()
@@ -7203,7 +7291,7 @@ fn build_preprocess_args(
         decompose: preprocess_enabled && effective_decomposition(args),
         no_decompose: false,
         gender: args.gender,
-        window_size: args.preprocess_window,
+        window_size: args.preprocess_window as i64,
         threads: args.threads,
         logfile: None,
         verbose: args.verbose,
@@ -7531,19 +7619,150 @@ mod scratch_tests {
     }
 
     #[test]
+    fn paired_bcf_inputs_implicitly_enable_bcf_reports_and_intermediates() {
+        let root = test_root("implicit-bcf-artifacts");
+        let truth_bcf = root.join("truth.bcf");
+        let query_bcf = root.join("query.bcf");
+        for (source, destination) in [
+            (fixture_path("truth.vcf"), &truth_bcf),
+            (fixture_path("query.vcf"), &query_bcf),
+        ] {
+            let (headers, records) = vcf::load_raw_vcf(&source).unwrap();
+            vcf::write_raw_vcf(destination, &headers, &records).unwrap();
+        }
+
+        let prefix = root.join("result");
+        let scratch_parent = root.join("scratch");
+        let mut options = args(prefix.clone(), &scratch_parent, true);
+        options.truth = truth_bcf.display().to_string();
+        options.query = query_bcf.display().to_string();
+        assert!(!options.bcf, "the CLI flag is intentionally absent");
+        run(options).unwrap();
+
+        assert!(suffixed_report_path(&prefix, "bcf").is_file());
+        assert!(suffixed_report_path(&prefix, "bcf.csi").is_file());
+        assert!(!suffixed_report_path(&prefix, "vcf.gz").exists());
+        let runinfo = fs::read_to_string(suffixed_report_path(&prefix, "runinfo.json")).unwrap();
+        assert!(
+            runinfo.contains("\"bcf\":false"),
+            "implicit output selection must not rewrite the explicit CLI flag: {runinfo}"
+        );
+        let scratch_runs = child_directories(&scratch_parent);
+        assert_eq!(scratch_runs.len(), 1);
+        assert!(scratch_runs[0].join("truth.prep.bcf").is_file());
+        assert!(scratch_runs[0].join("query.prep.bcf").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_report_parent_is_rejected_without_creating_artifacts() {
+        let root = test_root("missing-report-parent");
+        let missing_parent = root.join("missing");
+        let scratch_parent = root.join("scratch");
+        let options = args(missing_parent.join("result"), &scratch_parent, false);
+
+        let error = run(options).expect_err("missing report parents must be rejected");
+        assert!(error.to_string().contains("output path does not exist"));
+        assert!(!missing_parent.exists());
+        assert!(!scratch_parent.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regions_reject_legacy_overlaps_and_ordering_but_targets_do_not() {
+        let root = test_root("region-overlap-check");
+        for (label, contents) in [
+            ("overlap", "chr1\t0\t10\nchr1\t5\t12\n"),
+            ("out-of-order", "chr1\t10\t12\nchr1\t0\t6\n"),
+        ] {
+            let bed = root.join(format!("{label}.bed"));
+            fs::write(&bed, contents).unwrap();
+            let mut options = args(
+                root.join(format!("{label}-result")),
+                &root.join(format!("{label}-scratch")),
+                false,
+            );
+            options.regions_bedfile = Some(bed.display().to_string());
+            let error = run(options).expect_err("invalid -R BED must fail before comparison");
+            assert!(
+                error
+                    .to_string()
+                    .contains("The regions bed file (specified using -R) has overlaps")
+            );
+        }
+
+        let targets = root.join("targets.bed");
+        fs::write(&targets, "chr1\t10\t12\nchr1\t0\t12\n").unwrap();
+        let target_prefix = root.join("target-result");
+        let mut options = args(target_prefix.clone(), &root.join("target-scratch"), false);
+        options.targets_bedfile = Some(targets.display().to_string());
+        run(options).expect("-T keeps accepting overlapping or out-of-order intervals");
+        assert!(suffixed_report_path(&target_prefix, "summary.csv").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_truth_with_default_locations_fails_before_query_comparison() {
+        let root = test_root("empty-truth-default-locations");
+        let truth = root.join("truth.vcf");
+        fs::write(
+            &truth,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=16>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTRUTH\n",
+            ),
+        )
+        .unwrap();
+        let mut options = args(root.join("result"), &root.join("scratch"), false);
+        options.truth = truth.display().to_string();
+
+        let error = run(options).expect_err("legacy derives default contigs from truth calls");
+        assert!(
+            error
+                .to_string()
+                .contains("Truth and reference have no chromosomes in common")
+        );
+
+        let explicit_prefix = root.join("explicit-result");
+        let mut explicit = args(
+            explicit_prefix.clone(),
+            &root.join("explicit-scratch"),
+            false,
+        );
+        explicit.truth = truth.display().to_string();
+        explicit.locations = Some("chr1".to_string());
+        run(explicit).expect("an explicit contig bypasses legacy default-contig discovery");
+        assert!(suffixed_report_path(&explicit_prefix, "summary.csv").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bcf_report_size_spans_the_full_reference() {
         let contig_lengths = BTreeMap::from([("chr1".to_string(), 100), ("chrX".to_string(), 40)]);
         let contigs_in_play = BTreeSet::from(["chr1".to_string()]);
 
         assert_eq!(
-            report_subset_size(&contig_lengths, &contigs_in_play, false),
+            report_subset_size(&contig_lengths, &contigs_in_play, false, false),
             100,
             "ordinary reports retain their active-contig size"
         );
         assert_eq!(
-            report_subset_size(&contig_lengths, &contigs_in_play, true),
+            report_subset_size(&contig_lengths, &contigs_in_play, true, false),
             140,
             "legacy BCF reports size the complete reference dictionary"
+        );
+
+        let aliased_lengths = BTreeMap::from([
+            ("1".to_string(), 100),
+            ("chr1".to_string(), 100),
+            ("chrX".to_string(), 40),
+        ]);
+        assert_eq!(
+            report_subset_size(&aliased_lengths, &contigs_in_play, false, true),
+            200,
+            "implicit BCF reports retain both declared chromosome aliases"
         );
     }
 
@@ -7663,10 +7882,19 @@ mod scratch_tests {
 
     #[cfg(unix)]
     #[test]
-    fn vcfeval_uses_preprocessed_inputs_and_decorates_quantified_output() {
+    fn vcfeval_with_paired_bcf_inputs_keeps_vcf_handoff_and_publishes_bcf() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = test_root("vcfeval-contract");
+        let truth_bcf = root.join("truth.bcf");
+        let query_bcf = root.join("query.bcf");
+        for (source, destination) in [
+            (fixture_path("truth.vcf"), &truth_bcf),
+            (fixture_path("query.vcf"), &query_bcf),
+        ] {
+            let (headers, records) = vcf::load_raw_vcf(&source).unwrap();
+            vcf::write_raw_vcf(destination, &headers, &records).unwrap();
+        }
         let ga4gh = root.join("ga4gh.vcf");
         fs::write(
             &ga4gh,
@@ -7677,6 +7905,13 @@ mod scratch_tests {
                 "##FORMAT=<ID=BD,Number=1,Type=String,Description=\"Decision\">\n",
                 "##FORMAT=<ID=BK,Number=1,Type=String,Description=\"Kind\">\n",
                 "##FORMAT=<ID=QQ,Number=1,Type=Float,Description=\"Quality\">\n",
+                "##INFO=<ID=IQQ,Number=1,Type=Float,Description=\"Quality\">\n",
+                "##INFO=<ID=ctype,Number=1,Type=String,Description=\"Comparison type\">\n",
+                "##INFO=<ID=gtt1,Number=1,Type=String,Description=\"Truth genotype type\">\n",
+                "##INFO=<ID=gtt2,Number=1,Type=String,Description=\"Query genotype type\">\n",
+                "##INFO=<ID=kind,Number=1,Type=String,Description=\"Match kind\">\n",
+                "##INFO=<ID=type,Number=1,Type=String,Description=\"Match type\">\n",
+                "##INFO=<ID=RegionsExtent,Number=1,Type=String,Description=\"Region extent\">\n",
                 "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTRUTH\tQUERY\n",
                 "chr1\t5\t.\tG\tT\t60\tPASS\tBS=5\tGT:BD:BK:QQ\t1/1:TP:gm:60\t1/1:TP:gm:60\n",
             ),
@@ -7687,7 +7922,7 @@ mod scratch_tests {
         fs::write(
             &fake_rtg,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then out=\"$2\"; shift 2; else shift; fi\ndone\nmkdir -p \"$out\"\ngzip -c '{}' > \"$out/output.vcf.gz\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then out=\"$2\"; shift 2; else shift; fi\ndone\nmkdir -p \"$out\"\ngzip -c '{}' > \"$out/output.vcf.gz\"\n: > \"$out/output.vcf.gz.tbi\"\n",
                 captured.display(),
                 ga4gh.display(),
             ),
@@ -7698,17 +7933,19 @@ mod scratch_tests {
         fs::create_dir(&template).unwrap();
 
         let mut options = args(root.join("result"), &root.join("scratch"), false);
+        options.truth = truth_bcf.display().to_string();
+        options.query = query_bcf.display().to_string();
         options.engine = CompareEngine::Vcfeval;
         options.engine_vcfeval = fake_rtg.display().to_string();
         options.engine_vcfeval_template = Some(template.display().to_string());
         options.output_vtc = true;
-        options.preserve_info = true;
         run(options).unwrap();
 
-        let invocation = fs::read_to_string(captured).unwrap();
+        let invocation = fs::read_to_string(&captured).unwrap();
         assert!(invocation.contains("truth.prep.vcf.gz"), "{invocation}");
         assert!(invocation.contains("query.prep.vcf.gz"), "{invocation}");
-        let (headers, records) = vcf::load_raw_vcf(&root.join("result.vcf.gz")).unwrap();
+        assert!(!root.join("result.vcf.gz").exists());
+        let (headers, records) = vcf::load_raw_vcf(&root.join("result.bcf")).unwrap();
         assert!(headers.iter().any(|line| line.contains("ID=VTC,")));
         assert!(headers.iter().any(|line| line.contains("ID=XCMP,")));
         assert!(
@@ -7717,6 +7954,29 @@ mod scratch_tests {
             records[0].info
         );
         assert!(records[0].info.contains("XCMP="), "{}", records[0].info);
+
+        let preserve_prefix = root.join("preserve-result");
+        let preserve_scratch = root.join("preserve-scratch");
+        let mut preserve = args(preserve_prefix.clone(), &preserve_scratch, false);
+        preserve.engine = CompareEngine::Vcfeval;
+        preserve.engine_vcfeval = fake_rtg.display().to_string();
+        preserve.engine_vcfeval_template = Some(template.display().to_string());
+        preserve.preserve_info = true;
+        let error = run(preserve).expect_err("pinned vcfeval --preserve-info crashes");
+        assert!(error.to_string().contains("vcfeval --preserve-info"));
+        let invocation = fs::read_to_string(&captured).unwrap();
+        assert!(invocation.contains("vcfeval"), "{invocation}");
+        assert!(suffixed_report_path(&preserve_prefix, "runinfo.json").is_file());
+        for suffix in [
+            "summary.csv",
+            "extended.csv",
+            "vcf.gz",
+            "bcf",
+            "metrics.json.gz",
+        ] {
+            assert!(!suffixed_report_path(&preserve_prefix, suffix).exists());
+        }
+        assert!(child_directories(&preserve_scratch).is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7933,6 +8193,8 @@ mod scratch_tests {
     fn concurrent_runs_share_parent_without_colliding_and_cleanup() {
         let root = test_root("concurrent");
         let scratch_parent = root.join("scratch");
+        fs::create_dir_all(root.join("first")).unwrap();
+        fs::create_dir_all(root.join("second")).unwrap();
         let first = args(root.join("first/result"), &scratch_parent, false);
         let second = args(root.join("second/result"), &scratch_parent, false);
 
@@ -7956,6 +8218,7 @@ mod scratch_tests {
     fn keep_scratch_retains_run_but_errors_cleanup_by_default() {
         let root = test_root("lifecycle");
         let kept_parent = root.join("kept");
+        fs::create_dir(root.join("kept-output")).unwrap();
         run(args(root.join("kept-output/result"), &kept_parent, true)).unwrap();
 
         let kept = child_directories(&kept_parent);
@@ -7966,6 +8229,7 @@ mod scratch_tests {
         assert!(kept[0].join("query.prep.vcf.gz.tbi").is_file());
 
         let error_parent = root.join("error");
+        fs::create_dir(root.join("error-output")).unwrap();
         let mut failing = args(root.join("error-output/result"), &error_parent, false);
         failing.truth = root.join("missing.vcf").display().to_string();
         assert!(run(failing).is_err());

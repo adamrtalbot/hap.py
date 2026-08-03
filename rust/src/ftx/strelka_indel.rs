@@ -6,7 +6,8 @@ use crate::strelka;
 use crate::vcf::RawVcfRecord;
 
 use super::common::{
-    csv_escape, format_info_float, format_python_float, parse_scoring_features, render_filter,
+    ScoringFeatures, csv_escape, format_info_float, format_python_float, parse_scoring_features,
+    render_filter,
 };
 
 const FIXED_COLUMNS: &[&str] = &[
@@ -52,7 +53,7 @@ pub(super) fn emit_with_depths(
     let header_depths = strelka::parse_depths(headers);
     let depths = depth_override.unwrap_or(&header_depths);
     let mut header = format!(",{}", FIXED_COLUMNS.join(","));
-    for feature in &scoring_features {
+    for feature in &scoring_features.columns {
         header.push_str(",E.");
         header.push_str(feature);
     }
@@ -69,7 +70,7 @@ pub(super) fn emit_with_depths(
 fn render_row(
     record: &RawVcfRecord,
     depths: &BTreeMap<String, f64>,
-    scoring_features: &[String],
+    scoring_features: &ScoringFeatures,
     index: usize,
     label: &str,
 ) -> String {
@@ -133,18 +134,7 @@ fn render_row(
         csv_escape(label),
     ];
 
-    let evsf_value = strelka::info_value(info, "EVSF");
-    let evsf: Vec<&str> = evsf_value
-        .as_deref()
-        .map(|value| value.split(',').collect())
-        .unwrap_or_default();
-    for index in 0..scoring_features.len() {
-        cells.push(format_info_float(
-            evsf.get(index)
-                .and_then(|value| value.parse::<f64>().ok())
-                .unwrap_or(0.0),
-        ));
-    }
+    cells.extend(scoring_features.render_evsf(strelka::info_value(info, "EVSF").as_deref()));
     cells.join(",")
 }
 
@@ -186,13 +176,11 @@ mod tests {
     fn renders_legacy_strelka_indel_shape_and_defaults() {
         let mut depths = BTreeMap::new();
         depths.insert("chr1".to_string(), 40.0);
-        let row = render_row(
-            &record(),
-            &depths,
-            &["one".to_string(), "two".to_string()],
-            0,
-            "FP",
-        );
+        let scoring = ScoringFeatures {
+            columns: vec!["one".to_string(), "two".to_string()],
+            names_by_index: vec!["one".to_string(), "two".to_string()],
+        };
+        let row = render_row(&record(), &depths, &scoring, 0, "FP");
         let cells: Vec<&str> = row.split(',').collect();
         assert_eq!(
             &cells[1..11],
@@ -205,5 +193,22 @@ mod tests {
         assert_eq!(cells[21], "0.75");
         assert_eq!(cells[31], "1.5");
         assert_eq!(cells[32], "0.0");
+    }
+
+    #[test]
+    fn later_scoring_headers_remap_values_but_keep_earlier_columns() {
+        let headers = vec![
+            "##indel_scoring_features=old_first,shared_second".to_string(),
+            "##indel_scoring_features=new_first".to_string(),
+        ];
+
+        let lines = emit_with_depths(&[record()], &headers, "FP", None);
+
+        assert!(
+            lines[0].ends_with(",E.old_first,E.shared_second,E.new_first"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].ends_with(",,0.0,1.5"), "{}", lines[1]);
     }
 }

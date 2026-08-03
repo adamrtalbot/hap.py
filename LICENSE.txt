@@ -31,6 +31,6 @@ OR TORT INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 -------------------------------------------------------------------------------
 
-Third-party Rust crates are distributed under their own licenses. Their exact
-versions are recorded in Cargo.lock and their license metadata is available
-through the crates.io registry.
+Third-party Rust crates and redistributed verification fixtures remain under
+their own licenses. Crate versions are recorded in Cargo.lock; applicable
+fixture and dependency license texts are retained in THIRD_PARTY_LICENSES.

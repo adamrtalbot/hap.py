@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use crate::strelka;
 use crate::vcf::RawVcfRecord;
 
-use super::common::{csv_escape, format_info_float, format_python_float, parse_scoring_features};
+use super::common::{
+    ScoringFeatures, csv_escape, format_info_float, format_python_float, parse_scoring_features,
+};
 
 /// Fixed column order, excluding the leading pandas index cell and the
 /// dynamic `E.<scoring-feature>` tail. The `SomaticEVS` column is kept
@@ -60,7 +62,7 @@ pub(super) fn emit_with_depths(
 
     let mut header_line = String::from(",");
     header_line.push_str(&FIXED_COLUMNS.join(","));
-    for name in &scoring_features {
+    for name in &scoring_features.columns {
         header_line.push_str(",E.");
         header_line.push_str(name);
     }
@@ -81,7 +83,7 @@ pub(super) fn emit_with_depths(
 fn render_row(
     record: &RawVcfRecord,
     avg_depth: &BTreeMap<String, f64>,
-    scoring_features: &[String],
+    scoring_features: &ScoringFeatures,
     index: usize,
     label: &str,
 ) -> String {
@@ -156,7 +158,7 @@ fn render_row(
     let filter_cell = csv_escape(&render_strelka_filter(&record.filter));
 
     let mut cells: Vec<String> =
-        Vec::with_capacity(FIXED_COLUMNS.len() + scoring_features.len() + 1);
+        Vec::with_capacity(FIXED_COLUMNS.len() + scoring_features.columns.len() + 1);
     cells.push(index.to_string());
     cells.push(record.chrom.clone());
     cells.push(record.pos.to_string());
@@ -189,18 +191,7 @@ fn render_row(
     // `##snv_scoring_features` header. Missing / unparseable → 0.0;
     // pandas float-coerces the column so even all-missing renders as
     // "0.0" when any other row had a real float.
-    if !scoring_features.is_empty() {
-        let evsf: Vec<f64> = strelka::info_value(info, "EVSF")
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.parse::<f64>().unwrap_or(0.0))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for i in 0..scoring_features.len() {
-            cells.push(format_info_float(evsf.get(i).copied().unwrap_or(0.0)));
-        }
-    }
+    cells.extend(scoring_features.render_evsf(strelka::info_value(info, "EVSF").as_deref()));
 
     cells.join(",")
 }
@@ -298,7 +289,13 @@ mod tests {
         );
         let mut avg = BTreeMap::new();
         avg.insert("chr21".to_string(), 135.5);
-        let line = render_row(&rec, &avg, &[], 0, "strelka_admix_snvs.vcf.gz");
+        let line = render_row(
+            &rec,
+            &avg,
+            &ScoringFeatures::default(),
+            0,
+            "strelka_admix_snvs.vcf.gz",
+        );
         let expected = "0,chr21,9412105,A,T,ref,1,61,,,-1.0,15.09,0.0,0.0,0.0,0.0,\
                         26.0,77.0,0.1918819188191882,0.5682656826568265,0.0,\
                         0.2857142857142857,57.82,8.0,0.0,-0.12,strelka_admix_snvs.vcf.gz";
@@ -350,13 +347,55 @@ mod tests {
             "10:0:0:0,0:0,0:0,0:10,10",
         );
         let avg: BTreeMap<String, f64> = BTreeMap::new();
-        let line = render_row(&rec, &avg, &[], 0, "t");
+        let line = render_row(&rec, &avg, &ScoringFeatures::default(), 0, "t");
         // MQ column is the 23rd field (0-based index 22); find it.
         let fields: Vec<&str> = line.split(',').collect();
         assert_eq!(fields[22], "0.0");
         assert_eq!(fields[23], "0.0");
         assert_eq!(fields[24], "0.0");
         assert_eq!(fields[25], "0");
+    }
+
+    #[test]
+    fn later_scoring_headers_remap_values_but_keep_earlier_columns() {
+        let rec = mk_record(
+            "NT=ref;QSS_NT=10;EVSF=1.5,2.5",
+            "DP:FDP:SDP:AU:CU:GU:TU",
+            "10:0:0:10,10:0,0:0,0:0,0",
+            "10:0:0:0,0:0,0:0,0:10,10",
+        );
+        let headers = vec![
+            "##snv_scoring_features=old_first,shared_second".to_string(),
+            "##snv_scoring_features=new_first".to_string(),
+        ];
+
+        let lines = emit_with_depths(&[rec], &headers, "tag", None);
+
+        assert!(
+            lines[0].ends_with(",E.old_first,E.shared_second,E.new_first"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].ends_with(",,2.5,1.5"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn scalar_evsf_is_not_treated_as_a_feature_list() {
+        let rec = mk_record(
+            "NT=ref;QSS_NT=10;EVSF=1.5",
+            "DP:FDP:SDP:AU:CU:GU:TU",
+            "10:0:0:10,10:0,0:0,0:0,0",
+            "10:0:0:0,0:0,0:0,0:10,10",
+        );
+
+        let lines = emit_with_depths(
+            &[rec],
+            &["##snv_scoring_features=only".to_string()],
+            "tag",
+            None,
+        );
+
+        assert!(lines[1].ends_with(",0.0"), "{}", lines[1]);
     }
 
     #[test]
@@ -367,7 +406,7 @@ mod tests {
             "10:0:0:10,10:0,0:0,0:0,0",
             "10:0:0:0,0:0,0:0,0:10,10",
         );
-        let line = render_row(&rec, &BTreeMap::new(), &[], 0, "t");
+        let line = render_row(&rec, &BTreeMap::new(), &ScoringFeatures::default(), 0, "t");
         let fields: Vec<&str> = line.split(',').collect();
         assert_eq!(fields[22], "0.0");
         assert_eq!(fields[23], "0.0");
@@ -383,7 +422,7 @@ mod tests {
             "10:0:0:10,10:0,0:0,0:0,0",
             "10:0:0:0,0:0,0:0,0:10,10",
         );
-        let line = render_row(&rec, &BTreeMap::new(), &[], 0, "t");
+        let line = render_row(&rec, &BTreeMap::new(), &ScoringFeatures::default(), 0, "t");
         let fields: Vec<&str> = line.split(',').collect();
         assert_eq!(fields[10], "-1.0");
     }
@@ -397,7 +436,7 @@ mod tests {
             "10:0:0:0,0:0,0:0,0:10,10",
         );
         rec.filter = "First,Second".to_string();
-        let line = render_row(&rec, &BTreeMap::new(), &[], 0, "t");
+        let line = render_row(&rec, &BTreeMap::new(), &ScoringFeatures::default(), 0, "t");
         assert!(line.contains(",\"First,Second\","));
     }
 }

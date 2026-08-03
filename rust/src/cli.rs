@@ -1,6 +1,6 @@
 use clap::{
-    Arg, ArgAction, ArgMatches, Args, Command as ClapCommand, Error, FromArgMatches, Parser,
-    Subcommand, ValueEnum,
+    Arg, ArgAction, ArgMatches, Args, Command as ClapCommand, CommandFactory, Error,
+    FromArgMatches, Parser, Subcommand, ValueEnum,
 };
 
 #[derive(Parser, Debug)]
@@ -17,14 +17,20 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
-    #[command(alias = "compare")]
+    #[command(alias = "compare", args_override_self = true)]
     Germline(CompareArgs),
+    #[command(args_override_self = true)]
     Somatic(SomaticArgs),
-    #[command(name = "pre", alias = "preprocess", alias = "prepy")]
+    #[command(
+        name = "pre",
+        alias = "preprocess",
+        alias = "prepy",
+        args_override_self = true
+    )]
     Preprocess(PreprocessArgs),
-    #[command(alias = "ftxpy")]
+    #[command(alias = "ftxpy", args_override_self = true)]
     Ftx(FtxArgs),
-    #[command(visible_alias = "qfy")]
+    #[command(visible_alias = "qfy", args_override_self = true)]
     Quantify(QuantifyArgs),
     #[command(visible_alias = "vcfcheck")]
     Validate(ValidateArgs),
@@ -124,7 +130,7 @@ pub struct CompareArgs {
     #[arg(
         long = "fixchr",
         default_missing_value = "true",
-        num_args = 0..=1,
+        num_args = 0,
         overrides_with = "no_fixchr"
     )]
     pub fixchr: Option<bool>,
@@ -413,7 +419,7 @@ pub struct PreprocessArgs {
     #[arg(
         long = "fixchr",
         default_missing_value = "true",
-        num_args = 0..=1,
+        num_args = 0,
         overrides_with = "no_fixchr"
     )]
     pub fixchr: Option<bool>,
@@ -485,8 +491,13 @@ pub struct PreprocessArgs {
     #[arg(long = "gender", value_enum, default_value_t = PreprocessGender::Auto)]
     pub gender: PreprocessGender,
 
-    #[arg(short = 'w', long = "window-size", default_value_t = 10_000)]
-    pub window_size: usize,
+    #[arg(
+        short = 'w',
+        long = "window-size",
+        default_value_t = 10_000,
+        allow_hyphen_values = true
+    )]
+    pub window_size: i64,
 
     #[arg(long = "threads")]
     pub threads: Option<usize>,
@@ -724,13 +735,13 @@ fn augment_quantify_args(command: ClapCommand, required: bool) -> ClapCommand {
                 .short('X')
                 .long("write-counts")
                 .action(ArgAction::SetTrue)
-                .conflicts_with("no_write_counts"),
+                .overrides_with("no_write_counts"),
         )
         .arg(
             Arg::new("no_write_counts")
                 .long("no-write-counts")
                 .action(ArgAction::SetTrue)
-                .conflicts_with("write_counts"),
+                .overrides_with("write_counts"),
         )
         .arg(
             Arg::new("output_vtc")
@@ -883,7 +894,7 @@ pub struct SomaticArgs {
         long = "fixchr-truth",
         visible_alias = "fix-chr-truth",
         default_missing_value = "true",
-        num_args = 0..=1,
+        num_args = 0,
         overrides_with = "no_fixchr_truth"
     )]
     pub fixchr_truth: Option<bool>,
@@ -892,7 +903,7 @@ pub struct SomaticArgs {
         long = "fixchr-query",
         visible_alias = "fix-chr-query",
         default_missing_value = "true",
-        num_args = 0..=1,
+        num_args = 0,
         overrides_with = "no_fixchr_query"
     )]
     pub fixchr_query: Option<bool>,
@@ -928,7 +939,7 @@ pub struct SomaticArgs {
     #[arg(long = "bin-afs", default_value_t = false)]
     pub af_strat: bool,
 
-    #[arg(long = "af-binsize", default_value = "0.2")]
+    #[arg(long = "af-binsize", default_value = "0.2", allow_hyphen_values = true)]
     pub af_strat_binsize: String,
 
     #[arg(long = "af-truth", default_value = "I.T_ALT_RATE")]
@@ -1052,12 +1063,66 @@ fn default_somatic_reference() -> String {
 /// clap treats that spelling as a cluster (`-F -N`), so normalize only that
 /// exact somatic token before parsing and leave every other command untouched.
 pub fn process_args_with_legacy_somatic_aliases() -> Vec<std::ffi::OsString> {
-    let mut arguments = std::env::args_os().collect::<Vec<_>>();
+    normalize_legacy_arguments(std::env::args_os().collect())
+}
+
+fn normalize_legacy_arguments(mut arguments: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     if arguments.get(1).and_then(|value| value.to_str()) == Some("somatic") {
         for argument in arguments.iter_mut().skip(2) {
             if argument == "-FN" {
                 *argument = "--count-filtered-fn".into();
             }
+        }
+    }
+
+    let canonical = match arguments.get(1).and_then(|value| value.to_str()) {
+        Some("germline" | "compare") => "germline",
+        Some("somatic") => "somatic",
+        Some("pre" | "preprocess" | "prepy") => "pre",
+        Some("ftx" | "ftxpy") => "ftx",
+        Some("quantify" | "qfy") => "quantify",
+        // vcfcheck uses Boost.Program_options, which does not implement
+        // argparse's unique long-option abbreviations.
+        _ => return arguments,
+    };
+    let command = Cli::command();
+    let Some(subcommand) = command.find_subcommand(canonical) else {
+        return arguments;
+    };
+    let long_options = subcommand
+        .get_arguments()
+        .filter_map(Arg::get_long)
+        .collect::<Vec<_>>();
+    let mut after_terminator = false;
+    for argument in arguments.iter_mut().skip(2) {
+        if after_terminator {
+            continue;
+        }
+        let Some(value) = argument.to_str() else {
+            continue;
+        };
+        if value == "--" {
+            after_terminator = true;
+            continue;
+        }
+        let Some(option) = value.strip_prefix("--") else {
+            continue;
+        };
+        let (prefix, suffix) = option
+            .split_once('=')
+            .map_or((option, ""), |(prefix, _value)| {
+                (prefix, &option[prefix.len()..])
+            });
+        if prefix.is_empty() || long_options.contains(&prefix) {
+            continue;
+        }
+        let matches = long_options
+            .iter()
+            .filter(|candidate| candidate.starts_with(prefix))
+            .copied()
+            .collect::<Vec<_>>();
+        if let [expanded] = matches.as_slice() {
+            *argument = format!("--{expanded}{suffix}").into();
         }
     }
     arguments
@@ -1078,6 +1143,27 @@ pub fn requests_legacy_subcommand_version(arguments: &[std::ffi::OsString]) -> b
             .skip(2)
             .take_while(|argument| *argument != "--")
             .any(|argument| argument == "-v" || argument == "--version")
+}
+
+/// Validate all supplied germline tokens while relaxing the positional and
+/// output requirements that hap.py checks only after handling `--version`.
+pub fn validate_legacy_germline_version_arguments(
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Error> {
+    CompareArgs::augment_args_for_update(ClapCommand::new("germline").args_override_self(true))
+        .try_get_matches_from(
+            std::iter::once(std::ffi::OsString::from("germline"))
+                .chain(arguments.iter().skip(2).cloned()),
+        )
+        .map(|_| ())
+}
+
+pub fn legacy_unknown_argument_exit_code(arguments: &[std::ffi::OsString]) -> Option<i32> {
+    match arguments.get(1).and_then(|value| value.to_str())? {
+        "germline" | "compare" => Some(1),
+        "pre" | "preprocess" | "prepy" | "quantify" | "qfy" => Some(0),
+        _ => None,
+    }
 }
 
 /// qfy.py validates its required arguments before honoring its version flag.
@@ -1295,6 +1381,190 @@ mod tests {
     }
 
     #[test]
+    fn repeated_legacy_options_match_each_wrapper_parser() {
+        let cli = Cli::try_parse_from([
+            "hap",
+            "germline",
+            "truth.vcf",
+            "query.vcf",
+            "-o",
+            "first",
+            "-o",
+            "last",
+            "-r",
+            "first.fa",
+            "-r",
+            "last.fa",
+            "--roc",
+            "QUAL",
+            "--roc",
+            "INFO.QQ",
+            "--pass-only",
+            "--pass-only",
+        ])
+        .expect("argparse accepts repeated germline options");
+        let Command::Germline(args) = cli.command else {
+            panic!("germline should parse");
+        };
+        assert_eq!(args.report_prefix, "last");
+        assert_eq!(args.reference, "last.fa");
+        assert_eq!(args.roc, "INFO.QQ");
+        assert!(args.pass_only);
+
+        let cli = Cli::try_parse_from([
+            "hap",
+            "somatic",
+            "truth.vcf",
+            "query.vcf",
+            "-o",
+            "first",
+            "-o",
+            "last",
+            "-l",
+            "chr1",
+            "-l",
+            "chr2",
+        ])
+        .expect("argparse accepts repeated somatic options");
+        let Command::Somatic(args) = cli.command else {
+            panic!("somatic should parse");
+        };
+        assert_eq!(args.output, "last");
+        assert_eq!(args.location.as_deref(), Some("chr2"));
+
+        let cli = Cli::try_parse_from([
+            "hap",
+            "pre",
+            "input.vcf",
+            "output.vcf",
+            "-r",
+            "first.fa",
+            "-r",
+            "last.fa",
+            "-w",
+            "10",
+            "-w",
+            "-1",
+        ])
+        .expect("argparse accepts repeated pre options");
+        let Command::Preprocess(args) = cli.command else {
+            panic!("pre should parse");
+        };
+        assert_eq!(args.reference.as_deref(), Some("last.fa"));
+        assert_eq!(args.window_size, -1);
+
+        let cli = Cli::try_parse_from([
+            "hap",
+            "ftx",
+            "input.vcf",
+            "-o",
+            "first.csv",
+            "-o",
+            "last.csv",
+            "--feature-table",
+            "generic",
+            "--feature-table",
+            "hcc.mutect.snv",
+        ])
+        .expect("argparse accepts repeated ftx options");
+        let Command::Ftx(args) = cli.command else {
+            panic!("ftx should parse");
+        };
+        assert_eq!(args.output, "last.csv");
+        assert_eq!(args.features, "hcc.mutect.snv");
+
+        let cli = Cli::try_parse_from([
+            "hap",
+            "qfy",
+            "input.vcf",
+            "-o",
+            "first",
+            "-o",
+            "last",
+            "-r",
+            "ref.fa",
+            "--roc",
+            "QUAL",
+            "--roc",
+            "FORMAT.GQ",
+        ])
+        .expect("argparse accepts repeated qfy options");
+        let Command::Quantify(args) = cli.command else {
+            panic!("qfy should parse");
+        };
+        assert_eq!(args.report_prefix, "last");
+        assert_eq!(args.roc, "FORMAT.GQ");
+
+        let error = Cli::try_parse_from([
+            "hap",
+            "vcfcheck",
+            "input.vcf",
+            "-o",
+            "first.json",
+            "-o",
+            "last.json",
+            "--apply-filters",
+            "true",
+            "--apply-filters",
+            "false",
+        ])
+        .expect_err("program_options rejects repeated scalar options");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn argparse_wrappers_expand_only_unique_long_option_prefixes() {
+        for (arguments, expanded) in [
+            (
+                vec!["hap", "germline", "--threa=3"],
+                vec!["hap", "germline", "--threads=3"],
+            ),
+            (
+                vec!["hap", "somatic", "--count-filtered-f"],
+                vec!["hap", "somatic", "--count-filtered-fn"],
+            ),
+            (
+                vec!["hap", "prepy", "--wind", "12"],
+                vec!["hap", "prepy", "--window-size", "12"],
+            ),
+            (
+                vec!["hap", "ftxpy", "--feature-l", "oracle"],
+                vec!["hap", "ftxpy", "--feature-label", "oracle"],
+            ),
+            (
+                vec!["hap", "qfy", "--report-p", "result"],
+                vec!["hap", "qfy", "--report-prefix", "result"],
+            ),
+        ] {
+            let normalized = normalize_legacy_arguments(
+                arguments
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+            );
+            assert_eq!(
+                normalized,
+                expanded
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let ambiguous = ["hap", "pre", "--f"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(normalize_legacy_arguments(ambiguous.clone()), ambiguous);
+
+        let boost = ["hap", "vcfcheck", "--output-f", "result.json"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(normalize_legacy_arguments(boost.clone()), boost);
+    }
+
+    #[test]
     fn qfy_alias_honours_legacy_count_switches() {
         let cli = Cli::try_parse_from([
             "hap",
@@ -1347,7 +1617,7 @@ mod tests {
         };
         assert!(args.write_counts);
 
-        let error = Cli::try_parse_from([
+        let cli = Cli::try_parse_from([
             "hap",
             "qfy",
             "annotated.vcf.gz",
@@ -1358,9 +1628,28 @@ mod tests {
             "--write-counts",
             "--no-write-counts",
         ])
-        .expect_err("opposite count switches must remain mutually exclusive");
-        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
-        assert_eq!(error.exit_code(), 2);
+        .expect("legacy qfy accepts opposite count switches");
+        let Command::Quantify(args) = cli.command else {
+            panic!("qfy should resolve to quantify");
+        };
+        assert!(!args.write_counts, "the final negative switch must win");
+
+        let cli = Cli::try_parse_from([
+            "hap",
+            "qfy",
+            "annotated.vcf.gz",
+            "-o",
+            "report",
+            "-r",
+            "ref.fa",
+            "--no-write-counts",
+            "--write-counts",
+        ])
+        .expect("legacy qfy accepts the reverse switch order");
+        let Command::Quantify(args) = cli.command else {
+            panic!("qfy should resolve to quantify");
+        };
+        assert!(args.write_counts, "the final positive switch must win");
     }
 
     #[test]
@@ -1740,6 +2029,33 @@ mod tests {
         ])
         .expect_err("legacy verbosity controls are mutually exclusive");
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+
+        for arguments in [
+            vec![
+                "hap",
+                "germline",
+                "truth.vcf",
+                "query.vcf",
+                "-o",
+                "report",
+                "--fixchr",
+                "false",
+            ],
+            vec!["hap", "pre", "input.vcf", "output.vcf", "--fixchr", "false"],
+            vec![
+                "hap",
+                "somatic",
+                "truth.vcf",
+                "query.vcf",
+                "-o",
+                "report",
+                "--fixchr-truth",
+                "false",
+            ],
+        ] {
+            Cli::try_parse_from(arguments)
+                .expect_err("legacy fixchr switches do not accept Boolean values");
+        }
     }
 
     #[test]

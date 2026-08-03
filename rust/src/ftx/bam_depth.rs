@@ -9,6 +9,7 @@ use noodles_bgzf as bgzf;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 const BAM_MAGIC: &[u8; 4] = b"BAM\x01";
 const CORE_SIZE: usize = 32;
@@ -39,7 +40,17 @@ pub(super) fn normalization_depths(paths: &[String]) -> Result<BTreeMap<String, 
     for path in paths {
         let file = File::open(path).with_context(|| format!("failed to open BAM {path}"))?;
         let reader = bgzf::io::Reader::new(file);
-        for reference in scan_bam(reader).with_context(|| format!("failed to read BAM {path}"))? {
+        // Legacy's indexed fetch accepts either common BAI filename and
+        // leaves every reference at zero when neither exists.
+        let appended_index = PathBuf::from(format!("{path}.bai"));
+        let stem_index = Path::new(path).with_extension("bai");
+        let references = if appended_index.is_file() || stem_index.is_file() {
+            scan_bam(reader)
+        } else {
+            read_bam_references(reader)
+        }
+        .with_context(|| format!("failed to read BAM {path}"))?;
+        for reference in references {
             let coverage = reference.coverage();
             let entry = coverages.entry(reference.name).or_default();
             entry.0 += coverage;
@@ -53,7 +64,15 @@ pub(super) fn normalization_depths(paths: &[String]) -> Result<BTreeMap<String, 
         .collect())
 }
 
-fn scan_bam<R: Read>(mut reader: R) -> Result<Vec<ReferenceStats>> {
+fn scan_bam<R: Read>(reader: R) -> Result<Vec<ReferenceStats>> {
+    read_bam(reader, true)
+}
+
+fn read_bam_references<R: Read>(reader: R) -> Result<Vec<ReferenceStats>> {
+    read_bam(reader, false)
+}
+
+fn read_bam<R: Read>(mut reader: R, scan_alignments: bool) -> Result<Vec<ReferenceStats>> {
     let mut magic = [0; 4];
     reader.read_exact(&mut magic)?;
     if &magic != BAM_MAGIC {
@@ -83,6 +102,10 @@ fn scan_bam<R: Read>(mut reader: R) -> Result<Vec<ReferenceStats>> {
             sampled_reads: 0,
             sampled_bases: 0,
         });
+    }
+
+    if !scan_alignments {
+        return Ok(references);
     }
 
     while let Some(block_size) = read_optional_i32(&mut reader)? {
@@ -245,10 +268,30 @@ mod tests {
             let mut writer = bgzf::io::Writer::new(file);
             writer.write_all(&bam_bytes(lengths)).unwrap();
             writer.finish().unwrap();
+            let index_path = if index == 0 {
+                PathBuf::from(format!("{}.bai", path.display()))
+            } else {
+                path.with_extension("bai")
+            };
+            std::fs::write(index_path, []).unwrap();
             paths.push(path.display().to_string());
         }
         let depths = normalization_depths(&paths).unwrap();
         assert!((depths["chr1"] - 1.05).abs() <= f64::EPSILON * 2.0);
+    }
+
+    #[test]
+    fn missing_bai_yields_zero_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reads.bam");
+        let file = File::create(&path).unwrap();
+        let mut writer = bgzf::io::Writer::new(file);
+        writer.write_all(&bam_bytes(&[20, 20])).unwrap();
+        writer.finish().unwrap();
+
+        let depths = normalization_depths(&[path.display().to_string()]).unwrap();
+
+        assert_eq!(depths, BTreeMap::from([("chr1".to_string(), 0.0)]));
     }
 
     #[test]

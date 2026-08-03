@@ -47,6 +47,28 @@ process QFY_LEGACY {
         --false-positives ${fp_bed} \
         --threads ${task.cpus ?: 1} \
         --report-prefix result
+
+    # The legacy threaded reporter can exit successfully after dropping rows
+    # and appending a malformed aggregate row. Fail the task so the isolated,
+    # bounded retry policy regenerates a structurally valid oracle report.
+    gzip -cd result.roc.all.csv.gz | awk -F',' '
+        NR == 1 {
+            expected_fields = NF
+            if (expected_fields != 65 && expected_fields != 71) exit 1
+            if (\$1 != "Type" || \$2 != "Subtype" || \$3 != "Subset" ||
+                \$4 != "Filter" || \$5 != "Genotype" || \$6 != "QQ.Field" ||
+                \$7 != "QQ") exit 1
+            next
+        }
+        {
+            if (NF != expected_fields) exit 1
+            if (\$1 != "SNP" && \$1 != "INDEL") exit 1
+            if (\$1 == "" || \$2 == "" || \$3 == "" || \$4 == "" ||
+                \$5 == "" || \$6 == "" || \$7 == "") exit 1
+            rows++
+        }
+        END { if (rows == 0) exit 1 }
+    '
     """
 }
 

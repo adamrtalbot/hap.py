@@ -5,6 +5,8 @@
 //! extractor. `format_python_float` is the single entry point for that —
 //! other feature tables should never reach for `format!("{v}")` directly.
 
+use std::collections::BTreeMap;
+
 use crate::report;
 
 /// Escapes a CSV cell only when the content demands it. Mirrors the CSV
@@ -48,25 +50,70 @@ pub(super) fn format_info_float(value: f64) -> String {
     format_python_float(if value == 0.0 { 0.0 } else { value })
 }
 
-/// Returns the ordered list of scoring-feature names from a Strelka VCF
-/// header. The line looks like `##snv_scoring_features=GQX,EVS_LOG,...`
-/// (Strelka's VQSR output); absent → empty Vec.
-///
-/// Whitespace around names is stripped to match the Python extractor's
-/// tolerance of hand-edited inputs. The same helper serves indel scoring
-/// features (`##indel_scoring_features=`) via the `prefix` parameter.
-pub(super) fn parse_scoring_features(headers: &[String], prefix: &str) -> Vec<String> {
-    let needle = format!("##{prefix}=");
+/// Legacy keeps every scoring-feature column from every matching header, but
+/// its index-to-name lookup is overwritten by each later header. Those two
+/// views intentionally differ when malformed VCFs repeat the metadata line.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct ScoringFeatures {
+    pub(super) columns: Vec<String>,
+    pub(super) names_by_index: Vec<String>,
+}
+
+impl ScoringFeatures {
+    pub(super) fn render_evsf(&self, raw: Option<&str>) -> Vec<String> {
+        let mut values = self
+            .names_by_index
+            .iter()
+            .map(|name| (name.as_str(), 0.0))
+            .collect::<BTreeMap<_, _>>();
+
+        // `vcfExtract.field` produces a list only when the source contains a
+        // comma. Enumerating a scalar raises in legacy and leaves defaults.
+        if let Some(raw) = raw.filter(|value| value.contains(',')) {
+            for (index, value) in raw.split(',').enumerate() {
+                if let Some(name) = self.names_by_index.get(index)
+                    && let Ok(value) = value.parse::<f64>()
+                {
+                    values.insert(name, value);
+                }
+            }
+        }
+
+        self.columns
+            .iter()
+            .map(|name| {
+                values
+                    .get(name.as_str())
+                    .copied()
+                    .map(format_info_float)
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+}
+
+/// Parse literal Strelka/Pisces scoring metadata using the legacy loop.
+pub(super) fn parse_scoring_features(headers: &[String], prefix: &str) -> ScoringFeatures {
+    let needle = format!("##{prefix}");
+    let mut parsed = ScoringFeatures::default();
     for header in headers {
-        if let Some(rest) = header.strip_prefix(&needle) {
-            return rest
-                .split(',')
-                .map(|n| n.trim().to_string())
-                .filter(|n| !n.is_empty())
-                .collect();
+        if !header.contains(&needle) {
+            continue;
+        }
+        let Some((_, value)) = header.split_once('=') else {
+            continue;
+        };
+        for (index, name) in value.split(',').enumerate() {
+            let name = name.to_string();
+            parsed.columns.push(name.clone());
+            if index < parsed.names_by_index.len() {
+                parsed.names_by_index[index] = name;
+            } else {
+                parsed.names_by_index.push(name);
+            }
         }
     }
-    Vec::new()
+    parsed
 }
 
 #[cfg(test)]
@@ -104,7 +151,11 @@ mod tests {
     #[test]
     fn parse_scoring_features_absent_returns_empty() {
         let headers = vec!["##fileformat=VCFv4.1".to_string()];
-        assert!(parse_scoring_features(&headers, "snv_scoring_features").is_empty());
+        assert!(
+            parse_scoring_features(&headers, "snv_scoring_features")
+                .columns
+                .is_empty()
+        );
     }
 
     #[test]
@@ -114,7 +165,7 @@ mod tests {
             "##snv_scoring_features=GQX,EVS_LOG,AD_RATE".to_string(),
         ];
         assert_eq!(
-            parse_scoring_features(&headers, "snv_scoring_features"),
+            parse_scoring_features(&headers, "snv_scoring_features").columns,
             vec![
                 "GQX".to_string(),
                 "EVS_LOG".to_string(),
@@ -124,11 +175,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_scoring_features_trims_whitespace() {
+    fn parse_scoring_features_preserves_whitespace() {
         let headers = vec!["##snv_scoring_features= GQX , EVS_LOG".to_string()];
         assert_eq!(
-            parse_scoring_features(&headers, "snv_scoring_features"),
-            vec!["GQX".to_string(), "EVS_LOG".to_string()]
+            parse_scoring_features(&headers, "snv_scoring_features").columns,
+            vec![" GQX ".to_string(), " EVS_LOG".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_scoring_features_appends_every_matching_header() {
+        let headers = vec![
+            "##snv_scoring_features=first,second".to_string(),
+            "##snv_scoring_features=later".to_string(),
+        ];
+        let parsed = parse_scoring_features(&headers, "snv_scoring_features");
+        assert_eq!(
+            parsed.columns,
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "later".to_string()
+            ]
+        );
+        assert_eq!(
+            parsed.names_by_index,
+            vec!["later".to_string(), "second".to_string()]
         );
     }
 

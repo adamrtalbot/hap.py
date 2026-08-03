@@ -18,11 +18,24 @@ fn vcfeval_handoff_matches_saved_legacy_oracle() {
     fs::create_dir(&template).expect("create fake SDF template");
     let fake_rtg = temp.path().join("rtg");
     let handoff = fixture("rtg-output.vcf");
+    let indexed_handoff = temp.path().join("rtg-output.vcf.gz");
+    let (headers, records) = hap_rs::vcf::load_raw_vcf(&handoff).expect("load RTG handoff");
+    let record_lines = records
+        .iter()
+        .map(hap_rs::vcf::RawVcfRecord::to_line)
+        .collect::<Vec<_>>();
+    hap_rs::vcf::write_indexed_vcf(
+        &indexed_handoff,
+        &headers,
+        record_lines.iter().map(String::as_str),
+    )
+    .expect("index RTG handoff");
     fs::write(
         &fake_rtg,
         format!(
-            "#!/bin/sh\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then out=\"$2\"; shift 2; else shift; fi\ndone\nmkdir -p \"$out\"\ngzip -c '{}' > \"$out/output.vcf.gz\"\n",
-            handoff.display()
+            "#!/bin/sh\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then out=\"$2\"; shift 2; else shift; fi\ndone\nmkdir -p \"$out\"\ncp '{}' \"$out/output.vcf.gz\"\ncp '{}.tbi' \"$out/output.vcf.gz.tbi\"\n",
+            indexed_handoff.display(),
+            indexed_handoff.display()
         ),
     )
     .expect("write fake RTG executable");

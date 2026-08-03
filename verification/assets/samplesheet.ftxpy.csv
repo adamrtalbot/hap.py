@@ -10,7 +10,7 @@ chr21_hcc_strelka_snv_tp,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.f
 chr21_hcc_strelka_snv_fn,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,hcc.strelka.snv,--feature-label FN
 ftx_bam_depth,local:assets/fixtures/ftx-bam/input.vcf,local:assets/fixtures/ftx-bam/ref.fa,local:assets/fixtures/ftx-bam/reads.bam,hcc.strelka.snv,--feature-label bam-oracle
 ftx_called_nonref,local:assets/fixtures/ftx-nonref.vcf,local:assets/fixtures/tiny.fa,,generic,
-ftx_location,local:assets/fixtures/ftx-bam/options.vcf,local:assets/fixtures/ftx-bam/ref.fa,,generic,-l 1:7-7 --feature-label oracle
+ftx_location,local:assets/fixtures/ftx-bam/options.vcf,local:assets/fixtures/ftx-bam/ref.fa,,generic,-l 1:7 --feature-label oracle
 ftx_fix_chr,local:assets/fixtures/ftx-bam/options.vcf,local:assets/fixtures/ftx-bam/ref.fa,,generic,--fix-chr --feature-label oracle
 ftx_normalize,local:assets/fixtures/ftx-bam/normalize.vcf,local:assets/fixtures/ftx-bam/ref.fa,,generic,--normalize --feature-label oracle
 ftx_mutect_snv,local:assets/fixtures/ftx-bam/mutect.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,hcc.mutect.snv,--feature-label oracle

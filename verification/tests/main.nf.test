@@ -21,6 +21,7 @@ nextflow_pipeline {
                 qfy_samplesheet = new File('assets/samplesheet.qfy.csv').canonicalPath
                 vcfcheck_samplesheet = new File('assets/samplesheet.vcfcheck.csv').canonicalPath
                 option_coverage = new File('assets/option-coverage.csv').canonicalPath
+                expected_artifacts = new File('assets/expected-artifacts.csv').canonicalPath
             }
         }
 
@@ -46,6 +47,7 @@ nextflow_pipeline {
             def coverageFailures = []
             def parityFailures = []
             def checked = 0
+            def comparedArtifacts = 0
 
             def duplicateCases = selectedCases.groupBy { it }
                 .findAll { _case, occurrences -> occurrences.size() > 1 }
@@ -59,12 +61,12 @@ nextflow_pipeline {
             // diagnosis. Without that explicit override, the release gate is
             // required to execute every wrapper lane.
             def expectedReleaseCounts = [
-                happy: 19,
+                happy: 20,
                 sompy: 23,
                 prepy: 37,
                 ftxpy: 24,
-                qfy: 4,
-                vcfcheck: 4,
+                qfy: 7,
+                vcfcheck: 9,
             ]
             def expectedReleaseTotal = expectedReleaseCounts.values().sum()
             def requiredReleaseCases = expectedReleaseCounts.keySet().toSet()
@@ -196,6 +198,86 @@ nextflow_pipeline {
                 }
             }
 
+            def artifactManifest = new File(params.expected_artifacts.toString())
+            def artifactRows = []
+            if (!artifactManifest.isFile()) {
+                coverageFailures << "expected artifact manifest absent: $artifactManifest"
+            } else {
+                def artifactLines = artifactManifest.readLines('UTF-8')
+                def expectedHeader = 'lane,sample_id,artifacts'
+                if (artifactLines.isEmpty() || artifactLines.first() != expectedHeader) {
+                    coverageFailures << "expected artifact manifest header must be: $expectedHeader"
+                } else {
+                    artifactLines.drop(1)
+                        .findAll { it.trim() && !it.trim().startsWith('#') }
+                        .eachWithIndex { line, rowIndex ->
+                            def fields = line.split(',', 3).collect { it.trim() }
+                            if (fields.size() != 3 || fields.any { !it }) {
+                                coverageFailures << "expected artifact row ${rowIndex + 2} must contain three non-empty fields"
+                            } else {
+                                def artifacts = fields[2].split(';', -1).collect { it.trim() }
+                                if (artifacts.any { !it }) {
+                                    coverageFailures << "expected artifact row ${rowIndex + 2} contains an empty artifact name"
+                                }
+                                if (artifacts != artifacts.toSorted()) {
+                                    coverageFailures << "expected artifact row ${rowIndex + 2} is not bytewise sorted"
+                                }
+                                if (artifacts.toSet().size() != artifacts.size()) {
+                                    coverageFailures << "expected artifact row ${rowIndex + 2} contains duplicate names"
+                                }
+                                def invalidNames = artifacts.findAll { artifact ->
+                                    !artifact.startsWith('result') || artifact.contains('/') || artifact.contains('\\\\')
+                                }
+                                if (!invalidNames.isEmpty()) {
+                                    coverageFailures << "expected artifact row ${rowIndex + 2} has invalid names: ${invalidNames.join(', ')}"
+                                }
+                                artifactRows << [
+                                    lane: fields[0],
+                                    sampleId: fields[1],
+                                    artifacts: artifacts,
+                                ]
+                            }
+                        }
+                }
+            }
+
+            def duplicateArtifactMappings = artifactRows.groupBy { [it.lane, it.sampleId] }
+                .findAll { _mapping, occurrences -> occurrences.size() > 1 }
+                .keySet()
+                .sort { mapping -> "${mapping[0]}:${mapping[1]}" }
+            duplicateArtifactMappings.each { mapping ->
+                coverageFailures << "duplicate expected artifact mapping: ${mapping[0]}:${mapping[1]}"
+            }
+            if (artifactRows.size() != expectedReleaseTotal) {
+                coverageFailures << "expected artifact manifest has ${artifactRows.size()} rows; expected $expectedReleaseTotal"
+            }
+            def expectedArtifactComparisons = artifactRows.collect { it.artifacts.size() }.sum() ?: 0
+            if (expectedArtifactComparisons != 436) {
+                coverageFailures << "expected artifact manifest has $expectedArtifactComparisons artifacts; expected 436"
+            }
+            artifactRows.each { artifactRow ->
+                if (!caseSamplesheets.containsKey(artifactRow.lane)) {
+                    coverageFailures << "unknown expected artifact lane: ${artifactRow.lane}"
+                } else if (!sampleIdsByCase[artifactRow.lane]?.contains(artifactRow.sampleId)) {
+                    coverageFailures << "${artifactRow.lane}:${artifactRow.sampleId} expected artifacts do not resolve to a samplesheet row"
+                }
+            }
+            requiredReleaseCases.each { caseName ->
+                def laneArtifactRows = artifactRows.findAll { it.lane == caseName }
+                if (laneArtifactRows.size() != expectedReleaseCounts[caseName]) {
+                    coverageFailures << "$caseName (expected artifact manifest has ${laneArtifactRows.size()} rows; expected ${expectedReleaseCounts[caseName]})"
+                }
+                def artifactIds = laneArtifactRows.collect { it.sampleId }.toSet()
+                ((sampleIdsByCase[caseName] ?: [] as Set) - artifactIds).sort().each { sampleId ->
+                    coverageFailures << "$caseName:$sampleId (samplesheet row has no expected artifact contract)"
+                }
+            }
+            def expectedArtifactsByIdentity = [:]
+            artifactRows.each { artifactRow ->
+                expectedArtifactsByIdentity[[artifactRow.lane.toString(), artifactRow.sampleId.toString()]] =
+                    artifactRow.artifacts.toSet()
+            }
+
             selectedCases.each { caseName ->
                 if (!caseSamplesheets.containsKey(caseName)) {
                     coverageFailures << "$caseName (selected case has no samplesheet contract)"
@@ -252,23 +334,59 @@ nextflow_pipeline {
                         coverageFailures << "$caseName:$sampleId (empty or internally inconsistent comparator status)"
                         return
                     }
+                    def invalidStatusFiles = status.files.findAll { entry ->
+                        !(entry instanceof Map) ||
+                            !(entry.name instanceof String) || !entry.name ||
+                            !(entry.ok instanceof Boolean) ||
+                            !(entry.reason instanceof String)
+                    }
+                    if (!invalidStatusFiles.isEmpty()) {
+                        coverageFailures << "$caseName:$sampleId (comparator status has invalid file entries)"
+                        return
+                    }
+                    def duplicateStatusNames = status.files
+                        .groupBy { it.name }
+                        .findAll { _name, occurrences -> occurrences.size() > 1 }
+                        .keySet()
+                        .sort()
+                    if (!duplicateStatusNames.isEmpty()) {
+                        coverageFailures << "$caseName:$sampleId (duplicate status artifact names: ${duplicateStatusNames.join(', ')})"
+                        return
+                    }
 
-                    // Guard against a stale/incomplete status payload: its
-                    // artifact names must cover the symmetric union currently
-                    // published under legacy/ and rust/.
-                    def publishedNames = (legacyDir.listFiles() + rustDir.listFiles())
+                    // Guard against a stale/incomplete status payload and
+                    // against both sides agreeing on the same wrong artifact
+                    // set. Each side and the status must equal the independent
+                    // legacy-observed contract for this exact identity.
+                    def expectedNames = expectedArtifactsByIdentity[[caseName.toString(), sampleId.toString()]]
+                    if (expectedNames == null || expectedNames.isEmpty()) {
+                        coverageFailures << "$caseName:$sampleId (expected artifact contract absent or empty)"
+                        return
+                    }
+                    comparedArtifacts += expectedNames.size()
+                    def legacyNames = legacyDir.listFiles()
                         .findAll { it.isFile() && it.name.startsWith('result') }
                         .collect { it.name }
                         .toSet()
+                    def rustNames = rustDir.listFiles()
+                        .findAll { it.isFile() && it.name.startsWith('result') }
+                        .collect { it.name }
+                        .toSet()
+                    if (legacyNames != expectedNames) {
+                        coverageFailures << "$caseName:$sampleId (legacy artifact set differs from exact manifest)"
+                    }
+                    if (rustNames != expectedNames) {
+                        coverageFailures << "$caseName:$sampleId (Rust artifact set differs from exact manifest)"
+                    }
                     def statusNames = status.files
                         .collect { it.name }
                         .findAll { it != '<artifact-set>' }
                         .toSet()
-                    if (publishedNames != statusNames) {
-                        coverageFailures << "$caseName:$sampleId (status artifact set differs from published union)"
+                    if (statusNames != expectedNames) {
+                        coverageFailures << "$caseName:$sampleId (status artifact set differs from exact manifest)"
                     }
 
-                    def failedFiles = status.files.findAll { !it.ok }
+                    def failedFiles = status.files.findAll { it.ok == false }
                     if (status.failed != failedFiles.size()) {
                         coverageFailures << "$caseName:$sampleId (status failed count is inconsistent)"
                     }
@@ -277,6 +395,14 @@ nextflow_pipeline {
                         parityFailures << "$caseName:$sampleId ($details)"
                     }
                 }
+            }
+
+            def selectedExpectedArtifactComparisons = artifactRows
+                .findAll { selectedCases.contains(it.lane) }
+                .collect { it.artifacts.size() }
+                .sum() ?: 0
+            if (comparedArtifacts != selectedExpectedArtifactComparisons) {
+                coverageFailures << "checked $comparedArtifacts artifacts; expected $selectedExpectedArtifactComparisons for selected lanes"
             }
 
             assert coverageFailures.isEmpty() :

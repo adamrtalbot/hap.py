@@ -275,22 +275,26 @@ impl RawVcfRecord {
 }
 
 pub fn read_text(path: &Path) -> Result<String> {
+    let data = read_decoded_bytes(path)?;
+    String::from_utf8(data).with_context(|| format!("{} is not valid UTF-8", path.display()))
+}
+
+fn read_decoded_bytes(path: &Path) -> Result<Vec<u8>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
-        let data = if is_bgzf(&bytes) {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        if is_bgzf(&bytes) {
             let mut reader = bgzf::io::Reader::new(bytes.as_slice());
             let mut data = Vec::new();
             reader.read_to_end(&mut data)?;
-            data
+            Ok(data)
         } else {
             let mut decoder = MultiGzDecoder::new(bytes.as_slice());
             let mut data = Vec::new();
             decoder.read_to_end(&mut data)?;
-            data
-        };
-        String::from_utf8(data).with_context(|| format!("{} is not valid UTF-8", path.display()))
+            Ok(data)
+        }
     } else {
-        String::from_utf8(bytes).with_context(|| format!("{} is not valid UTF-8", path.display()))
+        Ok(bytes)
     }
 }
 
@@ -306,11 +310,12 @@ fn is_bgzf(bytes: &[u8]) -> bool {
 }
 
 pub fn load_raw_vcf(path: &Path) -> Result<(Vec<String>, Vec<RawVcfRecord>)> {
-    if path.extension().and_then(|extension| extension.to_str()) == Some("bcf") {
-        let data = crate::bcf::read_uncompressed(path)?;
+    let data = read_decoded_bytes(path)?;
+    if crate::bcf::is_bcf_data(&data) {
         return crate::bcf::decode(&data, path);
     }
-    let text = read_text(path)?;
+    let text = String::from_utf8(data)
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
     let mut headers = Vec::new();
     let mut records = Vec::new();
     for line in text.lines() {
@@ -1248,9 +1253,10 @@ pub fn parse_locations(
 ) -> Result<Vec<LocationFilter>> {
     let mut filters = Vec::new();
     for token in text.split(',').filter(|token| !token.trim().is_empty()) {
-        if let Some((chrom_part, range_part)) = token.split_once(':')
-            && let Some((start, end)) = range_part.split_once('-')
-        {
+        if let Some((chrom_part, position_part)) = token.split_once(':') {
+            let (start, end) = position_part
+                .split_once('-')
+                .unwrap_or((position_part, position_part));
             filters.push(LocationFilter::Range {
                 chrom: normalize_chrom(chrom_part, reference_contigs),
                 start: start
@@ -1286,6 +1292,47 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::tempdir;
+
+    #[test]
+    fn single_position_location_matches_only_that_position() -> Result<()> {
+        let reference_contigs = BTreeSet::from(["1".to_string()]);
+        let locations = parse_locations("1:7", &reference_contigs)?;
+
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].matches("1", 7));
+        assert!(!locations[0].matches("1", 6));
+        assert!(!locations[0].matches("1", 8));
+        assert!(!locations[0].matches("chr1", 7));
+        Ok(())
+    }
+
+    #[test]
+    fn input_format_is_sniffed_independently_of_the_filename_suffix() -> Result<()> {
+        let directory = tempdir()?;
+        let headers = [
+            "##fileformat=VCFv4.2".to_string(),
+            "##contig=<ID=chr1,length=100>".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO".to_string(),
+        ];
+        let record = RawVcfRecord::from_line(
+            "chr1\t7\tformat-sniff\tA\tC\t.\tPASS\t.",
+            Path::new("source.vcf"),
+        )?;
+
+        let bcf = directory.path().join("source.bcf");
+        write_raw_vcf(&bcf, &headers, std::slice::from_ref(&record))?;
+        let misnamed_bcf = directory.path().join("misnamed.vcf");
+        fs::copy(&bcf, &misnamed_bcf)?;
+        assert_eq!(load_raw_vcf(&misnamed_bcf)?.1[0].id, "format-sniff");
+
+        let bgzf = directory.path().join("source.vcf.gz");
+        let record_line = record.to_line();
+        write_indexed_vcf(&bgzf, &headers, [record_line.as_str()])?;
+        let noncanonical_bgzf = directory.path().join("source.bgz");
+        fs::copy(&bgzf, &noncanonical_bgzf)?;
+        assert_eq!(load_raw_vcf(&noncanonical_bgzf)?.1[0].id, "format-sniff");
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct ParsedReferenceIndex {

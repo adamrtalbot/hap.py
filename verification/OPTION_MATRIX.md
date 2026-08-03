@@ -53,13 +53,16 @@ replace a live matrix coverage ID. `assets/option-coverage.csv` maps each live
 coverage ID to one samplesheet row. `factor_family` and `interaction_class` are
 human-maintained review labels, not enforced enum values. The nf-test contract
 rejects unknown lanes, unknown sample IDs, duplicate coverage IDs, and a
-default release run that omits a governed lane.
+default release run that omits a governed lane. The separate
+`assets/expected-artifacts.csv` contract maps those same 120 identities to 436
+exact legacy-observed artifacts; both output trees and every status payload
+must match it exactly.
 
 ## Factor catalogue
 
 This catalogue is the compatibility inventory used to select and extend rows.
 An entry here is not, by itself, a claim of live coverage; the authoritative
-live set is the 111 IDs in `assets/option-coverage.csv`.
+live set is the 120 IDs in `assets/option-coverage.csv`.
 
 ### Germline (`happy`)
 
@@ -116,7 +119,7 @@ live set is the 111 IDs in `assets/option-coverage.csv`.
 |---|---|
 | Invocation and formats | input/report/reference; xcmp and GA4GH annotations; VCF/VCF.gz/BCF input; visible `qfy` alias |
 | Confidence and stratification | FP BED; TSV regions; repeated direct regions; stratification fixchr |
-| Artifact set | write VCF; write/no-write counts conflict; no JSON |
+| Artifact set | write VCF; write/no-write counts last-token precedence; no JSON |
 | ROC | custom field; disable; repeated regions; filter; delta boundaries; CI alpha boundaries |
 | Failures | invalid controls; duplicate/reserved regions; missing inputs; input/output overwrite |
 
@@ -134,7 +137,8 @@ live set is the 111 IDs in `assets/option-coverage.csv`.
 
 - Give every live behavior class or interaction a stable coverage ID.
 - A coverage ID may move to a better row, but must not disappear silently.
-- Samplesheet row deletion requires removing or remapping its manifest entries.
+- Samplesheet row deletion requires removing or remapping both its option and
+  exact-artifact manifest entries.
 - Focused local runs may select fewer lanes. An unoverridden release run must
   select exactly all six governed lanes.
 - New accepted options must be added to this catalogue before release.

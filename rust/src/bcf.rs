@@ -133,6 +133,29 @@ fn decode_header_dictionary(data: &[u8], path: &Path) -> Result<HeaderDictionary
 }
 
 fn read_csi_chunks(path: &Path) -> Result<Vec<Vec<(u64, u64)>>> {
+    Ok(read_csi_bins(path)?
+        .references
+        .into_iter()
+        .map(|bins| {
+            bins.into_iter()
+                .flat_map(|bin| bin.chunks)
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+struct CsiIndex {
+    min_shift: usize,
+    depth: usize,
+    references: Vec<Vec<CsiBin>>,
+}
+
+struct CsiBin {
+    id: u64,
+    chunks: Vec<(u64, u64)>,
+}
+
+fn read_csi_bins(path: &Path) -> Result<CsiIndex> {
     let payload = read_uncompressed(path)
         .with_context(|| format!("failed to read CSI index {}", path.display()))?;
     let mut cursor = Cursor::new(&payload);
@@ -158,7 +181,7 @@ fn read_csi_chunks(path: &Path) -> Result<Vec<Vec<(u64, u64)>>> {
     let mut references = Vec::with_capacity(reference_count);
     for _ in 0..reference_count {
         let bin_count = nonnegative_i32(&mut cursor, "bin count")?;
-        let mut chunks = Vec::new();
+        let mut bins = Vec::new();
         for _ in 0..bin_count {
             let bin = u64::from(cursor.u32()?);
             let _loffset = cursor.u64()?;
@@ -166,6 +189,7 @@ fn read_csi_chunks(path: &Path) -> Result<Vec<Vec<(u64, u64)>>> {
             if bin > metadata_bin {
                 bail!("CSI bin {bin} exceeds metadata bin {metadata_bin}");
             }
+            let mut chunks = Vec::new();
             for _ in 0..chunk_count {
                 let start = cursor.u64()?;
                 let end = cursor.u64()?;
@@ -176,8 +200,11 @@ fn read_csi_chunks(path: &Path) -> Result<Vec<Vec<(u64, u64)>>> {
                     chunks.push((start, end));
                 }
             }
+            if bin != metadata_bin {
+                bins.push(CsiBin { id: bin, chunks });
+            }
         }
-        references.push(chunks);
+        references.push(bins);
     }
     match cursor.remaining() {
         0 => {}
@@ -186,7 +213,104 @@ fn read_csi_chunks(path: &Path) -> Result<Vec<Vec<(u64, u64)>>> {
         }
         trailing => bail!("CSI index has {trailing} trailing bytes"),
     }
-    Ok(references)
+    Ok(CsiIndex {
+        min_shift,
+        depth,
+        references,
+    })
+}
+
+/// Prove that a point query through a CSI index can retrieve a specific BCF
+/// record. Reading all chunks is insufficient because a structurally valid
+/// chunk attached to the wrong bin remains reachable by a whole-contig scan.
+pub(crate) fn csi_record_is_queryable(
+    path: &Path,
+    index_path: &Path,
+    target: &RawVcfRecord,
+) -> Result<bool> {
+    let uncompressed = read_uncompressed(path)
+        .with_context(|| format!("failed to read indexed BCF {}", path.display()))?;
+    let dictionary = decode_header_dictionary(&uncompressed, path)?;
+    let rid = dictionary
+        .contigs
+        .iter()
+        .position(|contig| contig == &target.chrom)
+        .with_context(|| {
+            format!(
+                "BCF record contig {} is absent from its header",
+                target.chrom
+            )
+        })?;
+    let index = read_csi_bins(index_path)?;
+    let reference = index
+        .references
+        .get(rid)
+        .context("CSI reference is absent from BCF index")?;
+    let start = target.pos.saturating_sub(1) as u64;
+    let query_bins = csi_query_bins(start, start.saturating_add(1), index.min_shift, index.depth)?;
+    let chunks = reference
+        .iter()
+        .filter(|bin| query_bins.contains(&bin.id))
+        .flat_map(|bin| bin.chunks.iter().copied())
+        .collect::<Vec<_>>();
+    let expected = target.to_line();
+    let mut reader = bgzf::io::Reader::new(File::open(path)?);
+    for (chunk_start, chunk_end) in merge_chunks(chunks) {
+        if chunk_start == chunk_end {
+            continue;
+        }
+        reader
+            .seek(bgzf::VirtualPosition::from(chunk_start))
+            .with_context(|| {
+                format!("failed to seek CSI point-query chunk for {}", target.chrom)
+            })?;
+        while u64::from(reader.virtual_position()) < chunk_end {
+            let before = u64::from(reader.virtual_position());
+            let record = read_record(&mut reader, &dictionary, path)?;
+            if record.to_line() == expected {
+                return Ok(true);
+            }
+            if u64::from(reader.virtual_position()) <= before {
+                bail!("BCF reader made no progress in CSI point-query chunk");
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn csi_query_bins(start: u64, end: u64, min_shift: usize, depth: usize) -> Result<Vec<u64>> {
+    if end <= start {
+        bail!("CSI query interval is empty");
+    }
+    let end = end - 1;
+    let mut bins = Vec::new();
+    let mut level_offset = 0u64;
+    for level in 0..=depth {
+        let shift = min_shift
+            .checked_add(
+                (depth - level)
+                    .checked_mul(3)
+                    .context("CSI depth overflow")?,
+            )
+            .context("CSI query shift overflow")?;
+        if shift >= u64::BITS as usize {
+            bail!("CSI query shift is out of range");
+        }
+        let first = level_offset
+            .checked_add(start >> shift)
+            .context("CSI query bin overflow")?;
+        let last = level_offset
+            .checked_add(end >> shift)
+            .context("CSI query bin overflow")?;
+        bins.extend(first..=last);
+        level_offset = level_offset
+            .checked_add(
+                1u64.checked_shl((level * 3) as u32)
+                    .context("CSI level offset overflow")?,
+            )
+            .context("CSI level offset overflow")?;
+    }
+    Ok(bins)
 }
 
 fn nonnegative_i32(cursor: &mut Cursor<'_>, field: &str) -> Result<usize> {

@@ -118,12 +118,6 @@ pub fn run(args: FtxArgs) -> Result<()> {
     } else {
         PathBuf::from(format!("{}.csv", args.output))
     };
-    if let Some(parent) = output.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     fs::write(&output, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("failed to write {}", output.display()))?;
 
@@ -176,7 +170,7 @@ pub(crate) fn emit_feature_table_with_depths(
             generic::emit_fields(records, label, HCC_OTHER_SNV_TRUTH_FIELDS)
         }
         "hcc.mutect.snv" | "hcc.mutect.indel" => {
-            legacy_callers::emit_mutect_with_depths(records, headers, label, depths)
+            legacy_callers::emit_mutect_with_depths(records, headers, label, depths)?
         }
         "hcc.varscan2.snv" if matches!(label, "TP" | "FN") => {
             generic::emit_fields(records, label, HCC_OTHER_SNV_TRUTH_FIELDS)
@@ -197,7 +191,7 @@ pub(crate) fn emit_feature_table_with_depths(
             generic::emit_fields(records, label, HCC_STRELKA_INDEL_TRUTH_FIELDS)
         }
         "hcc.pisces.snv" | "hcc.pisces.indel" => {
-            legacy_callers::emit_pisces_with_depths(records, headers, label, depths)
+            legacy_callers::emit_pisces_with_depths(records, headers, label, depths)?
         }
         other => bail!("unsupported --feature-table: {other}"),
     };
@@ -265,23 +259,26 @@ const HCC_OTHER_SNV_TRUTH_FIELDS: &[&str] = &[
 fn prepare_records(
     args: &FtxArgs,
     reference_sequences: &BTreeMap<String, String>,
-    reference_contigs: &BTreeSet<String>,
+    _reference_contigs: &BTreeSet<String>,
 ) -> Result<(Vec<String>, Vec<vcf::RawVcfRecord>)> {
     let (headers, records) = vcf::load_raw_vcf(Path::new(&args.input))?;
+    // `--fix-chr` rewrites VCF records before selection, but legacy passes
+    // location and BED contigs to bcftools literally.
+    let literal_contigs = BTreeSet::new();
     let locations = args
         .location
         .as_deref()
-        .map(|value| vcf::parse_locations(value, reference_contigs))
+        .map(|value| vcf::parse_locations(value, &literal_contigs))
         .transpose()?;
     let regions = args
         .regions_bedfile
         .as_ref()
-        .map(|path| vcf::load_bed(Path::new(path), reference_contigs))
+        .map(|path| vcf::load_bed(Path::new(path), &literal_contigs))
         .transpose()?;
     let targets = args
         .targets_bedfile
         .as_ref()
-        .map(|path| vcf::load_bed(Path::new(path), reference_contigs))
+        .map(|path| vcf::load_bed(Path::new(path), &literal_contigs))
         .transpose()?;
 
     let mut output = Vec::with_capacity(records.len());
@@ -698,6 +695,36 @@ mod tests {
     }
 
     #[test]
+    fn fix_chr_does_not_rewrite_region_or_target_bed_contigs() {
+        let (scratch, input, reference) = fixture(
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n1\t2\t.\tA\tC\t60\tPASS\t.\n",
+            ">chr1\nAAAA\n",
+        );
+        let selector = scratch.path().join("selector.bed");
+        fs::write(&selector, "1\t0\t4\n").unwrap();
+        let sequences = fasta::read_sequences(&reference).unwrap();
+        let contigs = sequences.keys().cloned().collect();
+
+        for use_regions in [true, false] {
+            let mut selected_args = args(&input, &reference);
+            selected_args.fixchr = true;
+            selected_args.normalize = true;
+            if use_regions {
+                selected_args.regions_bedfile = Some(selector.display().to_string());
+            } else {
+                selected_args.targets_bedfile = Some(selector.display().to_string());
+            }
+
+            let (_, records) = prepare_records(&selected_args, &sequences, &contigs).unwrap();
+
+            assert!(
+                records.is_empty(),
+                "rewritten record contig must not match the literal BED contig"
+            );
+        }
+    }
+
+    #[test]
     fn bam_depths_override_strelka_header_normalization() {
         let record = vcf::RawVcfRecord {
             chrom: "chr1".to_string(),
@@ -744,6 +771,22 @@ mod tests {
         run(run_args).unwrap();
 
         assert!(output.with_extension("csv").is_file());
+    }
+
+    #[test]
+    fn missing_output_parent_is_not_created() {
+        let (scratch, input, reference) = fixture(
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\nchr1\t2\t.\tA\tC\t60\tPASS\t.\n",
+            ">chr1\nAAAA\n",
+        );
+        let missing_parent = scratch.path().join("missing");
+        let output = missing_parent.join("features");
+        let mut run_args = args(&input, &reference);
+        run_args.output = output.display().to_string();
+
+        assert!(run(run_args).is_err());
+        assert!(!missing_parent.exists());
+        assert!(!output.with_extension("csv").exists());
     }
 
     #[test]

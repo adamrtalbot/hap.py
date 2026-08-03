@@ -281,6 +281,11 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         args.feature_table = Some(config.feature_table.to_string());
     }
     validate_args(&args)?;
+    let af_bins = if args.af_strat {
+        parse_af_bins(&args.af_strat_binsize)
+    } else {
+        Vec::new()
+    };
     let mut controls = SomaticOperationalControls::prepare(&args)?;
     controls.info(&format!(
         "Scratch path is {}",
@@ -620,6 +625,64 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         .as_ref()
         .map(|_| renumber_feature_rows(&[tp_rows, fp_rows, fn_rows, ambi_rows, unk_rows]));
 
+    // som.py writes feature and ambiguity detail artifacts before it derives
+    // the FP denominator. Preserve that order because the legacy range/FP
+    // bug below exits after these files have already been created.
+    if !ambiguous_classes.is_empty() {
+        write_legacy_count_table(
+            &suffixed_report_path(Path::new(&args.output), "ambiclasses.csv"),
+            "class",
+            &ambiguous_classes,
+        )?;
+    }
+    if !ambiguous_reasons.is_empty() {
+        write_legacy_count_table(
+            &suffixed_report_path(Path::new(&args.output), "ambireasons.csv"),
+            "reason",
+            &ambiguous_reasons,
+        )?;
+    }
+    if let Some(header) = feature_header.as_deref() {
+        let ordered_rows = ordered_feature_rows.as_deref().unwrap_or_default();
+        fs::write(
+            suffixed_report_path(Path::new(&args.output), "features.csv"),
+            format!("{header}\n{}\n", ordered_rows.join("\n")),
+        )
+        .with_context(|| format!("failed to write {}.features.csv", args.output))?;
+        if let Some(roc_name) = args.roc.as_deref() {
+            write_somatic_roc(
+                &suffixed_report_path(Path::new(&args.output), "roc.csv"),
+                header,
+                ordered_rows,
+                roc_name,
+            )?;
+            if args.af_strat {
+                for &(start, end) in &af_bins {
+                    let rows = feature_rows_for_af_roc(
+                        header,
+                        ordered_rows,
+                        start,
+                        end,
+                        &args.af_strat_truth,
+                        &args.af_strat_query,
+                    )?;
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    for prefix in ["records", "SNVs", "indels"] {
+                        let path = PathBuf::from(format!(
+                            "{}.{}.{}.roc.csv",
+                            args.output,
+                            prefix,
+                            format_af_interval(start, end)
+                        ));
+                        write_somatic_roc(&path, header, &rows, roc_name)?;
+                    }
+                }
+            }
+        }
+    }
+
     if fp_region_size_requires_reference(
         args.fp_region_size.as_deref(),
         fp_regions.as_deref().unwrap_or(&[]),
@@ -628,6 +691,11 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     {
         reference_sequences = Some(fasta::read_sequences(Path::new(&args.reference))?);
     }
+    validate_legacy_fp_location_denominator(
+        args.fp_region_size.as_deref(),
+        args.location.as_deref(),
+        has_automatic_fp_bases(fp_regions.as_deref().unwrap_or(&[]), &ambiguous_regions),
+    )?;
     let empty_reference = BTreeMap::new();
     let fp_region_size = calculate_fp_region_size(
         args.fp_region_size.as_deref(),
@@ -641,7 +709,8 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     let commandline = legacy_som_commandline(&args);
 
     let mut lines = Vec::new();
-    lines.push(if args.af_strat {
+    let use_af_column_order = args.af_strat && !af_bins.is_empty();
+    lines.push(if use_af_column_order {
         stats_header_af(args.count_filtered_fn)
     } else {
         stats_header(args.count_filtered_fn)
@@ -673,18 +742,20 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
                     &filtered_by_type,
                 )
             };
-            lines.push(render_row_af(
-                index,
-                label,
-                row,
-                &StatsRowContext {
-                    fp_region_size,
-                    ci_alpha,
-                    filtered,
-                    include_filtered_columns: args.count_filtered_fn,
-                    commandline: &commandline,
-                },
-            ));
+            let context = StatsRowContext {
+                fp_region_size,
+                ci_alpha,
+                filtered,
+                include_filtered_columns: args.count_filtered_fn,
+                commandline: &commandline,
+            };
+            lines.push(if use_af_column_order {
+                render_row_af(index, label, row, &context)
+            } else if args.af_strat {
+                render_row_af_without_bins(index, label, row, &context)
+            } else {
+                render_row(index, label, row, &context)
+            });
         }
     } else {
         for (index, label) in STATS_TYPE_ROWS {
@@ -736,7 +807,7 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         )?;
         for prefix in ["records", "SNVs", "indels"] {
             for (start, end, counts, filtered) in &af_counts {
-                let label = format!("{prefix}.{start:.6}-{end:.6}");
+                let label = format!("{prefix}.{}", format_af_interval(*start, *end));
                 lines.push(render_row_af(
                     0,
                     &label,
@@ -774,55 +845,19 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         explanation_enabled.then_some(&ambiguous_reasons),
     )?;
 
-    if let Some(header) = feature_header {
-        let features = suffixed_report_path(Path::new(&args.output), "features.csv");
+    if let Some(header) = feature_header.as_deref() {
         let ordered_rows = ordered_feature_rows.as_deref().unwrap_or_default();
-        fs::write(
-            &features,
-            format!("{header}\n{}\n", ordered_rows.join("\n")),
-        )
-        .with_context(|| format!("failed to write {}", features.display()))?;
-        if let Some(roc_name) = args.roc.as_deref() {
-            write_somatic_roc(
-                &suffixed_report_path(Path::new(&args.output), "roc.csv"),
-                &header,
-                ordered_rows,
-                roc_name,
-            )?;
-            if args.af_strat {
-                for (start, end) in parse_af_bins(&args.af_strat_binsize) {
-                    let rows = feature_rows_for_af_roc(
-                        &header,
-                        ordered_rows,
-                        start,
-                        end,
-                        &args.af_strat_truth,
-                        &args.af_strat_query,
-                    )?;
-                    if rows.is_empty() {
-                        continue;
-                    }
-                    for prefix in ["records", "SNVs", "indels"] {
-                        let path = PathBuf::from(format!(
-                            "{}.{}.{start:.6}-{end:.6}.roc.csv",
-                            args.output, prefix
-                        ));
-                        write_somatic_roc(&path, &header, &rows, roc_name)?;
-                    }
-                }
-            }
-        }
         if args.happy_stats {
             write_happy_style_summary(
                 &suffixed_report_path(Path::new(&args.output), "summary.csv"),
-                &header,
+                header,
                 ordered_rows,
                 feature_table_name,
             )?;
             if args.af_strat {
                 write_happy_style_extended(
                     &suffixed_report_path(Path::new(&args.output), "extended.csv"),
-                    &header,
+                    header,
                     ordered_rows,
                     feature_table_name,
                     &args.af_strat_binsize,
@@ -831,18 +866,6 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
                 )?;
             }
         }
-    }
-    if args.explain_ambiguous && !args.ambiguous_beds.is_empty() {
-        write_legacy_count_table(
-            &suffixed_report_path(Path::new(&args.output), "ambiclasses.csv"),
-            "class",
-            &ambiguous_classes,
-        )?;
-        write_legacy_count_table(
-            &suffixed_report_path(Path::new(&args.output), "ambireasons.csv"),
-            "reason",
-            &ambiguous_reasons,
-        )?;
     }
     controls.info("Somatic comparison complete")?;
     controls.scratch.cleanup()
@@ -1674,7 +1697,12 @@ fn write_happy_style_extended(
         let subset = if inclusive_last {
             format!("[{start:.2},1.00]")
         } else {
-            format!("[{start:.2},{end:.2})")
+            let end = if end.is_nan() {
+                "nan".to_string()
+            } else {
+                format!("{end:.2}")
+            };
+            format!("[{start:.2},{end})")
         };
         let in_bin = |value: &str| {
             value.parse::<f64>().is_ok_and(|value| {
@@ -1792,29 +1820,40 @@ fn round_four(value: f64) -> f64 {
 }
 
 fn parse_af_bins(raw: &str) -> Vec<(f64, f64)> {
-    let mut bins = raw
+    let bins = raw
         .split(',')
         .filter_map(|part| part.parse::<f64>().ok())
         .collect::<Vec<_>>();
-    if bins.is_empty() {
-        bins.push(0.2);
-    }
     let mut out = Vec::new();
     let mut start = 0.0;
     let mut idx = 0usize;
-    while start < 1.0 {
+    while start < 1.0 && !bins.is_empty() {
         let mut end = start + bins[idx];
         if end >= 1.0 {
-            end = 1.0;
+            // Python som.py uses 1.00000001 internally so AF=1 is included,
+            // while formatting the public bound to six decimals as 1.000000.
+            end = 1.000_000_01;
         }
-        out.push((start, end));
-        if end >= 1.0 {
+        if start >= end {
             break;
         }
+        out.push((start, end));
         start = end;
         idx = (idx + 1) % bins.len();
     }
     out
+}
+
+fn format_af_bound(value: f64) -> String {
+    if value.is_nan() {
+        "nan".to_string()
+    } else {
+        format!("{value:.6}")
+    }
+}
+
+fn format_af_interval(start: f64, end: f64) -> String {
+    format!("{}-{}", format_af_bound(start), format_af_bound(end))
 }
 
 fn calculate_af_stats(
@@ -2167,6 +2206,41 @@ fn fp_region_size_requires_reference(
         && !has_automatic_fp_bases(fp_regions, ambiguous_regions)
 }
 
+fn validate_legacy_fp_location_denominator(
+    requested_size: Option<&str>,
+    location: Option<&str>,
+    has_automatic_fp_bases: bool,
+) -> Result<()> {
+    if !has_automatic_fp_bases
+        || requested_size
+            .and_then(|size| size.parse::<i64>().ok())
+            .is_some()
+    {
+        return Ok(());
+    }
+    let Some(location) = location.filter(|location| !location.is_empty()) else {
+        return Ok(());
+    };
+    let Some((_, rest)) = location.split_once(':') else {
+        return Ok(());
+    };
+    if rest.is_empty() {
+        return Ok(());
+    }
+
+    // This deliberately mirrors som.py's `partition("_")` typo. Bcftools
+    // accepts `chr:start-end`, then the denominator code tries to parse the
+    // entire `start-end` token as an integer and the run exits after writing
+    // any requested feature/ROC artifacts but before stats or metrics.
+    let (start, end) = rest.split_once('_').unwrap_or((rest, ""));
+    for bound in [start, end].into_iter().filter(|bound| !bound.is_empty()) {
+        bound
+            .parse::<i64>()
+            .with_context(|| format!("invalid literal for int() with base 10: '{bound}'"))?;
+    }
+    Ok(())
+}
+
 fn calculate_fp_region_size(
     requested: Option<&str>,
     fp_regions: &[vcf::BedInterval],
@@ -2252,6 +2326,25 @@ fn render_row(
     counts: SomaticCounts,
     context: &StatsRowContext<'_>,
 ) -> String {
+    render_row_standard_order(index, label, counts, context, false)
+}
+
+fn render_row_af_without_bins(
+    index: usize,
+    label: &str,
+    counts: SomaticCounts,
+    context: &StatsRowContext<'_>,
+) -> String {
+    render_row_standard_order(index, label, counts, context, true)
+}
+
+fn render_row_standard_order(
+    index: usize,
+    label: &str,
+    counts: SomaticCounts,
+    context: &StatsRowContext<'_>,
+    blank_undefined_ratios: bool,
+) -> String {
     let (recall, recall_lower, recall_upper) =
         jeffreys_ci(counts.tp, counts.tp + counts.fn_count, context.ci_alpha);
     let (precision, precision_lower, precision_upper) =
@@ -2284,12 +2377,12 @@ fn render_row(
         py_float(recall),
         py_float(recall_lower),
         py_float(recall_upper),
-        py_float(ratio(counts.tp, counts.truth_total)),
+        formatted_ratio(counts.tp, counts.truth_total, blank_undefined_ratios),
         py_float(precision),
         py_float(precision_lower),
         py_float(precision_upper),
-        py_float(ratio(counts.unk, counts.query_total)),
-        py_float(ratio(counts.ambi, counts.query_total)),
+        formatted_ratio(counts.unk, counts.query_total, blank_undefined_ratios),
+        formatted_ratio(counts.ambi, counts.query_total, blank_undefined_ratios),
         context.fp_region_size.to_string(),
         fp_rate_or_blank(counts.fp, context.fp_region_size),
     ]);
@@ -2298,17 +2391,27 @@ fn render_row(
             let unfiltered_tp = counts.tp.saturating_sub(filtered.tp);
             let unfiltered_fp = counts.fp.saturating_sub(filtered.fp);
             columns.extend([
-                py_float(ratio(unfiltered_tp, counts.tp + counts.fn_count)),
-                py_float(ratio(unfiltered_tp, unfiltered_tp + unfiltered_fp)),
+                formatted_ratio(
+                    unfiltered_tp,
+                    counts.tp + counts.fn_count,
+                    blank_undefined_ratios,
+                ),
+                formatted_ratio(
+                    unfiltered_tp,
+                    unfiltered_tp + unfiltered_fp,
+                    blank_undefined_ratios,
+                ),
                 fp_rate_or_blank(unfiltered_fp, context.fp_region_size),
-                py_float(ratio(
+                formatted_ratio(
                     counts.unk.saturating_sub(filtered.unk),
                     counts.query_total,
-                )),
-                py_float(ratio(
+                    blank_undefined_ratios,
+                ),
+                formatted_ratio(
                     counts.ambi.saturating_sub(filtered.ambi),
                     counts.query_total,
-                )),
+                    blank_undefined_ratios,
+                ),
             ]);
         } else {
             columns.extend([
@@ -2323,6 +2426,14 @@ fn render_row(
     columns.push(version.to_string());
     columns.push(context.commandline.to_string());
     columns.join(",")
+}
+
+fn formatted_ratio(numerator: usize, denominator: usize, blank_undefined: bool) -> String {
+    if blank_undefined {
+        ratio_or_blank(numerator, denominator)
+    } else {
+        py_float(ratio(numerator, denominator))
+    }
 }
 
 /// Render the column order produced by the legacy pandas concat used when
@@ -2588,12 +2699,8 @@ fn validate_af_bins(raw: &str) -> Result<()> {
         bail!("AF bin size list must not be empty");
     }
     for bin in bins {
-        let value = bin
-            .parse::<f64>()
+        bin.parse::<f64>()
             .with_context(|| format!("failed to parse AF bin size '{bin}'"))?;
-        if !value.is_finite() || value <= 0.0 {
-            bail!("AF bin sizes must be finite and greater than zero");
-        }
     }
     Ok(())
 }
@@ -3730,6 +3837,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_ambiguity_explanations_do_not_create_detail_tables() {
+        let root = unique_test_dir("empty-explanation");
+        let truth = root.join("truth.vcf");
+        let query = root.join("query.vcf");
+        let ambiguous = root.join("ambiguous.bed");
+        fs::create_dir_all(&root).expect("create empty explanation test root");
+        write_test_vcf(&truth, 7);
+        write_test_vcf(&query, 7);
+        fs::write(
+            &ambiguous,
+            "chr1\t7\t8\tignored\tunk\t2\tignored\tlow-vaf\n",
+        )
+        .expect("write ambiguous BED");
+
+        let mut args = parsed_somatic(&[]);
+        args.truth = truth.display().to_string();
+        args.query = query.display().to_string();
+        args.output = root.join("result").display().to_string();
+        args.reference = root.join("missing.fa").display().to_string();
+        args.ambiguous_beds = vec![ambiguous.display().to_string()];
+        args.explain_ambiguous = true;
+        args.fp_region_size = Some("10".to_string());
+        args.quiet = true;
+        run(args).expect("empty explanation comparison must succeed");
+
+        assert!(!root.join("result.ambiclasses.csv").exists());
+        assert!(!root.join("result.ambireasons.csv").exists());
+        let metrics =
+            fs::read_to_string(root.join("result.metrics.json")).expect("read explanation metrics");
+        assert!(!metrics.contains("\"id\": \"ambiclasses\""));
+        assert!(!metrics.contains("\"id\": \"ambireasons\""));
+
+        fs::remove_dir_all(&root).expect("remove empty explanation test root");
+    }
+
+    #[test]
     fn explicit_fp_bed_participates_in_explanations_and_uppercase_ambiguous_denominator() {
         let root = unique_test_dir("fp-explanation-denominator");
         let truth = root.join("truth.vcf");
@@ -3947,6 +4090,77 @@ mod tests {
             "T_AF",
         ]))
         .expect("implemented AF extended-summary controls should remain supported");
+    }
+
+    #[test]
+    fn af_bin_edge_values_follow_the_pinned_python_loop() {
+        for raw in ["0", "-0.1", "nan", "inf"] {
+            let args = parsed_somatic(&["--af-binsize", raw]);
+            validate_args(&args)
+                .unwrap_or_else(|error| panic!("legacy AF bin {raw:?} was rejected: {error}"));
+        }
+        for raw in ["", "bogus"] {
+            let mut args = parsed_somatic(&[]);
+            args.af_strat_binsize = raw.to_string();
+            assert!(validate_args(&args).is_err());
+        }
+
+        assert!(parse_af_bins("0").is_empty());
+        assert!(parse_af_bins("-0.1").is_empty());
+        let nan = parse_af_bins("nan");
+        assert_eq!(nan.len(), 1);
+        assert_eq!(nan[0].0, 0.0);
+        assert!(nan[0].1.is_nan());
+        assert_eq!(format_af_interval(nan[0].0, nan[0].1), "0.000000-nan");
+        assert_eq!(parse_af_bins("inf"), vec![(0.0, 1.000_000_01)]);
+        assert_eq!(format_af_interval(0.0, 1.000_000_01), "0.000000-1.000000");
+    }
+
+    #[test]
+    fn af_bin_edge_values_emit_the_legacy_stats_rows() {
+        let root = unique_test_dir("af-bin-edges");
+        let truth = root.join("truth.vcf");
+        let query = root.join("query.vcf");
+        fs::create_dir_all(&root).expect("create AF edge test root");
+        write_test_vcf(&truth, 7);
+        write_test_vcf(&query, 8);
+
+        for (label, value, expected_interval) in [
+            ("zero", "0", None),
+            ("negative", "-0.1", None),
+            ("nan", "nan", Some("records.0.000000-nan")),
+            ("infinity", "inf", Some("records.0.000000-1.000000")),
+        ] {
+            let mut args = parsed_somatic(&[]);
+            args.truth = truth.display().to_string();
+            args.query = query.display().to_string();
+            args.output = root.join(label).display().to_string();
+            args.reference = root.join("missing.fa").display().to_string();
+            args.feature_table = Some("generic".to_string());
+            args.af_strat = true;
+            args.af_strat_binsize = value.to_string();
+            args.af_strat_truth = "QUAL.truth".to_string();
+            args.af_strat_query = "QUAL".to_string();
+            args.fp_region_size = Some("10".to_string());
+            args.quiet = true;
+            run(args).unwrap_or_else(|error| panic!("AF edge {value:?} failed: {error}"));
+
+            let stats = fs::read_to_string(root.join(format!("{label}.stats.csv")))
+                .expect("read AF edge stats");
+            let intervals = stats
+                .lines()
+                .filter(|line| line.contains("records."))
+                .collect::<Vec<_>>();
+            match expected_interval {
+                Some(expected) => {
+                    assert_eq!(intervals.len(), 1);
+                    assert!(intervals[0].contains(expected));
+                }
+                None => assert!(intervals.is_empty()),
+            }
+        }
+
+        fs::remove_dir_all(&root).expect("remove AF edge test root");
     }
 
     #[test]
@@ -4198,6 +4412,41 @@ mod tests {
             column_json("fp.rate", "fp.rate", "double", &rates, false),
             "{\"values\": [null, null], \"type\": \"double\", \"id\": \"fp.rate\", \"label\": \"fp.rate\"}"
         );
+    }
+
+    #[test]
+    fn fp_bed_with_dash_range_preserves_legacy_late_failure_artifacts() {
+        let root = unique_test_dir("fp-range-failure");
+        let truth = root.join("truth.vcf");
+        let query = root.join("query.vcf");
+        let fp = root.join("fp.bed");
+        fs::create_dir_all(&root).expect("create FP range failure test root");
+        write_test_vcf(&truth, 7);
+        write_test_vcf(&query, 8);
+        fs::write(&fp, "chr1\t0\t20\t2\tFP\tsource=upper\n").expect("write FP BED");
+
+        let mut args = parsed_somatic(&[]);
+        args.truth = truth.display().to_string();
+        args.query = query.display().to_string();
+        args.output = root.join("result").display().to_string();
+        args.reference = root.join("missing.fa").display().to_string();
+        args.fp_bedfile = Some(fp.display().to_string());
+        args.location = Some("chr1:1-10".to_string());
+        args.feature_table = Some("generic".to_string());
+        args.quiet = true;
+
+        let error = run(args).expect_err("legacy denominator parsing must reject dash ranges");
+        assert!(error.to_string().contains("invalid literal for int()"));
+        assert!(
+            root.join("result.features.csv").is_file(),
+            "som.py writes the feature table before the denominator failure"
+        );
+        assert!(!root.join("result.stats.csv").exists());
+        assert!(!root.join("result.metrics.json").exists());
+        validate_legacy_fp_location_denominator(Some("10"), Some("chr1:1-10"), true)
+            .expect("an explicit integer denominator bypasses the legacy range bug");
+
+        fs::remove_dir_all(&root).expect("remove FP range failure test root");
     }
 
     #[test]

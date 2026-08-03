@@ -10,7 +10,8 @@ const WARNING_REFPADDING: usize = 0;
 const WARNING_OVERLAP: usize = 1;
 const WARNING_SYMALT: usize = 2;
 const WARNING_UNCERTAIN_LENGTH: usize = 3;
-const WARNING_COUNT: usize = 4;
+const WARNING_BCFERROR: usize = 4;
+const WARNING_COUNT: usize = 5;
 
 #[derive(Default)]
 struct ValidationCounts {
@@ -44,18 +45,34 @@ struct RecordGenotypes {
     allele_counts: Vec<usize>,
 }
 
+struct VcfHeader {
+    sample_count: usize,
+    contigs: BTreeSet<String>,
+    info: BTreeSet<String>,
+    format: BTreeMap<String, HeaderValueType>,
+    filters: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum HeaderValueType {
+    Integer,
+    Float,
+    Other,
+}
+
+struct FormatParseError {
+    key: String,
+    value_type: HeaderValueType,
+    invalid_character: char,
+    extreme_value: bool,
+}
+
 pub fn run(args: ValidateArgs) -> Result<()> {
     let stderr = std::io::stderr();
     run_with_diagnostics(args, &mut stderr.lock())
 }
 
 fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Result<()> {
-    if args.check_bcf_errors {
-        bail!(
-            "--check-bcf-errors true is unsupported: the built-in VCF reader does not perform htslib BCF translation checks"
-        );
-    }
-
     let reference_contigs = if let Some(reference) = &args.reference {
         fasta::contig_lengths(Path::new(reference))?
             .into_keys()
@@ -80,7 +97,11 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
         .transpose()?;
 
     let (headers, records) = vcf::load_raw_vcf(Path::new(&args.input))?;
-    ensure_sample_header(&headers)?;
+    let mut header = VcfHeader::from_lines(&headers)?;
+    let location_is_lowercase_x = args
+        .locations
+        .as_deref()
+        .is_some_and(location_selects_lowercase_x);
     let reference_sequences = args
         .reference
         .as_ref()
@@ -90,8 +111,76 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
     let mut counts = ValidationCounts::default();
     let mut previous = PreviousRecord::default();
     let mut errors = Vec::new();
+    let mut parsed_any_record = false;
+    let mut previous_record_failed_to_parse = false;
+    let mut reported_extreme_format_value = false;
 
-    for record in records {
+    for mut record in records {
+        if record.samples.len() < header.sample_count {
+            writeln!(
+                diagnostics,
+                "[E::vcf_parse_format] Number of columns at {}:{} does not match the number of samples ({} vs {})",
+                record.chrom,
+                record.pos,
+                record.samples.len(),
+                header.sample_count
+            )?;
+            if !parsed_any_record || previous_record_failed_to_parse {
+                break;
+            }
+            previous_record_failed_to_parse = true;
+            continue;
+        }
+        record.samples.truncate(header.sample_count);
+
+        if let Some(parse_error) = header.format_parse_error(&record) {
+            if parse_error.extreme_value && !reported_extreme_format_value {
+                let integer_suffix = match parse_error.value_type {
+                    HeaderValueType::Integer => " and set to missing",
+                    HeaderValueType::Float | HeaderValueType::Other => "",
+                };
+                writeln!(
+                    diagnostics,
+                    "[W::vcf_parse_format] Extreme FORMAT/{} value encountered{} at {}:{}",
+                    parse_error.key, integer_suffix, record.chrom, record.pos
+                )?;
+                reported_extreme_format_value = true;
+            }
+            writeln!(
+                diagnostics,
+                "[E::vcf_parse_format] Invalid character '{}' in '{}' FORMAT field at {}:{}",
+                parse_error.invalid_character, parse_error.key, record.chrom, record.pos
+            )?;
+            if !parsed_any_record || previous_record_failed_to_parse {
+                break;
+            }
+            previous_record_failed_to_parse = true;
+            continue;
+        }
+        parsed_any_record = true;
+        previous_record_failed_to_parse = false;
+
+        let translation_error = header.translation_error(&record, diagnostics)?;
+        if translation_error != 0 {
+            if args.check_bcf_errors {
+                bail!(
+                    "Record at {}:{} will not translate into BCF. Check if the header is incomplete (error code {}). The header must have all contigs present as #contig entries (contrary to the htslib error message, tabix indexing is not sufficient), and all the INFO and FORMAT types must match the values in all records.",
+                    record.chrom,
+                    record.pos,
+                    translation_error
+                );
+            }
+            if counts.warnings[WARNING_BCFERROR] == 0 {
+                writeln!(
+                    diagnostics,
+                    "[W] Record at {}:{} will not translate into BCF. Check if the header is incomplete  (error code {}) -- all records like this are skipped.",
+                    record.chrom, record.pos, translation_error
+                )?;
+            }
+            counts.warnings[WARNING_BCFERROR] += 1;
+            continue;
+        }
+
         let chrom = if reference_contigs.is_empty() {
             record.chrom.clone()
         } else {
@@ -139,7 +228,7 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
             args.all_warnings,
             diagnostics,
         )?;
-        update_record_counts(&record, &genotype, &mut counts);
+        update_record_counts(&record, &genotype, &mut counts, location_is_lowercase_x);
 
         if let Some(reference_sequences) = &reference_sequences
             && let Some(reason) = validate_record(&record, reference_sequences)
@@ -197,16 +286,220 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
     Ok(())
 }
 
-fn ensure_sample_header(headers: &[String]) -> Result<()> {
-    let sample_count = headers
-        .iter()
-        .find(|line| line.starts_with("#CHROM\t"))
-        .map(|line| line.split('\t').count().saturating_sub(9))
-        .unwrap_or(0);
-    if sample_count == 0 {
-        bail!("input VCF has no samples; legacy vcfcheck requires at least one sample");
+impl VcfHeader {
+    fn from_lines(headers: &[String]) -> Result<Self> {
+        let sample_count = headers
+            .iter()
+            .find(|line| line.starts_with("#CHROM\t"))
+            .map(|line| line.split('\t').count().saturating_sub(9))
+            .unwrap_or(0);
+        if sample_count == 0 {
+            bail!("input VCF has no samples; legacy vcfcheck requires at least one sample");
+        }
+        Ok(Self {
+            sample_count,
+            contigs: header_ids(headers, "##contig="),
+            info: header_ids(headers, "##INFO="),
+            format: header_format_types(headers),
+            filters: header_ids(headers, "##FILTER="),
+        })
     }
-    Ok(())
+
+    fn translation_error<W: Write>(
+        &mut self,
+        record: &vcf::RawVcfRecord,
+        diagnostics: &mut W,
+    ) -> Result<usize> {
+        let mut error = 0;
+        if self.contigs.insert(record.chrom.clone()) {
+            writeln!(
+                diagnostics,
+                "[W::vcf_parse] Contig '{}' is not defined in the header. (Quick workaround: index the file with tabix.)",
+                record.chrom
+            )?;
+            error |= 1;
+        }
+        for filter in record
+            .filter
+            .split(';')
+            .filter(|filter| *filter != "." && *filter != "PASS")
+        {
+            if self.filters.insert(filter.to_string()) {
+                writeln!(
+                    diagnostics,
+                    "[W::vcf_parse_filter] FILTER '{filter}' is not defined in the header"
+                )?;
+                error |= 2;
+            }
+        }
+        for field in record
+            .info
+            .split(';')
+            .filter(|field| *field != "." && !field.is_empty())
+        {
+            let key = field.split_once('=').map_or(field, |(key, _)| key);
+            if self.info.insert(key.to_string()) {
+                writeln!(
+                    diagnostics,
+                    "[W::vcf_parse_info] INFO '{key}' is not defined in the header, assuming Type=String"
+                )?;
+                error |= 2;
+            }
+        }
+        for key in record.format_keys() {
+            if !self.format.contains_key(key) {
+                writeln!(
+                    diagnostics,
+                    "[W::vcf_parse_format] FORMAT '{key}' at {}:{} is not defined in the header, assuming Type=String",
+                    record.chrom, record.pos
+                )?;
+                self.format.insert(key.to_string(), HeaderValueType::Other);
+                error |= 2;
+            }
+        }
+        Ok(error)
+    }
+
+    fn format_parse_error(&self, record: &vcf::RawVcfRecord) -> Option<FormatParseError> {
+        let format_keys = record.format_keys();
+        record.samples.iter().find_map(|sample| {
+            format_keys
+                .iter()
+                .zip(sample.split(':'))
+                .find_map(|(key, value)| {
+                    let value_type = *self.format.get(*key)?;
+                    let (invalid_character, extreme_value) = value_type.parse_error(value)?;
+                    Some(FormatParseError {
+                        key: (*key).to_string(),
+                        value_type,
+                        invalid_character,
+                        extreme_value,
+                    })
+                })
+        })
+    }
+}
+
+impl HeaderValueType {
+    fn parse_error(self, value: &str) -> Option<(char, bool)> {
+        if value.is_empty() || matches!(self, Self::Other) {
+            return None;
+        }
+        value
+            .split(',')
+            .filter(|part| *part != ".")
+            .find_map(|part| match self {
+                Self::Integer => integer_parse_error(part),
+                Self::Float => float_parse_error(part),
+                Self::Other => None,
+            })
+    }
+}
+
+fn integer_parse_error(value: &str) -> Option<(char, bool)> {
+    let unsigned = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .unwrap_or(value);
+    let invalid = unsigned
+        .chars()
+        .find(|character| !character.is_ascii_digit());
+    invalid.map(|character| {
+        (
+            character,
+            !unsigned.as_bytes().first().is_some_and(u8::is_ascii_digit),
+        )
+    })
+}
+
+fn float_parse_error(value: &str) -> Option<(char, bool)> {
+    let unsigned = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .unwrap_or(value);
+    if value.parse::<f64>().is_ok()
+        || ["nan", "inf", "infinity"]
+            .iter()
+            .any(|special| unsigned.eq_ignore_ascii_case(special))
+    {
+        return None;
+    }
+
+    let bytes = unsigned.as_bytes();
+    let mut index = 0;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    let mut digit_count = index;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let decimal_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        digit_count += index - decimal_start;
+    }
+    if bytes
+        .get(index)
+        .is_some_and(|byte| matches!(*byte, b'e' | b'E'))
+        && digit_count > 0
+    {
+        index += 1;
+        if bytes
+            .get(index)
+            .is_some_and(|byte| matches!(*byte, b'+' | b'-'))
+        {
+            index += 1;
+        }
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+    }
+    let invalid = unsigned[index..]
+        .chars()
+        .next()
+        .or_else(|| unsigned.chars().next())?;
+    Some((invalid, digit_count == 0))
+}
+
+fn header_ids(headers: &[String], prefix: &str) -> BTreeSet<String> {
+    headers
+        .iter()
+        .filter_map(|line| line.strip_prefix(prefix)?.strip_prefix("<ID="))
+        .filter_map(|fields| fields.split([',', '>']).next())
+        .map(str::to_string)
+        .collect()
+}
+
+fn header_format_types(headers: &[String]) -> BTreeMap<String, HeaderValueType> {
+    headers
+        .iter()
+        .filter_map(|line| line.strip_prefix("##FORMAT=")?.strip_prefix('<'))
+        .filter_map(|fields| {
+            let id = header_attribute(fields, "ID")?;
+            let value_type = match header_attribute(fields, "Type")? {
+                "Integer" => HeaderValueType::Integer,
+                "Float" => HeaderValueType::Float,
+                _ => HeaderValueType::Other,
+            };
+            Some((id.to_string(), value_type))
+        })
+        .collect()
+}
+
+fn header_attribute<'a>(fields: &'a str, key: &str) -> Option<&'a str> {
+    fields.split(',').find_map(|field| {
+        let (field_key, value) = field.split_once('=')?;
+        (field_key == key).then_some(value.trim_end_matches('>'))
+    })
+}
+
+fn location_selects_lowercase_x(location: &str) -> bool {
+    location
+        .split(',')
+        .next()
+        .and_then(|location| location.split(':').next())
+        == Some("x")
 }
 
 fn inspect_genotypes(record: &vcf::RawVcfRecord) -> Result<RecordGenotypes> {
@@ -246,13 +539,13 @@ fn inspect_genotypes(record: &vcf::RawVcfRecord) -> Result<RecordGenotypes> {
                 continue;
             }
             result.any_nonref = true;
-            let alt = alts.get(index - 1).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "call with invalid genotype allele {index} at {}:{}",
+            let Some(alt) = alts.get(index - 1) else {
+                bail!(
+                    "Call with invalid genotype (non-existent allele) at {}:{}",
                     record.chrom,
-                    record.pos
-                )
-            })?;
+                    record.pos + usize::from(reference_padding(record) > 0)
+                );
+            };
             if alt.starts_with('<') {
                 result.any_symbolic = true;
             }
@@ -410,19 +703,31 @@ fn update_record_counts(
     record: &vcf::RawVcfRecord,
     genotype: &RecordGenotypes,
     counts: &mut ValidationCounts,
+    location_is_lowercase_x: bool,
 ) {
     counts.ref_records += usize::from(genotype.any_ref);
     counts.nonref_records += usize::from(genotype.any_nonref);
     counts.haploid += usize::from(genotype.any_haploid);
     counts.diploid += usize::from(genotype.any_diploid);
     counts.polyploid += usize::from(genotype.any_polyploid);
-    if record.chrom.eq_ignore_ascii_case("x") || record.chrom.eq_ignore_ascii_case("chrx") {
+    if record.chrom == "X"
+        || record.chrom == "chrX"
+        || record.chrom == "chrx"
+        || location_is_lowercase_x
+    {
         counts.haploid_x |= genotype.any_haploid;
         counts.diploid_x |= genotype.any_diploid || genotype.any_polyploid;
     }
 }
 
 fn write_warning_summaries<W: Write>(counts: &ValidationCounts, diagnostics: &mut W) -> Result<()> {
+    if counts.warnings[WARNING_BCFERROR] > 0 {
+        writeln!(
+            diagnostics,
+            "[W] Variants that will cause trouble when writing BCF: {}",
+            counts.warnings[WARNING_BCFERROR]
+        )?;
+    }
     for (warning, label) in [
         (
             WARNING_REFPADDING,
@@ -496,7 +801,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn write_vcf(path: &Path, records: &[&str]) -> Result<()> {
-        let mut text = "##fileformat=VCFv4.2\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n".to_string();
+        let mut text = "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=100>\n##FILTER=<ID=LowQual,Description=\"Synthetic filter\">\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n".to_string();
         for record in records {
             text.push_str(record);
             text.push('\n');
@@ -611,16 +916,271 @@ mod tests {
     }
 
     #[test]
-    fn bcf_translation_check_is_rejected_instead_of_ignored() -> Result<()> {
+    fn unchecked_bcf_translation_errors_are_warned_and_skipped() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("check.json");
+        write_vcf(&input, &["chr2\t1\t.\tA\tC\t.\tPASS\t.\tGT\t0/1"])?;
+        let mut diagnostics = Vec::new();
+        run_with_diagnostics(args(&input, &output), &mut diagnostics)?;
+
+        assert_eq!(
+            fs::read_to_string(output)?,
+            "{\"OVERLAP\":0,\"REFPADDING\":0,\"SYMALT\":0,\"UNCERTAINLENGTH\":0,\"diploid\":0,\"haploid\":0,\"male\":false,\"nonref\":0,\"polyploid\":0,\"records\":0,\"ref\":0}\n"
+        );
+        let diagnostics = String::from_utf8(diagnostics)?;
+        assert_eq!(
+            diagnostics,
+            "[W::vcf_parse] Contig 'chr2' is not defined in the header. (Quick workaround: index the file with tabix.)\n[W] Record at chr2:1 will not translate into BCF. Check if the header is incomplete  (error code 1) -- all records like this are skipped.\n[W] Variants that will cause trouble when writing BCF: 1\n[I] Total VCF records:         0\n[I] Non-reference VCF records: 0\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checked_bcf_translation_errors_are_fatal() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("check.json");
+        write_vcf(&input, &["chr2\t1\t.\tA\tC\t.\tPASS\t.\tGT\t0/1"])?;
+        let mut args = args(&input, &output);
+        args.check_bcf_errors = true;
+        let error = run_with_diagnostics(args, &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains(
+            "Record at chr2:1 will not translate into BCF. Check if the header is incomplete (error code 1)."
+        ));
+        assert!(!output.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn checked_bcf_translation_accepts_valid_records() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let output = directory.path().join("check.json");
         write_vcf(&input, &["chr1\t1\t.\tA\tC\t.\tPASS\t.\tGT\t0/1"])?;
-        let mut args = args(&input, &output);
-        args.check_bcf_errors = true;
-        let error = run_with_diagnostics(args, &mut Vec::new()).unwrap_err();
-        assert!(error.to_string().contains("unsupported"));
-        assert!(!output.exists());
+        let mut case_args = args(&input, &output);
+        case_args.check_bcf_errors = true;
+        run_with_diagnostics(case_args, &mut Vec::new())?;
+
+        assert!(fs::read_to_string(output)?.contains("\"records\":1"));
+        Ok(())
+    }
+
+    #[test]
+    fn undefined_field_translation_errors_follow_bcf_mode() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let unchecked_output = directory.path().join("unchecked.json");
+        write_vcf(
+            &input,
+            &[
+                "chr1\t1\t.\tA\tC\t.\tLowX\tUNDECLARED=1\tGT:DP\t0/1:10",
+                "chr1\t2\t.\tA\tG\t.\tLowX\tUNDECLARED=2\tGT:DP\t0/1:20",
+            ],
+        )?;
+
+        let mut diagnostics = Vec::new();
+        run_with_diagnostics(args(&input, &unchecked_output), &mut diagnostics)?;
+        assert!(fs::read_to_string(unchecked_output)?.contains("\"records\":1"));
+        assert_eq!(
+            String::from_utf8(diagnostics)?,
+            "[W::vcf_parse_filter] FILTER 'LowX' is not defined in the header\n[W::vcf_parse_info] INFO 'UNDECLARED' is not defined in the header, assuming Type=String\n[W::vcf_parse_format] FORMAT 'DP' at chr1:1 is not defined in the header, assuming Type=String\n[W] Record at chr1:1 will not translate into BCF. Check if the header is incomplete  (error code 2) -- all records like this are skipped.\n[W] Variants that will cause trouble when writing BCF: 1\n[I] Total VCF records:         1\n[I] Non-reference VCF records: 1\n"
+        );
+
+        let checked_output = directory.path().join("checked.json");
+        let mut checked_args = args(&input, &checked_output);
+        checked_args.check_bcf_errors = true;
+        let error = run_with_diagnostics(checked_args, &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("(error code 2)"));
+        assert!(!checked_output.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_gt_allele_index_is_fatal_for_both_bcf_modes() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        write_vcf(&input, &["chr1\t1\t.\tA\tC\t.\tPASS\t.\tGT\t2/2"])?;
+
+        for check_bcf_errors in [false, true] {
+            let output = directory
+                .path()
+                .join(format!("check-{check_bcf_errors}.json"));
+            let mut case_args = args(&input, &output);
+            case_args.check_bcf_errors = check_bcf_errors;
+            let error = run_with_diagnostics(case_args, &mut Vec::new()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Call with invalid genotype (non-existent allele) at chr1:1"
+            );
+            assert!(!output.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn declared_info_type_and_field_cardinality_are_not_translation_errors() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("check.json");
+        fs::write(
+            &input,
+            "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=100>\n##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=AD,Number=1,Type=Integer,Description=\"Allelic depth\">\n##FORMAT=<ID=PL,Number=G,Type=Integer,Description=\"Likelihoods\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\nchr1\t1\t.\tA\tC\t.\tPASS\tDP=bad\tGT\t0/1\nchr1\t2\t.\tA\tG\t.\tPASS\tDP=1,2\tGT:AD:PL\t0/1:3,4:0,10\n",
+        )?;
+        run_with_diagnostics(args(&input, &output), &mut Vec::new())?;
+
+        assert!(fs::read_to_string(output)?.contains("\"records\":2"));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_typed_format_value_is_silently_skipped() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        fs::write(
+            &input,
+            "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=100>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\nchr1\t1\t.\tA\tC\t.\tPASS\t.\tGT:DP\t0/1:bad\nchr1\t2\t.\tA\tG\t.\tPASS\t.\tGT:DP\t0/1:10\n",
+        )?;
+
+        for check_bcf_errors in [false, true] {
+            let output = directory
+                .path()
+                .join(format!("check-{check_bcf_errors}.json"));
+            let mut case_args = args(&input, &output);
+            case_args.check_bcf_errors = check_bcf_errors;
+            let mut diagnostics = Vec::new();
+            run_with_diagnostics(case_args, &mut diagnostics)?;
+
+            assert!(fs::read_to_string(output)?.contains("\"records\":0"));
+            let diagnostics = String::from_utf8(diagnostics)?;
+            assert_eq!(
+                diagnostics,
+                "[W::vcf_parse_format] Extreme FORMAT/DP value encountered and set to missing at chr1:1\n[E::vcf_parse_format] Invalid character 'b' in 'DP' FORMAT field at chr1:1\n[I] Total VCF records:         0\n[I] Non-reference VCF records: 0\n"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_float_format_diagnostic_matches_htslib() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("check.json");
+        fs::write(
+            &input,
+            "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=100>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=AF,Number=1,Type=Float,Description=\"Allele frequency\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\nchr1\t1\t.\tA\tC\t.\tPASS\t.\tGT:AF\t0/1:bad\n",
+        )?;
+        let mut diagnostics = Vec::new();
+        run_with_diagnostics(args(&input, &output), &mut diagnostics)?;
+
+        assert_eq!(
+            String::from_utf8(diagnostics)?,
+            "[W::vcf_parse_format] Extreme FORMAT/AF value encountered at chr1:1\n[E::vcf_parse_format] Invalid character 'b' in 'AF' FORMAT field at chr1:1\n[I] Total VCF records:         0\n[I] Non-reference VCF records: 0\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_numeric_suffix_emits_only_the_htslib_error() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("check.json");
+        fs::write(
+            &input,
+            "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=100>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\nchr1\t1\t.\tA\tC\t.\tPASS\t.\tGT:DP\t0/1:10x\n",
+        )?;
+        let mut diagnostics = Vec::new();
+        run_with_diagnostics(args(&input, &output), &mut diagnostics)?;
+
+        assert_eq!(
+            String::from_utf8(diagnostics)?,
+            "[E::vcf_parse_format] Invalid character 'x' in 'DP' FORMAT field at chr1:1\n[I] Total VCF records:         0\n[I] Non-reference VCF records: 0\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_format_recovery_matches_the_legacy_reader() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("check.json");
+        fs::write(
+            &input,
+            "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=100>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\nchr1\t1\t.\tA\tC\t.\tPASS\t.\tGT:DP\t0/1:10\nchr1\t2\t.\tA\tG\t.\tPASS\t.\tGT:DP\t0/1:bad\nchr1\t3\t.\tA\tT\t.\tPASS\t.\tGT:DP\t0/1:20\nchr1\t4\t.\tA\tC\t.\tPASS\t.\tGT:DP\t0/1:bad\nchr1\t5\t.\tA\tG\t.\tPASS\t.\tGT:DP\t0/1:also_bad\nchr1\t6\t.\tA\tT\t.\tPASS\t.\tGT:DP\t0/1:30\n",
+        )?;
+        let mut diagnostics = Vec::new();
+        run_with_diagnostics(args(&input, &output), &mut diagnostics)?;
+
+        assert!(fs::read_to_string(output)?.contains("\"records\":2"));
+        assert_eq!(
+            String::from_utf8(diagnostics)?,
+            "[W::vcf_parse_format] Extreme FORMAT/DP value encountered and set to missing at chr1:2\n[E::vcf_parse_format] Invalid character 'b' in 'DP' FORMAT field at chr1:2\n[E::vcf_parse_format] Invalid character 'b' in 'DP' FORMAT field at chr1:4\n[E::vcf_parse_format] Invalid character 'a' in 'DP' FORMAT field at chr1:5\n[I] Total VCF records:         2\n[I] Non-reference VCF records: 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extra_sample_columns_are_ignored_like_htslib() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("check.json");
+        write_vcf(&input, &["chr1\t1\t.\tA\tC\t.\tPASS\t.\tGT\t0/0\t0/1"])?;
+        run_with_diagnostics(args(&input, &output), &mut Vec::new())?;
+
+        assert_eq!(
+            fs::read_to_string(output)?,
+            "{\"OVERLAP\":0,\"REFPADDING\":0,\"SYMALT\":0,\"UNCERTAINLENGTH\":0,\"diploid\":0,\"haploid\":0,\"male\":false,\"nonref\":0,\"polyploid\":0,\"records\":1,\"ref\":1}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_sample_columns_skip_the_record() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("check.json");
+        fs::write(
+            &input,
+            "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=100>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\nchr1\t1\t.\tA\tC\t.\tPASS\t.\tGT\t0/1\n",
+        )?;
+        let mut diagnostics = Vec::new();
+        run_with_diagnostics(args(&input, &output), &mut diagnostics)?;
+
+        assert!(fs::read_to_string(output)?.contains("\"records\":0"));
+        assert_eq!(
+            String::from_utf8(diagnostics)?,
+            "[E::vcf_parse_format] Number of columns at chr1:1 does not match the number of samples (1 vs 2)\n[I] Total VCF records:         0\n[I] Non-reference VCF records: 0\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn male_inference_preserves_legacy_chromosome_spelling() -> Result<()> {
+        let directory = tempdir()?;
+        for (chrom, location, expected_male) in [
+            ("X", None, true),
+            ("chrX", None, true),
+            ("chrx", None, true),
+            ("x", None, false),
+            ("CHRX", None, false),
+            ("x", Some("x"), true),
+        ] {
+            let input = directory.path().join(format!("{chrom}.vcf"));
+            let output = directory.path().join(format!("{chrom}-{location:?}.json"));
+            fs::write(
+                &input,
+                format!(
+                    "##fileformat=VCFv4.2\n##contig=<ID={chrom},length=100>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n{chrom}\t1\t.\tA\tC\t.\tPASS\t.\tGT\t1\n"
+                ),
+            )?;
+            let mut case_args = args(&input, &output);
+            case_args.locations = location.map(str::to_string);
+            run_with_diagnostics(case_args, &mut Vec::new())?;
+            assert!(
+                fs::read_to_string(output)?.contains(&format!("\"male\":{expected_male}")),
+                "unexpected male inference for {chrom} with location {location:?}"
+            );
+        }
         Ok(())
     }
 }

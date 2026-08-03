@@ -158,8 +158,19 @@ fn run_rust_preprocess_case(case: &PreprocessFixtureCase) -> Result<PathBuf> {
 
 fn run_rust_quantify_case(case: &QuantifyFixtureCase) -> Result<PathBuf> {
     let output_dir = prepare_output_dir("rust-check", case.id)?;
+    let indexed_input = output_dir.join("annotated.vcf.gz");
+    let (headers, records) = crate::vcf::load_raw_vcf(&case.input_vcf_path())?;
+    let record_lines = records
+        .iter()
+        .map(crate::vcf::RawVcfRecord::to_line)
+        .collect::<Vec<_>>();
+    crate::vcf::write_indexed_vcf(
+        &indexed_input,
+        &headers,
+        record_lines.iter().map(String::as_str),
+    )?;
     quantify::run(QuantifyArgs {
-        input_vcf: case.input_vcf_path().display().to_string(),
+        input_vcf: indexed_input.display().to_string(),
         report_prefix: output_dir.join("oracle").display().to_string(),
         reference: case.reference_path().display().to_string(),
         // This fixture already carries finalized per-sample BD/BK fields.

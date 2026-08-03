@@ -34,10 +34,36 @@ struct BlocksplitContigState {
 
 #[derive(Default)]
 struct BlocksplitSelection {
-    resets: HashSet<usize>,
     /// `None` represents legacy's all-empty fallback, which processes the
     /// complete prepared stream instead of scheduling no jobs.
-    included_indices: Option<HashSet<usize>>,
+    jobs: Option<Vec<BlocksplitJob>>,
+}
+
+struct BlocksplitJob {
+    included_indices: HashSet<usize>,
+    /// Resets can land on records discarded later by VariantCallsOnly. They
+    /// must therefore be applied immediately after selecting the prepared
+    /// input record, before genotype-based filtering.
+    reset_before_indices: HashSet<usize>,
+}
+
+#[cfg(test)]
+impl BlocksplitSelection {
+    fn reset_indices(&self) -> HashSet<usize> {
+        self.jobs
+            .iter()
+            .flatten()
+            .flat_map(|job| job.reset_before_indices.iter().copied())
+            .collect()
+    }
+
+    fn included_indices(&self) -> Option<HashSet<usize>> {
+        self.jobs.as_ref().map(|jobs| {
+            jobs.iter()
+                .flat_map(|job| job.included_indices.iter().copied())
+                .collect()
+        })
+    }
 }
 
 pub fn run(args: PreprocessArgs) -> Result<()> {
@@ -52,26 +78,32 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
     } else {
         PathBuf::from(&args.output)
     };
+    require_output_parent(&output_path)?;
     let reference_path = resolve_reference(args.reference.as_deref())?;
+    let (mut headers, records) = vcf::load_raw_vcf(Path::new(&args.input))?;
+    require_vcf_sample(&headers)?;
+    let reference_index = fasta::read_index(&reference_path)?;
     let reference_sequences = fasta::read_sequences(&reference_path)?;
-    let reference_contigs: BTreeSet<String> = reference_sequences.keys().cloned().collect();
+    let reference_contigs: BTreeSet<String> = reference_index.keys().cloned().collect();
+    // Legacy passes selectors to bcftools after its optional CHROM rewrite;
+    // selector names themselves are never normalized against the reference.
+    let literal_contigs = BTreeSet::new();
     let regions = args
         .regions_bedfile
         .as_ref()
-        .map(|path| vcf::load_bed(Path::new(path), &reference_contigs))
+        .map(|path| vcf::load_bed(Path::new(path), &literal_contigs))
         .transpose()?;
     let targets = args
         .targets_bedfile
         .as_ref()
-        .map(|path| vcf::load_bed(Path::new(path), &reference_contigs))
+        .map(|path| vcf::load_bed(Path::new(path), &literal_contigs))
         .transpose()?;
     let locations = args
         .locations
         .as_deref()
-        .map(|text| vcf::parse_locations(text, &reference_contigs))
+        .map(|text| vcf::parse_locations(text, &literal_contigs))
         .transpose()?;
 
-    let (mut headers, mut records) = vcf::load_raw_vcf(Path::new(&args.input))?;
     if args.convert_gvcf_to_vcf {
         filter_gvcf_headers(&mut headers);
     }
@@ -109,71 +141,76 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
             &observations,
             args.window_size,
             LEGACY_MAX_BLOCKS.min(effective_threads.saturating_mul(4)),
-            locations.is_some(),
+            locations.as_deref(),
         )
     } else {
         BlocksplitSelection::default()
     };
 
     let mut output = Vec::new();
-    let mut normalized_seen = HashSet::new();
-    // Track the reference end of the previous record per chromosome.
-    // Legacy partialcredit.py uses this to prevent left-shifting a variant
-    // into the span of the preceding record (mirrors the sequential
-    // `pos_min` update in the C++ RefVar.cpp leftShift callers).
-    let mut prev_end_by_chrom: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut prepared_record_index = 0usize;
-    for mut record in records.drain(..) {
-        if fixchr {
-            record.chrom = add_legacy_chr_prefix(&record.chrom);
-        }
-        if (args.pass_only && !record.is_pass())
-            || (!args.pass_only
-                && !passes_filters_only(&record.filter, args.filters_only.as_deref()))
-        {
-            continue;
-        }
-        let effective_end = record.effective_end_pos(Path::new(&args.input))?;
-        if !vcf::matches_interval_filters(
-            &record.chrom,
-            record.pos,
-            effective_end,
-            regions.as_deref(),
-            targets.as_deref(),
-            locations.as_deref(),
-        ) {
-            continue;
-        }
-
-        // Standalone pre defaults this field to true because legacy pre.py
-        // accidentally leaves preprocess()'s default in force. hap.py,
-        // however, explicitly forwards its own default=false. Honor the
-        // resolved value here so germline keeps called <NON_REF> alleles unless
-        // the user requests filtering, without changing standalone pre parity.
-        if args.convert_gvcf_to_vcf {
-            if !convert_gvcf_record(&mut record) {
+    let job_count = blocksplit_selection.jobs.as_ref().map_or(1, Vec::len);
+    for job_index in 0..job_count {
+        let job = blocksplit_selection
+            .jobs
+            .as_ref()
+            .map(|jobs| &jobs[job_index]);
+        let mut normalized_seen = HashSet::new();
+        // Each legacy partial-credit job owns an independent left-shift
+        // boundary, so overlapping jobs must process their copies separately.
+        let mut prev_end_by_chrom: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut prepared_record_index = 0usize;
+        for mut record in records.iter().cloned() {
+            if fixchr {
+                record.chrom = add_legacy_chr_prefix(&record.chrom);
+            }
+            if (args.pass_only && !record.is_pass())
+                || (!args.pass_only
+                    && !passes_filters_only(&record.filter, args.filters_only.as_deref()))
+            {
                 continue;
             }
-        } else {
-            let drop_record = args.filter_nonref
-                && (calls_non_ref_allele(&record)
-                    || (normalization_enabled
-                        && somatic_mode.is_none()
-                        && !trim_uncalled_non_ref(&mut record)));
-            if drop_record {
+            let effective_end = record.effective_end_pos(Path::new(&args.input))?;
+            if !vcf::matches_interval_filters(
+                &record.chrom,
+                record.pos,
+                effective_end,
+                regions.as_deref(),
+                targets.as_deref(),
+                locations.as_deref(),
+            ) {
                 continue;
             }
-        }
 
-        // VariantReader.cpp treats a symbolic deletion as an empty ALT over
-        // the complete INFO/END span. VariantWriter then adds the preceding
-        // reference base so the emitted VCF contains an ordinary, anchored
-        // deletion. Do this before REF validation: when END is present the
-        // legacy reader intentionally ignores the input REF and rebuilds it
-        // from the reference sequence.
-        let symbolic_deletion =
-            if normalization_enabled && record.alt_allele.split(',').any(|alt| alt == "<DEL>") {
+            // Standalone pre defaults this field to true because legacy pre.py
+            // accidentally leaves preprocess()'s default in force. hap.py,
+            // however, explicitly forwards its own default=false. Honor the
+            // resolved value here so germline keeps called <NON_REF> alleles unless
+            // the user requests filtering, without changing standalone pre parity.
+            if args.convert_gvcf_to_vcf {
+                if !convert_gvcf_record(&mut record) {
+                    continue;
+                }
+            } else {
+                let drop_record = args.filter_nonref
+                    && (calls_non_ref_allele(&record)
+                        || (normalization_enabled
+                            && somatic_mode.is_none()
+                            && !trim_uncalled_non_ref(&mut record)));
+                if drop_record {
+                    continue;
+                }
+            }
+
+            // VariantReader.cpp treats a symbolic deletion as an empty ALT over
+            // the complete INFO/END span. VariantWriter then adds the preceding
+            // reference base so the emitted VCF contains an ordinary, anchored
+            // deletion. Do this before REF validation: when END is present the
+            // legacy reader intentionally ignores the input REF and rebuilds it
+            // from the reference sequence.
+            let symbolic_deletion = if normalization_enabled
+                && record.alt_allele.split(',').any(|alt| alt == "<DEL>")
+            {
                 let reference = reference_sequences.get(&record.chrom).ok_or_else(|| {
                     anyhow::anyhow!("reference contig {} not found", record.chrom)
                 })?;
@@ -186,229 +223,225 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                 None
             };
 
-        if args.bcftools_norm {
-            let Some(reference) = reference_sequences.get(&record.chrom) else {
-                continue;
-            };
-            if !record_reference_matches(&record, reference.as_bytes()) {
-                continue;
-            }
-        } else {
-            validate_record_reference(&record, &reference_sequences)?;
-        }
-
-        let converted = if let (Some(mode), Some(sample_names)) =
-            (somatic_mode, somatic_sample_names.as_deref())
-        {
-            finalize_somatic_for_pipeline(
-                convert_somatic_record(&record, mode, sample_names),
-                mode,
-                normalization_enabled,
-            )
-        } else {
-            vec![record]
-        };
-
-        for mut record in converted {
             if args.bcftools_norm {
                 let Some(reference) = reference_sequences.get(&record.chrom) else {
                     continue;
                 };
-                normalize_bcftools_record(&mut record, reference.as_bytes());
-                let key = (
-                    record.chrom.clone(),
-                    record.pos,
-                    record.ref_allele.clone(),
-                    record.alt_allele.clone(),
-                );
-                if !normalized_seen.insert(key) {
+                if !record_reference_matches(&record, reference.as_bytes()) {
                     continue;
                 }
+            } else if normalization_enabled {
+                validate_record_reference(&record, &reference_sequences)?;
             }
-            let record_index = prepared_record_index;
-            prepared_record_index += 1;
-            if blocksplit_selection
-                .included_indices
-                .as_ref()
-                .is_some_and(|included| !included.contains(&record_index))
+
+            let converted = if let (Some(mode), Some(sample_names)) =
+                (somatic_mode, somatic_sample_names.as_deref())
             {
-                continue;
-            }
-            let reset_before_record = blocksplit_selection.resets.contains(&record_index);
-            if !normalization_enabled {
-                output.push(record);
-                continue;
-            }
-            if reset_before_record {
-                prev_end_by_chrom.remove(&record.chrom);
-            }
-            if args.convert_gvcf_to_vcf {
-                ensure_missing_ad(&mut record);
-            }
-            // Allele-count INFO fields become stale after preprocessing splits
-            // multi-allelics or decomposes complex variants. Legacy hap.py's C++
-            // preprocess binary (via `VariantAlleleRemover` → `VariantCallsOnly`)
-            // drops them so downstream tools recompute. We mirror that here on the
-            // main code path so output stays deterministic for every caller, not
-            // just the parity oracle.
-            strip_stale_info_keys(&mut record);
-
-            // Legacy `VariantReader`/`VariantWriter` drops variant IDs (rsIDs) on
-            // output — `preprocess` rebuilds records from CHROM/POS/REF/ALT only,
-            // so the ID column always becomes `.`.
-            record.id = ".".to_string();
-
-            // Upper-case REF/ALT so soft-masked lowercase bases from the reference
-            // come out as the canonical uppercase form legacy emits. We already
-            // tolerate case when validating; now we normalise on output.
-            record.ref_allele = record.ref_allele.to_ascii_uppercase();
-            record.alt_allele = record.alt_allele.to_ascii_uppercase();
-
-            // Legacy `VariantWriter` emits FILTER=`.` for PASS records (htslib's
-            // `bcf_update_filter` treats an empty filter vector as `.`). Normalise
-            // PASS to `.` so downstream byte-diff matches.
-            if record.filter == "PASS" {
-                record.filter = ".".to_string();
-            }
-
-            // Legacy stores INFO as an ordered map keyed alphabetically by tag
-            // (std::map<std::string,...>) before serialising — htslib then writes
-            // entries in that order. Sort our INFO tags the same way so output
-            // byte-matches.
-            sort_info_keys(&mut record);
-
-            // Legacy represents PL internally as a single integer per sample (the
-            // `v.asInt()` path in `VariantWriter.cpp` line 563). When bcftools
-            // emits the record the array is truncated to the last stored value,
-            // which for biallelic diploid sites is the HOM_ALT likelihood. We
-            // reproduce that truncation here so SAMPLE cells byte-match.
-            collapse_pl_to_last_value(&mut record);
-
-            // Multi-allelic indel decomposition + primitive splitting.
-            //
-            // Replaces the previous `should_split_multi_allelic_indel +
-            // split_multi_allelic` branch: `variant_pipeline::primitive_split`
-            // implements the legacy `VariantPrimitiveSplitter` (stage 5 of
-            // `VariantInput.cpp`) plus the `aggregate_hetalt` re-merge that
-            // brings same-position primitives back to a multi-allelic shape.
-            // Same-direction insertions (`T → TG,TTG`) re-merge into a single
-            // record; mixed-direction or different-length deletions fan out
-            // into per-primitive records anchored at their canonical position.
-            // Insert the ADO field BEFORE primitive_split *and* before any GT
-            // normalisation. Legacy computes `ad_other` (= ADO) from the
-            // *original* GT+AD inside VariantReader, then preserves that value
-            // across both the half-call AlleleSplitter and the per-allele
-            // PrimitiveSplitter. Computing ADO after splitting OR after the
-            // haploid → homalt expansion below would widen the "called" set
-            // if computed after expansion (input `GT=1` ad=[1,23] becomes
-            // `1/1` ad=[1,23] → ADO=AD[0]=1, the unused ref depth, which
-            // matches legacy). Computing ADO from the original GT=1 first
-            // preserves that ref-depth signal correctly.
-            ensure_missing_ad(&mut record);
-            insert_ado_format(&mut record);
-            ensure_missing_dp(&mut record);
-
-            // VariantCallsOnly removes ALT alleles that no sample calls before
-            // primitive decomposition. Besides reducing ordinary multi-allelic
-            // records, this prevents the primitive splitter from emitting a
-            // hom-ref sibling for every uncalled component of a complex allele.
-            // Capture ADO first: legacy derives it from the original GT/AD and
-            // then projects GT and AD onto the retained alleles.
-            if somatic_mode.is_none()
-                && !args.convert_gvcf_to_vcf
-                && !retain_called_alternates(&mut record)
-            {
-                continue;
-            }
-
-            // Normalise haploid GTs to the legacy het / hom shape. The C++
-            // VariantAlleleSplitter treats a single haploid alt call (ngt == 1
-            // with gt[0] > 0) as a het half-call and emits `0/1` after the
-            // half-call merge — see `VariantAlleleSplitter.cpp:180-227`. Mirror
-            // that here so that haploid input lines (`GT=1` on autosomes) come
-            // out byte-identical to legacy without a chrX/Y-specific shim.
-            if somatic_mode.is_none() {
-                normalise_haploid_genotypes(&mut record, gender == PreprocessGender::Male);
-            }
-
-            // Capture before record is potentially consumed by vec![record].
-            let record_chrom = record.chrom.clone();
-            let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
-            let previous_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
-            let prev_end = previous_end;
-
-            let source_records = if matches!(
-                symbolic_deletion,
-                Some(SymbolicDeletionMaterialization::LeadingAnchor)
-            ) {
-                split_called_alleles(&record)
+                finalize_somatic_for_pipeline(
+                    convert_somatic_record(&record, mode, sample_names),
+                    mode,
+                    normalization_enabled,
+                )
             } else {
-                vec![MaterializedAlleleRecord {
-                    record,
-                    reverse_hetalt_samples: Vec::new(),
-                }]
+                vec![record]
             };
-            let mut emitted_groups = Vec::with_capacity(source_records.len());
-            for source in source_records {
-                let reverse_hetalt_samples = source.reverse_hetalt_samples;
-                let source = source.record;
-                let mut emitted =
-                    if decompose && !source.alt_allele.split(',').any(is_symbolic_allele) {
-                        if let Some(reference) = reference_sequences.get(&source.chrom) {
-                            variant_pipeline::primitive_split_with_floor(
-                                &source,
-                                reference.as_bytes(),
-                                prev_end,
-                            )
+
+            for mut record in converted {
+                if args.bcftools_norm {
+                    let Some(reference) = reference_sequences.get(&record.chrom) else {
+                        continue;
+                    };
+                    normalize_bcftools_record(&mut record, reference.as_bytes());
+                    let key = (
+                        record.chrom.clone(),
+                        record.pos,
+                        record.ref_allele.clone(),
+                        record.alt_allele.clone(),
+                    );
+                    if !normalized_seen.insert(key) {
+                        continue;
+                    }
+                }
+                let record_index = prepared_record_index;
+                prepared_record_index += 1;
+                if job.is_some_and(|job| !job.included_indices.contains(&record_index)) {
+                    continue;
+                }
+                if job.is_some_and(|job| job.reset_before_indices.contains(&record_index)) {
+                    prev_end_by_chrom.remove(&record.chrom);
+                }
+                if !normalization_enabled {
+                    output.push(record);
+                    continue;
+                }
+                if args.convert_gvcf_to_vcf {
+                    ensure_missing_ad(&mut record);
+                }
+                // Allele-count INFO fields become stale after preprocessing splits
+                // multi-allelics or decomposes complex variants. Legacy hap.py's C++
+                // preprocess binary (via `VariantAlleleRemover` → `VariantCallsOnly`)
+                // drops them so downstream tools recompute. We mirror that here on the
+                // main code path so output stays deterministic for every caller, not
+                // just the parity oracle.
+                strip_stale_info_keys(&mut record);
+
+                // Legacy `VariantReader`/`VariantWriter` drops variant IDs (rsIDs) on
+                // output — `preprocess` rebuilds records from CHROM/POS/REF/ALT only,
+                // so the ID column always becomes `.`.
+                record.id = ".".to_string();
+
+                // Upper-case REF/ALT so soft-masked lowercase bases from the reference
+                // come out as the canonical uppercase form legacy emits. We already
+                // tolerate case when validating; now we normalise on output.
+                record.ref_allele = record.ref_allele.to_ascii_uppercase();
+                record.alt_allele = record.alt_allele.to_ascii_uppercase();
+
+                // Legacy `VariantWriter` emits FILTER=`.` for PASS records (htslib's
+                // `bcf_update_filter` treats an empty filter vector as `.`). Normalise
+                // PASS to `.` so downstream byte-diff matches.
+                if record.filter == "PASS" {
+                    record.filter = ".".to_string();
+                }
+
+                // Legacy stores INFO as an ordered map keyed alphabetically by tag
+                // (std::map<std::string,...>) before serialising — htslib then writes
+                // entries in that order. Sort our INFO tags the same way so output
+                // byte-matches.
+                sort_info_keys(&mut record);
+
+                // Legacy represents PL internally as a single integer per sample (the
+                // `v.asInt()` path in `VariantWriter.cpp` line 563). When bcftools
+                // emits the record the array is truncated to the last stored value,
+                // which for biallelic diploid sites is the HOM_ALT likelihood. We
+                // reproduce that truncation here so SAMPLE cells byte-match.
+                collapse_pl_to_last_value(&mut record);
+
+                // Multi-allelic indel decomposition + primitive splitting.
+                //
+                // Replaces the previous `should_split_multi_allelic_indel +
+                // split_multi_allelic` branch: `variant_pipeline::primitive_split`
+                // implements the legacy `VariantPrimitiveSplitter` (stage 5 of
+                // `VariantInput.cpp`) plus the `aggregate_hetalt` re-merge that
+                // brings same-position primitives back to a multi-allelic shape.
+                // Same-direction insertions (`T → TG,TTG`) re-merge into a single
+                // record; mixed-direction or different-length deletions fan out
+                // into per-primitive records anchored at their canonical position.
+                // Insert the ADO field BEFORE primitive_split *and* before any GT
+                // normalisation. Legacy computes `ad_other` (= ADO) from the
+                // *original* GT+AD inside VariantReader, then preserves that value
+                // across both the half-call AlleleSplitter and the per-allele
+                // PrimitiveSplitter. Computing ADO after splitting OR after the
+                // haploid → homalt expansion below would widen the "called" set
+                // if computed after expansion (input `GT=1` ad=[1,23] becomes
+                // `1/1` ad=[1,23] → ADO=AD[0]=1, the unused ref depth, which
+                // matches legacy). Computing ADO from the original GT=1 first
+                // preserves that ref-depth signal correctly.
+                ensure_missing_ad(&mut record);
+                insert_ado_format(&mut record);
+                ensure_missing_dp(&mut record);
+
+                // VariantCallsOnly removes ALT alleles that no sample calls before
+                // primitive decomposition. Besides reducing ordinary multi-allelic
+                // records, this prevents the primitive splitter from emitting a
+                // hom-ref sibling for every uncalled component of a complex allele.
+                // Capture ADO first: legacy derives it from the original GT/AD and
+                // then projects GT and AD onto the retained alleles.
+                if somatic_mode.is_none()
+                    && !args.convert_gvcf_to_vcf
+                    && !retain_called_alternates(&mut record)
+                {
+                    continue;
+                }
+
+                // Normalise haploid GTs to the legacy het / hom shape. The C++
+                // VariantAlleleSplitter treats a single haploid alt call (ngt == 1
+                // with gt[0] > 0) as a het half-call and emits `0/1` after the
+                // half-call merge — see `VariantAlleleSplitter.cpp:180-227`. Mirror
+                // that here so that haploid input lines (`GT=1` on autosomes) come
+                // out byte-identical to legacy without a chrX/Y-specific shim.
+                if somatic_mode.is_none() {
+                    normalise_haploid_genotypes(&mut record, gender == PreprocessGender::Male);
+                }
+
+                // Capture before record is potentially consumed by vec![record].
+                let record_chrom = record.chrom.clone();
+                let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
+                let previous_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
+                let prev_end = previous_end;
+
+                let source_records = if matches!(
+                    symbolic_deletion,
+                    Some(SymbolicDeletionMaterialization::LeadingAnchor)
+                ) {
+                    split_called_alleles(&record)
+                } else {
+                    vec![MaterializedAlleleRecord {
+                        record,
+                        reverse_hetalt_samples: Vec::new(),
+                    }]
+                };
+                let mut emitted_groups = Vec::with_capacity(source_records.len());
+                for source in source_records {
+                    let reverse_hetalt_samples = source.reverse_hetalt_samples;
+                    let source = source.record;
+                    let mut emitted =
+                        if decompose && !source.alt_allele.split(',').any(is_symbolic_allele) {
+                            if let Some(reference) = reference_sequences.get(&source.chrom) {
+                                variant_pipeline::primitive_split_with_floor(
+                                    &source,
+                                    reference.as_bytes(),
+                                    prev_end,
+                                )
+                            } else {
+                                vec![source]
+                            }
                         } else {
                             vec![source]
+                        };
+                    if decompose {
+                        for record in &mut emitted {
+                            restore_legacy_hetalt_orientation(record, &reverse_hetalt_samples);
                         }
-                    } else {
-                        vec![source]
-                    };
-                if decompose {
-                    for record in &mut emitted {
-                        restore_legacy_hetalt_orientation(record, &reverse_hetalt_samples);
+                    }
+                    emitted_groups.push(emitted);
+                }
+                for emitted in emitted_groups {
+                    // Only leftshift records that came through primitive_split
+                    // unchanged. Fanned-out primitives are already canonical.
+                    let leftshift_eligible = emitted.len() == 1;
+                    for mut split in emitted {
+                        if leftshift
+                            && leftshift_eligible
+                            && !split.alt_allele.contains(',')
+                            && split.alt_allele != "."
+                            && !split.alt_allele.is_empty()
+                            && !is_symbolic_allele(&split.alt_allele)
+                            && let Some(reference) = reference_sequences.get(&split.chrom)
+                        {
+                            apply_left_shift(&mut split, reference.as_bytes(), prev_end);
+                        }
+                        canonicalize_multi_allelic_order(&mut split);
+                        canonicalize_legacy_genotypes(&mut split);
+                        if split.qual.is_empty() || split.qual == "." {
+                            split.qual = "0".to_string();
+                        }
+                        blank_secondary_sample_annotations(&mut split);
+                        // Canonical FORMAT ordering: GT → AD/ADO/DP (fixed) → other
+                        // integer-typed fields alphabetical → float-typed alphabetical →
+                        // string-typed alphabetical. Mirrors the `int_fmts/float_fmts/
+                        // string_fmts` loop order in `VariantWriter.cpp` combined with
+                        // dynamic per-value type detection.
+                        reorder_format_fields(&mut split);
+                        output.push(split);
                     }
                 }
-                emitted_groups.push(emitted);
+                // Advance the per-chromosome boundary so the next variant cannot
+                // left-shift into this record's reference span.
+                prev_end_by_chrom
+                    .entry(record_chrom)
+                    .and_modify(|e| *e = (*e).max(orig_end))
+                    .or_insert(orig_end);
             }
-            for emitted in emitted_groups {
-                // Only leftshift records that came through primitive_split
-                // unchanged. Fanned-out primitives are already canonical.
-                let leftshift_eligible = emitted.len() == 1;
-                for mut split in emitted {
-                    if leftshift
-                        && leftshift_eligible
-                        && !split.alt_allele.contains(',')
-                        && split.alt_allele != "."
-                        && !split.alt_allele.is_empty()
-                        && !is_symbolic_allele(&split.alt_allele)
-                        && let Some(reference) = reference_sequences.get(&split.chrom)
-                    {
-                        apply_left_shift(&mut split, reference.as_bytes(), prev_end);
-                    }
-                    canonicalize_multi_allelic_order(&mut split);
-                    canonicalize_legacy_genotypes(&mut split);
-                    if split.qual.is_empty() || split.qual == "." {
-                        split.qual = "0".to_string();
-                    }
-                    blank_secondary_sample_annotations(&mut split);
-                    // Canonical FORMAT ordering: GT → AD/ADO/DP (fixed) → other
-                    // integer-typed fields alphabetical → float-typed alphabetical →
-                    // string-typed alphabetical. Mirrors the `int_fmts/float_fmts/
-                    // string_fmts` loop order in `VariantWriter.cpp` combined with
-                    // dynamic per-value type detection.
-                    reorder_format_fields(&mut split);
-                    output.push(split);
-                }
-            }
-            // Advance the per-chromosome boundary so the next variant cannot
-            // left-shift into this record's reference span.
-            prev_end_by_chrom
-                .entry(record_chrom)
-                .and_modify(|e| *e = (*e).max(orig_end))
-                .or_insert(orig_end);
         }
     }
 
@@ -428,6 +461,16 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
     }
 
     vcf::write_raw_vcf(&output_path, &headers, &output)?;
+    if output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("vcf")
+    {
+        bail!(
+            "plain VCF output {} cannot be indexed; legacy pre.py exits unsuccessfully",
+            output_path.display()
+        );
+    }
     logger.info(&format!(
         "Wrote {} records to {}",
         output.len(),
@@ -508,7 +551,7 @@ fn collect_blocksplit_observations(
             if !record_reference_matches(&record, reference.as_bytes()) {
                 continue;
             }
-        } else {
+        } else if normalization_enabled {
             validate_record_reference(&record, reference_sequences)?;
         }
 
@@ -571,36 +614,27 @@ fn collect_blocksplit_observations(
 
 fn select_blocksplit_resets(
     observations: &[BlocksplitObservation],
-    window_size: usize,
+    window_size: i64,
     block_count: usize,
-    reset_location_starts: bool,
+    locations: Option<&[vcf::LocationFilter]>,
 ) -> BlocksplitSelection {
     if block_count == 0 {
         return BlocksplitSelection::default();
     }
     let mut states = std::collections::BTreeMap::<(usize, String), BlocksplitContigState>::new();
-    let mut first_index_by_location = std::collections::BTreeMap::new();
-    let mut called_locations = HashSet::new();
     for (index, observation) in observations.iter().enumerate() {
-        for &location_group in &observation.location_groups {
-            first_index_by_location
-                .entry(location_group)
-                .or_insert(index);
-        }
         if !observation.called {
             continue;
         }
         for &location_group in &observation.location_groups {
-            called_locations.insert(location_group);
             let state = states
                 .entry((location_group, observation.chrom.clone()))
                 .or_default();
             state.total_variants += 1;
             state.candidate_variants += 1;
-            if state
-                .last_called_end
-                .is_some_and(|last_end| observation.pos > last_end.saturating_add(window_size))
-                && state.candidate_variants > LEGACY_MIN_BLOCK_VARIANTS
+            if state.last_called_end.is_some_and(|last_end| {
+                observation.pos as i128 > last_end as i128 + window_size as i128
+            }) && state.candidate_variants > LEGACY_MIN_BLOCK_VARIANTS
             {
                 state.candidates.push((index, state.candidate_variants));
                 state.candidate_variants = 0;
@@ -617,44 +651,120 @@ fn select_blocksplit_resets(
         return BlocksplitSelection::default();
     }
 
-    let active_partitions = states.keys().cloned().collect::<HashSet<_>>();
-    let included_indices = observations
-        .iter()
-        .enumerate()
-        .filter_map(|(index, observation)| {
-            observation
-                .location_groups
-                .iter()
-                .any(|location_group| {
-                    active_partitions.contains(&(*location_group, observation.chrom.clone()))
-                })
-                .then_some(index)
-        })
-        .collect();
-
-    let mut resets = HashSet::new();
-    if reset_location_starts {
-        for (location_group, index) in first_index_by_location {
-            if index > 0 && called_locations.contains(&location_group) {
-                resets.insert(index);
-            }
-        }
-    }
-    for state in states.values() {
+    let mut partition_resets = std::collections::BTreeMap::new();
+    for (partition, state) in &states {
         let target_variants = LEGACY_MIN_BLOCK_VARIANTS.max(state.total_variants / block_count);
         let mut accumulated = 0usize;
+        let mut selected = Vec::new();
         for &(index, candidate_variants) in &state.candidates {
             accumulated += candidate_variants;
             if accumulated > target_variants {
-                resets.insert(index);
+                selected.push(index);
                 accumulated = 0;
             }
         }
+        partition_resets.insert(partition.clone(), selected);
     }
-    BlocksplitSelection {
-        resets,
-        included_indices: Some(included_indices),
+    let jobs = build_blocksplit_jobs(observations, &states, &partition_resets, locations);
+    BlocksplitSelection { jobs: Some(jobs) }
+}
+
+fn build_blocksplit_jobs(
+    observations: &[BlocksplitObservation],
+    states: &std::collections::BTreeMap<(usize, String), BlocksplitContigState>,
+    partition_resets: &std::collections::BTreeMap<(usize, String), Vec<usize>>,
+    locations: Option<&[vcf::LocationFilter]>,
+) -> Vec<BlocksplitJob> {
+    let mut jobs = Vec::new();
+    for ((location_group, chrom), state) in states {
+        let chrom_indices = observations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, observation)| (observation.chrom == *chrom).then_some(index))
+            .collect::<Vec<_>>();
+        let boundaries = partition_resets
+            .get(&(*location_group, chrom.clone()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let location_start = locations.and_then(|_| {
+            chrom_indices
+                .iter()
+                .copied()
+                .find(|&index| observations[index].location_groups.contains(location_group))
+        });
+
+        // blocksplit's no-breakpoint fallback returns the complete contig,
+        // even when the requested location covers only one part of it.
+        if state.candidates.is_empty() || boundaries.is_empty() {
+            let included_indices = chrom_indices.into_iter().collect::<HashSet<_>>();
+            let reset_before_indices = location_start
+                .filter(|index| *index > 0 && included_indices.contains(index))
+                .into_iter()
+                .collect();
+            jobs.push(BlocksplitJob {
+                included_indices,
+                reset_before_indices,
+            });
+            continue;
+        }
+
+        let final_end = locations
+            .and_then(|filters| filters.get(*location_group))
+            .and_then(|filter| match filter {
+                vcf::LocationFilter::Range {
+                    chrom: expected,
+                    end,
+                    ..
+                } if expected == chrom => Some(*end),
+                _ => None,
+            });
+        let mut block_start = None;
+        let mut block_start_index = None;
+        for &boundary_index in boundaries {
+            let block_end = observations[boundary_index].pos;
+            let included_indices = chrom_indices
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    let pos = observations[index].pos;
+                    block_start.is_none_or(|start| pos >= start) && pos < block_end
+                })
+                .collect::<HashSet<_>>();
+            if !included_indices.is_empty() {
+                let reset_before_indices = [block_start_index, location_start]
+                    .into_iter()
+                    .flatten()
+                    .filter(|index| *index > 0 && included_indices.contains(index))
+                    .collect();
+                jobs.push(BlocksplitJob {
+                    included_indices,
+                    reset_before_indices,
+                });
+            }
+            block_start = Some(block_end);
+            block_start_index = Some(boundary_index);
+        }
+        let included_indices = chrom_indices
+            .into_iter()
+            .filter(|&index| {
+                let pos = observations[index].pos;
+                block_start.is_none_or(|start| pos >= start)
+                    && final_end.is_none_or(|end| pos < end)
+            })
+            .collect::<HashSet<_>>();
+        if !included_indices.is_empty() {
+            let reset_before_indices = [block_start_index, location_start]
+                .into_iter()
+                .flatten()
+                .filter(|index| *index > 0 && included_indices.contains(index))
+                .collect();
+            jobs.push(BlocksplitJob {
+                included_indices,
+                reset_before_indices,
+            });
+        }
     }
+    jobs
 }
 
 /// Primitive splitting can move one allele to the trailing edge of an
@@ -808,6 +918,32 @@ fn resolve_reference(explicit: Option<&str>) -> Result<PathBuf> {
     )
 }
 
+fn require_output_parent(output: &Path) -> Result<()> {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && !parent.is_dir()
+    {
+        bail!("output parent does not exist: {}", parent.display());
+    }
+    Ok(())
+}
+
+fn require_vcf_sample(headers: &[String]) -> Result<()> {
+    let has_sample = headers
+        .iter()
+        .find(|line| line.starts_with("#CHROM"))
+        .is_some_and(|line| {
+            line.split('\t')
+                .nth(9)
+                .is_some_and(|sample| !sample.is_empty())
+        });
+    if !has_sample {
+        bail!("input VCF has no samples");
+    }
+    Ok(())
+}
+
 fn resolve_reference_candidates(
     explicit: Option<&Path>,
     hg19: Option<&Path>,
@@ -855,6 +991,9 @@ fn resolve_fixchr(
 }
 
 fn add_legacy_chr_prefix(chrom: &str) -> String {
+    if chrom == "chrMT" {
+        return "chrM".to_string();
+    }
     if chrom.starts_with("chr") {
         return chrom.to_string();
     }
@@ -888,7 +1027,7 @@ fn resolve_gender(requested: PreprocessGender, records: &[vcf::RawVcfRecord]) ->
     let mut diploid_x = false;
     for record in records
         .iter()
-        .filter(|record| matches!(record.chrom.as_str(), "X" | "chrX" | "x" | "chrx"))
+        .filter(|record| matches!(record.chrom.as_str(), "X" | "chrX" | "chrx"))
     {
         let Some(format) = record.format.as_deref() else {
             continue;
@@ -2524,12 +2663,34 @@ mod tests {
     }
 
     #[test]
+    fn gender_auto_does_not_treat_lowercase_x_as_x_chromosome() {
+        let mut lowercase_x = make_record(".");
+        lowercase_x.chrom = "x".to_string();
+        lowercase_x.format = Some("GT".to_string());
+        lowercase_x.samples = vec!["1".to_string()];
+        assert_eq!(
+            resolve_gender(PreprocessGender::Auto, &[lowercase_x]),
+            PreprocessGender::Female,
+            "pinned vcfcheck compares its location variable to lowercase x"
+        );
+
+        let mut lowercase_chrx = make_record(".");
+        lowercase_chrx.chrom = "chrx".to_string();
+        lowercase_chrx.format = Some("GT".to_string());
+        lowercase_chrx.samples = vec!["1".to_string()];
+        assert_eq!(
+            resolve_gender(PreprocessGender::Auto, &[lowercase_chrx]),
+            PreprocessGender::Male
+        );
+    }
+
+    #[test]
     fn region_and_auto_fixchr_complete_half_called_x_genotype_like_legacy() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let reference = directory.path().join("ref.fa");
         let regions = directory.path().join("regions.bed");
-        let output = directory.path().join("output.vcf");
+        let output = directory.path().join("output.vcf.gz");
         fs::write(
             &input,
             concat!(
@@ -2611,6 +2772,7 @@ mod tests {
 
         assert_eq!(add_legacy_chr_prefix("1"), "chr1");
         assert_eq!(add_legacy_chr_prefix("MT"), "chrM");
+        assert_eq!(add_legacy_chr_prefix("chrMT"), "chrM");
         assert_eq!(add_legacy_chr_prefix("GL000207.1"), "GL000207.1");
         assert_eq!(add_legacy_chr_prefix("chr1"), "chr1");
     }
@@ -2619,7 +2781,7 @@ mod tests {
     fn fixchr_adds_lengthless_headers_for_rewritten_contigs() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
-        let output = directory.path().join("output.vcf");
+        let output = directory.path().join("output.vcf.gz");
         let reference = directory.path().join("ref.fa");
         fs::write(&reference, ">1\nAAAAA\n>chr1\nAAAAA\n>chrX\nAAAAA\n")?;
         fs::write(
@@ -2684,6 +2846,215 @@ mod tests {
         assert_eq!(records[0].info, "AC=1");
         assert_eq!(records[0].format.as_deref(), Some("GT"));
         assert_eq!(records[0].samples, vec!["0/1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn sites_only_vcf_is_rejected_like_vcfcheck() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("sites.vcf");
+        let output = directory.path().join("output.vcf.gz");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1\nAAAAA\n")?;
+        write_test_fai(&reference)?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=5>\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+                "chr1\t2\t.\tA\tC\t10\tPASS\t.\n",
+            ),
+        )?;
+
+        let error = run(interval_args(&input, &output, &reference, None, None)).unwrap_err();
+        assert!(error.to_string().contains("no samples"));
+        assert!(!output.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_normalization_passes_through_ref_mismatch() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf.gz");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1\nAAAAA\n")?;
+        write_test_fai(&reference)?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=5>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "chr1\t2\tmismatch\tC\tT\t10\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.leftshift = false;
+        args.no_leftshift = true;
+        args.decompose = false;
+        args.no_decompose = true;
+        args.gender = PreprocessGender::None;
+
+        run(args)?;
+
+        let (_, records) = vcf::load_raw_vcf(&output)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].ref_allele, "C");
+        assert_eq!(records[0].id, "mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn missing_reference_index_is_rejected() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf.gz");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1\nAAAAA\n")?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=5>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "chr1\t2\t.\tA\tC\t10\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+
+        let args = interval_args(&input, &output, &reference, None, None);
+        fs::remove_file(format!("{}.fai", reference.display()))?;
+        let error = run(args).unwrap_err();
+        assert!(error.to_string().contains("is not indexed"));
+        assert!(!output.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_and_malformed_reference_indexes_are_rejected() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf.gz");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1\nAAAAA\n")?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=5>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "chr1\t2\t.\tA\tC\t10\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+        let index = format!("{}.fai", reference.display());
+
+        for (contents, expected) in [
+            ("", "no contigs found in FASTA index"),
+            ("chr1\tbad\t6\t5\t6\n", "invalid FASTA index length"),
+        ] {
+            fs::write(&index, contents)?;
+            let error = run(interval_args(&input, &output, &reference, None, None)).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert!(!output.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plain_vcf_output_failure_leaves_unindexed_output() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1\nAAAAA\n")?;
+        write_test_fai(&reference)?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=5>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "chr1\t2\t.\tA\tC\t10\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.leftshift = false;
+        args.no_leftshift = true;
+        args.decompose = false;
+        args.no_decompose = true;
+        args.gender = PreprocessGender::None;
+        args.threads = Some(1);
+        let error = run(args).unwrap_err();
+        assert!(error.to_string().contains("plain VCF output"));
+        assert!(output.is_file());
+        assert_eq!(vcf::load_raw_vcf(&output)?.1.len(), 1);
+        assert!(!PathBuf::from(format!("{}.tbi", output.display())).exists());
+        assert!(!PathBuf::from(format!("{}.csi", output.display())).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_output_parent_is_rejected_without_artifacts() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output_parent = directory.path().join("missing");
+        let output = output_parent.join("output.vcf.gz");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1\nAAAAA\n")?;
+        write_test_fai(&reference)?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=5>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "chr1\t2\t.\tA\tC\t10\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+
+        let error = run(interval_args(&input, &output, &reference, None, None)).unwrap_err();
+        assert!(error.to_string().contains("output parent does not exist"));
+        assert!(!output_parent.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn negative_window_is_accepted_when_blocksplit_is_unused() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf.gz");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1\nAAAAA\n")?;
+        write_test_fai(&reference)?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=5>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "chr1\t2\t.\tA\tC\t10\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.leftshift = false;
+        args.no_leftshift = true;
+        args.decompose = false;
+        args.no_decompose = true;
+        args.gender = PreprocessGender::None;
+        args.threads = Some(1);
+        args.window_size = -1;
+        run(args)?;
+
+        assert_eq!(vcf::load_raw_vcf(&output)?.1.len(), 1);
         Ok(())
     }
 
@@ -2768,7 +3139,8 @@ mod tests {
             concat!(
                 "##fileformat=VCFv4.2\n",
                 "##contig=<ID=chr1,length=5>\n",
-                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
             ),
         )?;
         let mut args = interval_args(&input, &output, &reference, None, None);
@@ -2788,6 +3160,11 @@ mod tests {
         regions: Option<&Path>,
         targets: Option<&Path>,
     ) -> PreprocessArgs {
+        let mut index = reference.as_os_str().to_os_string();
+        index.push(".fai");
+        if !Path::new(&index).is_file() {
+            write_test_fai(reference).expect("test reference index should be writable");
+        }
         PreprocessArgs {
             input: input.display().to_string(),
             output: output.display().to_string(),
@@ -2820,14 +3197,31 @@ mod tests {
         }
     }
 
+    fn write_test_fai(reference: &Path) -> Result<()> {
+        let sequences = fasta::read_sequences(reference)?;
+        let mut offset = 0u64;
+        let mut index = String::new();
+        for (name, sequence) in sequences {
+            let line_bases = sequence.len().max(1);
+            index.push_str(&format!(
+                "{name}\t{}\t{offset}\t{line_bases}\t{}\n",
+                sequence.len(),
+                line_bases + 1
+            ));
+            offset += sequence.len() as u64 + name.len() as u64 + 3;
+        }
+        fs::write(format!("{}.fai", reference.display()), index)?;
+        Ok(())
+    }
+
     #[test]
     fn region_uses_gvcf_end_while_target_uses_start_position() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let reference = directory.path().join("ref.fa");
         let boundary = directory.path().join("boundary.bed");
-        let region_output = directory.path().join("region.vcf");
-        let target_output = directory.path().join("target.vcf");
+        let region_output = directory.path().join("region.vcf.gz");
+        let target_output = directory.path().join("target.vcf.gz");
         fs::write(
             &input,
             concat!(
@@ -2860,12 +3254,58 @@ mod tests {
     }
 
     #[test]
+    fn selectors_remain_literal_after_fixchr_rewrites_records() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let reference = directory.path().join("ref.fa");
+        let selector = directory.path().join("selector.bed");
+        let location_output = directory.path().join("location.vcf.gz");
+        let region_output = directory.path().join("region.vcf.gz");
+        let target_output = directory.path().join("target.vcf.gz");
+        fs::write(&reference, ">chr1\nAAAAA\n")?;
+        fs::write(&selector, "1\t0\t5\n")?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=1,length=5>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "1\t2\t.\tA\tC\t10\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+
+        let mut location_args = interval_args(&input, &location_output, &reference, None, None);
+        location_args.fixchr = Some(true);
+        location_args.locations = Some("1:1-5".to_string());
+        run(location_args)?;
+
+        let mut region_args =
+            interval_args(&input, &region_output, &reference, Some(&selector), None);
+        region_args.fixchr = Some(true);
+        run(region_args)?;
+
+        let mut target_args =
+            interval_args(&input, &target_output, &reference, None, Some(&selector));
+        target_args.fixchr = Some(true);
+        run(target_args)?;
+
+        for output in [location_output, region_output, target_output] {
+            assert!(
+                vcf::load_raw_vcf(&output)?.1.is_empty(),
+                "selector contig 1 must not be rewritten to match emitted chr1 records"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn leftshift_switch_controls_repeat_indel_normalization() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let reference = directory.path().join("ref.fa");
-        let shifted_output = directory.path().join("shifted.vcf");
-        let unchanged_output = directory.path().join("unchanged.vcf");
+        let shifted_output = directory.path().join("shifted.vcf.gz");
+        let unchanged_output = directory.path().join("unchanged.vcf.gz");
         fs::write(
             &input,
             concat!(
@@ -2894,7 +3334,7 @@ mod tests {
     fn tiny_parallel_inputs_do_not_create_window_block_boundaries() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
-        let output = directory.path().join("output.vcf");
+        let output = directory.path().join("output.vcf.gz");
         let reference = directory.path().join("ref.fa");
         fs::write(&reference, ">chr1\nAAAAAAAAAAAAAAAAAAAA\n")?;
         fs::write(
@@ -2926,7 +3366,7 @@ mod tests {
     fn location_start_reset_survives_a_dropped_homref_record() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
-        let output = directory.path().join("output.vcf");
+        let output = directory.path().join("output.vcf.gz");
         let reference = directory.path().join("ref.fa");
         fs::write(&reference, format!(">chr1\n{}\n", "A".repeat(120)))?;
         fs::write(
@@ -2964,7 +3404,7 @@ mod tests {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let reference = directory.path().join("ref.fa");
-        let output = directory.path().join("output.vcf");
+        let output = directory.path().join("output.vcf.gz");
         fs::write(
             &input,
             concat!(
@@ -2999,8 +3439,8 @@ mod tests {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let reference = directory.path().join("ref.fa");
-        let output = directory.path().join("output.vcf");
-        let decomposed_output = directory.path().join("decomposed.vcf");
+        let output = directory.path().join("output.vcf.gz");
+        let decomposed_output = directory.path().join("decomposed.vcf.gz");
         fs::write(
             &input,
             concat!(
@@ -3055,7 +3495,7 @@ mod tests {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let reference = directory.path().join("ref.fa");
-        let output = directory.path().join("output.vcf");
+        let output = directory.path().join("output.vcf.gz");
         fs::write(
             &input,
             concat!(
@@ -3224,8 +3664,31 @@ mod tests {
         // emits the middle one after cumulative candidate counts exceed the
         // 404 / 2 target. A naive every-gap reset would emit all three.
         assert_eq!(
-            select_blocksplit_resets(&observations, 1, 2, false).resets,
+            select_blocksplit_resets(&observations, 1, 2, None).reset_indices(),
             HashSet::from([202])
+        );
+    }
+
+    #[test]
+    fn blocksplit_preserves_negative_window_gap_arithmetic() {
+        let observations = (0..101)
+            .map(|_| BlocksplitObservation {
+                chrom: "chr1".into(),
+                pos: 1,
+                end: 1,
+                called: true,
+                location_groups: vec![0],
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            select_blocksplit_resets(&observations, -1, 2, None).reset_indices(),
+            HashSet::from([100])
+        );
+        assert!(
+            select_blocksplit_resets(&observations, 0, 2, None)
+                .reset_indices()
+                .is_empty()
         );
     }
 
@@ -3256,7 +3719,7 @@ mod tests {
         });
 
         assert_eq!(
-            select_blocksplit_resets(&observations, 1, 40, false).resets,
+            select_blocksplit_resets(&observations, 1, 40, None).reset_indices(),
             HashSet::from([102])
         );
     }
@@ -3288,8 +3751,8 @@ mod tests {
         });
 
         assert!(
-            select_blocksplit_resets(&observations, 1, 40, false)
-                .resets
+            select_blocksplit_resets(&observations, 1, 40, None)
+                .reset_indices()
                 .is_empty()
         );
     }
@@ -3317,10 +3780,112 @@ mod tests {
 
         // Legacy invokes blocksplit once per comma-separated location, so
         // each location computes its own total and target even on one contig.
+        let locations = [
+            vcf::LocationFilter::Contig("chr1".to_string()),
+            vcf::LocationFilter::Contig("chr1".to_string()),
+        ];
         assert_eq!(
-            select_blocksplit_resets(&observations, 1, 2, true).resets,
+            select_blocksplit_resets(&observations, 1, 2, Some(&locations)).reset_indices(),
             HashSet::from([101, 202, 303])
         );
+    }
+
+    #[test]
+    fn parallel_comma_locations_duplicate_the_selected_stream_in_position_order() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf.gz");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, format!(">chr1\n{}\n", "A".repeat(120)))?;
+        let mut vcf_text = concat!(
+            "##fileformat=VCFv4.2\n",
+            "##contig=<ID=chr1,length=120>\n",
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+        )
+        .to_string();
+        for pos in 1..=120 {
+            vcf_text.push_str(&format!(
+                "chr1\t{pos}\tv{pos}\tA\tC\t30\tPASS\t.\tGT\t0/1\n"
+            ));
+        }
+        fs::write(&input, vcf_text)?;
+
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.gender = PreprocessGender::None;
+        args.locations = Some("chr1:1-100,chr1:51-120".to_string());
+        args.threads = Some(2);
+        run(args)?;
+
+        let positions = vcf::load_raw_vcf(&output)?
+            .1
+            .into_iter()
+            .map(|record| record.pos)
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 240);
+        for (offset, pair) in positions.chunks_exact(2).enumerate() {
+            assert_eq!(pair, [offset + 1, offset + 1]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_comma_locations_preserve_independent_multiblock_jobs() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf.gz");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, format!(">chr1\n{}\n", "A".repeat(3_200)))?;
+        let mut vcf_text = concat!(
+            "##fileformat=VCFv4.2\n",
+            "##contig=<ID=chr1,length=3200>\n",
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+        )
+        .to_string();
+        for cluster_start in [1, 1_001, 2_001, 3_001] {
+            for pos in cluster_start..=cluster_start + 100 {
+                vcf_text.push_str(&format!(
+                    "chr1\t{pos}\tv{pos}\tA\tC\t30\tPASS\t.\tGT\t0/1\n"
+                ));
+            }
+        }
+        fs::write(&input, vcf_text)?;
+
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.gender = PreprocessGender::None;
+        args.locations = Some("chr1:1-2101,chr1:1001-3101".to_string());
+        args.threads = Some(2);
+        args.window_size = 10;
+        run(args)?;
+
+        let positions = vcf::load_raw_vcf(&output)?
+            .1
+            .into_iter()
+            .map(|record| record.pos)
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 705);
+        assert!(positions.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let mut multiplicities = std::collections::BTreeMap::new();
+        for pos in positions {
+            *multiplicities.entry(pos).or_insert(0usize) += 1;
+        }
+        for pos in 1..=101 {
+            assert_eq!(multiplicities.get(&pos), Some(&2));
+        }
+        for pos in 1_001..=1_101 {
+            assert_eq!(multiplicities.get(&pos), Some(&2));
+        }
+        for pos in 2_001..=2_100 {
+            assert_eq!(multiplicities.get(&pos), Some(&2));
+        }
+        assert_eq!(multiplicities.get(&2_101), Some(&1));
+        for pos in 3_001..=3_100 {
+            assert_eq!(multiplicities.get(&pos), Some(&1));
+        }
+        assert_eq!(multiplicities.get(&3_101), None);
+        Ok(())
     }
 
     #[test]
@@ -3349,12 +3914,12 @@ mod tests {
             },
         ];
 
-        let mixed = select_blocksplit_resets(&observations, 1, 2, false);
-        assert_eq!(mixed.included_indices, Some(HashSet::from([0, 1])));
+        let mixed = select_blocksplit_resets(&observations, 1, 2, None);
+        assert_eq!(mixed.included_indices(), Some(HashSet::from([0, 1])));
 
         observations[0].called = false;
-        let all_empty = select_blocksplit_resets(&observations, 1, 2, false);
-        assert_eq!(all_empty.included_indices, None);
+        let all_empty = select_blocksplit_resets(&observations, 1, 2, None);
+        assert_eq!(all_empty.included_indices(), None);
     }
 
     #[test]
@@ -3708,7 +4273,7 @@ mod tests {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let reference = directory.path().join("ref.fa");
-        let output = directory.path().join("output.vcf");
+        let output = directory.path().join("output.vcf.gz");
         fs::write(
             &input,
             concat!(
@@ -3866,9 +4431,9 @@ mod tests {
         let directory = tempdir()?;
         let reference = directory.path().join("ref.fa");
         let mixed_input = directory.path().join("mixed.vcf");
-        let mixed_output = directory.path().join("mixed.out.vcf");
+        let mixed_output = directory.path().join("mixed.out.vcf.gz");
         let empty_input = directory.path().join("empty.vcf");
-        let empty_output = directory.path().join("empty.out.vcf");
+        let empty_output = directory.path().join("empty.out.vcf.gz");
         fs::write(&reference, ">chr1\nAAAAA\n>chr2\nAAAAA\n")?;
         let header = concat!(
             "##fileformat=VCFv4.2\n",

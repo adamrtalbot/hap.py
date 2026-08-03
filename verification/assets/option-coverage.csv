@@ -12,6 +12,7 @@ happy.truth_preprocessing,happy,chr21_preprocess_controls,preprocessing,pairwise
 happy.filtered_truth,happy,chr21_filtered_truth,selection,single
 happy.output_metadata,happy,chr21_output_metadata,artifact_set,pairwise
 happy.bcf_output,happy,matrix_bcf,format,format
+happy.bcf_input_implicit,happy,matrix_implicit_bcf,format,precedence
 happy.gvcf_conversion,happy,matrix_gvcf_conversion,preprocessing,pairwise
 happy.restrict_filters,happy,matrix_restrict_filters,selection,pairwise
 happy.targets,happy,matrix_targets,selection,single
@@ -106,7 +107,15 @@ qfy.xcmp_baseline,qfy,chr21_region,annotation,baseline
 qfy.ga4gh,qfy,chr21_ga4gh,annotation,single
 qfy.ga4gh_roc,qfy,chr21_ga4gh_roc_controls,reporting,pairwise
 qfy.ga4gh_artifacts,qfy,chr21_ga4gh_artifacts,artifact_set_bcf_vtc_runtime_controls,pairwise
+qfy.counts_last_off,qfy,chr21_counts_last_off,artifact_set,precedence
+qfy.counts_last_on,qfy,chr21_counts_last_on,artifact_set,precedence
+qfy.four_column_strat,qfy,chr21_four_column_strat,stratification,pairwise
 vcfcheck.baseline,vcfcheck,formats,validation,baseline
 vcfcheck.warning_controls,vcfcheck,warning_controls,diagnostics,pairwise
 vcfcheck.ploidy,vcfcheck,ploidy,limit,boundary
 vcfcheck.negative_limit,vcfcheck,negative_limit,limit,boundary
+vcfcheck.missing_contig,vcfcheck,missing_contig,translation,malformed_header
+vcfcheck.sample_count_mismatch,vcfcheck,sample_count_mismatch,sample_layout,malformed_record
+vcfcheck.lowercase_x,vcfcheck,lowercase_x,ploidy,contig_case
+vcfcheck.vcf44_number_p,vcfcheck,vcf44_number_p,format,external_conformance
+vcfcheck.invalid_pl_cardinality,vcfcheck,invalid_pl_cardinality,translation,external_malformed

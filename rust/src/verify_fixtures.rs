@@ -43,6 +43,8 @@ enum Command {
         rust_dir: PathBuf,
         #[arg(long)]
         prefix: String,
+        #[arg(long = "expected-artifact", value_name = "NAME")]
+        expected_artifact: Vec<String>,
         #[arg(long)]
         case: String,
         #[arg(long)]
@@ -80,6 +82,7 @@ fn main() -> Result<()> {
             legacy_dir,
             rust_dir,
             prefix,
+            expected_artifact,
             case,
             sample,
             report,
@@ -88,6 +91,7 @@ fn main() -> Result<()> {
             legacy_dir: &legacy_dir,
             rust_dir: &rust_dir,
             prefix: &prefix,
+            expected_artifacts: &expected_artifact,
             case: &case,
             sample: &sample,
             report: &report,
