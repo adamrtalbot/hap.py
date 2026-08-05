@@ -31,4 +31,140 @@ nextflow_process {
             assert comparison.differences[0].actual == 'rust value'
         }
     }
+
+    test("ignores runtime VCF provenance but preserves header comparison") {
+
+        when {
+            process {
+                """
+                input[0] = Channel.of(tuple(
+                    [id: 'vcf_runtime_metadata'],
+                    'prepy',
+                    'result',
+                    file("${projectDir}/tests/fixtures/diff/legacy/result.vcf", checkIfExists: true),
+                    file("${projectDir}/tests/fixtures/diff/rust/result.vcf", checkIfExists: true),
+                ))
+                """
+            }
+        }
+
+        then {
+            def comparison = new groovy.json.JsonSlurper().parse(new File(process.out.comparison[0][2]))
+            assert process.success
+            assert comparison.ok
+            assert comparison.differences.isEmpty()
+        }
+    }
+
+    test("ignores runtime container identity in runinfo JSON") {
+
+        when {
+            process {
+                """
+                input[0] = Channel.of(tuple(
+                    [id: 'runinfo_runtime_metadata'],
+                    'happy',
+                    'result',
+                    file("${projectDir}/tests/fixtures/diff/legacy/result.runinfo.json", checkIfExists: true),
+                    file("${projectDir}/tests/fixtures/diff/rust/result.runinfo.json", checkIfExists: true),
+                ))
+                """
+            }
+        }
+
+        then {
+            def comparison = new groovy.json.JsonSlurper().parse(new File(process.out.comparison[0][2]))
+            assert process.success
+            assert comparison.ok
+            assert comparison.differences.isEmpty()
+        }
+    }
+
+    test("reports non-runtime VCF header differences") {
+
+        when {
+            process {
+                """
+                input[0] = Channel.of(tuple(
+                    [id: 'vcf_schema_difference'],
+                    'prepy',
+                    'schema',
+                    file("${projectDir}/tests/fixtures/diff/legacy/schema.vcf", checkIfExists: true),
+                    file("${projectDir}/tests/fixtures/diff/rust/schema.vcf", checkIfExists: true),
+                ))
+                """
+            }
+        }
+
+        then {
+            def comparison = new groovy.json.JsonSlurper().parse(new File(process.out.comparison[0][2]))
+            assert process.success
+            assert !comparison.ok
+            assert comparison.differences.size() == 1
+            assert comparison.differences[0].artifact == 'schema.vcf'
+            assert comparison.differences[0].location == '/line/2'
+        }
+    }
+
+    test("validates BCF content and companion CSI indexes semantically") {
+
+        when {
+            process {
+                """
+                input[0] = Channel.of(tuple(
+                    [id: 'bcf_and_index'],
+                    'prepy',
+                    'input',
+                    [
+                        file("${projectDir}/assets/fixtures/pre-matrix/input.bcf", checkIfExists: true),
+                        file("${projectDir}/assets/fixtures/pre-matrix/input.bcf.csi", checkIfExists: true),
+                    ],
+                    [
+                        file("${projectDir}/assets/fixtures/pre-matrix/input.bcf", checkIfExists: true),
+                        file("${projectDir}/assets/fixtures/pre-matrix/input.bcf.csi", checkIfExists: true),
+                    ],
+                ))
+                """
+            }
+        }
+
+        then {
+            def comparison = new groovy.json.JsonSlurper().parse(new File(process.out.comparison[0][2]))
+            assert process.success
+            assert comparison.ok
+            assert comparison.differences.isEmpty()
+        }
+    }
+
+    test("rejects invalid companion indexes") {
+
+        when {
+            process {
+                """
+                input[0] = Channel.of(tuple(
+                    [id: 'invalid_index'],
+                    'prepy',
+                    'input',
+                    [
+                        file("${projectDir}/assets/fixtures/pre-matrix/input.bcf", checkIfExists: true),
+                        file("${projectDir}/tests/fixtures/diff/invalid-index/input.bcf.csi", checkIfExists: true),
+                    ],
+                    [
+                        file("${projectDir}/assets/fixtures/pre-matrix/input.bcf", checkIfExists: true),
+                        file("${projectDir}/tests/fixtures/diff/invalid-index/input.bcf.csi", checkIfExists: true),
+                    ],
+                ))
+                """
+            }
+        }
+
+        then {
+            def comparison = new groovy.json.JsonSlurper().parse(new File(process.out.comparison[0][2]))
+            assert process.success
+            assert !comparison.ok
+            assert comparison.differences.size() == 1
+            assert comparison.differences[0].artifact == 'input.bcf.csi'
+            assert comparison.differences[0].kind == 'invalid'
+        }
+    }
 }

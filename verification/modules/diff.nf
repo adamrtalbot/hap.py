@@ -19,6 +19,8 @@ process DIFF_OUTPUTS {
     import io
     import json
     import pathlib
+    import re
+    import subprocess
     import sys
 
     lane, case_id, prefix = sys.argv[1:]
@@ -41,10 +43,18 @@ process DIFF_OUTPUTS {
         '/version',
         '/runInfo',
         '/timestamp',
+        '/dist',
+        '/environment',
+        '/mac_ver',
+        '/python_implementation',
+        '/python_prefix',
+        '/python_version',
+        '/uname',
         '/metadata/required/version',
         '/metadata/required/description',
     }
     volatile_csv_columns = {'sompyversion', 'sompycmd'}
+    volatile_vcf_header = re.compile(r'^##bcftools_[^=]*(?:Command|Version)=')
 
     def normalize_json(value, pointer=''):
         if isinstance(value, dict):
@@ -105,6 +115,38 @@ process DIFF_OUTPUTS {
             output.append(stream.getvalue())
         return ('\\n'.join(output) + '\\n').encode('utf-8')
 
+    def normalize_vcf(value):
+        lines = value.decode('utf-8').splitlines()
+        normalized = [line for line in lines if not volatile_vcf_header.match(line)]
+        return ('\\n'.join(normalized) + '\\n').encode('utf-8') if normalized else b''
+
+    def decode_bcf(path):
+        result = subprocess.run(
+            ['bcftools', 'view', '--no-version', '-Ov', str(path)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.stdout
+
+    def index_data_path(index_path):
+        if index_path.name.endswith('.tbi'):
+            return index_path.with_name(index_path.name[:-4])
+        if index_path.name.endswith('.csi'):
+            return index_path.with_name(index_path.name[:-4])
+        raise ValueError('unsupported index extension: %s' % index_path.name)
+
+    def validate_index(index_path):
+        data_path = index_data_path(index_path)
+        if not data_path.is_file():
+            raise ValueError('index companion is missing: %s' % data_path.name)
+        subprocess.run(
+            ['bcftools', 'index', '--stats', str(data_path)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def artifact_record(path):
         value = content(path)
         return {
@@ -126,9 +168,23 @@ process DIFF_OUTPUTS {
         rust_path = pathlib.Path('rust') / artifact
         if not legacy_path.is_file() or not rust_path.is_file():
             continue
+        if artifact.endswith(('.tbi', '.csi')):
+            difference = {
+                'artifact': artifact,
+                'legacy_sha256': hashlib.sha256(legacy_path.read_bytes()).hexdigest(),
+                'rust_sha256': hashlib.sha256(rust_path.read_bytes()).hexdigest(),
+            }
+            try:
+                validate_index(legacy_path)
+                validate_index(rust_path)
+                continue
+            except Exception as error:
+                difference.update(kind='invalid', location='/', expected=None, actual=None, reason=str(error))
+                differences.append(difference)
+                continue
         legacy_content = content(legacy_path)
         rust_content = content(rust_path)
-        if legacy_content == rust_content:
+        if legacy_content == rust_content and not artifact.endswith('.bcf'):
             continue
         difference = {
             'artifact': artifact,
@@ -144,10 +200,22 @@ process DIFF_OUTPUTS {
                     continue
                 pointer, expected_value, actual_value, reason = json_diff
                 difference.update(kind='json', location=pointer, expected=expected_value, actual=actual_value, reason=reason)
+            elif artifact.endswith('.bcf'):
+                text_diff = text_difference(
+                    normalize_vcf(decode_bcf(legacy_path)),
+                    normalize_vcf(decode_bcf(rust_path)),
+                )
+                if text_diff is None:
+                    continue
+                location, expected_value, actual_value = text_diff
+                difference.update(kind='bcf', location=location, expected=expected_value, actual=actual_value, reason='ordered BCF content differs')
             elif artifact.endswith(('.csv', '.csv.gz', '.txt', '.vcf', '.vcf.gz', '.bed', '.bed.gz', '.fai')):
                 if artifact.endswith(('.csv', '.csv.gz')):
                     legacy_content = normalize_csv(legacy_content)
                     rust_content = normalize_csv(rust_content)
+                elif artifact.endswith(('.vcf', '.vcf.gz')):
+                    legacy_content = normalize_vcf(legacy_content)
+                    rust_content = normalize_vcf(rust_content)
                 text_diff = text_difference(legacy_content, rust_content)
                 if text_diff is None:
                     continue

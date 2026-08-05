@@ -1,0 +1,6 @@
+##fileformat=VCFv4.2
+##bcftools_viewVersion=1.22+htslib-1.22
+##bcftools_viewCommand=view input.vcf; Date=Wed Aug  5 12:24:11 2026
+##contig=<ID=chr1,length=10>
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+chr1	1	.	A	T	.	PASS	.
