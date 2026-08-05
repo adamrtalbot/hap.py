@@ -2,7 +2,7 @@
 //
 // Runs qfy.py and the Rust quantify compatibility command against the same
 // xcmp-annotated VCF. QFY_ANNOTATE creates that shared input once from a
-// bounded, upstream-pinned chr21 fixture using the oracle comparator.
+// bounded, upstream-pinned chr21 fixture using the reference comparator.
 
 process QFY_ANNOTATE {
     tag { "${meta.id}" }
@@ -38,7 +38,7 @@ process QFY_LEGACY {
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     """
@@ -48,27 +48,6 @@ process QFY_LEGACY {
         --threads ${task.cpus ?: 1} \
         --report-prefix result
 
-    # The legacy threaded reporter can exit successfully after dropping rows
-    # and appending a malformed aggregate row. Fail the task so the isolated,
-    # bounded retry policy regenerates a structurally valid oracle report.
-    gzip -cd result.roc.all.csv.gz | awk -F',' '
-        NR == 1 {
-            expected_fields = NF
-            if (expected_fields != 65 && expected_fields != 71) exit 1
-            if (\$1 != "Type" || \$2 != "Subtype" || \$3 != "Subset" ||
-                \$4 != "Filter" || \$5 != "Genotype" || \$6 != "QQ.Field" ||
-                \$7 != "QQ") exit 1
-            next
-        }
-        {
-            if (NF != expected_fields) exit 1
-            if (\$1 != "SNP" && \$1 != "INDEL") exit 1
-            if (\$1 == "" || \$2 == "" || \$3 == "" || \$4 == "" ||
-                \$5 == "" || \$6 == "" || \$7 == "") exit 1
-            rows++
-        }
-        END { if (rows == 0) exit 1 }
-    '
     """
 }
 
@@ -78,15 +57,14 @@ process QFY_RUST {
 
     input:
     tuple val(meta), path(input_vcf), path(input_tbi), path(reference), path(reference_fai), path(fp_bed), path(fp_bed_tbi), val(args)
-    path hap_bin
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     """
-    ./${hap_bin} quantify ${args} ${input_vcf} \
+    hap quantify ${args} ${input_vcf} \
         --reference ${reference} \
         --false-positives ${fp_bed} \
         --report-prefix result

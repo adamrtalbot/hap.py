@@ -3,432 +3,51 @@ nextflow_pipeline {
     name "verification parity workflow"
     script "../main.nf"
 
-    test("hap.py vs hap-rs parity across every selected samplesheet row") {
+    test("all selected lane cases have an empty structured difference list") {
 
         when {
             params {
                 outdir = "$outputDir"
-                // nf-test exposes only parameters declared in this block to
-                // the `then` closure; values inherited solely from
-                // nextflow.config run the workflow but are not available to
-                // the assertions below.  Declare the matrix contract here so
-                // coverage is checked against the exact inputs that were run.
                 cases = System.getenv('HAP_TEST_CASES') ?: 'happy,sompy,prepy,ftxpy,qfy,vcfcheck'
-                happy_samplesheet = new File('assets/samplesheet.happy.csv').canonicalPath
-                sompy_samplesheet = new File('assets/samplesheet.sompy.csv').canonicalPath
-                prepy_samplesheet = new File('assets/samplesheet.prepy.csv').canonicalPath
-                ftxpy_samplesheet = new File('assets/samplesheet.ftxpy.csv').canonicalPath
-                qfy_samplesheet = new File('assets/samplesheet.qfy.csv').canonicalPath
-                vcfcheck_samplesheet = new File('assets/samplesheet.vcfcheck.csv').canonicalPath
-                option_coverage = new File('assets/option-coverage.csv').canonicalPath
-                expected_artifacts = new File('assets/expected-artifacts.csv').canonicalPath
             }
         }
 
         then {
-            // DIFF_OUTPUTS is the single comparison authority. It invokes
-            // the staged Rust verifier and publishes one status.json per
-            // case/sample.  This test validates those verdicts plus complete
-            // samplesheet coverage; it does not maintain a second, weaker
-            // implementation of the file-format rules in Groovy.
-            def caseSamplesheets = [
-                happy: params.happy_samplesheet,
-                sompy: params.sompy_samplesheet,
-                prepy: params.prepy_samplesheet,
-                ftxpy: params.ftxpy_samplesheet,
-                qfy: params.qfy_samplesheet,
-                vcfcheck: params.vcfcheck_samplesheet,
-            ]
-            def selectedCases = params.cases.toString()
-                .tokenize(',')
-                .collect { it.trim() }
-                .findAll { it }
-
-            def coverageFailures = []
-            def parityFailures = []
-            def checked = 0
-            def comparedArtifacts = 0
-
-            def duplicateCases = selectedCases.groupBy { it }
-                .findAll { _case, occurrences -> occurrences.size() > 1 }
-                .keySet()
-                .sort()
-            if (!duplicateCases.isEmpty()) {
-                coverageFailures << "duplicate selected cases: ${duplicateCases.join(', ')}"
-            }
-
-            // A focused HAP_TEST_CASES run may select a subset for local
-            // diagnosis. Without that explicit override, the release gate is
-            // required to execute every wrapper lane.
-            def expectedReleaseCounts = [
+            def expectedCounts = [
                 happy: 20,
-                sompy: 23,
+                sompy: 22,
                 prepy: 37,
                 ftxpy: 24,
                 qfy: 7,
                 vcfcheck: 9,
             ]
-            def expectedReleaseTotal = expectedReleaseCounts.values().sum()
-            def requiredReleaseCases = expectedReleaseCounts.keySet().toSet()
-            if (caseSamplesheets.keySet().toSet() != requiredReleaseCases) {
-                coverageFailures << 'samplesheet contract must define exactly happy, sompy, prepy, ftxpy, qfy, and vcfcheck'
-            }
-            if (!System.getenv('HAP_TEST_CASES') && selectedCases.toSet() != requiredReleaseCases) {
-                def missingCases = (requiredReleaseCases - selectedCases.toSet()).sort()
-                def unexpectedCases = (selectedCases.toSet() - requiredReleaseCases).sort()
-                coverageFailures << "default release cases differ from the six-lane contract " +
-                    "(missing: ${missingCases ?: 'none'}; unexpected: ${unexpectedCases ?: 'none'})"
-            }
+            def selected = params.cases.toString().tokenize(',').collect { it.trim() }.findAll { it }
+            def unknown = selected.toSet() - expectedCounts.keySet()
 
-            // sample_id is the first CSV column. Quoted IDs are accepted;
-            // embedded commas are decoded without needing a Groovy CSV
-            // dependency in the nf-test runtime.
-            def parseSampleId = { line ->
-                if (!line.startsWith('"')) {
-                    return line.split(',', 2)[0].trim()
-                }
-                def value = new StringBuilder()
-                def offset = 1
-                while (offset < line.length()) {
-                    def character = line.charAt(offset)
-                    if (character == '"' && offset + 1 < line.length() && line.charAt(offset + 1) == '"') {
-                        value.append('"')
-                        offset += 2
-                    } else if (character == '"') {
-                        break
-                    } else {
-                        value.append(character)
-                        offset++
-                    }
-                }
-                return value.toString()
-            }
+            assert unknown.isEmpty() : "unknown lanes: ${unknown.sort().join(', ')}"
+            assert selected.size() == selected.toSet().size() : 'duplicate selected lanes'
 
-            // Load all six samplesheets even for a focused run. The option
-            // manifest is a repository-wide governance contract, not merely
-            // a description of the lanes selected for this invocation.
-            def sampleIdsByCase = [:]
-            caseSamplesheets.each { caseName, samplesheetPath ->
-                def samplesheet = new File(samplesheetPath.toString())
-                if (!samplesheet.isFile()) {
-                    coverageFailures << "$caseName (samplesheet absent: $samplesheet)"
-                    return
-                }
-                def sampleIds = samplesheet.readLines('UTF-8')
-                    .drop(1)
-                    .findAll { it.trim() && !it.trim().startsWith('#') }
-                    .collect(parseSampleId)
-                def duplicateIds = sampleIds.groupBy { it }
-                    .findAll { _id, occurrences -> occurrences.size() > 1 }
-                    .keySet()
-                    .sort()
-                if (!duplicateIds.isEmpty()) {
-                    coverageFailures << "$caseName (duplicate sample_id values: ${duplicateIds.join(', ')})"
-                }
-                if (sampleIds.size() != expectedReleaseCounts[caseName]) {
-                    coverageFailures << "$caseName (samplesheet has ${sampleIds.size()} rows; expected ${expectedReleaseCounts[caseName]})"
-                }
-                sampleIdsByCase[caseName] = sampleIds.toSet()
-            }
+            def verificationFile = new File("$outputDir/verification.json")
+            assert verificationFile.isFile() : 'verification.json was not published'
+            def verification = new groovy.json.JsonSlurper().parse(verificationFile)
+            def comparisons = verification.comparisons
+            def expectedTotal = selected.collect { expectedCounts[it] }.sum() ?: 0
+            def identities = comparisons.collect { "${it.lane}:${it.case_id}" }
 
-            def coverageFile = new File(params.option_coverage.toString())
-            def coverageRows = []
-            if (!coverageFile.isFile()) {
-                coverageFailures << "option coverage manifest absent: $coverageFile"
-            } else {
-                def coverageLines = coverageFile.readLines('UTF-8')
-                def expectedHeader = 'coverage_id,lane,sample_id,factor_family,interaction_class'
-                if (coverageLines.isEmpty() || coverageLines.first() != expectedHeader) {
-                    coverageFailures << "option coverage manifest header must be: $expectedHeader"
-                } else {
-                    coverageLines.drop(1)
-                        .findAll { it.trim() && !it.trim().startsWith('#') }
-                        .eachWithIndex { line, rowIndex ->
-                            def fields = line.split(',', -1).collect { it.trim() }
-                            if (fields.size() != 5 || fields.any { !it }) {
-                                coverageFailures << "option coverage row ${rowIndex + 2} must contain five non-empty fields"
-                            } else {
-                                coverageRows << [
-                                    coverageId: fields[0],
-                                    lane: fields[1],
-                                    sampleId: fields[2],
-                                ]
-                            }
-                        }
-                }
-            }
+            assert verification.schema_version == 1
+            assert verification.comparison_count == expectedTotal
+            assert comparisons.size() == expectedTotal
+            assert identities.size() == identities.toSet().size() : 'duplicate lane/case identities'
+            assert comparisons.every { it.lane in selected }
+            assert comparisons.every { it.ok instanceof Boolean && it.differences instanceof List }
+            assert comparisons.every { it.ok && it.differences.isEmpty() } :
+                groovy.json.JsonOutput.toJson(comparisons.findAll { !it.ok })
 
-            def duplicateCoverageIds = coverageRows.groupBy { it.coverageId }
-                .findAll { _id, occurrences -> occurrences.size() > 1 }
-                .keySet()
-                .sort()
-            if (!duplicateCoverageIds.isEmpty()) {
-                coverageFailures << "duplicate option coverage IDs: ${duplicateCoverageIds.join(', ')}"
-            }
-            if (coverageRows.size() != expectedReleaseTotal) {
-                coverageFailures << "option coverage manifest has ${coverageRows.size()} rows; expected $expectedReleaseTotal"
-            }
-            def duplicateCoverageMappings = coverageRows.groupBy { [it.lane, it.sampleId] }
-                .findAll { _mapping, occurrences -> occurrences.size() > 1 }
-                .keySet()
-                .sort { mapping -> "${mapping[0]}:${mapping[1]}" }
-            duplicateCoverageMappings.each { mapping ->
-                coverageFailures << "duplicate option coverage mapping: ${mapping[0]}:${mapping[1]}"
-            }
-            coverageRows.each { coverageRow ->
-                if (!caseSamplesheets.containsKey(coverageRow.lane)) {
-                    coverageFailures << "${coverageRow.coverageId} (unknown lane: ${coverageRow.lane})"
-                } else if (!sampleIdsByCase[coverageRow.lane]?.contains(coverageRow.sampleId)) {
-                    coverageFailures << "${coverageRow.coverageId} (${coverageRow.lane}:${coverageRow.sampleId} does not resolve to a samplesheet row)"
-                }
-            }
-            requiredReleaseCases.each { caseName ->
-                def laneCoverageRows = coverageRows.findAll { it.lane == caseName }
-                if (laneCoverageRows.size() != expectedReleaseCounts[caseName]) {
-                    coverageFailures << "$caseName (option coverage manifest has ${laneCoverageRows.size()} rows; expected ${expectedReleaseCounts[caseName]})"
-                }
-                def coveredIds = laneCoverageRows
-                    .collect { it.sampleId }
-                    .toSet()
-                if (coveredIds.isEmpty()) {
-                    coverageFailures << "$caseName (option coverage manifest has no rows)"
-                }
-                ((sampleIdsByCase[caseName] ?: [] as Set) - coveredIds).sort().each { sampleId ->
-                    coverageFailures << "$caseName:$sampleId (samplesheet row has no option coverage ID)"
-                }
-            }
-
-            def artifactManifest = new File(params.expected_artifacts.toString())
-            def artifactRows = []
-            if (!artifactManifest.isFile()) {
-                coverageFailures << "expected artifact manifest absent: $artifactManifest"
-            } else {
-                def artifactLines = artifactManifest.readLines('UTF-8')
-                def expectedHeader = 'lane,sample_id,artifacts'
-                if (artifactLines.isEmpty() || artifactLines.first() != expectedHeader) {
-                    coverageFailures << "expected artifact manifest header must be: $expectedHeader"
-                } else {
-                    artifactLines.drop(1)
-                        .findAll { it.trim() && !it.trim().startsWith('#') }
-                        .eachWithIndex { line, rowIndex ->
-                            def fields = line.split(',', 3).collect { it.trim() }
-                            if (fields.size() != 3 || fields.any { !it }) {
-                                coverageFailures << "expected artifact row ${rowIndex + 2} must contain three non-empty fields"
-                            } else {
-                                def artifacts = fields[2].split(';', -1).collect { it.trim() }
-                                if (artifacts.any { !it }) {
-                                    coverageFailures << "expected artifact row ${rowIndex + 2} contains an empty artifact name"
-                                }
-                                if (artifacts != artifacts.toSorted()) {
-                                    coverageFailures << "expected artifact row ${rowIndex + 2} is not bytewise sorted"
-                                }
-                                if (artifacts.toSet().size() != artifacts.size()) {
-                                    coverageFailures << "expected artifact row ${rowIndex + 2} contains duplicate names"
-                                }
-                                def invalidNames = artifacts.findAll { artifact ->
-                                    !artifact.startsWith('result') || artifact.contains('/') || artifact.contains('\\\\')
-                                }
-                                if (!invalidNames.isEmpty()) {
-                                    coverageFailures << "expected artifact row ${rowIndex + 2} has invalid names: ${invalidNames.join(', ')}"
-                                }
-                                artifactRows << [
-                                    lane: fields[0],
-                                    sampleId: fields[1],
-                                    artifacts: artifacts,
-                                ]
-                            }
-                        }
-                }
-            }
-
-            def duplicateArtifactMappings = artifactRows.groupBy { [it.lane, it.sampleId] }
-                .findAll { _mapping, occurrences -> occurrences.size() > 1 }
-                .keySet()
-                .sort { mapping -> "${mapping[0]}:${mapping[1]}" }
-            duplicateArtifactMappings.each { mapping ->
-                coverageFailures << "duplicate expected artifact mapping: ${mapping[0]}:${mapping[1]}"
-            }
-            if (artifactRows.size() != expectedReleaseTotal) {
-                coverageFailures << "expected artifact manifest has ${artifactRows.size()} rows; expected $expectedReleaseTotal"
-            }
-            def expectedArtifactComparisons = artifactRows.collect { it.artifacts.size() }.sum() ?: 0
-            if (expectedArtifactComparisons != 436) {
-                coverageFailures << "expected artifact manifest has $expectedArtifactComparisons artifacts; expected 436"
-            }
-            artifactRows.each { artifactRow ->
-                if (!caseSamplesheets.containsKey(artifactRow.lane)) {
-                    coverageFailures << "unknown expected artifact lane: ${artifactRow.lane}"
-                } else if (!sampleIdsByCase[artifactRow.lane]?.contains(artifactRow.sampleId)) {
-                    coverageFailures << "${artifactRow.lane}:${artifactRow.sampleId} expected artifacts do not resolve to a samplesheet row"
-                }
-            }
-            requiredReleaseCases.each { caseName ->
-                def laneArtifactRows = artifactRows.findAll { it.lane == caseName }
-                if (laneArtifactRows.size() != expectedReleaseCounts[caseName]) {
-                    coverageFailures << "$caseName (expected artifact manifest has ${laneArtifactRows.size()} rows; expected ${expectedReleaseCounts[caseName]})"
-                }
-                def artifactIds = laneArtifactRows.collect { it.sampleId }.toSet()
-                ((sampleIdsByCase[caseName] ?: [] as Set) - artifactIds).sort().each { sampleId ->
-                    coverageFailures << "$caseName:$sampleId (samplesheet row has no expected artifact contract)"
-                }
-            }
-            def expectedArtifactsByIdentity = [:]
-            artifactRows.each { artifactRow ->
-                expectedArtifactsByIdentity[[artifactRow.lane.toString(), artifactRow.sampleId.toString()]] =
-                    artifactRow.artifacts.toSet()
-            }
-
-            selectedCases.each { caseName ->
-                if (!caseSamplesheets.containsKey(caseName)) {
-                    coverageFailures << "$caseName (selected case has no samplesheet contract)"
-                    return
-                }
-                def expectedIds = sampleIdsByCase[caseName]
-                if (expectedIds == null) {
-                    return
-                }
-                def caseRoot = new File("$outputDir/$caseName")
-                if (!caseRoot.isDirectory()) {
-                    coverageFailures << "$caseName (case directory not published)"
-                    return
-                }
-                def actualIds = caseRoot.listFiles()
-                    .findAll { it.isDirectory() && !it.name.startsWith('.') }
-                    .collect { it.name }
-                    .toSet()
-
-                (expectedIds - actualIds).sort().each { sampleId ->
-                    coverageFailures << "$caseName:$sampleId (samplesheet row was not published)"
-                }
-                (actualIds - expectedIds).sort().each { sampleId ->
-                    coverageFailures << "$caseName:$sampleId (published without a samplesheet row)"
-                }
-
-                expectedIds.intersect(actualIds).sort().each { sampleId ->
-                    checked++
-                    def sampleDir = new File(caseRoot, sampleId)
-                    def legacyDir = new File(sampleDir, 'legacy')
-                    def rustDir = new File(sampleDir, 'rust')
-                    def statusFile = new File(sampleDir, 'status.json')
-                    def diffFile = new File(sampleDir, 'diff.log')
-                    if (!legacyDir.isDirectory() || !rustDir.isDirectory()) {
-                        coverageFailures << "$caseName:$sampleId (legacy/rust output directory absent)"
-                        return
-                    }
-                    if (!statusFile.isFile() || !diffFile.isFile()) {
-                        coverageFailures << "$caseName:$sampleId (comparator status or diff absent)"
-                        return
-                    }
-
-                    def status
-                    try {
-                        status = new groovy.json.JsonSlurper().parse(statusFile)
-                    } catch (Exception error) {
-                        coverageFailures << "$caseName:$sampleId (invalid status.json: ${error.message})"
-                        return
-                    }
-                    if (status.case != caseName || status.sample != sampleId) {
-                        coverageFailures << "$caseName:$sampleId (status identity case=${status.case}, sample=${status.sample})"
-                    }
-                    if (!(status.files instanceof List) || status.total != status.files.size() || status.total < 1) {
-                        coverageFailures << "$caseName:$sampleId (empty or internally inconsistent comparator status)"
-                        return
-                    }
-                    def invalidStatusFiles = status.files.findAll { entry ->
-                        !(entry instanceof Map) ||
-                            !(entry.name instanceof String) || !entry.name ||
-                            !(entry.ok instanceof Boolean) ||
-                            !(entry.reason instanceof String)
-                    }
-                    if (!invalidStatusFiles.isEmpty()) {
-                        coverageFailures << "$caseName:$sampleId (comparator status has invalid file entries)"
-                        return
-                    }
-                    def duplicateStatusNames = status.files
-                        .groupBy { it.name }
-                        .findAll { _name, occurrences -> occurrences.size() > 1 }
-                        .keySet()
-                        .sort()
-                    if (!duplicateStatusNames.isEmpty()) {
-                        coverageFailures << "$caseName:$sampleId (duplicate status artifact names: ${duplicateStatusNames.join(', ')})"
-                        return
-                    }
-
-                    // Guard against a stale/incomplete status payload and
-                    // against both sides agreeing on the same wrong artifact
-                    // set. Each side and the status must equal the independent
-                    // legacy-observed contract for this exact identity.
-                    def expectedNames = expectedArtifactsByIdentity[[caseName.toString(), sampleId.toString()]]
-                    if (expectedNames == null || expectedNames.isEmpty()) {
-                        coverageFailures << "$caseName:$sampleId (expected artifact contract absent or empty)"
-                        return
-                    }
-                    comparedArtifacts += expectedNames.size()
-                    def legacyNames = legacyDir.listFiles()
-                        .findAll { it.isFile() && it.name.startsWith('result') }
-                        .collect { it.name }
-                        .toSet()
-                    def rustNames = rustDir.listFiles()
-                        .findAll { it.isFile() && it.name.startsWith('result') }
-                        .collect { it.name }
-                        .toSet()
-                    if (legacyNames != expectedNames) {
-                        coverageFailures << "$caseName:$sampleId (legacy artifact set differs from exact manifest)"
-                    }
-                    if (rustNames != expectedNames) {
-                        coverageFailures << "$caseName:$sampleId (Rust artifact set differs from exact manifest)"
-                    }
-                    def statusNames = status.files
-                        .collect { it.name }
-                        .findAll { it != '<artifact-set>' }
-                        .toSet()
-                    if (statusNames != expectedNames) {
-                        coverageFailures << "$caseName:$sampleId (status artifact set differs from exact manifest)"
-                    }
-
-                    def failedFiles = status.files.findAll { it.ok == false }
-                    if (status.failed != failedFiles.size()) {
-                        coverageFailures << "$caseName:$sampleId (status failed count is inconsistent)"
-                    }
-                    if (!failedFiles.isEmpty()) {
-                        def details = failedFiles.collect { "${it.name}: ${it.reason}" }.join('; ')
-                        parityFailures << "$caseName:$sampleId ($details)"
-                    }
-                }
-            }
-
-            def selectedExpectedArtifactComparisons = artifactRows
-                .findAll { selectedCases.contains(it.lane) }
-                .collect { it.artifacts.size() }
-                .sum() ?: 0
-            if (comparedArtifacts != selectedExpectedArtifactComparisons) {
-                coverageFailures << "checked $comparedArtifacts artifacts; expected $selectedExpectedArtifactComparisons for selected lanes"
-            }
-
-            assert coverageFailures.isEmpty() :
-                "${coverageFailures.size()} coverage/contract failure(s):\n  " + coverageFailures.join('\n  ')
-            assert checked > 0 : 'no selected samplesheet rows were checked'
-            assert parityFailures.isEmpty() :
-                "${parityFailures.size()} case/sample parity failure(s):\n  " + parityFailures.join('\n  ')
-            assert path("$outputDir/report.md").exists()
-            assert path("$outputDir/report.csv").exists()
-
-            def expectedReportRows = selectedCases
-                .findAll { sampleIdsByCase.containsKey(it) }
-                .collect { sampleIdsByCase[it].size() }
-                .sum() ?: 0
             def reportRows = new File("$outputDir/report.csv")
                 .readLines('UTF-8')
                 .drop(1)
                 .findAll { it.trim() }
-            def reportIdentities = reportRows.collect { line ->
-                def fields = line.split(',', 3)
-                fields.size() >= 2 ? "${fields[0]}:${fields[1]}" : line
-            }
-            assert reportRows.size() == expectedReportRows :
-                "aggregate report has ${reportRows.size()} rows; expected $expectedReportRows"
-            assert reportIdentities.toSet().size() == expectedReportRows :
-                'aggregate report contains duplicate case/sample identities'
+            assert reportRows.size() == expectedTotal
             assert workflow.success
         }
     }

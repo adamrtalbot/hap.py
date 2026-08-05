@@ -12,7 +12,7 @@ process FTXPY_LEGACY {
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     def bam_args = has_bam ? "--bam ${bam}" : ''
@@ -30,16 +30,15 @@ process FTXPY_RUST {
 
     input:
     tuple val(meta), path(input_vcf), path(reference), path(reference_fai), path(bam), path(bam_index), val(has_bam), val(feature_table), val(args)
-    path hap_bin
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     def bam_args = has_bam ? "--bam ${bam}" : ''
     """
-    ./${hap_bin} ftx ${args} ${bam_args} ${input_vcf} \\
+    hap ftx ${args} ${bam_args} ${input_vcf} \\
         -o result \\
         --reference ${reference} \\
         --feature-table ${feature_table}

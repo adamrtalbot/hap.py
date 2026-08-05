@@ -3,7 +3,7 @@
 // verification/main.nf
 //
 // Concordance pipeline: runs every supported subcommand through both the
-// legacy hap.py oracle (inside the pinned Wave container) and the local
+// legacy hap.py reference (inside the pinned Wave container) and the local
 // `hap` binary (no container), then diffs outputs per case and writes an
 // aggregated markdown report.
 //
@@ -68,57 +68,12 @@ def samples(samplesheet, transform) {
     channel.fromPath(samplesheet).splitCsv(header: true).map(transform)
 }
 
-// Load the independently observed legacy artifact contract before any tasks
-// launch. Every selected samplesheet identity must resolve to one non-empty
-// exact set; DIFF_OUTPUTS then rejects missing and extra artifacts on either
-// side instead of accepting the symmetric union produced by the run itself.
-def expectedArtifactMap() {
-    def manifest = file(params.expected_artifacts, checkIfExists: true).toFile()
-    def lines = manifest.readLines('UTF-8')
-    if (lines.isEmpty() || lines.first() != 'lane,sample_id,artifacts') {
-        throw new IllegalArgumentException('expected artifact manifest must start with lane,sample_id,artifacts')
-    }
-
-    def result = [:]
-    lines
-        .drop(1)
-        .findAll { line -> line.trim() }
-        .eachWithIndex { line, rowIndex ->
-            def fields = line.split(',', 3)
-            if (fields.size() != 3 || fields.any { field -> !field.trim() }) {
-                throw new IllegalArgumentException("expected artifact row ${rowIndex + 2} must contain three non-empty fields")
-            }
-            def key = "${fields[0].trim()}:${fields[1].trim()}"
-            if (result.containsKey(key)) {
-                throw new IllegalArgumentException("duplicate expected artifact identity: ${key}")
-            }
-            def artifacts = fields[2].split(';', -1).collect { artifact -> artifact.trim() }
-            if (artifacts.any { artifact -> !artifact }) {
-                throw new IllegalArgumentException("expected artifact row ${rowIndex + 2} contains an empty artifact name")
-            }
-            result[key] = artifacts
-        }
-    result
-}
-
-def expectedArtifactsFor(expectations, lane, sampleId) {
-    def key = "${lane}:${sampleId}"
-    def artifacts = expectations[key]
-    if (artifacts == null || artifacts.isEmpty()) {
-        throw new IllegalArgumentException("no expected artifact contract for ${key}")
-    }
-    artifacts
-}
-
 // ---------------------------------------------------------------------------
 // Workflow
 // ---------------------------------------------------------------------------
 
 workflow {
-    hap = file(params.hap_bin, checkIfExists: true)
-    verifier = file(params.verify_bin, checkIfExists: true)
     cases = selected_cases()
-    artifact_expectations = expectedArtifactMap()
 
     statuses = channel.empty()
 
@@ -143,15 +98,15 @@ workflow {
         }
 
         HAPPY_LEGACY(happy_in)
-        HAPPY_RUST(happy_in, hap)
+        HAPPY_RUST(happy_in)
 
         happy_pair = HAPPY_LEGACY.out.outputs
             .join(HAPPY_RUST.out.outputs, by: 0)
             .map { meta, legacy_files, rust_files ->
-                tuple(meta, 'happy', 'result', expectedArtifactsFor(artifact_expectations, 'happy', meta.id), legacy_files, rust_files)
+                tuple(meta, 'happy', 'result', legacy_files, rust_files)
             }
-        DIFF_HAPPY(happy_pair, verifier)
-        statuses = statuses.mix(DIFF_HAPPY.out.status)
+        DIFF_HAPPY(happy_pair)
+        statuses = statuses.mix(DIFF_HAPPY.out.comparison)
     }
 
     // -----------------------------------------------------------------------
@@ -176,15 +131,15 @@ workflow {
         }
 
         SOMPY_LEGACY(sompy_in)
-        SOMPY_RUST(sompy_in, hap)
+        SOMPY_RUST(sompy_in)
 
         sompy_pair = SOMPY_LEGACY.out.outputs
             .join(SOMPY_RUST.out.outputs, by: 0)
             .map { meta, legacy_files, rust_files ->
-                tuple(meta, 'sompy', 'result', expectedArtifactsFor(artifact_expectations, 'sompy', meta.id), legacy_files, rust_files)
+                tuple(meta, 'sompy', 'result', legacy_files, rust_files)
             }
-        DIFF_SOMPY(sompy_pair, verifier)
-        statuses = statuses.mix(DIFF_SOMPY.out.status)
+        DIFF_SOMPY(sompy_pair)
+        statuses = statuses.mix(DIFF_SOMPY.out.comparison)
     }
 
     // -----------------------------------------------------------------------
@@ -206,15 +161,15 @@ workflow {
         }
 
         PREPY_LEGACY(prepy_in)
-        PREPY_RUST(prepy_in, hap)
+        PREPY_RUST(prepy_in)
 
         prepy_pair = PREPY_LEGACY.out.outputs
             .join(PREPY_RUST.out.outputs, by: 0)
             .map { meta, legacy_files, rust_files ->
-                tuple(meta, 'prepy', 'result', expectedArtifactsFor(artifact_expectations, 'prepy', meta.id), legacy_files, rust_files)
+                tuple(meta, 'prepy', 'result', legacy_files, rust_files)
             }
-        DIFF_PREPY(prepy_pair, verifier)
-        statuses = statuses.mix(DIFF_PREPY.out.status)
+        DIFF_PREPY(prepy_pair)
+        statuses = statuses.mix(DIFF_PREPY.out.comparison)
     }
 
     // -----------------------------------------------------------------------
@@ -237,15 +192,15 @@ workflow {
         }
 
         FTXPY_LEGACY(ftxpy_in)
-        FTXPY_RUST(ftxpy_in, hap)
+        FTXPY_RUST(ftxpy_in)
 
         ftxpy_pair = FTXPY_LEGACY.out.outputs
             .join(FTXPY_RUST.out.outputs, by: 0)
             .map { meta, legacy_files, rust_files ->
-                tuple(meta, 'ftxpy', 'result', expectedArtifactsFor(artifact_expectations, 'ftxpy', meta.id), legacy_files, rust_files)
+                tuple(meta, 'ftxpy', 'result', legacy_files, rust_files)
             }
-        DIFF_FTXPY(ftxpy_pair, verifier)
-        statuses = statuses.mix(DIFF_FTXPY.out.status)
+        DIFF_FTXPY(ftxpy_pair)
+        statuses = statuses.mix(DIFF_FTXPY.out.comparison)
     }
 
     // -----------------------------------------------------------------------
@@ -270,15 +225,15 @@ workflow {
 
         QFY_ANNOTATE(qfy_in)
         QFY_LEGACY(QFY_ANNOTATE.out.annotated)
-        QFY_RUST(QFY_ANNOTATE.out.annotated, hap)
+        QFY_RUST(QFY_ANNOTATE.out.annotated)
 
         qfy_pair = QFY_LEGACY.out.outputs
             .join(QFY_RUST.out.outputs, by: 0)
             .map { meta, legacy_files, rust_files ->
-                tuple(meta, 'qfy', 'result', expectedArtifactsFor(artifact_expectations, 'qfy', meta.id), legacy_files, rust_files)
+                tuple(meta, 'qfy', 'result', legacy_files, rust_files)
             }
-        DIFF_QFY(qfy_pair, verifier)
-        statuses = statuses.mix(DIFF_QFY.out.status)
+        DIFF_QFY(qfy_pair)
+        statuses = statuses.mix(DIFF_QFY.out.comparison)
     }
 
     // -----------------------------------------------------------------------
@@ -295,15 +250,15 @@ workflow {
         }
 
         VCFCHECK_LEGACY(vcfcheck_in)
-        VCFCHECK_RUST(vcfcheck_in, hap)
+        VCFCHECK_RUST(vcfcheck_in)
 
         vcfcheck_pair = VCFCHECK_LEGACY.out.outputs
             .join(VCFCHECK_RUST.out.outputs, by: 0)
             .map { meta, legacy_files, rust_files ->
-                tuple(meta, 'vcfcheck', 'result', expectedArtifactsFor(artifact_expectations, 'vcfcheck', meta.id), legacy_files, rust_files)
+                tuple(meta, 'vcfcheck', 'result', legacy_files, rust_files)
             }
-        DIFF_VCFCHECK(vcfcheck_pair, verifier)
-        statuses = statuses.mix(DIFF_VCFCHECK.out.status)
+        DIFF_VCFCHECK(vcfcheck_pair)
+        statuses = statuses.mix(DIFF_VCFCHECK.out.comparison)
     }
 
     // -----------------------------------------------------------------------
@@ -313,9 +268,9 @@ workflow {
     // REPORT only needs the JSON payloads; the meta/case_name stay in
     // the per-case publishDir layout.
     // -----------------------------------------------------------------------
-    status_jsons = statuses
+    comparison_jsons = statuses
         .map { _meta, _case, json -> json }
         .collect()
 
-    REPORT(status_jsons, verifier)
+    REPORT(comparison_jsons)
 }

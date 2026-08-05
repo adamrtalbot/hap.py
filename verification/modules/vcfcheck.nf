@@ -12,7 +12,7 @@ process VCFCHECK_LEGACY {
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     """
@@ -27,15 +27,14 @@ process VCFCHECK_RUST {
 
     input:
     tuple val(meta), path(input_vcf), val(args)
-    path hap_bin
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     """
-    ./${hap_bin} validate ${args} ${input_vcf} \
+    hap validate ${args} ${input_vcf} \
         --output-json result.json
     """
 }

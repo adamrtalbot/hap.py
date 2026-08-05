@@ -14,7 +14,7 @@ process PREPY_LEGACY {
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     """
@@ -32,15 +32,14 @@ process PREPY_RUST {
 
     input:
     tuple val(meta), path(input_vcf), path(input_tbi), path(reference), path(reference_fai), path(regions_bed), path(regions_bed_tbi), val(args)
-    path hap_bin
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     """
-    ./${hap_bin} pre ${args} ${input_vcf} result.vcf.gz \\
+    hap pre ${args} ${input_vcf} result.vcf.gz \\
         --reference ${reference} \\
         --threads ${task.cpus ?: 1} \\
         -R ${regions_bed}

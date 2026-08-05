@@ -1,0 +1,34 @@
+nextflow_process {
+
+    name "Test DIFF_OUTPUTS"
+    script "../modules/diff.nf"
+    process "DIFF_OUTPUTS"
+
+    test("reports the first changed text line") {
+
+        when {
+            process {
+                """
+                input[0] = Channel.of(tuple(
+                    [id: 'changed'],
+                    'happy',
+                    'result',
+                    file("${projectDir}/tests/fixtures/diff/legacy/result.txt", checkIfExists: true),
+                    file("${projectDir}/tests/fixtures/diff/rust/result.txt", checkIfExists: true),
+                ))
+                """
+            }
+        }
+
+        then {
+            def comparison = new groovy.json.JsonSlurper().parse(new File(process.out.comparison[0][2]))
+            assert process.success
+            assert !comparison.ok
+            assert comparison.differences.size() == 1
+            assert comparison.differences[0].artifact == 'result.txt'
+            assert comparison.differences[0].location == '/line/2'
+            assert comparison.differences[0].expected == 'legacy value'
+            assert comparison.differences[0].actual == 'rust value'
+        }
+    }
+}

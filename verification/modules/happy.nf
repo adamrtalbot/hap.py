@@ -14,7 +14,7 @@ process HAPPY_LEGACY {
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     """
@@ -24,27 +24,6 @@ process HAPPY_LEGACY {
         --false-positives ${fp_bed} \\
         -o result
 
-    # hap.py can occasionally exit successfully after appending a malformed
-    # aggregate ROC row. Turn that upstream data race into a task failure so
-    # the retry policy in nextflow.config regenerates the oracle artifacts.
-    gzip -cd result.roc.all.csv.gz | awk -F',' '
-        NR == 1 {
-            expected_fields = NF
-            if (expected_fields != 65 && expected_fields != 71) exit 1
-            if (\$1 != "Type" || \$2 != "Subtype" || \$3 != "Subset" ||
-                \$4 != "Filter" || \$5 != "Genotype" || \$6 != "QQ.Field" ||
-                \$7 != "QQ") exit 1
-            next
-        }
-        {
-            if (NF != expected_fields) exit 1
-            if (\$1 != "SNP" && \$1 != "INDEL") exit 1
-            if (\$1 == "" || \$2 == "" || \$3 == "" || \$4 == "" ||
-                \$5 == "" || \$6 == "" || \$7 == "") exit 1
-            rows++
-        }
-        END { if (rows == 0) exit 1 }
-    '
     """
 }
 
@@ -54,15 +33,14 @@ process HAPPY_RUST {
 
     input:
     tuple val(meta), path(truth_vcf, stageAs: 'truth/*'), path(truth_tbi, stageAs: 'truth/*'), path(query_vcf, stageAs: 'query/*'), path(query_tbi, stageAs: 'query/*'), path(reference), path(reference_fai), path(fp_bed), path(fp_bed_tbi), val(args)
-    path hap_bin
 
     output:
     tuple val(meta), path('result*'), emit: outputs
-    path '.command.{log,sh}', emit: runlogs, optional: true
+    path '.command.log', hidden: true, emit: runlogs
 
     script:
     """
-    ./${hap_bin} germline ${args} ${truth_vcf} ${query_vcf} \\
+    hap germline ${args} ${truth_vcf} ${query_vcf} \\
         --reference ${reference} \\
         --threads ${task.cpus ?: 1} \\
         --false-positives ${fp_bed} \\

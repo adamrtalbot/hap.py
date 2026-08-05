@@ -1,29 +1,36 @@
-// verification/modules/report.nf
-//
-// Collects every per-case status.json produced by DIFF_OUTPUTS and
-// renders a single markdown summary at ${outdir}/report.md. Parity
-// gating (failing the run on any FAIL row) is enforced by the nf-test
-// suite under verification/tests/, so this process always succeeds.
-
 process REPORT {
     tag 'aggregate'
-    publishDir "${params.outdir}", mode: 'copy'
+    publishDir params.outdir, mode: 'copy'
 
     input:
-    path status_files, stageAs: 'status???.json'
-    path verifier_bin, stageAs: 'verify-fixtures'
+    path comparison_files, stageAs: 'comparison???.json'
 
     output:
-    path 'report.md', emit: markdown
-    path 'report.csv', emit: csv
+    path 'verification.json', emit: verification
+    path 'report.csv', emit: report
 
     script:
     """
-    ./verify-fixtures aggregate-report \\
-        --image '${params.legacy_image}' \\
-        --hap-bin '${params.hap_bin}' \\
-        --markdown report.md \\
-        --csv report.csv \\
-        status???.json
+    python3 - comparison???.json <<'PY'
+    import csv
+    import json
+    import pathlib
+    import sys
+
+    comparisons = [json.loads(pathlib.Path(name).read_text()) for name in sys.argv[1:]]
+    comparisons.sort(key=lambda item: (item['lane'], item['case_id']))
+    verification = {
+        'schema_version': 1,
+        'ok': all(item['ok'] for item in comparisons),
+        'comparison_count': len(comparisons),
+        'comparisons': comparisons,
+    }
+    pathlib.Path('verification.json').write_text(json.dumps(verification, indent=2, sort_keys=True) + '\\n')
+    with open('report.csv', 'w', newline='') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(['lane', 'case_id', 'ok', 'difference_count'])
+        for item in comparisons:
+            writer.writerow([item['lane'], item['case_id'], item['ok'], len(item['differences'])])
+    PY
     """
 }
