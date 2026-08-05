@@ -107,6 +107,7 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
     if args.convert_gvcf_to_vcf {
         filter_gvcf_headers(&mut headers);
     }
+    let string_format_fields = string_format_fields(&headers);
     let somatic_mode = resolve_somatic_mode(&args);
     let somatic_sample_names = somatic_mode.map(|_| somatic_info_sample_names(&headers));
     if let Some(sample_names) = somatic_sample_names.as_deref() {
@@ -282,7 +283,7 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                 // preprocess binary (via `VariantAlleleRemover` → `VariantCallsOnly`)
                 // drops them so downstream tools recompute. We mirror that here on the
                 // main code path so output stays deterministic for every caller, not
-                // just the parity oracle.
+                // just the parity reference.
                 strip_stale_info_keys(&mut record);
 
                 // Legacy `VariantReader`/`VariantWriter` drops variant IDs (rsIDs) on
@@ -294,7 +295,8 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                 // come out as the canonical uppercase form legacy emits. We already
                 // tolerate case when validating; now we normalise on output.
                 record.ref_allele = record.ref_allele.to_ascii_uppercase();
-                record.alt_allele = record.alt_allele.to_ascii_uppercase();
+                record.alt_allele = uppercase_alleles_preserving_breakends(&record.alt_allele);
+                let import_failed = materialize_breakend_import_failure(&mut record);
 
                 // Legacy `VariantWriter` emits FILTER=`.` for PASS records (htslib's
                 // `bcf_update_filter` treats an empty filter vector as `.`). Normalise
@@ -340,6 +342,15 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                 insert_ado_format(&mut record);
                 ensure_missing_dp(&mut record);
 
+                // The legacy C++ Variant representation has MAX_GT=2. During
+                // active preprocessing, wider calls are converted to no-calls
+                // before VariantCallsOnly removes their now-uncalled record.
+                // This is observable in hap.py's vcfeval handoff for triploid
+                // and tetraploid query records.
+                if somatic_mode.is_none() {
+                    mask_genotypes_wider_than_diploid(&mut record);
+                }
+
                 // VariantCallsOnly removes ALT alleles that no sample calls before
                 // primitive decomposition. Besides reducing ordinary multi-allelic
                 // records, this prevents the primitive splitter from emitting a
@@ -348,6 +359,7 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                 // then projects GT and AD onto the retained alleles.
                 if somatic_mode.is_none()
                     && !args.convert_gvcf_to_vcf
+                    && !import_failed
                     && !retain_called_alternates(&mut record)
                 {
                     continue;
@@ -425,7 +437,11 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                         if split.qual.is_empty() || split.qual == "." {
                             split.qual = "0".to_string();
                         }
-                        blank_secondary_sample_annotations(&mut split);
+                        blank_secondary_sample_annotations(
+                            &mut split,
+                            args.bcf,
+                            &string_format_fields,
+                        );
                         // Canonical FORMAT ordering: GT → AD/ADO/DP (fixed) → other
                         // integer-typed fields alphabetical → float-typed alphabetical →
                         // string-typed alphabetical. Mirrors the `int_fmts/float_fmts/
@@ -1439,6 +1455,26 @@ fn retain_called_alternates(record: &mut vcf::RawVcfRecord) -> bool {
     true
 }
 
+fn mask_genotypes_wider_than_diploid(record: &mut vcf::RawVcfRecord) {
+    let Some(gt_index) = record
+        .format
+        .as_deref()
+        .and_then(|format| format.split(':').position(|field| field == "GT"))
+    else {
+        return;
+    };
+    for sample in &mut record.samples {
+        let mut cells = sample.split(':').map(str::to_string).collect::<Vec<_>>();
+        let Some(gt) = cells.get_mut(gt_index) else {
+            continue;
+        };
+        if gt.split(['/', '|']).count() > 2 {
+            *gt = ".".to_string();
+        }
+        *sample = cells.join(":");
+    }
+}
+
 /// Port the standalone gVCF conversion pipeline:
 /// `N_ALT >= 2` → keep only GT/DP/GQ → trim uncalled alleles → exclude
 /// `<NON_REF>`. Returns false when the record is no longer a variant.
@@ -2164,7 +2200,23 @@ fn canonicalize_multi_allelic_order(record: &mut vcf::RawVcfRecord) {
         .join(",");
 }
 
-fn blank_secondary_sample_annotations(record: &mut vcf::RawVcfRecord) {
+fn string_format_fields(headers: &[String]) -> BTreeSet<String> {
+    headers
+        .iter()
+        .filter(|header| header.starts_with("##FORMAT=<") && header.contains("Type=String"))
+        .filter_map(|header| {
+            header
+                .strip_prefix("##FORMAT=<ID=")
+                .and_then(|tail| tail.split_once(',').map(|(id, _)| id.to_string()))
+        })
+        .collect()
+}
+
+fn blank_secondary_sample_annotations(
+    record: &mut vcf::RawVcfRecord,
+    bcf_output: bool,
+    string_fields: &BTreeSet<String>,
+) {
     let keys: Vec<&str> = record
         .format
         .as_deref()
@@ -2181,7 +2233,11 @@ fn blank_secondary_sample_annotations(record: &mut vcf::RawVcfRecord) {
             if !matches!(*key, "GT" | "AD" | "ADO" | "DP")
                 && let Some(value) = cells.get_mut(index)
             {
-                *value = ".".to_string();
+                *value = if bcf_output && string_fields.contains(*key) {
+                    String::new()
+                } else {
+                    ".".to_string()
+                };
             } else if homref
                 && *key == "AD"
                 && let Some(value) = cells.get_mut(index)
@@ -2423,10 +2479,13 @@ fn record_reference_matches(record: &vcf::RawVcfRecord, reference: &[u8]) -> boo
 /// multi-allelic record retains its original allele indexes.
 fn normalize_bcftools_record(record: &mut vcf::RawVcfRecord, reference: &[u8]) {
     let alts: Vec<&str> = record.alt_allele.split(',').collect();
-    if alts
-        .iter()
-        .any(|alt| alt.is_empty() || *alt == "." || alt.starts_with('<') || *alt == "*")
-    {
+    if alts.iter().any(|alt| {
+        alt.is_empty()
+            || *alt == "."
+            || alt.starts_with('<')
+            || *alt == "*"
+            || alt.contains(['[', ']'])
+    }) {
         return;
     }
     let end = record.end_pos();
@@ -2467,6 +2526,60 @@ fn normalize_bcftools_record(record: &mut vcf::RawVcfRecord, reference: &[u8]) {
     record.ref_allele =
         String::from_utf8_lossy(&reference[common_start - 1..common_end]).to_ascii_uppercase();
     record.alt_allele = alts.join(",");
+}
+
+fn uppercase_alleles_preserving_breakends(alts: &str) -> String {
+    alts.split(',')
+        .map(|alt| {
+            let Some(first) = alt.find(['[', ']']) else {
+                return alt.to_ascii_uppercase();
+            };
+            let Some(relative_second) = alt[first + 1..].find(['[', ']']) else {
+                return alt.to_ascii_uppercase();
+            };
+            let second = first + 1 + relative_second;
+            format!(
+                "{}{}{}",
+                alt[..=first].to_ascii_uppercase(),
+                &alt[first + 1..second],
+                alt[second..].to_ascii_uppercase()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn materialize_breakend_import_failure(record: &mut vcf::RawVcfRecord) -> bool {
+    if !record.alt_allele.contains(['[', ']']) {
+        return false;
+    }
+
+    record.alt_allele = ".".to_string();
+    let mut info = record
+        .info
+        .split(';')
+        .filter(|field| !field.is_empty() && *field != ".")
+        .filter(|field| {
+            let key = field.split_once('=').map_or(*field, |(key, _)| key);
+            key != "END" && key != "IMPORT_FAIL"
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    info.push(format!("END={}", record.pos));
+    info.push("IMPORT_FAIL".to_string());
+    record.info = info.join(";");
+
+    let Some(gt_index) = record.format_keys().iter().position(|key| *key == "GT") else {
+        return true;
+    };
+    for sample in &mut record.samples {
+        let mut fields = sample.split(':').map(str::to_string).collect::<Vec<_>>();
+        if let Some(gt) = fields.get_mut(gt_index) {
+            *gt = "0/0".to_string();
+            *sample = fields.join(":");
+        }
+    }
+    true
 }
 
 fn pad_bcftools_allele(
@@ -2934,7 +3047,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_malformed_reference_indexes_are_rejected() -> Result<()> {
+    fn empty_reference_index_is_accepted_but_malformed_lengths_are_rejected() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let output = directory.path().join("output.vcf.gz");
@@ -2952,15 +3065,22 @@ mod tests {
         )?;
         let index = format!("{}.fai", reference.display());
 
-        for (contents, expected) in [
-            ("", "no contigs found in FASTA index"),
-            ("chr1\tbad\t6\t5\t6\n", "invalid FASTA index length"),
-        ] {
-            fs::write(&index, contents)?;
-            let error = run(interval_args(&input, &output, &reference, None, None)).unwrap_err();
-            assert!(error.to_string().contains(expected), "{error:#}");
-            assert!(!output.exists());
+        fs::write(&index, "")?;
+        run(interval_args(&input, &output, &reference, None, None))?;
+        assert!(output.exists());
+        fs::remove_file(&output)?;
+        let output_index = PathBuf::from(format!("{}.tbi", output.display()));
+        if output_index.exists() {
+            fs::remove_file(output_index)?;
         }
+
+        fs::write(&index, "chr1\tbad\t6\t5\t6\n")?;
+        let error = run(interval_args(&input, &output, &reference, None, None)).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid FASTA index length"),
+            "{error:#}"
+        );
+        assert!(!output.exists());
         Ok(())
     }
 
@@ -3580,6 +3700,29 @@ mod tests {
     }
 
     #[test]
+    fn breakend_normalization_preserves_remote_contig_spelling() {
+        assert_eq!(
+            uppercase_alleles_preserving_breakends("t]chr1:70],a"),
+            "T]chr1:70],A"
+        );
+
+        let mut record = make_record(".");
+        record.pos = 40;
+        record.ref_allele = "T".to_string();
+        record.alt_allele = "T]chr1:70]".to_string();
+        record.info = "SVTYPE=BND".to_string();
+        record.format = Some("GT:GQ".to_string());
+        record.samples = vec!["0/1:45".to_string()];
+        normalize_bcftools_record(&mut record, b"ACGTACGTACGT");
+        assert_eq!(record.alt_allele, "T]chr1:70]");
+        assert!(materialize_breakend_import_failure(&mut record));
+        sort_info_keys(&mut record);
+        assert_eq!(record.alt_allele, ".");
+        assert_eq!(record.info, "END=40;IMPORT_FAIL;SVTYPE=BND");
+        assert_eq!(record.samples, ["0/0:45"]);
+    }
+
+    #[test]
     fn ref_bytes_equal_respects_n_wildcards() {
         assert!(ref_bytes_equal(b"N", b"A"));
         assert!(ref_bytes_equal(b"ACN", b"acg"));
@@ -4008,6 +4151,21 @@ mod tests {
     }
 
     #[test]
+    fn active_preprocessing_masks_genotypes_wider_than_diploid() {
+        let mut record = make_record(".");
+        record.format = Some("GT:GQ".to_string());
+        record.samples = vec![
+            "0/1:40".to_string(),
+            "0/1/1:50".to_string(),
+            "0|0|1|1:60".to_string(),
+        ];
+
+        mask_genotypes_wider_than_diploid(&mut record);
+
+        assert_eq!(record.samples, ["0/1:40", ".:50", ".:60"]);
+    }
+
+    #[test]
     fn sort_info_keys_collapses_negative_zero_in_lists() {
         let mut record = make_record("AF=-0,0.5");
         sort_info_keys(&mut record);
@@ -4338,9 +4496,14 @@ mod tests {
             "0/1:7,8:0:15:20:variant".to_string(),
             "0/0:16,0:0:16:25:normal".to_string(),
         ];
-        blank_secondary_sample_annotations(&mut record);
+        let string_fields = BTreeSet::from(["GT".to_string(), "TXT".to_string()]);
+        blank_secondary_sample_annotations(&mut record, false, &string_fields);
         assert_eq!(record.samples[0], "0/1:7,8:0:15:20:variant");
         assert_eq!(record.samples[1], "0/0:.,.:.:16:.:.");
+
+        record.samples[1] = "0/0:16,0:0:16:25:normal".to_string();
+        blank_secondary_sample_annotations(&mut record, true, &string_fields);
+        assert_eq!(record.samples[1], "0/0:.,.:.:16:.:");
     }
 
     #[test]

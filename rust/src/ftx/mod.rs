@@ -148,12 +148,39 @@ pub(crate) fn emit_feature_table_with_depths(
     label: &str,
     depths: Option<&BTreeMap<String, f64>>,
 ) -> Result<Vec<String>> {
+    emit_feature_table_internal(feature, records, headers, label, depths, false)
+}
+
+pub(crate) fn emit_feature_table_for_somatic(
+    feature: &str,
+    records: &[vcf::RawVcfRecord],
+    headers: &[String],
+    label: &str,
+    depths: Option<&BTreeMap<String, f64>>,
+) -> Result<Vec<String>> {
+    emit_feature_table_internal(feature, records, headers, label, depths, true)
+}
+
+fn emit_feature_table_internal(
+    feature: &str,
+    records: &[vcf::RawVcfRecord],
+    headers: &[String],
+    label: &str,
+    depths: Option<&BTreeMap<String, f64>>,
+    somatic_precision: bool,
+) -> Result<Vec<String>> {
     let lines = match feature {
         "generic" => generic::emit(records, label),
         "admix.strelka.snv" if matches!(label, "TP" | "FN") => {
             generic::emit_fields(records, label, ADMIX_STRELKA_TRUTH_FIELDS)
         }
-        "admix.strelka.snv" => strelka_snv::emit_with_depths(records, headers, label, depths),
+        "admix.strelka.snv" => strelka_snv::emit_with_depths_precision(
+            records,
+            headers,
+            label,
+            depths,
+            somatic_precision,
+        ),
         "admix.strelka.indel" if matches!(label, "TP" | "FN") => {
             generic::emit_fields(records, label, ADMIX_STRELKA_TRUTH_FIELDS)
         }
@@ -161,7 +188,13 @@ pub(crate) fn emit_feature_table_with_depths(
         "hcc.strelka.snv" if matches!(label, "TP" | "FN") => {
             generic::emit_fields(records, label, HCC_STRELKA_SNV_TRUTH_FIELDS)
         }
-        "hcc.strelka.snv" => strelka_snv::emit_with_depths(records, headers, label, depths),
+        "hcc.strelka.snv" => strelka_snv::emit_with_depths_precision(
+            records,
+            headers,
+            label,
+            depths,
+            somatic_precision,
+        ),
         "hcc.strelka.indel" if matches!(label, "TP" | "FN") => {
             generic::emit_fields(records, label, HCC_STRELKA_INDEL_TRUTH_FIELDS)
         }
@@ -284,9 +317,6 @@ fn prepare_records(
     let mut output = Vec::with_capacity(records.len());
     let mut seen = HashSet::new();
     for mut record in records {
-        if calls_final_non_ref_allele(&record) {
-            continue;
-        }
         if args.fixchr {
             record.chrom = legacy_fix_chrom(&record.chrom);
         }
@@ -336,26 +366,6 @@ fn prepare_records(
     }
 
     Ok((headers, output))
-}
-
-/// Legacy `ftx.py` leaves `preprocessVCF`'s `filter_nonref` default enabled.
-/// Its streaming filter treats only the final ALT as `<NON_REF>` and assumes
-/// the first sample cell is GT, dropping the whole record when any sample calls
-/// that allele index.
-fn calls_final_non_ref_allele(record: &vcf::RawVcfRecord) -> bool {
-    let alts: Vec<&str> = record.alt_allele.split(',').collect();
-    if alts.last() != Some(&"<NON_REF>") {
-        return false;
-    }
-    let non_ref_index = alts.len();
-    record.samples.iter().any(|sample| {
-        sample
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .split(['/', '|'])
-            .any(|token| token.parse::<usize>().ok() == Some(non_ref_index))
-    })
 }
 
 /// Legacy's two Perl substitutions prefix a leading numeric/X/Y/M contig,
@@ -561,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn called_final_non_ref_alleles_are_filtered_like_legacy_ftx() {
+    fn called_final_non_ref_alleles_are_retained_like_legacy_ftx() {
         let (_scratch, input, reference) = fixture(
             concat!(
                 "##fileformat=VCFv4.2\n",
@@ -583,7 +593,7 @@ mod tests {
                 .iter()
                 .map(|record| record.id.as_str())
                 .collect::<Vec<_>>(),
-            ["uncalled", "not-final"]
+            ["called", "uncalled", "not-final"]
         );
     }
 

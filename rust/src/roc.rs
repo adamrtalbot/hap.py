@@ -16,8 +16,8 @@
 
 use crate::compare::{AnnotatedRow, suffixed_report_path};
 use crate::report::{
-    CountsBucket, EXTENDED_HEADER, append_stats, f1_score, format_count, het_hom_ratio,
-    metric_ratio, python_repr_float, ti_tv_ratio,
+    CountsBucket, EXTENDED_HEADER, append_stats_with_missing, empty_comparison_extended_lines,
+    f1_score, format_count, het_hom_ratio, metric_ratio, python_repr_float, ti_tv_ratio,
 };
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
@@ -114,6 +114,24 @@ pub fn write_roc_files_with_options(
         bail!("ROC CI alpha must be 0 (disabled) or strictly between 0 and 1");
     }
     let groups = accumulate_with_options(rows, options);
+
+    if !groups.values().any(|group| !group.obs.is_empty()) {
+        let all = empty_comparison_extended_lines(subset_size);
+        write_gzip_csv(
+            &suffixed_report_path(prefix, "roc.all.csv.gz"),
+            &roc_header(options.ci_alpha),
+            &all,
+        )?;
+        let indices = vec![1, 0];
+        return Ok(MetricIndices {
+            tables: BTreeMap::from([
+                ("summary.metrics".to_string(), indices.clone()),
+                ("all.metrics".to_string(), indices.clone()),
+                ("roc.all".to_string(), indices),
+            ]),
+            table_order: vec!["roc.all".to_string()],
+        });
+    }
 
     if options.preserve_raw_table {
         write_legacy_roc_table(prefix, &groups, subset_size, conf_size, options)?;
@@ -461,7 +479,7 @@ fn build_metric_indices(
 
 /// Reproduce the iteration order of the pinned Python 2.7 dictionary used by
 /// `qfy.py` to append `res` tables to metrics JSON. The dictionary keys and
-/// hashes are fixed by the oracle (`hash_randomization=0`); insertion order is
+/// hashes are fixed by the reference (`hash_randomization=0`); insertion order is
 /// determined by the first matching row in the C++ unordered ROC table.
 fn legacy_python_table_order(raw: &[String], available_tables: &BTreeSet<&str>) -> Vec<String> {
     let mut insertions = Vec::new();
@@ -2109,7 +2127,7 @@ impl<'a> Sample<'a> {
     }
 
     fn variant_type(&self) -> Option<&'a str> {
-        self.bvt.filter(|value| *value != "NOCALL")
+        self.bvt.filter(|value| matches!(*value, "SNP" | "INDEL"))
     }
 
     /// Per-side ROC threshold value: legacy hap.py uses each sample's
@@ -2678,6 +2696,7 @@ fn render_row(
     // TOTAL / FN blocks emit `0` for the count and `.` for substats.
     let is_filter_tier = counts_only;
     let supports_titv = key.ty == "SNP";
+    let missing_titv = if conf_size > 0 { "." } else { "" };
     let mut row = Vec::with_capacity(EXTENDED_HEADER.len());
 
     row.push(key.ty.clone());
@@ -2753,14 +2772,28 @@ fn render_row(
     // from whichever pair is present — if either side is missing, the
     // ratio is blank (legacy's NaN/NaN → NaN rendering via pandas).
     let emit_block = |row: &mut Vec<String>, bucket: &CountsBucket| match &emitted.substats {
-        None if is_filter_tier || emitted.qq_str == "*" => append_stats(row, bucket, supports_titv),
-        None => append_roc_stats(row, bucket, supports_titv),
+        None if is_filter_tier || emitted.qq_str == "*" => {
+            append_stats_with_missing(row, bucket, supports_titv, missing_titv)
+        }
+        None => append_roc_stats(row, bucket, supports_titv, missing_titv),
         Some(avail) => {
             row.push(bucket.total.to_string());
-            emit_substat_cell(row, bucket.ti, supports_titv && avail.ti, supports_titv);
-            emit_substat_cell(row, bucket.tv, supports_titv && avail.tv, supports_titv);
-            emit_substat_cell(row, bucket.het, avail.het, true);
-            emit_substat_cell(row, bucket.homalt, avail.homalt, true);
+            emit_substat_cell(
+                row,
+                bucket.ti,
+                supports_titv && avail.ti,
+                supports_titv,
+                missing_titv,
+            );
+            emit_substat_cell(
+                row,
+                bucket.tv,
+                supports_titv && avail.tv,
+                supports_titv,
+                missing_titv,
+            );
+            emit_substat_cell(row, bucket.het, avail.het, true, missing_titv);
+            emit_substat_cell(row, bucket.homalt, avail.homalt, true, missing_titv);
             if supports_titv && avail.ti && avail.tv {
                 row.push(ti_tv_ratio(bucket.ti, bucket.tv));
             } else {
@@ -2844,7 +2877,7 @@ fn format_ci(value: f64) -> String {
 }
 
 /// Modified Jeffreys interval used by legacy Tools/ci.py.
-fn jeffreys_interval(x: usize, n: usize, alpha: f64) -> (f64, f64) {
+pub(crate) fn jeffreys_interval(x: usize, n: usize, alpha: f64) -> (f64, f64) {
     if n == 0 {
         return (0.0, 1.0);
     }
@@ -2865,9 +2898,15 @@ fn jeffreys_interval(x: usize, n: usize, alpha: f64) -> (f64, f64) {
     (lower.max(0.0), upper.min(1.0))
 }
 
-fn emit_substat_cell(row: &mut Vec<String>, value: usize, kept: bool, supported: bool) {
+fn emit_substat_cell(
+    row: &mut Vec<String>,
+    value: usize,
+    kept: bool,
+    supported: bool,
+    missing: &str,
+) {
     if !supported {
-        row.push(".".to_string());
+        row.push(missing.to_string());
     } else if kept {
         row.push(format_count(value));
     } else {
@@ -2875,14 +2914,19 @@ fn emit_substat_cell(row: &mut Vec<String>, value: usize, kept: bool, supported:
     }
 }
 
-fn append_roc_stats(row: &mut Vec<String>, bucket: &CountsBucket, supports_titv: bool) {
+fn append_roc_stats(
+    row: &mut Vec<String>,
+    bucket: &CountsBucket,
+    supports_titv: bool,
+    missing_titv: &str,
+) {
     row.push(bucket.total.to_string());
     if supports_titv {
         row.push(format_count(bucket.ti));
         row.push(format_count(bucket.tv));
     } else {
-        row.push(".".to_string());
-        row.push(".".to_string());
+        row.push(missing_titv.to_string());
+        row.push(missing_titv.to_string());
     }
     row.push(format_count(bucket.het));
     row.push(format_count(bucket.homalt));
@@ -3282,7 +3326,7 @@ mod tests {
         assert_eq!(cells[12], "0");
         // Subset.Size = raw subset_size integer at Subset="*".
         assert_eq!(cells[13], "100");
-        // INDEL ti/tv cells are unsupported and use the legacy `.` marker.
+        // Confidence regions make unsupported INDEL ti/tv cells use `.`.
         assert_eq!(cells[17], ".");
         assert_eq!(cells[18], ".");
         // TiTv_ratio: empty for INDEL.
@@ -3291,6 +3335,21 @@ mod tests {
         // Het/hom ratio: both zero → empty.
         let het_hom = het_hom_ratio(0, 0);
         assert_eq!(het_hom, "");
+
+        let without_confidence = render_row(
+            &key,
+            &emitted,
+            100,
+            140,
+            0,
+            &subset_sizes,
+            &subset_confidence_sizes,
+            false,
+            0.0,
+        );
+        let cells = without_confidence.split(',').collect::<Vec<_>>();
+        assert_eq!(cells[17], "");
+        assert_eq!(cells[18], "");
     }
 
     #[test]
@@ -3837,11 +3896,8 @@ mod tests {
 
     #[test]
     fn confidence_interval_csv_uses_python_scientific_notation() {
-        assert_eq!(format_ci(5.280_579_842_943_484e-5), "5.280579842943484e-05");
-        assert_eq!(
-            format_ci(0.000_814_921_550_822_522_7),
-            "0.0008149215508225227"
-        );
+        assert_eq!(format_ci(5.280_579_842_943_484e-5), "5.28057984294e-05");
+        assert_eq!(format_ci(0.000_814_921_550_822_522_7), "0.000814921550823");
     }
 
     #[test]
@@ -3888,10 +3944,10 @@ mod tests {
         assert_eq!(
             &cells[cells.len() - 6..],
             [
-                "0.15811388300841897",
+                "0.158113883008",
                 "1.0",
                 "0.0",
-                "0.7162483204365873",
+                "0.716248320437",
                 "0.0",
                 "1.0",
             ]

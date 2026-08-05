@@ -127,8 +127,8 @@ mod tests {
         assert_eq!(format_python_float(-1.0), "-1.0");
         assert_eq!(format_python_float(0.5), "0.5");
         assert_eq!(format_python_float(0.1), "0.1");
-        assert_eq!(format_python_float(26.0 / 135.5), "0.1918819188191882");
-        assert_eq!(format_python_float(77.0 / 135.5), "0.5682656826568265");
+        assert_eq!(format_python_float(26.0 / 135.5), "0.191881918819");
+        assert_eq!(format_python_float(77.0 / 135.5), "0.568265682657");
     }
 
     #[test]

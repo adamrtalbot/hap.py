@@ -2,8 +2,11 @@ use crate::vcf::RawVcfRecord;
 use anyhow::{Context, Result, bail};
 use noodles_bgzf as bgzf;
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+use std::fs::File;
+#[cfg(test)]
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -64,6 +67,7 @@ pub(crate) fn decode(data: &[u8], path: &Path) -> Result<(Vec<String>, Vec<RawVc
 /// that the published index can actually seek into and decode the data file;
 /// merely parsing the index structure would not detect omitted records or
 /// invalid chunk boundaries.
+#[cfg(test)]
 pub(crate) fn read_indexed_records(
     path: &Path,
     index_path: &Path,
@@ -118,6 +122,7 @@ pub(crate) fn read_indexed_records(
     Ok(indexed)
 }
 
+#[cfg(test)]
 fn decode_header_dictionary(data: &[u8], path: &Path) -> Result<HeaderDictionary> {
     if !is_bcf_data(data) {
         bail!("{} is not BCF2", path.display());
@@ -132,6 +137,7 @@ fn decode_header_dictionary(data: &[u8], path: &Path) -> Result<HeaderDictionary
     parse_bcf_header(header_text)
 }
 
+#[cfg(test)]
 fn read_csi_chunks(path: &Path) -> Result<Vec<Vec<(u64, u64)>>> {
     Ok(read_csi_bins(path)?
         .references
@@ -144,17 +150,17 @@ fn read_csi_chunks(path: &Path) -> Result<Vec<Vec<(u64, u64)>>> {
         .collect())
 }
 
+#[cfg(test)]
 struct CsiIndex {
-    min_shift: usize,
-    depth: usize,
     references: Vec<Vec<CsiBin>>,
 }
 
+#[cfg(test)]
 struct CsiBin {
-    id: u64,
     chunks: Vec<(u64, u64)>,
 }
 
+#[cfg(test)]
 fn read_csi_bins(path: &Path) -> Result<CsiIndex> {
     let payload = read_uncompressed(path)
         .with_context(|| format!("failed to read CSI index {}", path.display()))?;
@@ -201,7 +207,7 @@ fn read_csi_bins(path: &Path) -> Result<CsiIndex> {
                 }
             }
             if bin != metadata_bin {
-                bins.push(CsiBin { id: bin, chunks });
+                bins.push(CsiBin { chunks });
             }
         }
         references.push(bins);
@@ -213,110 +219,15 @@ fn read_csi_bins(path: &Path) -> Result<CsiIndex> {
         }
         trailing => bail!("CSI index has {trailing} trailing bytes"),
     }
-    Ok(CsiIndex {
-        min_shift,
-        depth,
-        references,
-    })
+    Ok(CsiIndex { references })
 }
 
-/// Prove that a point query through a CSI index can retrieve a specific BCF
-/// record. Reading all chunks is insufficient because a structurally valid
-/// chunk attached to the wrong bin remains reachable by a whole-contig scan.
-pub(crate) fn csi_record_is_queryable(
-    path: &Path,
-    index_path: &Path,
-    target: &RawVcfRecord,
-) -> Result<bool> {
-    let uncompressed = read_uncompressed(path)
-        .with_context(|| format!("failed to read indexed BCF {}", path.display()))?;
-    let dictionary = decode_header_dictionary(&uncompressed, path)?;
-    let rid = dictionary
-        .contigs
-        .iter()
-        .position(|contig| contig == &target.chrom)
-        .with_context(|| {
-            format!(
-                "BCF record contig {} is absent from its header",
-                target.chrom
-            )
-        })?;
-    let index = read_csi_bins(index_path)?;
-    let reference = index
-        .references
-        .get(rid)
-        .context("CSI reference is absent from BCF index")?;
-    let start = target.pos.saturating_sub(1) as u64;
-    let query_bins = csi_query_bins(start, start.saturating_add(1), index.min_shift, index.depth)?;
-    let chunks = reference
-        .iter()
-        .filter(|bin| query_bins.contains(&bin.id))
-        .flat_map(|bin| bin.chunks.iter().copied())
-        .collect::<Vec<_>>();
-    let expected = target.to_line();
-    let mut reader = bgzf::io::Reader::new(File::open(path)?);
-    for (chunk_start, chunk_end) in merge_chunks(chunks) {
-        if chunk_start == chunk_end {
-            continue;
-        }
-        reader
-            .seek(bgzf::VirtualPosition::from(chunk_start))
-            .with_context(|| {
-                format!("failed to seek CSI point-query chunk for {}", target.chrom)
-            })?;
-        while u64::from(reader.virtual_position()) < chunk_end {
-            let before = u64::from(reader.virtual_position());
-            let record = read_record(&mut reader, &dictionary, path)?;
-            if record.to_line() == expected {
-                return Ok(true);
-            }
-            if u64::from(reader.virtual_position()) <= before {
-                bail!("BCF reader made no progress in CSI point-query chunk");
-            }
-        }
-    }
-    Ok(false)
-}
-
-fn csi_query_bins(start: u64, end: u64, min_shift: usize, depth: usize) -> Result<Vec<u64>> {
-    if end <= start {
-        bail!("CSI query interval is empty");
-    }
-    let end = end - 1;
-    let mut bins = Vec::new();
-    let mut level_offset = 0u64;
-    for level in 0..=depth {
-        let shift = min_shift
-            .checked_add(
-                (depth - level)
-                    .checked_mul(3)
-                    .context("CSI depth overflow")?,
-            )
-            .context("CSI query shift overflow")?;
-        if shift >= u64::BITS as usize {
-            bail!("CSI query shift is out of range");
-        }
-        let first = level_offset
-            .checked_add(start >> shift)
-            .context("CSI query bin overflow")?;
-        let last = level_offset
-            .checked_add(end >> shift)
-            .context("CSI query bin overflow")?;
-        bins.extend(first..=last);
-        level_offset = level_offset
-            .checked_add(
-                1u64.checked_shl((level * 3) as u32)
-                    .context("CSI level offset overflow")?,
-            )
-            .context("CSI level offset overflow")?;
-    }
-    Ok(bins)
-}
-
+#[cfg(test)]
 fn nonnegative_i32(cursor: &mut Cursor<'_>, field: &str) -> Result<usize> {
     usize::try_from(cursor.i32()?).with_context(|| format!("CSI {field} is negative"))
 }
 
+#[cfg(test)]
 fn merge_chunks(mut chunks: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     chunks.sort_unstable_by_key(|chunk| chunk.0);
     let mut merged: Vec<(u64, u64)> = Vec::new();
@@ -332,6 +243,7 @@ fn merge_chunks(mut chunks: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     merged
 }
 
+#[cfg(test)]
 fn read_record<R: Read>(
     reader: &mut R,
     dictionary: &HeaderDictionary,
@@ -598,14 +510,9 @@ fn decode_format_cell(
 ) -> Result<String> {
     if atomic_type == 7 {
         let bytes = cursor.take(width)?;
-        let text = String::from_utf8_lossy(bytes)
+        return Ok(String::from_utf8_lossy(bytes)
             .trim_end_matches('\0')
-            .to_string();
-        return Ok(if text.is_empty() {
-            ".".to_string()
-        } else {
-            text
-        });
+            .to_string());
     }
     if atomic_type == 5 {
         let mut values = Vec::new();
@@ -721,6 +628,7 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    #[cfg(test)]
     fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -797,6 +705,7 @@ pub(crate) fn write(path: &Path, headers: &[String], records: &[RawVcfRecord]) -
         writer.write_all(&encoded_header.text)?;
 
         let mut chunks = vec![None::<(u64, u64)>; encoded_header.dictionary.contigs.len()];
+        let mut record_counts = vec![0_u64; encoded_header.dictionary.contigs.len()];
         for record in records {
             let rid = encoded_header
                 .contig_indexes
@@ -811,9 +720,10 @@ pub(crate) fn write(path: &Path, headers: &[String], records: &[RawVcfRecord]) -
             writer.write_all(&individual)?;
             let end = u64::from(writer.virtual_position());
             chunks[rid as usize].get_or_insert((start, end)).1 = end;
+            record_counts[rid as usize] += 1;
         }
         writer.finish()?.sync_all()?;
-        write_csi(&temp_csi, &chunks)?;
+        write_csi(&temp_csi, &chunks, &record_counts)?;
         replace_pair(&temp_bcf, path, &temp_csi, &csi_path)
     })();
     if result.is_err() {
@@ -1137,37 +1047,52 @@ fn encode_float_cells(output: &mut Vec<u8>, cells: &[&str]) -> Result<()> {
 fn encode_string_cells(output: &mut Vec<u8>, cells: &[&str]) {
     let width = cells
         .iter()
-        .map(|cell| if *cell == "." { 0 } else { cell.len() })
+        .map(|cell| cell.len())
         .max()
         .unwrap_or(1)
         .max(1);
     encode_type(output, width, 7);
     for cell in cells {
-        if *cell != "." {
-            output.extend_from_slice(cell.as_bytes());
-        }
-        output.resize(
-            output.len() + width.saturating_sub(if *cell == "." { 0 } else { cell.len() }),
-            0,
-        );
+        output.extend_from_slice(cell.as_bytes());
+        output.resize(output.len() + width.saturating_sub(cell.len()), 0);
     }
 }
 
-pub(crate) fn write_csi(path: &Path, chunks: &[Option<(u64, u64)>]) -> Result<()> {
+pub(crate) fn write_csi(
+    path: &Path,
+    chunks: &[Option<(u64, u64)>],
+    record_counts: &[u64],
+) -> Result<()> {
+    if chunks.len() != record_counts.len() {
+        bail!("CSI chunks and record counts have different reference counts");
+    }
     let mut payload = Vec::new();
     payload.extend_from_slice(b"CSI\x01");
     payload.extend_from_slice(&14i32.to_le_bytes());
     payload.extend_from_slice(&5i32.to_le_bytes());
     payload.extend_from_slice(&0i32.to_le_bytes());
     payload.extend_from_slice(&(chunks.len() as i32).to_le_bytes());
-    for chunk in chunks {
-        payload.extend_from_slice(&(i32::from(chunk.is_some())).to_le_bytes());
+    const METADATA_BIN: u32 = 37_450;
+    for (chunk, record_count) in chunks.iter().zip(record_counts) {
+        payload.extend_from_slice(&(if chunk.is_some() { 2_i32 } else { 0_i32 }).to_le_bytes());
         if let Some((start, end)) = chunk {
             payload.extend_from_slice(&0u32.to_le_bytes());
             payload.extend_from_slice(&start.to_le_bytes());
             payload.extend_from_slice(&1i32.to_le_bytes());
             payload.extend_from_slice(&start.to_le_bytes());
             payload.extend_from_slice(&end.to_le_bytes());
+
+            // CSI inherits the BAI metadata pseudo-bin. Its first chunk is
+            // the reference's virtual-offset range; its second stores mapped
+            // and unmapped record counts. `bcftools index --stats` requires
+            // this metadata even when ordinary region queries already work.
+            payload.extend_from_slice(&METADATA_BIN.to_le_bytes());
+            payload.extend_from_slice(&0u64.to_le_bytes());
+            payload.extend_from_slice(&2i32.to_le_bytes());
+            payload.extend_from_slice(&start.to_le_bytes());
+            payload.extend_from_slice(&end.to_le_bytes());
+            payload.extend_from_slice(&record_count.to_le_bytes());
+            payload.extend_from_slice(&0u64.to_le_bytes());
         }
     }
     payload.extend_from_slice(&0u64.to_le_bytes());
@@ -1197,6 +1122,7 @@ fn replace_pair(temp_data: &Path, data: &Path, temp_index: &Path, index: &Path) 
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn read_uncompressed(path: &Path) -> Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     if bytes.starts_with(&[0x1f, 0x8b]) {
@@ -1235,6 +1161,7 @@ mod tests {
             "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">".to_string(),
             "##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"AD\">".to_string(),
             "##FORMAT=<ID=GQ,Number=1,Type=Float,Description=\"GQ\">".to_string(),
+            "##FORMAT=<ID=ST,Number=1,Type=String,Description=\"String\">".to_string(),
             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tA\tB".to_string(),
         ];
         let records = vec![RawVcfRecord {
@@ -1246,8 +1173,11 @@ mod tests {
             qual: "42.5".to_string(),
             filter: "PASS".to_string(),
             info: "TAG=value".to_string(),
-            format: Some("GT:AD:GQ".to_string()),
-            samples: vec!["1/2:3,4,5:20.5".to_string(), "0/1:8,9,0:.".to_string()],
+            format: Some("GT:AD:GQ:ST".to_string()),
+            samples: vec![
+                "1/2:3,4,5:20.5:.".to_string(),
+                "0/1:8,9,0:.:value".to_string(),
+            ],
         }];
         write(&output, &headers, &records)?;
         let data = read_uncompressed(&output)?;

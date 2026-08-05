@@ -1528,8 +1528,8 @@ mod tests {
                 vec!["hap", "prepy", "--window-size", "12"],
             ),
             (
-                vec!["hap", "ftxpy", "--feature-l", "oracle"],
-                vec!["hap", "ftxpy", "--feature-label", "oracle"],
+                vec!["hap", "ftxpy", "--feature-l", "reference"],
+                vec!["hap", "ftxpy", "--feature-label", "reference"],
             ),
             (
                 vec!["hap", "qfy", "--report-p", "result"],

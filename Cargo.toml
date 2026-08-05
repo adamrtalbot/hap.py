@@ -17,14 +17,8 @@ include = [
     "/README.md",
     "/THIRD_PARTY_LICENSES/**",
     "/rust/src/**",
-    "/rust/FLAG_PARITY.md",
-    "/rust/PHASE1_BASELINE.md",
     "/tests/**",
 ]
-
-[features]
-default = []
-verification = []
 
 [lib]
 path = "rust/src/lib.rs"
@@ -32,16 +26,6 @@ path = "rust/src/lib.rs"
 [[bin]]
 name = "hap"
 path = "rust/src/main.rs"
-
-[[bin]]
-name = "verify-fixtures"
-path = "rust/src/verify_fixtures.rs"
-required-features = ["verification"]
-
-[[test]]
-name = "compare_fixtures"
-path = "tests/compare_fixtures.rs"
-required-features = ["verification"]
 
 [dependencies]
 anyhow = "1.0.100"

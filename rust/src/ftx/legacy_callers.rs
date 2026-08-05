@@ -700,13 +700,13 @@ mod tests {
                 &["0/0:12:11,1:7,1", "0/1:24:6,18:2,8"],
             )],
             &trailing_headers,
-            "oracle",
+            "reference",
             None,
         )
         .unwrap();
         assert!(
             lines[1].contains(
-                ",24.0,24.0,0,0,-1,-1,\"[6, 18]\",\"[6, 18]\",\"[2, 8]\",\"[2, 8]\",0.75,0.75,oracle"
+                ",24.0,24.0,0,0,-1,-1,\"[6, 18]\",\"[6, 18]\",\"[2, 8]\",\"[2, 8]\",0.75,0.75,reference"
             ),
             "both legacy prefixes resolve to the second sample: {}",
             lines[1]

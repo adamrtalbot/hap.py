@@ -12,9 +12,7 @@ use std::collections::BTreeMap;
 use crate::strelka;
 use crate::vcf::RawVcfRecord;
 
-use super::common::{
-    ScoringFeatures, csv_escape, format_info_float, format_python_float, parse_scoring_features,
-};
+use super::common::{ScoringFeatures, csv_escape, format_info_float, parse_scoring_features};
 
 /// Fixed column order, excluding the leading pandas index cell and the
 /// dynamic `E.<scoring-feature>` tail. The `SomaticEVS` column is kept
@@ -50,15 +48,27 @@ const FIXED_COLUMNS: &[&str] = &[
     "tag",
 ];
 
+#[cfg(test)]
 pub(super) fn emit_with_depths(
     records: &[RawVcfRecord],
     headers: &[String],
     label: &str,
     depth_override: Option<&BTreeMap<String, f64>>,
 ) -> Vec<String> {
+    emit_with_depths_precision(records, headers, label, depth_override, false)
+}
+
+pub(super) fn emit_with_depths_precision(
+    records: &[RawVcfRecord],
+    headers: &[String],
+    label: &str,
+    depth_override: Option<&BTreeMap<String, f64>>,
+    full_precision: bool,
+) -> Vec<String> {
     let scoring_features = parse_scoring_features(headers, "snv_scoring_features");
     let header_depths = strelka::parse_depths(headers);
     let avg_depth = depth_override.unwrap_or(&header_depths);
+    let float_columns = FloatColumns::from_records(records, avg_depth);
 
     let mut header_line = String::from(",");
     header_line.push_str(&FIXED_COLUMNS.join(","));
@@ -73,6 +83,8 @@ pub(super) fn emit_with_depths(
             record,
             avg_depth,
             &scoring_features,
+            &float_columns,
+            full_precision,
             index,
             label,
         ));
@@ -84,6 +96,8 @@ fn render_row(
     record: &RawVcfRecord,
     avg_depth: &BTreeMap<String, f64>,
     scoring_features: &ScoringFeatures,
+    float_columns: &FloatColumns,
+    full_precision: bool,
     index: usize,
     label: &str,
 ) -> String {
@@ -169,20 +183,60 @@ fn render_row(
     cells.push(qss_nt.to_string());
     cells.push(filter_cell);
     cells.push(String::new()); // SomaticEVS: qrec never writes it
-    cells.push(format_info_float(evs));
-    cells.push(format_info_float(vqsr));
-    cells.push(format_python_float(n_fdp_rate));
-    cells.push(format_python_float(t_fdp_rate));
-    cells.push(format_python_float(n_sdp_rate));
-    cells.push(format_python_float(t_sdp_rate));
-    cells.push(format_python_float(n_dp));
-    cells.push(format_python_float(t_dp));
-    cells.push(format_python_float(n_dp_rate));
-    cells.push(format_python_float(t_dp_rate));
-    cells.push(format_python_float(n_af));
-    cells.push(format_python_float(t_af));
-    cells.push(mq_cell);
-    cells.push(mq0_cell);
+    cells.push(format_staged_float(evs, full_precision));
+    cells.push(format_staged_float(vqsr, full_precision));
+    cells.push(format_inferred_rate(
+        n_fdp_rate,
+        float_columns.n_fdp,
+        full_precision,
+    ));
+    cells.push(format_inferred_rate(
+        t_fdp_rate,
+        float_columns.t_fdp,
+        full_precision,
+    ));
+    cells.push(format_inferred_rate(
+        n_sdp_rate,
+        float_columns.n_sdp,
+        full_precision,
+    ));
+    cells.push(format_inferred_rate(
+        t_sdp_rate,
+        float_columns.t_sdp,
+        full_precision,
+    ));
+    cells.push(format_staged_float(n_dp, full_precision));
+    cells.push(format_staged_float(t_dp, full_precision));
+    cells.push(format_inferred_rate(
+        n_dp_rate,
+        float_columns.dp_rate,
+        full_precision,
+    ));
+    cells.push(format_inferred_rate(
+        t_dp_rate,
+        float_columns.dp_rate,
+        full_precision,
+    ));
+    cells.push(format_inferred_rate(
+        n_af,
+        float_columns.n_af,
+        full_precision,
+    ));
+    cells.push(format_inferred_rate(
+        t_af,
+        float_columns.t_af,
+        full_precision,
+    ));
+    cells.push(if full_precision {
+        info_float_or_zero_precision(info, "MQ", true)
+    } else {
+        mq_cell
+    });
+    cells.push(if full_precision {
+        info_float_or_zero_precision(info, "MQ0", true)
+    } else {
+        mq0_cell
+    });
     cells.push(snvsb_cell);
     cells.push(rprs_cell);
     cells.push(csv_escape(label));
@@ -196,8 +250,69 @@ fn render_row(
     cells.join(",")
 }
 
+#[derive(Default)]
+struct FloatColumns {
+    n_fdp: bool,
+    t_fdp: bool,
+    n_sdp: bool,
+    t_sdp: bool,
+    dp_rate: bool,
+    n_af: bool,
+    t_af: bool,
+}
+
+impl FloatColumns {
+    fn from_records(records: &[RawVcfRecord], avg_depth: &BTreeMap<String, f64>) -> Self {
+        let mut columns = Self::default();
+        for record in records {
+            let normal = record.sample_map(0);
+            let tumor = record.sample_map(1);
+            let n_dp = strelka::parse_first_number(normal.get("DP")).unwrap_or(0.0);
+            let t_dp = strelka::parse_first_number(tumor.get("DP")).unwrap_or(0.0);
+            let n_sdp = strelka::parse_first_number(normal.get("SDP")).unwrap_or(0.0);
+            let t_sdp = strelka::parse_first_number(tumor.get("SDP")).unwrap_or(0.0);
+            columns.n_fdp |= n_dp != 0.0;
+            columns.t_fdp |= t_dp != 0.0;
+            columns.n_sdp |= n_dp + n_sdp != 0.0;
+            columns.t_sdp |= t_dp + t_sdp != 0.0;
+            columns.dp_rate |= avg_depth
+                .get(&record.chrom)
+                .is_some_and(|depth| *depth != 0.0);
+
+            let (n_ref, n_alt) = tier1_ref_alt(&normal, &record.ref_allele, &record.alt_allele);
+            let (t_ref, t_alt) = tier1_ref_alt(&tumor, &record.ref_allele, &record.alt_allele);
+            columns.n_af |= n_ref + n_alt != 0.0;
+            columns.t_af |= t_ref + t_alt != 0.0;
+        }
+        columns
+    }
+}
+
+fn format_inferred_rate(value: f64, float_column: bool, full_precision: bool) -> String {
+    if float_column {
+        format_staged_float(value, full_precision)
+    } else {
+        "0".to_string()
+    }
+}
+
+fn format_staged_float(value: f64, full_precision: bool) -> String {
+    if full_precision {
+        (if value == 0.0 { 0.0 } else { value }).to_string()
+    } else {
+        format_info_float(value)
+    }
+}
+
 fn info_float_or_zero(info: &str, key: &str) -> String {
-    format_info_float(strelka::info_float(info, key).unwrap_or(0.0))
+    info_float_or_zero_precision(info, key, false)
+}
+
+fn info_float_or_zero_precision(info: &str, key: &str, full_precision: bool) -> String {
+    format_staged_float(
+        strelka::info_float(info, key).unwrap_or(0.0),
+        full_precision,
+    )
 }
 
 fn info_float_or_integer_zero(info: &str, key: &str) -> String {
@@ -273,6 +388,24 @@ mod tests {
         }
     }
 
+    fn render_test_row(
+        record: &RawVcfRecord,
+        avg_depth: &BTreeMap<String, f64>,
+        scoring_features: &ScoringFeatures,
+        index: usize,
+        label: &str,
+    ) -> String {
+        render_row(
+            record,
+            avg_depth,
+            scoring_features,
+            &FloatColumns::from_records(std::slice::from_ref(record), avg_depth),
+            false,
+            index,
+            label,
+        )
+    }
+
     #[test]
     fn strelka_first_admix_record_matches_legacy_byte_exact() {
         // Derived from example/sompy/strelka_admix_snvs.vcf.gz row 0:
@@ -289,7 +422,7 @@ mod tests {
         );
         let mut avg = BTreeMap::new();
         avg.insert("chr21".to_string(), 135.5);
-        let line = render_row(
+        let line = render_test_row(
             &rec,
             &avg,
             &ScoringFeatures::default(),
@@ -297,8 +430,8 @@ mod tests {
             "strelka_admix_snvs.vcf.gz",
         );
         let expected = "0,chr21,9412105,A,T,ref,1,61,,,-1.0,15.09,0.0,0.0,0.0,0.0,\
-                        26.0,77.0,0.1918819188191882,0.5682656826568265,0.0,\
-                        0.2857142857142857,57.82,8.0,0.0,-0.12,strelka_admix_snvs.vcf.gz";
+                        26.0,77.0,0.191881918819,0.568265682657,0.0,\
+                        0.285714285714,57.82,8.0,0.0,-0.12,strelka_admix_snvs.vcf.gz";
         assert_eq!(line, expected);
     }
 
@@ -347,7 +480,7 @@ mod tests {
             "10:0:0:0,0:0,0:0,0:10,10",
         );
         let avg: BTreeMap<String, f64> = BTreeMap::new();
-        let line = render_row(&rec, &avg, &ScoringFeatures::default(), 0, "t");
+        let line = render_test_row(&rec, &avg, &ScoringFeatures::default(), 0, "t");
         // MQ column is the 23rd field (0-based index 22); find it.
         let fields: Vec<&str> = line.split(',').collect();
         assert_eq!(fields[22], "0.0");
@@ -406,7 +539,7 @@ mod tests {
             "10:0:0:10,10:0,0:0,0:0,0",
             "10:0:0:0,0:0,0:0,0:10,10",
         );
-        let line = render_row(&rec, &BTreeMap::new(), &ScoringFeatures::default(), 0, "t");
+        let line = render_test_row(&rec, &BTreeMap::new(), &ScoringFeatures::default(), 0, "t");
         let fields: Vec<&str> = line.split(',').collect();
         assert_eq!(fields[22], "0.0");
         assert_eq!(fields[23], "0.0");
@@ -422,7 +555,7 @@ mod tests {
             "10:0:0:10,10:0,0:0,0:0,0",
             "10:0:0:0,0:0,0:0,0:10,10",
         );
-        let line = render_row(&rec, &BTreeMap::new(), &ScoringFeatures::default(), 0, "t");
+        let line = render_test_row(&rec, &BTreeMap::new(), &ScoringFeatures::default(), 0, "t");
         let fields: Vec<&str> = line.split(',').collect();
         assert_eq!(fields[10], "-1.0");
     }
@@ -436,7 +569,7 @@ mod tests {
             "10:0:0:0,0:0,0:0,0:10,10",
         );
         rec.filter = "First,Second".to_string();
-        let line = render_row(&rec, &BTreeMap::new(), &ScoringFeatures::default(), 0, "t");
+        let line = render_test_row(&rec, &BTreeMap::new(), &ScoringFeatures::default(), 0, "t");
         assert!(line.contains(",\"First,Second\","));
     }
 }

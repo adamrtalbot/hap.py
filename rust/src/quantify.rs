@@ -104,6 +104,26 @@ pub fn run(args: QuantifyArgs) -> Result<()> {
 /// hap.py metadata. Returning the indices keeps that rewrite from replacing
 /// qfy's unordered-table row identifiers with synthetic `0..N` values.
 pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricIndices> {
+    run_with_metric_indices_mode(args, CompareQuantifyMode::default())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CompareQuantifyMode {
+    pub preserve_missing_query_qq: bool,
+    pub preserve_missing_nocall_bd: bool,
+}
+
+pub(crate) fn run_from_compare(
+    args: QuantifyArgs,
+    mode: CompareQuantifyMode,
+) -> Result<roc::MetricIndices> {
+    run_with_metric_indices_mode(args, mode)
+}
+
+fn run_with_metric_indices_mode(
+    args: QuantifyArgs,
+    mode: CompareQuantifyMode,
+) -> Result<roc::MetricIndices> {
     validate_options(&args)?;
     if let Some(logfile) = args.logfile.as_deref() {
         OpenOptions::new()
@@ -124,6 +144,9 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
     }
     require_quantifier_index(Path::new(&args.input_vcf))?;
     let (mut headers, mut records) = vcf::load_raw_vcf(Path::new(&args.input_vcf))?;
+    if annotation_type == "ga4gh" {
+        validate_ga4gh_qq_fields(&headers, &records)?;
+    }
     let benchmark_samples = benchmark_sample_indices(&headers);
     let do_roc = args.do_roc && benchmark_samples.has_both();
     let reference = crate::fasta::read_sequences(Path::new(&args.reference))?;
@@ -141,6 +164,7 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
             &stratifications,
             annotation_type == "ga4gh",
             benchmark_samples,
+            mode.preserve_missing_nocall_bd,
         );
         if annotation_type == "xcmp" {
             reannotate_xcmp_record_for_samples(
@@ -153,7 +177,12 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
             reannotate_ga4gh_record(record);
         }
     }
-    propagate_superlocus_annotations_for_samples(&mut records, annotation_type, benchmark_samples);
+    propagate_superlocus_annotations_for_samples(
+        &mut records,
+        annotation_type,
+        benchmark_samples,
+        mode.preserve_missing_query_qq,
+    );
     for record in &mut records {
         decorate_quantified_record_for_samples(
             record,
@@ -163,6 +192,9 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
             confidence.is_some(),
             benchmark_samples,
         );
+        if annotation_type == "ga4gh" {
+            normalize_integer_like_format_values(record, "QQ");
+        }
     }
     let subset_size = contigs_in_input(&records)
         .into_iter()
@@ -276,6 +308,11 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
         )?;
     }
     if args.write_vcf {
+        ensure_info_header(
+            &mut headers,
+            "Regions",
+            "##INFO=<ID=Regions,Number=.,Type=String,Description=\"Tags for regions.\">",
+        );
         if args.preserve_info {
             ensure_info_header(
                 &mut headers,
@@ -285,6 +322,7 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
         }
         if annotation_type == "ga4gh" {
             ensure_ga4gh_headers(&mut headers);
+            canonicalize_ga4gh_header_order(&mut headers);
         }
         if args.output_vtc {
             ensure_info_header(
@@ -707,6 +745,7 @@ fn annotate_regions(
         stratifications,
         rewrite_ga4gh_decisions,
         BenchmarkSamples::POSITIONAL,
+        false,
     );
 }
 
@@ -716,6 +755,7 @@ fn annotate_regions_for_samples(
     stratifications: &RegionMap,
     rewrite_ga4gh_decisions: bool,
     samples: BenchmarkSamples,
+    preserve_missing_nocall_bd: bool,
 ) {
     let effective_range = effective_reference_range(record);
     let record_chrom = record.chrom.clone();
@@ -773,10 +813,14 @@ fn annotate_regions_for_samples(
             // GA4GHQuantify's `count_unk` rule rewrites both samples outside
             // CONF. Truth-side UNK is omitted from truth counts; query-side
             // UNK supplies QUERY.UNK and ROC unknown counts.
-            if let Some(truth) = samples.truth {
+            if let Some(truth) = samples.truth
+                && !preserve_missing_nocall_decision(record, truth, preserve_missing_nocall_bd)
+            {
                 replace_existing_decision(record, truth, "UNK");
             }
-            if let Some(query) = samples.query {
+            if let Some(query) = samples.query
+                && !preserve_missing_nocall_decision(record, query, preserve_missing_nocall_bd)
+            {
                 replace_existing_decision(record, query, "UNK");
             }
         }
@@ -799,6 +843,7 @@ fn propagate_superlocus_annotations(records: &mut [RawVcfRecord], annotation_typ
         records,
         annotation_type,
         BenchmarkSamples::POSITIONAL,
+        false,
     );
 }
 
@@ -806,6 +851,7 @@ fn propagate_superlocus_annotations_for_samples(
     records: &mut [RawVcfRecord],
     annotation_type: &str,
     samples: BenchmarkSamples,
+    preserve_missing_query_qq: bool,
 ) {
     let mut start = 0usize;
     while start < records.len() {
@@ -851,7 +897,11 @@ fn propagate_superlocus_annotations_for_samples(
                 }
             }
         } else {
-            propagate_ga4gh_superlocus_for_samples(&mut records[start..end], samples);
+            propagate_ga4gh_superlocus_for_samples(
+                &mut records[start..end],
+                samples,
+                preserve_missing_query_qq,
+            );
         }
         start = end;
     }
@@ -872,6 +922,21 @@ fn replace_existing_decision(record: &mut RawVcfRecord, sample_index: usize, dec
     }
 }
 
+fn preserve_missing_nocall_decision(
+    record: &RawVcfRecord,
+    sample_index: usize,
+    enabled: bool,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    let sample = record.sample_map(sample_index);
+    sample.get("BVT").map(String::as_str) == Some("NOCALL")
+        && sample
+            .get("BD")
+            .is_none_or(|decision| decision.is_empty() || decision == ".")
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct Ga4ghAnnotation {
     bi: String,
@@ -883,13 +948,31 @@ struct Ga4ghAnnotation {
 /// selected genotype alleles. RTG's GA4GH intermediate supplies BD/BK/QQ but
 /// does not supply these count-oriented annotations.
 fn reannotate_ga4gh_record(record: &mut RawVcfRecord) {
-    ensure_format_fields(record, &["BI", "BVT", "BLT"]);
+    ensure_format_fields(record, &["BI", "BVT", "BLT", "QQ"]);
+    let has_overwide_genotype = (0..record.samples.len()).any(|sample_index| {
+        record
+            .sample_map(sample_index)
+            .get("GT")
+            .is_some_and(|gt| gt.split(['/', '|']).count() > 2)
+    });
     for sample_index in 0..record.samples.len() {
         let gt = record
             .sample_map(sample_index)
             .get("GT")
             .cloned()
             .unwrap_or_else(|| "./.".to_string());
+        if has_overwide_genotype {
+            set_format_value(record, sample_index, "BI", ".");
+            set_format_value(record, sample_index, "BVT", "UNK");
+            set_format_value(record, sample_index, "BLT", "ambi");
+            let qq = if gt.split(['/', '|']).count() > 2 {
+                "."
+            } else {
+                "0"
+            };
+            set_format_value(record, sample_index, "QQ", qq);
+            continue;
+        }
         let annotation = ga4gh_annotation(record, &gt);
         set_format_value(record, sample_index, "BI", &annotation.bi);
         set_format_value(record, sample_index, "BVT", annotation.bvt);
@@ -974,7 +1057,9 @@ fn ga4gh_location_type(alleles: &[Option<usize>]) -> &'static str {
     } else if alleles.iter().all(Option::is_none) || alleles.is_empty() {
         "nocall"
     } else if alleles.len() == 1 {
-        "hemi"
+        // GA4GH's legacy VariantStatistics categorises a one-allele call in
+        // the same partial-call bucket as `./1`; it does not emit `hemi`.
+        "halfcall"
     } else {
         "unknown"
     }
@@ -1159,6 +1244,59 @@ fn ensure_ga4gh_headers(headers: &mut Vec<String>) {
     }
 }
 
+fn validate_ga4gh_qq_fields(headers: &[String], records: &[RawVcfRecord]) -> Result<()> {
+    let qq_is_string = headers.iter().any(|header| {
+        let Some(body) = header.strip_prefix("##FORMAT=<") else {
+            return false;
+        };
+        let fields = body.split(',').collect::<Vec<_>>();
+        fields.contains(&"ID=QQ") && fields.contains(&"Type=String")
+    });
+    if !qq_is_string {
+        return Ok(());
+    }
+
+    // Legacy's numeric FORMAT reader sizes its result from the encoded BCF
+    // string width. A one-character String QQ is accepted as a missing numeric
+    // value, while a wider cell yields multiple values and aborts before any
+    // report is published (`BCFHelpers.cpp::getFormatFloat`).
+    for record in records {
+        let Some(qq_index) = record.format_keys().iter().position(|field| *field == "QQ") else {
+            continue;
+        };
+        let encoded_width = record
+            .samples
+            .iter()
+            .filter_map(|sample| sample.split(':').nth(qq_index))
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        if encoded_width > 1 {
+            bail!(
+                "too many QQ fields at {}:{}",
+                record.chrom,
+                record.pos.saturating_sub(1)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_ga4gh_header_order(headers: &mut Vec<String>) {
+    let Some(pass_index) = headers
+        .iter()
+        .position(|header| header.starts_with("##FILTER=<ID=PASS,"))
+    else {
+        return;
+    };
+    let pass = headers.remove(pass_index);
+    let insertion = headers
+        .iter()
+        .position(|header| !header.starts_with("##fileformat="))
+        .unwrap_or(headers.len());
+    headers.insert(insertion, pass);
+}
+
 fn ensure_info_header(headers: &mut Vec<String>, id: &str, declaration: &str) {
     if headers
         .iter()
@@ -1173,7 +1311,11 @@ fn ensure_info_header(headers: &mut Vec<String>, id: &str, declaration: &str) {
     headers.insert(index, declaration.to_string());
 }
 
-fn propagate_ga4gh_superlocus_for_samples(records: &mut [RawVcfRecord], samples: BenchmarkSamples) {
+fn propagate_ga4gh_superlocus_for_samples(
+    records: &mut [RawVcfRecord],
+    samples: BenchmarkSamples,
+    preserve_missing_query_qq: bool,
+) {
     let minimum_tp_qq = records
         .iter()
         .filter_map(|record| {
@@ -1197,6 +1339,12 @@ fn propagate_ga4gh_superlocus_for_samples(records: &mut [RawVcfRecord], samples:
         .collect::<BTreeSet<_>>();
 
     for record in records {
+        if let Some(query) = samples.query {
+            let query_qq = record.sample_map(query).get("QQ").cloned();
+            if !preserve_missing_query_qq && query_qq.as_deref().is_none_or(|value| value == ".") {
+                set_format_value(record, query, "QQ", "0");
+            }
+        }
         let truth_tp = samples.truth.is_some_and(|truth| {
             record.sample_map(truth).get("BD").map(String::as_str) == Some("TP")
         });
@@ -1236,6 +1384,25 @@ fn propagate_ga4gh_superlocus_for_samples(records: &mut [RawVcfRecord], samples:
                 .collect::<BTreeSet<_>>();
             filters.extend(block_filters.iter().cloned());
             record.filter = filters.into_iter().collect::<Vec<_>>().join(";");
+        }
+    }
+}
+
+fn normalize_integer_like_format_values(record: &mut RawVcfRecord, key: &str) {
+    let Some(index) = record.format_keys().iter().position(|field| *field == key) else {
+        return;
+    };
+    for sample in &mut record.samples {
+        let mut fields = sample.split(':').map(str::to_string).collect::<Vec<_>>();
+        let Some(value) = fields.get_mut(index) else {
+            continue;
+        };
+        if let Ok(number) = value.parse::<f64>()
+            && number.is_finite()
+            && number.fract() == 0.0
+        {
+            *value = number.to_string();
+            *sample = fields.join(":");
         }
     }
 }
@@ -2386,6 +2553,12 @@ fn write_quantify_summary(
         writer,
         "Type,Filter,TRUTH.TOTAL,TRUTH.TP,TRUTH.FN,QUERY.TOTAL,QUERY.FP,QUERY.UNK,FP.gt,FP.al,METRIC.Recall,METRIC.Precision,METRIC.Frac_NA,METRIC.F1_Score,TRUTH.TOTAL.TiTv_ratio,QUERY.TOTAL.TiTv_ratio,TRUTH.TOTAL.het_hom_ratio,QUERY.TOTAL.het_hom_ratio"
     )?;
+    if all_counts.is_empty() && pass_counts.is_empty() {
+        for variant_type in ["INDEL", "SNP"] {
+            writeln!(writer, "{variant_type},ALL,0,0,0,0,0,0,0,0,,,,,,,,")?;
+        }
+        return Ok(());
+    }
     for variant_type in ["INDEL", "SNP"].into_iter().filter(|variant_type| {
         all_counts.contains_key(*variant_type) || pass_counts.contains_key(*variant_type)
     }) {
@@ -2468,6 +2641,14 @@ fn write_quantify_extended(
         );
     }
     writeln!(writer, "{}", header.join(","))?;
+    if all_counts.by_type.is_empty() && pass_counts.by_type.is_empty() {
+        for line in report::empty_comparison_extended_lines(options.subset_size) {
+            let mut row = line.split(',').map(str::to_string).collect::<Vec<_>>();
+            row.resize(header.len(), String::new());
+            writeln!(writer, "{}", row.join(","))?;
+        }
+        return Ok(());
+    }
     let confidence_size_value = options.confidence_size;
     let confidence_size = confidence_size_value
         .map(|size| format!("{:.6}", size as f64))
@@ -2845,11 +3026,7 @@ fn format_metric(value: f64) -> String {
 }
 
 fn format_ratio(value: f64) -> String {
-    if (value.fract()).abs() < f64::EPSILON {
-        format!("{value:.1}")
-    } else {
-        value.to_string()
-    }
+    report::python_repr_float(value)
 }
 
 fn write_metrics_json(
@@ -2924,7 +3101,16 @@ mod tests {
     fn indexed_fixture(root: &Path) -> PathBuf {
         let input = root.join("input.vcf.gz");
         if !input.exists() {
-            let (headers, records) = vcf::load_raw_vcf(&fixture("annotated.vcf")).unwrap();
+            // The repository fixture intentionally preserves the historical
+            // invalid String-typed, multi-character QQ case used by the parity
+            // matrix. Unit tests exercising successful quantify behavior need
+            // the valid Float declaration the legacy numeric reader accepts.
+            let (mut headers, records) = vcf::load_raw_vcf(&fixture("annotated.vcf")).unwrap();
+            for header in &mut headers {
+                if header.starts_with("##FORMAT=<ID=QQ,") {
+                    *header = header.replace("Type=String", "Type=Float");
+                }
+            }
             vcf::write_raw_vcf(&input, &headers, &records).unwrap();
         }
         input
@@ -3056,6 +3242,22 @@ mod tests {
         assert_eq!(halfcall.bvt, "SNP");
         assert_eq!(halfcall.blt, "halfcall");
         assert_eq!(halfcall.bi, "ti");
+        assert_eq!(ga4gh_annotation(&record, "1").blt, "halfcall");
+    }
+
+    #[test]
+    fn ga4gh_reannotation_marks_overwide_genotype_locations_ambiguous() {
+        let mut record = RawVcfRecord::from_line(
+            "chr1\t3\t.\tA\tG\t.\tPASS\t.\tGT:BD\t0/1/1:N\t.",
+            Path::new("rtg.vcf"),
+        )
+        .unwrap();
+
+        reannotate_ga4gh_record(&mut record);
+
+        assert_eq!(record.format.as_deref(), Some("GT:BD:BI:BVT:BLT:QQ"));
+        assert_eq!(record.samples[0], "0/1/1:N:.:UNK:ambi:.");
+        assert_eq!(record.samples[1], ".:.:.:UNK:ambi:0");
     }
 
     #[test]
@@ -3073,6 +3275,79 @@ mod tests {
         assert_eq!(
             record.sample_map(1).get("BD").map(String::as_str),
             Some("UNK")
+        );
+
+        let mut query_only = RawVcfRecord::from_line(
+            "chr1\t4\t.\tA\tG\t50\tPASS\tBS=4\tGT:BD:BK:QQ\t./.:.:.:.\t0/1:FP:.:35",
+            Path::new("rtg.vcf"),
+        )
+        .unwrap();
+        annotate_regions(&mut query_only, Some(&[]), &RegionMap::new(), true);
+        assert_eq!(
+            query_only.sample_map(0).get("BD").map(String::as_str),
+            Some("UNK")
+        );
+        assert_eq!(
+            query_only.sample_map(1).get("BD").map(String::as_str),
+            Some("UNK")
+        );
+
+        let mut filtered_truth_handoff = RawVcfRecord::from_line(
+            "chr1\t5\t.\tA\tG\t50\tPASS\tBS=5\tGT:BD:BK:BI:BVT:BLT:QQ\t./.:.:.:.:NOCALL:nocall:.\t0/1:FP:.:ti:SNP:het:35",
+            Path::new("xcmp.vcf"),
+        )
+        .unwrap();
+        annotate_regions_for_samples(
+            &mut filtered_truth_handoff,
+            Some(&[]),
+            &RegionMap::new(),
+            true,
+            BenchmarkSamples::POSITIONAL,
+            true,
+        );
+        assert_eq!(
+            filtered_truth_handoff
+                .sample_map(0)
+                .get("BD")
+                .map(String::as_str),
+            Some("."),
+            "filtered-truth xcmp handoff preserves a missing truth decision"
+        );
+        assert_eq!(
+            filtered_truth_handoff
+                .sample_map(1)
+                .get("BD")
+                .map(String::as_str),
+            Some("UNK")
+        );
+
+        let mut filtered_truth_only_handoff = RawVcfRecord::from_line(
+            "chr1\t6\t.\tA\tG\t50\tPASS\tBS=6\tGT:BD:BK:BI:BVT:BLT:QQ\t0/1:FN:.:ti:SNP:het:.\t./.:.:.:.:NOCALL:nocall:.",
+            Path::new("xcmp.vcf"),
+        )
+        .unwrap();
+        annotate_regions_for_samples(
+            &mut filtered_truth_only_handoff,
+            Some(&[]),
+            &RegionMap::new(),
+            true,
+            BenchmarkSamples::POSITIONAL,
+            true,
+        );
+        assert_eq!(
+            filtered_truth_only_handoff
+                .sample_map(0)
+                .get("BD")
+                .map(String::as_str),
+            Some("UNK")
+        );
+        assert_eq!(
+            filtered_truth_only_handoff
+                .sample_map(1)
+                .get("BD")
+                .map(String::as_str),
+            Some("."),
+            "filtered-truth xcmp handoff preserves either NOCALL side"
         );
     }
 
@@ -3370,14 +3645,65 @@ mod tests {
     }
 
     #[test]
+    fn ga4gh_output_restores_missing_qualities_and_integer_rendering() {
+        let mut record = RawVcfRecord::from_line(
+            "chr1\t30\t.\tC\t<DEL>\t.\tPASS\t.\tGT:BD\t0/1:N\t./.:N",
+            Path::new("rtg.vcf"),
+        )
+        .unwrap();
+        reannotate_ga4gh_record(&mut record);
+        propagate_ga4gh_superlocus_for_samples(
+            std::slice::from_mut(&mut record),
+            BenchmarkSamples::POSITIONAL,
+            false,
+        );
+        assert_eq!(
+            record.sample_map(1).get("QQ").map(String::as_str),
+            Some("0")
+        );
+        set_format_value(&mut record, 1, "QQ", "60.0");
+        normalize_integer_like_format_values(&mut record, "QQ");
+
+        assert_eq!(record.format.as_deref(), Some("GT:BD:BI:BVT:BLT:QQ"));
+        assert_eq!(
+            record.sample_map(0).get("QQ").map(String::as_str),
+            Some(".")
+        );
+        assert_eq!(
+            record.sample_map(1).get("QQ").map(String::as_str),
+            Some("60")
+        );
+
+        let mut somatic_record = RawVcfRecord::from_line(
+            "chr1\t30\t.\tC\t<DEL>\t.\tPASS\t.\tGT:BD\t0/1:N\t./.:N",
+            Path::new("scmp-somatic.vcf"),
+        )
+        .unwrap();
+        reannotate_ga4gh_record(&mut somatic_record);
+        propagate_ga4gh_superlocus_for_samples(
+            std::slice::from_mut(&mut somatic_record),
+            BenchmarkSamples::POSITIONAL,
+            true,
+        );
+        assert_eq!(
+            somatic_record.sample_map(1).get("QQ").map(String::as_str),
+            Some("."),
+            "scmp-somatic preserves a missing query score"
+        );
+    }
+
+    #[test]
     fn ga4gh_output_headers_add_only_missing_legacy_declarations() {
         let mut headers = vec![
             "##fileformat=VCFv4.2".to_string(),
+            "##contig=<ID=chr1,length=10>".to_string(),
+            "##FILTER=<ID=PASS,Description=\"All filters passed\">".to_string(),
             "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">".to_string(),
             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTRUTH\tQUERY".to_string(),
         ];
         ensure_ga4gh_headers(&mut headers);
         ensure_ga4gh_headers(&mut headers);
+        canonicalize_ga4gh_header_order(&mut headers);
         for id in ["GT", "BD", "BK", "BI", "QQ", "BVT", "BLT"] {
             assert_eq!(
                 headers
@@ -3389,7 +3715,43 @@ mod tests {
             );
         }
         assert!(headers.iter().any(|header| header.contains("INFO=<ID=BS,")));
+        assert!(headers[1].starts_with("##FILTER=<ID=PASS,"));
         assert!(headers.last().unwrap().starts_with("#CHROM"));
+    }
+
+    #[test]
+    fn ga4gh_accepts_a_string_qq_declaration() {
+        let headers = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##FORMAT=<ID=QQ,Number=1,Type=String,Description=\"Score\">".to_string(),
+        ];
+        let mut record = RawVcfRecord::from_line(
+            "chr1\t2\t.\tA\tG\t60\tPASS\t.\tGT:QQ\t0/1:7\t0/1:.",
+            Path::new("fixture.vcf"),
+        )
+        .unwrap();
+        assert!(validate_ga4gh_qq_fields(&headers, std::slice::from_ref(&record)).is_ok());
+
+        record.samples[0] = "0/1:60".to_string();
+        let error = validate_ga4gh_qq_fields(&headers, &[record]).unwrap_err();
+        assert_eq!(error.to_string(), "too many QQ fields at chr1:1");
+    }
+
+    #[test]
+    fn region_header_uses_the_legacy_bcf_compatible_declaration() {
+        let mut headers = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO".to_string(),
+        ];
+        ensure_info_header(
+            &mut headers,
+            "Regions",
+            "##INFO=<ID=Regions,Number=.,Type=String,Description=\"Tags for regions.\">",
+        );
+        assert_eq!(
+            headers[1],
+            "##INFO=<ID=Regions,Number=.,Type=String,Description=\"Tags for regions.\">"
+        );
     }
 
     fn read_gzip(path: &Path) -> String {
@@ -3555,7 +3917,13 @@ mod tests {
         run(options).unwrap();
 
         let summary = fs::read_to_string(root.join("result.summary.csv")).unwrap();
-        assert_eq!(summary.lines().count(), 1);
+        assert_eq!(summary.lines().count(), 3);
+        assert!(
+            summary
+                .lines()
+                .skip(1)
+                .all(|line| line.contains(",ALL,0,0,0,0,0,0,0,0,"))
+        );
         assert!(!root.join("result.roc.Locations.SNP.csv.gz").exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -3811,6 +4179,10 @@ mod tests {
         let input = root.join("annotated.vcf.gz");
         let source = fs::read_to_string(fixture("annotated.vcf")).unwrap();
         let source = source
+            .replace(
+                "##FORMAT=<ID=QQ,Number=1,Type=String",
+                "##FORMAT=<ID=QQ,Number=1,Type=Float",
+            )
             .replace(
                 "##FORMAT=<ID=GT",
                 "##INFO=<ID=SCORE,Number=1,Type=Float,Description=\"ROC score\">\n##FORMAT=<ID=GT",

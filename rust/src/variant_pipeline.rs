@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn chr21_17809630_mixed_indel_primitive_splits_correctly() {
         // Replicates the trace `chr21:17809630 CA → CAA,C` documented in
-        // PHASE1_BASELINE.md. Reference bytes at 17809630..=17809631 are
+        // Reference bytes at 17809630..=17809631 are
         // "CA" — the same bases the C++ pipeline reads from the real chr21
         // FASTA at this position.
         let reference = windowed_ref(17_809_625, b"NNNNNCANNNN");

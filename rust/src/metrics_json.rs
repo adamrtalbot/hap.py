@@ -306,6 +306,7 @@ fn metrics_json_for_module_with_indices(
     tables: &[(&str, &str, &Path)],
     indices: Option<&BTreeMap<String, Vec<usize>>>,
 ) -> Result<String> {
+    let ci_alpha = commandline_ci_alpha(commandline);
     let rendered_tables = tables
         .iter()
         .map(|(id, label, path)| {
@@ -316,6 +317,7 @@ fn metrics_json_for_module_with_indices(
                 indices
                     .and_then(|tables| tables.get(*id))
                     .map(Vec::as_slice),
+                ci_alpha,
             )
         })
         .collect::<Result<Vec<_>>>()?
@@ -340,7 +342,7 @@ fn create_parent(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 fn table_json(id: &str, label: &str, path: &Path) -> Result<String> {
-    table_json_with_indices(id, label, path, None)
+    table_json_with_indices(id, label, path, None, None)
 }
 
 fn table_json_with_indices(
@@ -348,6 +350,7 @@ fn table_json_with_indices(
     label: &str,
     path: &Path,
     indices: Option<&[usize]>,
+    ci_alpha: Option<f64>,
 ) -> Result<String> {
     let text = crate::vcf::read_text(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -372,8 +375,10 @@ fn table_json_with_indices(
             .iter()
             .map(|row| row.get(column).map(String::as_str).unwrap_or(""))
             .collect::<Vec<_>>();
-        let kind = legacy_column_type(id, name);
-        out.push_str(&column_json(name, name, kind, &values));
+        let kind = legacy_column_type(id, name, &values);
+        out.push_str(&column_json(
+            name, name, kind, &values, &header, &rows, ci_alpha,
+        ));
     }
     out.push_str("],\"properties\":[],\"type\":\"Table\",\"id\":");
     out.push_str(&json_string(id));
@@ -395,7 +400,7 @@ fn index_column_json(count: usize, indices: Option<&[usize]>) -> String {
     format!("{{\"values\":[{values}],\"type\":\"string\",\"id\":\"types\",\"label\":\"types\"}}")
 }
 
-fn legacy_column_type(table_id: &str, column: &str) -> &'static str {
+fn legacy_column_type(table: &str, column: &str, values: &[&str]) -> &'static str {
     if matches!(
         column,
         "TRUTH.TOTAL"
@@ -407,12 +412,20 @@ fn legacy_column_type(table_id: &str, column: &str) -> &'static str {
             | "QUERY.UNK"
             | "FP.gt"
             | "FP.al"
-    ) || (column == "Subset.Size" && table_id.starts_with("roc.Locations."))
-    {
+    ) {
         "int64"
     } else if column.starts_with("METRIC.")
         || column.ends_with(".TiTv_ratio")
         || column.ends_with(".het_hom_ratio")
+        || (column == "Subset.Size"
+            && !values.is_empty()
+            && values
+                .iter()
+                .all(|value| value.ends_with(".0") && !value.ends_with(".000000")))
+        || (!values.is_empty() && values.iter().all(|value| value.is_empty()))
+        || (table == "roc.all" && values.iter().all(|value| *value == "."))
+        || (column == "Subset.IS_CONF.Size"
+            && values.iter().all(|value| value.is_empty() || *value == "."))
     {
         "double"
     } else {
@@ -420,11 +433,27 @@ fn legacy_column_type(table_id: &str, column: &str) -> &'static str {
     }
 }
 
-fn column_json(id: &str, label: &str, kind: &str, values: &[&str]) -> String {
+fn column_json(
+    id: &str,
+    label: &str,
+    kind: &str,
+    values: &[&str],
+    header: &[String],
+    rows: &[Vec<String>],
+    ci_alpha: Option<f64>,
+) -> String {
     let rendered = values
         .iter()
-        .map(|value| match kind {
+        .enumerate()
+        .map(|(row_index, value)| match kind {
             "int64" => render_int(value),
+            "double" if is_confidence_interval_column(id) => {
+                render_confidence_interval(id, value, header, &rows[row_index], ci_alpha)
+            }
+            "double" if id.starts_with("METRIC.") => render_legacy_metric(value),
+            "double" if is_ratio_column(id) => {
+                render_legacy_ratio(id, value, header, &rows[row_index])
+            }
             "double" => render_double(value),
             _ => json_string(value),
         })
@@ -436,6 +465,73 @@ fn column_json(id: &str, label: &str, kind: &str, values: &[&str]) -> String {
         json_string(id),
         json_string(label)
     )
+}
+
+fn commandline_ci_alpha(commandline: &str) -> Option<f64> {
+    let arguments = commandline.split_whitespace().collect::<Vec<_>>();
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--ci-alpha")
+        .and_then(|pair| pair[1].parse::<f64>().ok())
+        .filter(|alpha| alpha.is_finite() && *alpha > 0.0 && *alpha < 1.0)
+}
+
+fn is_confidence_interval_column(column: &str) -> bool {
+    matches!(
+        column,
+        "METRIC.Recall.Lower"
+            | "METRIC.Recall.Upper"
+            | "METRIC.Precision.Lower"
+            | "METRIC.Precision.Upper"
+            | "METRIC.Frac_NA.Lower"
+            | "METRIC.Frac_NA.Upper"
+    )
+}
+
+fn render_confidence_interval(
+    column: &str,
+    displayed: &str,
+    header: &[String],
+    row: &[String],
+    ci_alpha: Option<f64>,
+) -> String {
+    let Some(alpha) = ci_alpha else {
+        return render_legacy_metric(displayed);
+    };
+    let count = |name| {
+        row_value(header, row, name)
+            .filter(|value| !value.is_empty() && *value != ".")
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    let filter = row_value(header, row, "Filter").unwrap_or("");
+    let filter_tier = !matches!(filter, "ALL" | "PASS" | "SEL");
+    let observations = if column.starts_with("METRIC.Recall.") {
+        if filter_tier {
+            count("TRUTH.TP").map(|true_positives| (true_positives, true_positives))
+        } else {
+            count("TRUTH.TP").zip(count("TRUTH.TOTAL"))
+        }
+    } else if column.starts_with("METRIC.Precision.") {
+        count("QUERY.TP")
+            .zip(count("QUERY.FP"))
+            .map(|(true_positives, false_positives)| {
+                (true_positives, true_positives + false_positives)
+            })
+    } else if filter_tier {
+        Some((0, 0))
+    } else {
+        count("QUERY.UNK").zip(count("QUERY.TOTAL"))
+    };
+    let Some((successes, trials)) = observations else {
+        return render_legacy_metric(displayed);
+    };
+    let (lower, upper) = crate::roc::jeffreys_interval(successes, trials, alpha);
+    let value = if column.ends_with(".Lower") {
+        lower
+    } else {
+        upper
+    };
+    json_repr_float(value)
 }
 
 fn render_int(value: &str) -> String {
@@ -459,11 +555,151 @@ fn render_double(value: &str) -> String {
     if !number.is_finite() {
         return "null".to_string();
     }
-    let mut rendered = number.to_string();
-    if !rendered.contains(['.', 'e', 'E']) {
-        rendered.push_str(".0");
+    json_repr_float(number)
+}
+
+fn render_legacy_metric(value: &str) -> String {
+    if value.is_empty() || value == "." {
+        return "null".to_string();
     }
-    rendered
+    let Some(displayed) = parse_finite(value) else {
+        return "null".to_string();
+    };
+    let original = format!("{displayed:.6}");
+    let number = crate::report::pandas_xstrtod(&original);
+    if number.is_finite() {
+        json_repr_float(number)
+    } else {
+        "null".to_string()
+    }
+}
+
+fn is_ratio_column(column: &str) -> bool {
+    column.ends_with(".TiTv_ratio") || column.ends_with(".het_hom_ratio")
+}
+
+fn render_legacy_ratio(column: &str, displayed: &str, header: &[String], row: &[String]) -> String {
+    let Some((base, numerator_suffix, denominator_suffix)) = ratio_parts(column) else {
+        return render_double(displayed);
+    };
+    let numerator_column = format!("{base}.{numerator_suffix}");
+    let denominator_column = format!("{base}.{denominator_suffix}");
+    if header.iter().any(|name| name == &numerator_column)
+        && header.iter().any(|name| name == &denominator_column)
+    {
+        let numerator = row_value(header, row, &numerator_column).and_then(parse_finite);
+        let denominator = row_value(header, row, &denominator_column).and_then(parse_finite);
+        return if let (Some(numerator), Some(denominator)) = (numerator, denominator)
+            && denominator != 0.0
+        {
+            json_repr_float(numerator / denominator)
+        } else {
+            "null".to_string()
+        };
+    }
+
+    if displayed.is_empty() || displayed == "." {
+        return "null".to_string();
+    }
+
+    let Some(value) = parse_finite(displayed) else {
+        return "null".to_string();
+    };
+    let max_denominator = row_value(header, row, base)
+        .and_then(parse_finite)
+        .filter(|bound| *bound >= 1.0)
+        .map(|bound| bound as u64);
+    if let Some(max_denominator) = max_denominator
+        && let Some((numerator, denominator)) = limit_denominator(value, max_denominator)
+    {
+        return json_repr_float(numerator as f64 / denominator as f64);
+    }
+    json_repr_float(value)
+}
+
+fn ratio_parts(column: &str) -> Option<(&str, &str, &str)> {
+    column
+        .strip_suffix(".TiTv_ratio")
+        .map(|base| (base, "ti", "tv"))
+        .or_else(|| {
+            column
+                .strip_suffix(".het_hom_ratio")
+                .map(|base| (base, "het", "homalt"))
+        })
+}
+
+fn row_value<'a>(header: &[String], row: &'a [String], column: &str) -> Option<&'a str> {
+    header
+        .iter()
+        .position(|name| name == column)
+        .and_then(|index| row.get(index))
+        .map(String::as_str)
+}
+
+fn parse_finite(value: &str) -> Option<f64> {
+    if value.is_empty() || value == "." {
+        return None;
+    }
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
+}
+
+/// Return the closest rational to `value` whose denominator is no larger
+/// than `maximum`. This is the continued-fraction algorithm used by Python's
+/// `Fraction.limit_denominator`, and recovers the integer count division that
+/// pandas retained before formatting the CSV ratio to 12 significant digits.
+fn limit_denominator(value: f64, maximum: u64) -> Option<(u64, u64)> {
+    if !value.is_finite() || value < 0.0 || maximum == 0 {
+        return None;
+    }
+    if value == 0.0 {
+        return Some((0, 1));
+    }
+
+    let maximum = maximum as u128;
+    let (mut p0, mut q0, mut p1, mut q1) = (0_u128, 1_u128, 1_u128, 0_u128);
+    let mut remainder = value;
+    loop {
+        let coefficient = remainder.floor() as u128;
+        let q2 = q0.checked_add(coefficient.checked_mul(q1)?)?;
+        if q2 > maximum {
+            break;
+        }
+        let p2 = p0.checked_add(coefficient.checked_mul(p1)?)?;
+        (p0, q0, p1, q1) = (p1, q1, p2, q2);
+        let fraction = remainder - coefficient as f64;
+        if fraction == 0.0 {
+            return Some((u64::try_from(p1).ok()?, u64::try_from(q1).ok()?));
+        }
+        remainder = 1.0 / fraction;
+    }
+
+    let multiplier = (maximum - q0) / q1;
+    let bound1 = (
+        p0.checked_add(multiplier.checked_mul(p1)?)?,
+        q0.checked_add(multiplier.checked_mul(q1)?)?,
+    );
+    let bound2 = (p1, q1);
+    let error = |(numerator, denominator): (u128, u128)| {
+        (numerator as f64 / denominator as f64 - value).abs()
+    };
+    let best = if error(bound2) <= error(bound1) {
+        bound2
+    } else {
+        bound1
+    };
+    Some((u64::try_from(best.0).ok()?, u64::try_from(best.1).ok()?))
+}
+
+fn json_repr_float(value: f64) -> String {
+    let rendered = format!("{value:?}");
+    let Some((mantissa, exponent)) = rendered.split_once('e') else {
+        return rendered;
+    };
+    let exponent = exponent.parse::<i32>().unwrap_or(0);
+    format!("{mantissa}e{exponent:+03}")
 }
 
 fn push_field(out: &mut String, key: &str, value: &str) {
@@ -535,7 +771,7 @@ mod tests {
         let csv = dir.path().join("table.csv");
         fs::write(
             &csv,
-            "Type,Filter,TRUTH.TOTAL,METRIC.Recall,TRUTH.TOTAL.ti,TRUTH.TOTAL.tv,TRUTH.TOTAL.TiTv_ratio,Subset.Size,Subset.IS_CONF.Size\nSNP,ALL,3,0,3.000000,1.000000,.,42,21.000000\nINDEL,PASS,0,,,,1.5,42,\n",
+            "Type,Filter,TRUTH.TOTAL,METRIC.Recall,TRUTH.TOTAL.ti,TRUTH.TOTAL.tv,TRUTH.TOTAL.TiTv_ratio,Subset.Size,Subset.IS_CONF.Size\nSNP,ALL,3,0.969,3.000000,1.000000,.,42,21.000000\nINDEL,PASS,0,,,,1.5,42,\n",
         )
         .unwrap();
 
@@ -543,7 +779,7 @@ mod tests {
         assert!(json.contains("\"values\":[0,1],\"type\":\"string\",\"id\":\"types\""));
         assert!(json.contains("\"values\":[3,0],\"type\":\"int64\",\"id\":\"TRUTH.TOTAL\""));
         assert!(
-            json.contains("\"values\":[0.0,null],\"type\":\"double\",\"id\":\"METRIC.Recall\"")
+            json.contains("\"values\":[0.969,null],\"type\":\"double\",\"id\":\"METRIC.Recall\"")
         );
         assert!(json.contains(
             "\"values\":[\"3.000000\",\"\"],\"type\":\"string\",\"id\":\"TRUTH.TOTAL.ti\""
@@ -552,7 +788,7 @@ mod tests {
             "\"values\":[\"1.000000\",\"\"],\"type\":\"string\",\"id\":\"TRUTH.TOTAL.tv\""
         ));
         assert!(json.contains(
-            "\"values\":[null,1.5],\"type\":\"double\",\"id\":\"TRUTH.TOTAL.TiTv_ratio\""
+            "\"values\":[3.0,null],\"type\":\"double\",\"id\":\"TRUTH.TOTAL.TiTv_ratio\""
         ));
         assert!(
             json.contains("\"values\":[\"42\",\"42\"],\"type\":\"string\",\"id\":\"Subset.Size\"")
@@ -562,14 +798,48 @@ mod tests {
         ));
 
         let locations = table_json("roc.Locations.SNP", "roc.Locations.SNP", &csv).unwrap();
-        assert!(locations.contains("\"values\":[42,42],\"type\":\"int64\",\"id\":\"Subset.Size\""));
+        assert!(
+            locations
+                .contains("\"values\":[\"42\",\"42\"],\"type\":\"string\",\"id\":\"Subset.Size\"")
+        );
         assert!(locations.contains(
             "\"values\":[\"21.000000\",\"\"],\"type\":\"string\",\"id\":\"Subset.IS_CONF.Size\""
         ));
 
         let indexed =
-            table_json_with_indices("all.metrics", "all.metrics", &csv, Some(&[9, 3])).unwrap();
+            table_json_with_indices("all.metrics", "all.metrics", &csv, Some(&[9, 3]), None)
+                .unwrap();
         assert!(indexed.contains("\"values\":[9,3],\"type\":\"string\",\"id\":\"types\""));
+    }
+
+    #[test]
+    fn metrics_table_keeps_an_all_missing_confidence_size_numeric() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("table.csv");
+        fs::write(&csv, "Type,Subset.IS_CONF.Size\nSNP,.\nINDEL,\n").unwrap();
+
+        let json = table_json("all.metrics", "all.metrics", &csv).unwrap();
+        assert!(
+            json.contains(
+                "\"values\":[null,null],\"type\":\"double\",\"id\":\"Subset.IS_CONF.Size\""
+            )
+        );
+    }
+
+    #[test]
+    fn compact_ratio_recovers_the_underlying_integer_division() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("summary.csv");
+        fs::write(
+            &csv,
+            "Type,TRUTH.TOTAL,TRUTH.TOTAL.TiTv_ratio\nSNP,7871,1.84187725632\n",
+        )
+        .unwrap();
+
+        let json = table_json("summary.metrics", "summary.metrics", &csv).unwrap();
+        assert!(json.contains(
+            "\"values\":[1.8418772563176895],\"type\":\"double\",\"id\":\"TRUTH.TOTAL.TiTv_ratio\""
+        ));
     }
 
     #[test]

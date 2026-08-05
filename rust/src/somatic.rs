@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Version string emitted in the `sompyversion` column and JSON metadata.
 /// Matches legacy som.py when `Haplo.version.__version__` is empty — the
-/// pinned oracle container resolves this to `"som.py-"` (trailing hyphen with
+/// pinned reference container resolves this to `"som.py-"` (trailing hyphen with
 /// nothing after). We reproduce the exact literal so stats.csv byte-matches.
 const SOM_VERSION: &str = "som.py-";
 const STATS_TYPE_ROWS: [(usize, &str); 4] =
@@ -670,6 +670,11 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
                         continue;
                     }
                     for prefix in ["records", "SNVs", "indels"] {
+                        let type_label = (prefix != "records").then_some(prefix);
+                        let rows = feature_rows_for_type(&rows, header, type_label)?;
+                        if rows.is_empty() {
+                            continue;
+                        }
                         let path = PathBuf::from(format!(
                             "{}.{}.{}.roc.csv",
                             args.output,
@@ -706,7 +711,7 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         &truth_raw_filtered,
     );
 
-    let commandline = legacy_som_commandline(&args);
+    let commandline = somatic_commandline(&args);
 
     let mut lines = Vec::new();
     let use_af_column_order = args.af_strat && !af_bins.is_empty();
@@ -716,7 +721,7 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         stats_header(args.count_filtered_fn)
     });
     // These indexes are the stable pandas indexes produced by the pinned
-    // Python-2 oracle after its sequence of bcftools-stat merges. They are
+    // Python-2 reference after its sequence of bcftools-stat merges. They are
     // serialized by DataFrame.to_csv and are therefore part of the contract.
     if args.af_strat {
         for (index, label) in [
@@ -732,6 +737,9 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
             } else {
                 by_type.get(label).copied().unwrap_or_default()
             };
+            if label != "records" && row.truth_total == 0 {
+                continue;
+            }
             let filtered = if label == "records" {
                 args.count_filtered_fn.then_some(filtered_records)
             } else {
@@ -798,15 +806,23 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     if args.af_strat
         && let Some(header) = feature_header.as_deref()
     {
-        let af_counts = calculate_af_stats(
-            header,
-            ordered_feature_rows.as_deref().unwrap_or_default(),
-            &args.af_strat_binsize,
-            &args.af_strat_truth,
-            &args.af_strat_query,
-        )?;
         for prefix in ["records", "SNVs", "indels"] {
+            let type_label = (prefix != "records").then_some(prefix);
+            let af_counts = calculate_af_stats(
+                header,
+                ordered_feature_rows.as_deref().unwrap_or_default(),
+                &args.af_strat_binsize,
+                &args.af_strat_truth,
+                &args.af_strat_query,
+                type_label,
+            )?;
             for (start, end, counts, filtered) in &af_counts {
+                if counts.truth_total == 0
+                    && !(prefix == "records"
+                        && preserves_empty_records_af_bin(&args.af_strat_binsize, *end))
+                {
+                    continue;
+                }
                 let label = format!("{prefix}.{}", format_af_interval(*start, *end));
                 lines.push(render_row_af(
                     0,
@@ -841,6 +857,7 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         &metrics_json,
         &commandline,
         &output,
+        ci_alpha,
         explanation_enabled.then_some(&ambiguous_classes),
         explanation_enabled.then_some(&ambiguous_reasons),
     )?;
@@ -933,14 +950,14 @@ fn build_caller_feature_table(
     check_order: bool,
     groups: &CallerRecordGroups<'_>,
 ) -> Result<CallerFeatureTable> {
-    let truth_tp = ParsedFeatureTable::from_lines(ftx::emit_feature_table_with_depths(
+    let truth_tp = ParsedFeatureTable::from_lines(ftx::emit_feature_table_for_somatic(
         feature,
         groups.tp_truth,
         truth_headers,
         "TP",
         depths,
     )?)?;
-    let query_tp = ParsedFeatureTable::from_lines(ftx::emit_feature_table_with_depths(
+    let query_tp = ParsedFeatureTable::from_lines(ftx::emit_feature_table_for_somatic(
         feature,
         groups.tp_query,
         query_headers,
@@ -967,28 +984,28 @@ fn build_caller_feature_table(
     }
 
     let (tp_columns, tp) = merge_caller_tp_tables(&truth_tp, &query_tp);
-    let truth_fn = ParsedFeatureTable::from_lines(ftx::emit_feature_table_with_depths(
+    let truth_fn = ParsedFeatureTable::from_lines(ftx::emit_feature_table_for_somatic(
         feature,
         groups.fn_truth,
         truth_headers,
         "FN",
         depths,
     )?)?;
-    let query_fp = ParsedFeatureTable::from_lines(ftx::emit_feature_table_with_depths(
+    let query_fp = ParsedFeatureTable::from_lines(ftx::emit_feature_table_for_somatic(
         feature,
         groups.fp_query,
         query_headers,
         "FP",
         depths,
     )?)?;
-    let query_ambi = ParsedFeatureTable::from_lines(ftx::emit_feature_table_with_depths(
+    let query_ambi = ParsedFeatureTable::from_lines(ftx::emit_feature_table_for_somatic(
         feature,
         groups.ambi_query,
         query_headers,
         "AMBI",
         depths,
     )?)?;
-    let query_unk = ParsedFeatureTable::from_lines(ftx::emit_feature_table_with_depths(
+    let query_unk = ParsedFeatureTable::from_lines(ftx::emit_feature_table_for_somatic(
         feature,
         groups.unk_query,
         query_headers,
@@ -1844,6 +1861,18 @@ fn parse_af_bins(raw: &str) -> Vec<(f64, f64)> {
     out
 }
 
+fn preserves_empty_records_af_bin(raw: &str, end: f64) -> bool {
+    if end.is_nan() {
+        return true;
+    }
+
+    end >= 1.0
+        && raw
+            .split(',')
+            .filter_map(|part| part.parse::<f64>().ok())
+            .any(|value| value.is_infinite() && value.is_sign_positive())
+}
+
 fn format_af_bound(value: f64) -> String {
     if value.is_nan() {
         "nan".to_string()
@@ -1862,6 +1891,7 @@ fn calculate_af_stats(
     bin_sizes: &str,
     truth_af_field: &str,
     query_af_field: &str,
+    type_label: Option<&str>,
 ) -> Result<Vec<(f64, f64, SomaticCounts, FilteredCounts)>> {
     let headers = parse_csv_line(feature_header);
     let tag_index = csv_column_index(&headers, "tag")?;
@@ -1889,6 +1919,10 @@ fn calculate_af_stats(
         let mut counts = SomaticCounts::default();
         let mut filtered = FilteredCounts::default();
         for row in &rows {
+            if type_label.is_some_and(|expected| feature_row_type(&headers, row) != Some(expected))
+            {
+                continue;
+            }
             let tag = row.get(tag_index).map(String::as_str).unwrap_or_default();
             let filtered_call = row.get(filter_index).is_some_and(|value| !value.is_empty());
             match tag {
@@ -1925,6 +1959,59 @@ fn calculate_af_stats(
         output.push((start, end, counts, filtered));
     }
     Ok(output)
+}
+
+fn feature_rows_for_type(
+    feature_rows: &[String],
+    feature_header: &str,
+    type_label: Option<&str>,
+) -> Result<Vec<String>> {
+    let Some(type_label) = type_label else {
+        return Ok(feature_rows.to_vec());
+    };
+    let headers = parse_csv_line(feature_header);
+    Ok(feature_rows
+        .iter()
+        .filter(|row| feature_row_type(&headers, &parse_csv_line(row)) == Some(type_label))
+        .cloned()
+        .collect())
+}
+
+fn feature_row_type(headers: &[String], row: &[String]) -> Option<&'static str> {
+    let tag_index = csv_column_index(headers, "tag").ok()?;
+    let tag = row.get(tag_index)?.as_str();
+    let (reference_field, alternate_field) = if matches!(tag, "TP" | "FN") {
+        ("REF.truth", "ALT.truth")
+    } else {
+        ("REF", "ALT")
+    };
+    let reference = row.get(csv_column_index(headers, reference_field).ok()?)?;
+    let alternate = row.get(csv_column_index(headers, alternate_field).ok()?)?;
+    let (reference, alternate) = if reference.is_empty() || alternate.is_empty() {
+        (
+            row.get(csv_column_index(headers, "REF").ok()?)?,
+            row.get(csv_column_index(headers, "ALT").ok()?)?,
+        )
+    } else {
+        (reference, alternate)
+    };
+    feature_allele_type(reference, alternate)
+}
+
+fn feature_allele_type(reference: &str, alternate: &str) -> Option<&'static str> {
+    if alternate.is_empty() || alternate == "." {
+        return None;
+    }
+    if alternate == "*" || alternate.starts_with('<') || alternate.contains(['[', ']']) {
+        return Some("others");
+    }
+    if reference.len() == 1 && alternate.len() == 1 {
+        Some("SNVs")
+    } else if reference.len() > 1 && alternate.len() == reference.len() {
+        Some("MNPs")
+    } else {
+        Some("indels")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2940,13 +3027,7 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
 }
 
 fn py_float(value: f64) -> String {
-    let text = value.to_string();
-    let clean = if text == "-0" { "0" } else { text.as_str() };
-    if clean.contains(['.', 'e', 'E']) {
-        clean.to_string()
-    } else {
-        format!("{clean}.0")
-    }
+    crate::report::python_repr_float(value)
 }
 
 fn normalize_somatic_records(
@@ -3118,15 +3199,13 @@ fn calls_terminal_non_ref(record: &vcf::RawVcfRecord) -> bool {
     })
 }
 
-fn legacy_som_commandline(args: &SomaticArgs) -> String {
+fn somatic_commandline(args: &SomaticArgs) -> String {
     let process_args = std::env::args().collect::<Vec<_>>();
-    if let Some(subcommand) = process_args.iter().position(|value| value == "somatic") {
-        let mut parts = vec!["/opt/conda/bin/som.py".to_string()];
-        parts.extend(process_args.into_iter().skip(subcommand + 1));
-        return parts.join(" ");
+    if process_args.iter().any(|value| value == "somatic") {
+        return process_args.join(" ");
     }
 
-    let mut parts = vec!["/opt/conda/bin/som.py".to_string()];
+    let mut parts = vec!["hap".to_string(), "somatic".to_string()];
 
     if args.include_nonpass {
         parts.push("-P".to_string());
@@ -3164,6 +3243,7 @@ fn write_legacy_metrics_json(
     path: &Path,
     commandline: &str,
     stats_csv: &Path,
+    ci_alpha: f64,
     ambiguous_classes: Option<&BTreeMap<String, usize>>,
     ambiguous_reasons: Option<&BTreeMap<String, usize>>,
 ) -> Result<()> {
@@ -3208,11 +3288,19 @@ fn write_legacy_metrics_json(
         true,
     ));
     for (i, header) in metric_headers.iter().enumerate().skip(1) {
-        let values = metric_rows
-            .iter()
-            .map(|r| r.get(i).cloned().unwrap_or_default())
-            .collect::<Vec<_>>();
-        let kind = infer_type(&values);
+        let exact = exact_somatic_metric_values(header, &metric_headers, &metric_rows, ci_alpha);
+        let exact_metric = exact.is_some();
+        let values = exact.unwrap_or_else(|| {
+            metric_rows
+                .iter()
+                .map(|r| r.get(i).cloned().unwrap_or_default())
+                .collect::<Vec<_>>()
+        });
+        let kind = if exact_metric {
+            "double"
+        } else {
+            infer_type(&values)
+        };
         body.push_str(", ");
         body.push_str(&column_json(header, header, kind, &values, false));
     }
@@ -3223,13 +3311,117 @@ fn write_legacy_metrics_json(
     body.push_str("\"timestamp\": ");
     body.push_str(&json_string(&iso_timestamp_now()));
     body.push_str(", \"metadata\": {\"required\": {\"version\": \"\", \"id\": \"haplotypes\", \"module\": \"som.py\", \"description\": ");
+    let executable = commandline.split_whitespace().next().unwrap_or("hap");
     body.push_str(&json_string(&format!(
-        "/opt/conda/bin/som.py generated this JSON file via command line {}",
-        commandline
+        "{executable} generated this JSON file via command line {commandline}",
     )));
     body.push_str("}}}");
     fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn exact_somatic_metric_values(
+    column: &str,
+    headers: &[String],
+    rows: &[Vec<String>],
+    ci_alpha: f64,
+) -> Option<Vec<String>> {
+    let metric = matches!(
+        column,
+        "recall"
+            | "recall_lower"
+            | "recall_upper"
+            | "recall2"
+            | "precision"
+            | "precision_lower"
+            | "precision_upper"
+            | "na"
+            | "ambiguous"
+            | "fp.rate"
+            | "recall.filtered"
+            | "precision.filtered"
+            | "fp.rate.filtered"
+            | "na.filtered"
+            | "ambiguous.filtered"
+    );
+    if !metric {
+        return None;
+    }
+
+    let index = |name: &str| headers.iter().position(|header| header == name);
+    let count = |row: &[String], name: &str| {
+        index(name)
+            .and_then(|column| row.get(column))
+            .filter(|value| !value.is_empty() && value.as_str() != ".")
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| value as usize)
+    };
+    let ratio = |numerator: usize, denominator: usize| {
+        (denominator != 0).then(|| (numerator as f64 / denominator as f64).to_string())
+    };
+    let fp_rate = |false_positives: usize, region_size: usize| {
+        if region_size == 0 {
+            (false_positives != 0).then(|| "inf".to_string())
+        } else {
+            Some((1_000_000.0 * false_positives as f64 / region_size as f64).to_string())
+        }
+    };
+
+    Some(
+        rows.iter()
+            .map(|row| {
+                let Some(tp) = count(row, "tp") else {
+                    return String::new();
+                };
+                let fp = count(row, "fp").unwrap_or(0);
+                let fn_count = count(row, "fn").unwrap_or(0);
+                let truth_total = count(row, "total.truth").unwrap_or(0);
+                let query_total = count(row, "total.query").unwrap_or(0);
+                let unk = count(row, "unk").unwrap_or(0);
+                let ambi = count(row, "ambi").unwrap_or(0);
+                let fp_region_size = count(row, "fp.region.size").unwrap_or(0);
+                let (recall, recall_lower, recall_upper) = jeffreys_ci(tp, tp + fn_count, ci_alpha);
+                let (precision, precision_lower, precision_upper) =
+                    jeffreys_ci(tp, tp + fp, ci_alpha);
+                let exact = match column {
+                    "recall" => Some(recall.to_string()),
+                    "recall_lower" => Some(recall_lower.to_string()),
+                    "recall_upper" => Some(recall_upper.to_string()),
+                    "recall2" => ratio(tp, truth_total),
+                    "precision" => Some(precision.to_string()),
+                    "precision_lower" => Some(precision_lower.to_string()),
+                    "precision_upper" => Some(precision_upper.to_string()),
+                    "na" => ratio(unk, query_total),
+                    "ambiguous" => ratio(ambi, query_total),
+                    "fp.rate" => fp_rate(fp, fp_region_size),
+                    filtered => {
+                        let Some(filtered_tp) = count(row, "tp.filtered") else {
+                            return String::new();
+                        };
+                        let filtered_fp = count(row, "fp.filtered").unwrap_or(0);
+                        let filtered_unk = count(row, "unk.filtered").unwrap_or(0);
+                        let filtered_ambi = count(row, "ambi.filtered").unwrap_or(0);
+                        let unfiltered_tp = tp.saturating_sub(filtered_tp);
+                        let unfiltered_fp = fp.saturating_sub(filtered_fp);
+                        match filtered {
+                            "recall.filtered" => ratio(unfiltered_tp, tp + fn_count),
+                            "precision.filtered" => {
+                                ratio(unfiltered_tp, unfiltered_tp + unfiltered_fp)
+                            }
+                            "fp.rate.filtered" => fp_rate(unfiltered_fp, fp_region_size),
+                            "na.filtered" => ratio(unk.saturating_sub(filtered_unk), query_total),
+                            "ambiguous.filtered" => {
+                                ratio(ambi.saturating_sub(filtered_ambi), query_total)
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                exact.unwrap_or_default()
+            })
+            .collect(),
+    )
 }
 
 fn count_metric_json(id: &str, column: &str, counts: &BTreeMap<String, usize>) -> String {
@@ -3337,7 +3529,15 @@ fn column_json(
             "int64" | "double" if value.parse::<f64>().is_ok_and(|number| !number.is_finite()) => {
                 "null".to_string()
             }
-            "int64" | "double" => value.to_string(),
+            // pandas writes the displayed CSV with Python 2's 12-significant-
+            // digit `str(float)`, but json.dumps serializes the underlying
+            // binary64 value. Keep the full round-trippable value here instead
+            // of reusing the deliberately lossy CSV formatter.
+            "double" => value
+                .parse::<f64>()
+                .map(json_float)
+                .unwrap_or_else(|_| value.to_string()),
+            "int64" => value.to_string(),
             _ if numeric_strings && value.parse::<i64>().is_ok() => value.to_string(),
             _ => json_string(value),
         })
@@ -3349,6 +3549,14 @@ fn column_json(
         json_string(id),
         json_string(label)
     )
+}
+
+fn json_float(value: f64) -> String {
+    let mut rendered = value.to_string();
+    if !rendered.contains(['.', 'e', 'E']) {
+        rendered.push_str(".0");
+    }
+    rendered
 }
 
 fn json_string(value: &str) -> String {
@@ -4613,7 +4821,6 @@ mod tests {
             .expect("--no-order-check must bypass the developer safety check");
     }
 
-    #[cfg(feature = "verification")]
     #[test]
     fn bam_depths_flow_into_somatic_caller_features() {
         let fixture_dir =
@@ -4841,8 +5048,8 @@ mod tests {
             "0,chr1,40,UNK,A,,C,,,,0.7".to_string(),
             "0,chr1,50,AMBI,A,,C,,,,1.0".to_string(),
         ];
-        let bins =
-            calculate_af_stats(header, &rows, "0.5", "TRUTH_AF", "QUERY_AF").expect("AF stats");
+        let bins = calculate_af_stats(header, &rows, "0.5", "TRUTH_AF", "QUERY_AF", None)
+            .expect("AF stats");
         assert_eq!(bins.len(), 2);
         assert_eq!(bins[0].2.truth_total, 1);
         assert_eq!(bins[0].2.query_total, 2);
@@ -4884,12 +5091,23 @@ mod tests {
         assert_eq!(infer_type(&values), "double");
         assert_eq!(
             column_json("recall2", "recall2", "double", &values, false),
-            "{\"values\": [0, null, null], \"type\": \"double\", \"id\": \"recall2\", \"label\": \"recall2\"}"
+            "{\"values\": [0.0, null, null], \"type\": \"double\", \"id\": \"recall2\", \"label\": \"recall2\"}"
         );
 
         assert_eq!(infer_type(&["1".to_string(), "2".to_string()]), "int64");
         assert_eq!(infer_type(&["1.5".to_string(), String::new()]), "double");
         assert_eq!(infer_type(&[String::new(), ".".to_string()]), "string");
+
+        assert_eq!(
+            column_json(
+                "recall",
+                "recall",
+                "double",
+                &["0.9319987680936249".to_string()],
+                false,
+            ),
+            "{\"values\": [0.9319987680936249], \"type\": \"double\", \"id\": \"recall\", \"label\": \"recall\"}"
+        );
     }
 
     #[test]

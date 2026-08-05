@@ -1,5 +1,5 @@
 //! Deterministic positive-finite `log`, `exp`, and `pow` cores matching the
-//! AVX2/FMA scalar path selected by Ubuntu glibc 2.39 on the legacy oracle.
+//! AVX2/FMA scalar path selected by Ubuntu glibc 2.39 on the legacy reference.
 //!
 //! Ported from musl v1.2.5 commit 0784374d561435f7c787a555aeab8ede699ed298,
 //! `src/math/{log,log_data,exp,exp_data,pow,pow_data}.c`. Those files are

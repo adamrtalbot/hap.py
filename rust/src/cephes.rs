@@ -11,7 +11,7 @@
 //! coefficients, and convergence thresholds — only translated into
 //! Rust syntax and idiomatic arithmetic. Logarithm, exponential, and power
 //! operations use an internal port of the AVX2/FMA scalar math selected by the
-//! Ubuntu glibc 2.39 oracle so their last bits do not depend on the host libc.
+//! Ubuntu glibc 2.39 reference so their last bits do not depend on the host libc.
 
 // Preserve the original Cephes decimal constants for source and bit-level parity.
 #![allow(clippy::excessive_precision)]

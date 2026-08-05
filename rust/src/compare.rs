@@ -795,43 +795,49 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         requantify_rows.as_deref().unwrap_or(&rows),
     )?;
     let roc_indices = if requantify {
-        crate::quantify::run_with_metric_indices(crate::cli::QuantifyArgs {
-            input_vcf: comparison_vcf.display().to_string(),
-            report_prefix: args.report_prefix.clone(),
-            reference: args.reference.clone(),
-            // Rust comparison rows already carry finalized GA4GH BD/BK/BVT
-            // sample fields. Re-quantify those decisions while adding user
-            // stratifications/ROC controls; XCMP mode would instead expect
-            // the legacy pre-quantify INFO/type annotations.
-            annotation_type: Some("ga4gh".to_string()),
-            fp_bedfile: args.fp_bedfile.clone(),
-            strat_tsv: args.strat_tsv.clone(),
-            strat_regions: args.strat_regions.clone(),
-            strat_fixchr: args.strat_fixchr,
-            write_vcf: true,
-            write_counts,
-            output_vtc: false,
-            preserve_info: false,
-            // `--adjust-conf-regions` is a no-op when no confidence BED was
-            // supplied. Passing the truth VCF through to qfy in that case
-            // incorrectly turns the default happy setting into qfy's
-            // standalone argument error.
-            adjust_conf_regions: (adjust_conf && conf_bed.is_some())
-                .then(|| truth_variant_input.display().to_string()),
-            threads: None,
-            bcf: false,
-            logfile: None,
-            verbose: false,
-            quiet: false,
-            force_interactive: false,
-            roc: args.roc.clone(),
-            do_roc: !args.no_roc,
-            roc_regions: args.roc_regions.clone(),
-            roc_filter: args.roc_filter.clone(),
-            roc_delta: args.roc_delta,
-            ci_alpha: args.ci_alpha,
-            no_json: args.no_json,
-        })?
+        crate::quantify::run_from_compare(
+            crate::cli::QuantifyArgs {
+                input_vcf: comparison_vcf.display().to_string(),
+                report_prefix: args.report_prefix.clone(),
+                reference: args.reference.clone(),
+                // Rust comparison rows already carry finalized GA4GH BD/BK/BVT
+                // sample fields. Re-quantify those decisions while adding user
+                // stratifications/ROC controls; XCMP mode would instead expect
+                // the legacy pre-quantify INFO/type annotations.
+                annotation_type: Some("ga4gh".to_string()),
+                fp_bedfile: args.fp_bedfile.clone(),
+                strat_tsv: args.strat_tsv.clone(),
+                strat_regions: args.strat_regions.clone(),
+                strat_fixchr: args.strat_fixchr,
+                write_vcf: true,
+                write_counts,
+                output_vtc: false,
+                preserve_info: false,
+                // `--adjust-conf-regions` is a no-op when no confidence BED was
+                // supplied. Passing the truth VCF through to qfy in that case
+                // incorrectly turns the default happy setting into qfy's
+                // standalone argument error.
+                adjust_conf_regions: (adjust_conf && conf_bed.is_some())
+                    .then(|| truth_variant_input.display().to_string()),
+                threads: None,
+                bcf: false,
+                logfile: None,
+                verbose: false,
+                quiet: false,
+                force_interactive: false,
+                roc: args.roc.clone(),
+                do_roc: !args.no_roc,
+                roc_regions: args.roc_regions.clone(),
+                roc_filter: args.roc_filter.clone(),
+                roc_delta: args.roc_delta,
+                ci_alpha: args.ci_alpha,
+                no_json: args.no_json,
+            },
+            crate::quantify::CompareQuantifyMode {
+                preserve_missing_nocall_bd: args.usefiltered_truth,
+                ..Default::default()
+            },
+        )?
     } else {
         let indices = crate::roc::write_roc_files(prefix, &rows, subset_size, conf_size)?;
         if args.no_roc {
@@ -1041,6 +1047,56 @@ fn run_vcfeval(
     prefix: &Path,
     scratch: ScratchRun,
 ) -> Result<()> {
+    let mut strat_regions = args.strat_regions.clone();
+    if args.adjust_conf_regions
+        && !args.no_adjust_conf_regions
+        && let Some(conf_path) = args.fp_bedfile.as_deref()
+    {
+        let reference = fasta::read_sequences(Path::new(&args.reference))?;
+        let contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
+        let raw_conf = vcf::load_bed(Path::new(conf_path), &contigs)?;
+        let (_, truth_records) = vcf::load_raw_vcf(truth_prep)?;
+        let truth = truth_records
+            .into_iter()
+            .map(|record| -> Result<Variant> {
+                let effective_end = record.effective_end_pos(truth_prep)?;
+                let span = effective_end.saturating_sub(record.pos).saturating_add(1);
+                let mut ref_allele = record.ref_allele;
+                if span > ref_allele.len()
+                    && let Some(sequence) = reference.get(&record.chrom)
+                    && let Some(slice) = sequence
+                        .as_bytes()
+                        .get(record.pos.saturating_sub(1)..effective_end)
+                {
+                    ref_allele = String::from_utf8_lossy(slice).to_ascii_uppercase();
+                }
+                Ok(Variant {
+                    key: VariantKey {
+                        chrom: record.chrom,
+                        pos: record.pos,
+                        ref_allele,
+                        alt_allele: record.alt_allele,
+                    },
+                    qual: record.qual,
+                    filter: record.filter,
+                    gt: String::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let padding = gvcf2bed_padding(&truth, Some(&raw_conf));
+        let padding_path = scratch.path().join("truth.conf-vars.bed");
+        let mut output = fs::File::create(&padding_path)
+            .with_context(|| format!("failed to create {}", padding_path.display()))?;
+        for interval in padding {
+            writeln!(
+                output,
+                "{}\t{}\t{}",
+                interval.chrom, interval.start, interval.end
+            )
+            .with_context(|| format!("failed to write {}", padding_path.display()))?;
+        }
+        strat_regions.push(format!("CONF_VARS:{}", padding_path.display()));
+    }
     let inferred_template = args
         .reference
         .strip_suffix(".fa")
@@ -1140,7 +1196,7 @@ fn run_vcfeval(
     if args.preserve_info {
         // Pinned hap.py writes runinfo before preprocessing, reaches this
         // point after RTG succeeds, then crashes while merging the original
-        // INFO fields back into the vcfeval output. The compact oracle fails
+        // INFO fields back into the vcfeval output. The compact reference fails
         // in the first bcftools merge; inputs that pass it hit the subsequent
         // undefined `output_vcf` variable. Preserve that unconditional
         // failure and its final pre-quantification artifact set.
@@ -1148,34 +1204,37 @@ fn run_vcfeval(
         write_runinfo_for_args(args, explicit_bcf, prefix, &commandline)?;
         bail!("vcfeval --preserve-info failed while restoring input INFO fields");
     }
-    let roc_indices = crate::quantify::run_with_metric_indices(crate::cli::QuantifyArgs {
-        input_vcf: vcfeval_vcf.display().to_string(),
-        report_prefix: args.report_prefix.clone(),
-        reference: args.reference.clone(),
-        annotation_type: Some("ga4gh".to_string()),
-        fp_bedfile: args.fp_bedfile.clone(),
-        strat_tsv: args.strat_tsv.clone(),
-        strat_regions: args.strat_regions.clone(),
-        strat_fixchr: args.strat_fixchr,
-        write_vcf: true,
-        write_counts: args.write_counts && !args.no_write_counts,
-        output_vtc: false,
-        preserve_info: false,
-        adjust_conf_regions: None,
-        threads: None,
-        bcf: false,
-        logfile: None,
-        verbose: false,
-        quiet: false,
-        force_interactive: false,
-        roc: args.roc.clone(),
-        do_roc: !args.no_roc,
-        roc_regions: args.roc_regions.clone(),
-        roc_filter: args.roc_filter.clone(),
-        roc_delta: args.roc_delta,
-        ci_alpha: args.ci_alpha,
-        no_json: args.no_json,
-    })?;
+    let roc_indices = crate::quantify::run_from_compare(
+        crate::cli::QuantifyArgs {
+            input_vcf: vcfeval_vcf.display().to_string(),
+            report_prefix: args.report_prefix.clone(),
+            reference: args.reference.clone(),
+            annotation_type: Some("ga4gh".to_string()),
+            fp_bedfile: args.fp_bedfile.clone(),
+            strat_tsv: args.strat_tsv.clone(),
+            strat_regions,
+            strat_fixchr: args.strat_fixchr,
+            write_vcf: true,
+            write_counts: args.write_counts && !args.no_write_counts,
+            output_vtc: false,
+            preserve_info: false,
+            adjust_conf_regions: None,
+            threads: None,
+            bcf: false,
+            logfile: None,
+            verbose: false,
+            quiet: false,
+            force_interactive: false,
+            roc: args.roc.clone(),
+            do_roc: !args.no_roc,
+            roc_regions: args.roc_regions.clone(),
+            roc_filter: args.roc_filter.clone(),
+            roc_delta: args.roc_delta,
+            ci_alpha: args.ci_alpha,
+            no_json: args.no_json,
+        },
+        crate::quantify::CompareQuantifyMode::default(),
+    )?;
     if args.preserve_info || args.output_vtc {
         decorate_existing_comparison_vcf(
             &suffixed_report_path(prefix, "vcf.gz"),
@@ -1247,34 +1306,40 @@ fn run_scmp(
         &comparison_vcf,
     )?;
     let write_counts = args.write_counts && !args.no_write_counts;
-    let roc_indices = crate::quantify::run_with_metric_indices(crate::cli::QuantifyArgs {
-        input_vcf: comparison_vcf.display().to_string(),
-        report_prefix: args.report_prefix.clone(),
-        reference: args.reference.clone(),
-        annotation_type: Some("ga4gh".to_string()),
-        fp_bedfile: args.fp_bedfile.clone(),
-        strat_tsv: args.strat_tsv.clone(),
-        strat_regions,
-        strat_fixchr: args.strat_fixchr,
-        write_vcf: true,
-        write_counts,
-        output_vtc: args.output_vtc,
-        preserve_info: false,
-        adjust_conf_regions: None,
-        threads: None,
-        bcf: false,
-        logfile: None,
-        verbose: false,
-        quiet: false,
-        force_interactive: false,
-        roc: args.roc.clone(),
-        do_roc: !args.no_roc,
-        roc_regions: args.roc_regions.clone(),
-        roc_filter: args.roc_filter.clone(),
-        roc_delta: args.roc_delta,
-        ci_alpha: args.ci_alpha,
-        no_json: args.no_json,
-    })?;
+    let roc_indices = crate::quantify::run_from_compare(
+        crate::cli::QuantifyArgs {
+            input_vcf: comparison_vcf.display().to_string(),
+            report_prefix: args.report_prefix.clone(),
+            reference: args.reference.clone(),
+            annotation_type: Some("ga4gh".to_string()),
+            fp_bedfile: args.fp_bedfile.clone(),
+            strat_tsv: args.strat_tsv.clone(),
+            strat_regions,
+            strat_fixchr: args.strat_fixchr,
+            write_vcf: true,
+            write_counts,
+            output_vtc: args.output_vtc,
+            preserve_info: false,
+            adjust_conf_regions: None,
+            threads: None,
+            bcf: false,
+            logfile: None,
+            verbose: false,
+            quiet: false,
+            force_interactive: false,
+            roc: args.roc.clone(),
+            do_roc: !args.no_roc,
+            roc_regions: args.roc_regions.clone(),
+            roc_filter: args.roc_filter.clone(),
+            roc_delta: args.roc_delta,
+            ci_alpha: args.ci_alpha,
+            no_json: args.no_json,
+        },
+        crate::quantify::CompareQuantifyMode {
+            preserve_missing_query_qq: args.engine == CompareEngine::ScmpSomatic,
+            ..Default::default()
+        },
+    )?;
     let commandline = std::env::args().collect::<Vec<_>>().join(" ");
     write_runinfo_for_args(args, explicit_bcf, prefix, &commandline)?;
     rewrite_compare_metrics(args, prefix, &commandline, &roc_indices)?;
@@ -1630,7 +1695,7 @@ fn decorate_output_rows(
                 &mut record,
                 1,
                 "QQ",
-                if query_called { "nan" } else { "0" },
+                if query_called { "nan" } else { "." },
             );
         }
 
@@ -9025,7 +9090,7 @@ mod memory_guards {
         );
     }
 
-    // Class 4 pin (rust/PHASE1_BASELINE.md #52): BI (comparison_info)
+    // Class 4 pin: BI (comparison_info)
     // on multi-allelic SNPs with mixed ti/tv alleles must emit the
     // comma-joined per-allele tokens legacy uses, not a single
     // collapsed ti/tv. Chr21:17562906 `A → G,T GT=2/1`: A→G is ti,
@@ -9101,7 +9166,7 @@ mod memory_guards {
         assert!(!variant_is_conf(&var, "N", 15859600, 15859700, &intervals));
     }
 
-    // PHASE1_BASELINE.md #76: per-primitive CONF coverage. A multi-allelic
+    // Per-primitive CONF coverage: a multi-allelic
     // query whose deletion primitive sits inside CONF but whose insertion
     // primitive straddles a CONF edge must produce a RegionState where
     // `covered_query` contains the deletion primitive's key but NOT the
@@ -9290,6 +9355,42 @@ mod memory_guards {
         // Half-open BED: [15847470, 15847471) → 1 bp.
         assert_eq!(padding[0].start, 15847470);
         assert_eq!(padding[0].end, 15847471);
+    }
+
+    #[test]
+    fn gvcf2bed_padding_preserves_preprocessed_truth_spans() {
+        let truth = [
+            (10, "C", "A"),
+            (20, "T", "A"),
+            (29, "ACGTACG", "A"),
+            (40, "T", "."),
+            (50, "CG", "C"),
+        ]
+        .into_iter()
+        .map(|(pos, reference, alternate)| Variant {
+            key: VariantKey {
+                chrom: "chr1".to_string(),
+                pos,
+                ref_allele: reference.to_string(),
+                alt_allele: alternate.to_string(),
+            },
+            qual: ".".to_string(),
+            filter: "PASS".to_string(),
+            gt: String::new(),
+        })
+        .collect::<Vec<_>>();
+        let confidence = [vcf::BedInterval {
+            chrom: "chr1".to_string(),
+            start: 0,
+            end: 120,
+        }];
+        let padding = gvcf2bed_padding(&truth, Some(&confidence));
+        let size = padding
+            .iter()
+            .map(|interval| interval.end - interval.start)
+            .sum::<usize>();
+
+        assert_eq!(size, 10);
     }
 
     // Class 2 pin: `canonical_hetalt_gt` renders a query hetalt GT in

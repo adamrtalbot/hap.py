@@ -18,7 +18,7 @@ pub fn read_index(path: &Path) -> Result<BTreeMap<String, usize>> {
     let mut contigs = BTreeMap::new();
     for (line_number, line) in text.lines().enumerate() {
         let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() < 5 || fields[0].is_empty() {
+        if fields.len() < 2 || fields[0].is_empty() {
             bail!(
                 "invalid FASTA index line {} in {}",
                 line_number + 1,
@@ -33,41 +33,7 @@ pub fn read_index(path: &Path) -> Result<BTreeMap<String, usize>> {
                 index_path.display()
             )
         })?;
-        fields[2].parse::<u64>().with_context(|| {
-            format!(
-                "invalid FASTA index offset '{}' on line {} in {}",
-                fields[2],
-                line_number + 1,
-                index_path.display()
-            )
-        })?;
-        let line_bases = fields[3].parse::<usize>().with_context(|| {
-            format!(
-                "invalid FASTA index line-bases '{}' on line {} in {}",
-                fields[3],
-                line_number + 1,
-                index_path.display()
-            )
-        })?;
-        let line_width = fields[4].parse::<usize>().with_context(|| {
-            format!(
-                "invalid FASTA index line-width '{}' on line {} in {}",
-                fields[4],
-                line_number + 1,
-                index_path.display()
-            )
-        })?;
-        if (length > 0 && line_bases == 0) || line_width < line_bases {
-            bail!(
-                "invalid FASTA index geometry on line {} in {}",
-                line_number + 1,
-                index_path.display()
-            );
-        }
         contigs.insert(fields[0].to_string(), length);
-    }
-    if contigs.is_empty() {
-        bail!("no contigs found in FASTA index {}", index_path.display());
     }
     Ok(contigs)
 }
@@ -125,21 +91,13 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn read_index_rejects_empty_and_malformed_files() -> Result<()> {
+    fn read_index_rejects_malformed_names_and_lengths() -> Result<()> {
         let directory = tempdir()?;
         let reference = directory.path().join("ref.fa");
         fs::write(&reference, ">chr1\nAAAAA\n")?;
         let index = index_path(&reference);
 
-        fs::write(&index, "")?;
-        assert!(
-            read_index(&reference)
-                .unwrap_err()
-                .to_string()
-                .contains("no contigs")
-        );
-
-        fs::write(&index, "chr1\t5\n")?;
+        fs::write(&index, "chr1\n")?;
         assert!(
             read_index(&reference)
                 .unwrap_err()
@@ -164,6 +122,30 @@ mod tests {
         fs::write(&reference, ">chr1\nAAAAA\n")?;
         fs::write(index_path(&reference), "chr1\t5\t6\t5\t6\n")?;
 
+        assert_eq!(
+            read_index(&reference)?,
+            BTreeMap::from([("chr1".to_string(), 5)])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_index_matches_legacy_permissive_fai_fields() -> Result<()> {
+        let directory = tempdir()?;
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1\nAAAAA\n")?;
+        let index = index_path(&reference);
+
+        fs::write(&index, "")?;
+        assert_eq!(read_index(&reference)?, BTreeMap::new());
+
+        fs::write(&index, "chr1\t5\n")?;
+        assert_eq!(
+            read_index(&reference)?,
+            BTreeMap::from([("chr1".to_string(), 5)])
+        );
+
+        fs::write(&index, "chr1\t1\tinvalid\tgeometry\tis-ignored\nchr1\t5\n")?;
         assert_eq!(
             read_index(&reference)?,
             BTreeMap::from([("chr1".to_string(), 5)])

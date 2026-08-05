@@ -97,6 +97,12 @@ pub fn write_summary(
         writer,
         "Type,Filter,TRUTH.TOTAL,TRUTH.TP,TRUTH.FN,QUERY.TOTAL,QUERY.FP,QUERY.UNK,FP.gt,FP.al,METRIC.Recall,METRIC.Precision,METRIC.Frac_NA,METRIC.F1_Score,TRUTH.TOTAL.TiTv_ratio,QUERY.TOTAL.TiTv_ratio,TRUTH.TOTAL.het_hom_ratio,QUERY.TOTAL.het_hom_ratio"
     )?;
+    if all_counts.is_empty() && pass_counts.is_empty() {
+        for variant_type in ["INDEL", "SNP"] {
+            writeln!(writer, "{variant_type},ALL,0,0,0,0,0,0,0,0,,,,,,,,")?;
+        }
+        return Ok(());
+    }
     let mut variant_types: Vec<&String> = all_counts.keys().chain(pass_counts.keys()).collect();
     variant_types.sort();
     variant_types.dedup();
@@ -172,6 +178,13 @@ pub fn write_extended(
 ) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     writeln!(writer, "{}", EXTENDED_HEADER.join(","))?;
+
+    if all_counts.is_empty() && pass_counts.is_empty() {
+        for row in empty_comparison_extended_lines(subset_size) {
+            writeln!(writer, "{row}")?;
+        }
+        return Ok(());
+    }
 
     let mut variant_types: Vec<&String> = all_counts.keys().chain(pass_counts.keys()).collect();
     variant_types.sort();
@@ -397,12 +410,29 @@ pub fn write_extended(
     Ok(())
 }
 
-pub fn write_vcf(path: &Path, headers: &[String], rows: &[AnnotatedRow]) -> Result<()> {
-    vcf::write_indexed_vcf(path, headers, rows.iter().map(|row| row.line.as_str()))
+pub(crate) fn empty_comparison_extended_lines(subset_size: usize) -> Vec<String> {
+    ["INDEL", "SNP"]
+        .into_iter()
+        .map(|variant_type| {
+            let mut row = vec![String::new(); EXTENDED_HEADER.len()];
+            row[0] = variant_type.to_string();
+            row[1] = "*".to_string();
+            row[2] = "*".to_string();
+            row[3] = "ALL".to_string();
+            row[4] = "*".to_string();
+            row[5] = "nan".to_string();
+            row[6] = "*".to_string();
+            for index in [11, 12, 16, 23, 30, 37, 44, 51, 58] {
+                row[index] = "0".to_string();
+            }
+            row[13] = format!("{subset_size}.0");
+            row.join(",")
+        })
+        .collect()
 }
 
-pub(crate) fn append_stats(row: &mut Vec<String>, stats: &CountsBucket, supports_titv: bool) {
-    append_stats_with_missing(row, stats, supports_titv, ".");
+pub fn write_vcf(path: &Path, headers: &[String], rows: &[AnnotatedRow]) -> Result<()> {
+    vcf::write_indexed_vcf(path, headers, rows.iter().map(|row| row.line.as_str()))
 }
 
 fn append_extended_stats(
@@ -414,7 +444,7 @@ fn append_extended_stats(
     append_stats_with_missing(row, stats, supports_titv, missing_titv);
 }
 
-fn append_stats_with_missing(
+pub(crate) fn append_stats_with_missing(
     row: &mut Vec<String>,
     stats: &CountsBucket,
     supports_titv: bool,
@@ -527,7 +557,7 @@ pub(crate) fn format_metric(value: f64) -> String {
 /// The intermediate rounding produces results that differ by 1 ULP from
 /// `f64::from_str` on roughly half of inputs — for byte parity we have
 /// to reproduce that walk.
-fn pandas_xstrtod(s: &str) -> f64 {
+pub(crate) fn pandas_xstrtod(s: &str) -> f64 {
     let bytes = s.as_bytes();
     let mut idx = 0;
     let mut sign = 1.0_f64;
@@ -593,11 +623,9 @@ fn format_ratio(value: f64) -> String {
     python_repr_float(value)
 }
 
-// Match Python's repr() for floats: shortest-roundtrip representation that
-// always includes a decimal point. Rust's Debug formatter for f64 uses the
-// same shortest-roundtrip algorithm as Python's repr (Grisu/Ryu) and
-// preserves ".0" for integer-valued floats — exactly what pandas emits
-// when DataFrame.to_csv renders a float column with the default format.
+// Python 2's str(float), used by pandas 0.19.2 CSV emission, keeps 12
+// significant digits. It uses fixed notation for exponents in [-4, 11] and
+// scientific notation otherwise. Integer-valued fixed numbers retain `.0`.
 pub(crate) fn python_repr_float(value: f64) -> String {
     if value.is_nan() {
         return "nan".to_string();
@@ -609,28 +637,34 @@ pub(crate) fn python_repr_float(value: f64) -> String {
             "inf".to_string()
         };
     }
-    let s = format!("{value:?}");
-    // Python pandas zero-pads scientific notation exponents to ≥2 digits:
-    // Rust:  "9.499999999999999e-5" / "1.0e10"
-    // Python: "9.499999999999999e-05" / "1.0e+10"
-    // Pandas always emits sign (e+xx or e-xx) with 2-digit minimum.
-    if let Some(e_pos) = s.find('e') {
-        let (mantissa, exponent) = s.split_at(e_pos);
-        let exp_str = &exponent[1..]; // skip 'e'
-        let (sign, digits) = if let Some(stripped) = exp_str.strip_prefix('-') {
-            ("-", stripped)
-        } else if let Some(stripped) = exp_str.strip_prefix('+') {
-            ("+", stripped)
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0".to_string()
         } else {
-            ("+", exp_str)
+            "0.0".to_string()
         };
-        if digits.len() < 2 {
-            return format!("{mantissa}e{sign}0{digits}");
-        } else {
-            return format!("{mantissa}e{sign}{digits}");
-        }
     }
-    s
+    let exponent = value.abs().log10().floor() as i32;
+    if !(-4..12).contains(&exponent) {
+        let scientific = format!("{value:.11e}");
+        let (mantissa, exponent_text) = scientific.split_once('e').unwrap();
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        let exponent_value = exponent_text.parse::<i32>().unwrap();
+        return format!("{mantissa}e{exponent_value:+03}");
+    }
+    let decimal_places = usize::try_from(11 - exponent).unwrap_or(0);
+    let mut rendered = format!("{value:.decimal_places$}");
+    if rendered.contains('.') {
+        while rendered.ends_with('0') {
+            rendered.pop();
+        }
+        if rendered.ends_with('.') {
+            rendered.push('0');
+        }
+    } else {
+        rendered.push_str(".0");
+    }
+    rendered
 }
 
 #[cfg(test)]
@@ -653,21 +687,21 @@ mod format_tests {
     }
 
     #[test]
-    fn long_repr_preserves_all_digits() {
-        // These values are chosen so their f64 shortest-repr has trailing 9s/0s
-        // the way Python's repr does.
+    fn long_repr_matches_python_two_significant_digits() {
         let v: f64 = 0.9651790000000001;
-        assert_eq!(python_repr_float(v), "0.9651790000000001");
+        assert_eq!(python_repr_float(v), "0.965179");
         let w: f64 = 1.58980044345898;
-        assert_eq!(python_repr_float(w), "1.58980044345898");
+        assert_eq!(python_repr_float(w), "1.58980044346");
+        assert_eq!(python_repr_float(0.00009499999999999999), "9.5e-05");
+        assert_eq!(python_repr_float(1_234_567_890_123.0), "1.23456789012e+12");
     }
 
     #[test]
-    fn pandas_xstrtod_matches_legacy_oracle() {
+    fn pandas_xstrtod_matches_legacy_reference() {
         use super::pandas_xstrtod;
         // (input, expected pandas-parsed f64). These were captured by
         // running `pandas.to_numeric` inside the legacy Wave container
-        // (pandas 0.24.2 / Python 2.7) — the exact pipeline that drives
+        // (pandas 0.19.2 / Python 2.7) — the exact pipeline that drives
         // legacy METRIC.* CSV emission.
         let cases: &[(&str, f64)] = &[
             ("0.877140", f64::from_bits(0x3fec1187e7c06e19)), // predecessor of 0.87714
@@ -695,15 +729,15 @@ mod format_tests {
     #[test]
     fn format_metric_matches_legacy_byte_for_byte() {
         use super::format_metric;
-        // Recall = 7839/8937 → C++ "0.877140" → pandas-xstrtod → "0.8771399999999999"
-        assert_eq!(format_metric(7839.0 / 8937.0), "0.8771399999999999");
+        // Python 2 str() suppresses the parser's one-ULP representation noise.
+        assert_eq!(format_metric(7839.0 / 8937.0), "0.87714");
         // Precision = 7949/8292 → "0.958635" → pandas-xstrtod → "0.958635"
         assert_eq!(format_metric(7949.0 / 8292.0), "0.958635");
-        // F1 ≈ 0.916078519... → "0.916079" → "0.9160790000000001"
+        // F1 ≈ 0.916078519... → C++ "0.916079" → Python 2 "0.916079".
         let r = 7839.0 / 8937.0;
         let p = 7949.0 / 8292.0;
         let f1 = 2.0 * r * p / (r + p);
-        assert_eq!(format_metric(f1), "0.9160790000000001");
+        assert_eq!(format_metric(f1), "0.916079");
         // Frac_NA = 3520/11812 → "0.298002" → exact f64 → "0.298002"
         assert_eq!(format_metric(3520.0 / 11812.0), "0.298002");
     }
