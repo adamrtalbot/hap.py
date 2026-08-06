@@ -1,0 +1,10 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrT,length=80>
+##INFO=<ID=MATEID,Number=1,Type=String,Description="Mate breakend identifier">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+chrT	11	bnd1	C	C]chrT:41]	30	PASS	MATEID=bnd2	GT:AD	0/1:8,5
+chrT	12	bnd2	C	C[chrT:42[	30	PASS	MATEID=bnd1	GT:AD	0/1:9,4
+chrT	13	bnd3	C	]chrT:43]C	30	PASS	.	GT:AD	0/1:10,3
+chrT	14	bnd4	C	[chrT:44[C	30	PASS	.	GT:AD	0/1:11,2

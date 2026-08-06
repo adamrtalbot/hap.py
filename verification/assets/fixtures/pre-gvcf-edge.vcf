@@ -1,0 +1,12 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrT,length=80>
+##ALT=<ID=NON_REF,Description="Represents any possible alternative allele">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant block">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype quality">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	CALLED	BLOCK
+chrT	1	start_block	A	<NON_REF>	.	PASS	END=10	GT:DP:GQ	0/0:20:40	0/0:18:35
+chrT	11	called	C	T,<NON_REF>	30	PASS	.	GT:DP:GQ	0/1:22:45	0/0:19:38
+chrT	21	called_nonref	G	A,<NON_REF>	30	PASS	.	GT:DP:GQ	0/2:20:42	0/0:17:31
+chrT	31	end_block	T	<NON_REF>	.	PASS	END=80	GT:DP:GQ	0/0:21:41	0/0:16:30

@@ -1,0 +1,9 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrT,length=80>
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position">
+##ALT=<ID=DEL,Description="Deletion">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+chrT	1	start_ins	A	AT	30	PASS	.	GT	0/1
+chrT	79	end_del	TT	T	30	PASS	.	GT	0/1
+chrT	80	end_ins	T	TA	30	PASS	.	GT	0/1

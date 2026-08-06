@@ -1,0 +1,12 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrT,length=80>
+##ALT=<ID=DUP,Description="Duplication">
+##ALT=<ID=INV,Description="Inversion">
+##ALT=<ID=CNV,Description="Copy-number variant">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+chrT	11	dup	C	<DUP>	30	PASS	END=15	GT:AD	0/1:8,5
+chrT	21	inv	G	<INV>	30	PASS	END=25	GT:AD	0/1:9,6
+chrT	31	cnv	T	<CNV>	30	PASS	END=35	GT:AD	0/1:10,4

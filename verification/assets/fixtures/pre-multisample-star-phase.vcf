@@ -1,0 +1,6 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrT,length=80>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	PHASED	HALF_CALL
+chrT	11	mixed_spanning	C	T,*	30	PASS	.	GT:AD	1|2:8,5,6	./1:9,7,0

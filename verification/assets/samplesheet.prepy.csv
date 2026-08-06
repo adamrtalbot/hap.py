@@ -26,6 +26,13 @@ tiny_bcf_output,local:assets/fixtures/pre-somatic.vcf,local:assets/fixtures/tiny
 tiny_verbose_log,local:assets/fixtures/pre-somatic.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,--verbose --logfile pre.log --force-interactive
 tiny_symbolic_del,local:assets/fixtures/pre-symbolic-del.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
 tiny_edge_alleles,local:assets/fixtures/pre-edge-alleles.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
+tiny_multisample_star_phase,local:assets/fixtures/pre-multisample-star-phase.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
+tiny_symbolic_types,local:assets/fixtures/pre-symbolic-types.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
+tiny_breakend_forms,local:assets/fixtures/pre-breakend-forms.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
+tiny_gvcf_edge,local:assets/fixtures/pre-gvcf-edge.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,--convert-gvcf-to-vcf
+tiny_ploidy_format,local:assets/fixtures/pre-ploidy-format.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
+tiny_boundaries,local:assets/fixtures/pre-boundary.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
+tiny_boundary_symbolic,local:assets/fixtures/pre-boundary-symbolic.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
 matrix_location_postfix,local:assets/fixtures/pre-matrix/fixchr.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--fixchr -l chr1:2-2 --no-leftshift --no-decompose --gender none
 matrix_fixchr_auto,local:assets/fixtures/pre-matrix/fixchr.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--no-leftshift --no-decompose --gender none
 matrix_fixchr_disabled,local:assets/fixtures/pre-matrix/fixchr.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--no-fixchr --no-leftshift --no-decompose --gender none

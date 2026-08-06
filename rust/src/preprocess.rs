@@ -2241,8 +2241,25 @@ fn blank_secondary_sample_annotations(
             .position(|key| *key == "GT")
             .and_then(|index| cells.get(index))
             .is_some_and(|gt| gt == "0/0" || gt == "0|0");
+        let missing_gt = keys
+            .iter()
+            .position(|key| *key == "GT")
+            .and_then(|index| cells.get(index))
+            .is_some_and(|gt| {
+                gt.chars()
+                    .all(|character| matches!(character, '.' | '/' | '|'))
+            });
         for (index, key) in keys.iter().enumerate() {
-            if !matches!(*key, "GT" | "AD" | "ADO" | "DP")
+            if missing_gt
+                && *key != "GT"
+                && let Some(value) = cells.get_mut(index)
+            {
+                *value = if *key == "AD" {
+                    ".,.".to_string()
+                } else {
+                    ".".to_string()
+                };
+            } else if !matches!(*key, "GT" | "AD" | "ADO" | "DP" | "PL")
                 && let Some(value) = cells.get_mut(index)
             {
                 *value = if bcf_output && string_fields.contains(*key) {
@@ -2562,6 +2579,7 @@ fn uppercase_alleles_preserving_breakends(alts: &str) -> String {
 }
 
 fn materialize_unsupported_import_failure(record: &mut vcf::RawVcfRecord) -> bool {
+    let breakend = record.alt_allele.contains(['[', ']']);
     let unsupported = record.alt_allele.split(',').any(|alt| {
         alt.contains(['[', ']']) || (alt.starts_with('<') && !matches!(alt, "<DEL>" | "<NON_REF>"))
     });
@@ -2576,11 +2594,15 @@ fn materialize_unsupported_import_failure(record: &mut vcf::RawVcfRecord) -> boo
         .filter(|field| !field.is_empty() && *field != ".")
         .filter(|field| {
             let key = field.split_once('=').map_or(*field, |(key, _)| key);
-            key != "END" && key != "IMPORT_FAIL"
+            (key != "END" || !breakend) && key != "IMPORT_FAIL"
         })
         .map(str::to_string)
         .collect::<Vec<_>>();
-    info.push(format!("END={}", record.pos));
+    // Breakends have no local span, whereas unsupported symbolic records keep
+    // their declared END when the legacy reader materializes IMPORT_FAIL.
+    if breakend || !info.iter().any(|field| field.starts_with("END=")) {
+        info.push(format!("END={}", record.pos));
+    }
     info.push("IMPORT_FAIL".to_string());
     record.info = info.join(";");
 

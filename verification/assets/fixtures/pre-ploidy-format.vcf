@@ -1,0 +1,8 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrT,length=80>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+##FORMAT=<ID=PL,Number=G,Type=Integer,Description="Phred-scaled genotype likelihoods">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	HAPLOID	DIPLOID	TRIPLOID
+chrT	11	haploid_diploid	C	T	30	PASS	.	GT:AD:PL	1:3,12:10,0	0/1:8,7:10,0,20	./.:.:.
+chrT	21	triploid	G	A	30	PASS	.	GT:AD:PL	./.:.:.	./.:.:.	0/1/1:5,15:20,10,0,30
