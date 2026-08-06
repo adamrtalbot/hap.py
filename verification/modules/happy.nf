@@ -10,7 +10,7 @@ process HAPPY_LEGACY {
     publishDir { "${params.outdir}/happy/${meta.id}/legacy" }, mode: 'copy', pattern: 'result*'
 
     input:
-    tuple val(meta), path(truth_vcf, stageAs: 'truth/*'), path(truth_tbi, stageAs: 'truth/*'), path(query_vcf, stageAs: 'query/*'), path(query_tbi, stageAs: 'query/*'), path(reference), path(reference_fai), path(fp_bed), path(fp_bed_tbi), val(args)
+    tuple val(meta), path(truth_vcf, stageAs: 'truth/*'), path(truth_indexes, stageAs: 'truth/*'), path(query_vcf, stageAs: 'query/*'), path(query_indexes, stageAs: 'query/*'), path(reference), path(reference_fai), path(fp_bed), path(fp_indexes), path(stratification_files, stageAs: 'stratification/*'), val(args)
 
     output:
     tuple val(meta), path('result*'), emit: outputs
@@ -32,7 +32,7 @@ process HAPPY_RUST {
     publishDir { "${params.outdir}/happy/${meta.id}/rust" }, mode: 'copy', pattern: 'result*'
 
     input:
-    tuple val(meta), path(truth_vcf, stageAs: 'truth/*'), path(truth_tbi, stageAs: 'truth/*'), path(query_vcf, stageAs: 'query/*'), path(query_tbi, stageAs: 'query/*'), path(reference), path(reference_fai), path(fp_bed), path(fp_bed_tbi), val(args)
+    tuple val(meta), path(truth_vcf, stageAs: 'truth/*'), path(truth_indexes, stageAs: 'truth/*'), path(query_vcf, stageAs: 'query/*'), path(query_indexes, stageAs: 'query/*'), path(reference), path(reference_fai), path(fp_bed), path(fp_indexes), path(stratification_files, stageAs: 'stratification/*'), val(args)
 
     output:
     tuple val(meta), path('result*'), emit: outputs

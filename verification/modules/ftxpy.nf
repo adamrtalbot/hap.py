@@ -8,14 +8,14 @@ process FTXPY_LEGACY {
     publishDir { "${params.outdir}/ftxpy/${meta.id}/legacy" }, mode: 'copy', pattern: 'result*'
 
     input:
-    tuple val(meta), path(input_vcf), path(reference), path(reference_fai), path(bam), path(bam_index), val(has_bam), val(feature_table), val(args)
+    tuple val(meta), path(input_vcf), path(reference), path(reference_fai), path(bams), path(bam_indexes), path(region_files), val(feature_table), val(args)
 
     output:
     tuple val(meta), path('result*'), emit: outputs
     path '.command.log', hidden: true, emit: runlogs
 
     script:
-    def bam_args = has_bam ? "--bam ${bam}" : ''
+    def bam_args = bams.collect { bam -> "--bam ${bam}" }.join(' ')
     """
     ftx.py ${args} ${bam_args} ${input_vcf} \\
         -o result \\
@@ -29,14 +29,14 @@ process FTXPY_RUST {
     publishDir { "${params.outdir}/ftxpy/${meta.id}/rust" }, mode: 'copy', pattern: 'result*'
 
     input:
-    tuple val(meta), path(input_vcf), path(reference), path(reference_fai), path(bam), path(bam_index), val(has_bam), val(feature_table), val(args)
+    tuple val(meta), path(input_vcf), path(reference), path(reference_fai), path(bams), path(bam_indexes), path(region_files), val(feature_table), val(args)
 
     output:
     tuple val(meta), path('result*'), emit: outputs
     path '.command.log', hidden: true, emit: runlogs
 
     script:
-    def bam_args = has_bam ? "--bam ${bam}" : ''
+    def bam_args = bams.collect { bam -> "--bam ${bam}" }.join(' ')
     """
     hap ftx ${args} ${bam_args} ${input_vcf} \\
         -o result \\

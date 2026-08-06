@@ -9,10 +9,10 @@ process QFY_ANNOTATE {
     container params.legacy_image
 
     input:
-    tuple val(meta), path(truth_vcf), path(truth_tbi), path(query_vcf), path(query_tbi), path(reference), path(reference_fai), path(fp_bed), path(fp_bed_tbi), val(args)
+    tuple val(meta), path(truth_vcf), path(truth_indexes), path(query_vcf), path(query_indexes), path(reference), path(reference_fai), path(fp_bed), path(fp_indexes), path(stratification_files, stageAs: 'stratification/*'), val(args)
 
     output:
-    tuple val(meta), path('seed.vcf.gz'), path('seed.vcf.gz.tbi'), path(reference), path(reference_fai), path(fp_bed), path(fp_bed_tbi), val(args), emit: annotated
+    tuple val(meta), path('seed.vcf.gz'), path('seed.vcf.gz.tbi'), path(reference), path(reference_fai), path(fp_bed), path(fp_indexes), path(truth_vcf), path(truth_indexes), path(stratification_files), val(args), emit: annotated
 
     script:
     """
@@ -34,7 +34,7 @@ process QFY_LEGACY {
     publishDir { "${params.outdir}/qfy/${meta.id}/legacy" }, mode: 'copy', pattern: 'result*'
 
     input:
-    tuple val(meta), path(input_vcf), path(input_tbi), path(reference), path(reference_fai), path(fp_bed), path(fp_bed_tbi), val(args)
+    tuple val(meta), path(input_vcf), path(input_indexes), path(reference), path(reference_fai), path(fp_bed), path(fp_indexes), path(truth_vcf), path(truth_indexes), path(stratification_files, stageAs: 'stratification/*'), val(args)
 
     output:
     tuple val(meta), path('result*'), emit: outputs
@@ -56,7 +56,7 @@ process QFY_RUST {
     publishDir { "${params.outdir}/qfy/${meta.id}/rust" }, mode: 'copy', pattern: 'result*'
 
     input:
-    tuple val(meta), path(input_vcf), path(input_tbi), path(reference), path(reference_fai), path(fp_bed), path(fp_bed_tbi), val(args)
+    tuple val(meta), path(input_vcf), path(input_indexes), path(reference), path(reference_fai), path(fp_bed), path(fp_indexes), path(truth_vcf), path(truth_indexes), path(stratification_files, stageAs: 'stratification/*'), val(args)
 
     output:
     tuple val(meta), path('result*'), emit: outputs

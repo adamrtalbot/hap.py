@@ -24,7 +24,15 @@ or expected output to conceal one.
 
 ## Run
 
-Build the Rust binary, make it available on `PATH`, then run the gate:
+Build the Rust binary and make it available on `PATH`. The full matrix also
+requires RTG Tools 3.12.1-1 for the real `--engine vcfeval` case; for example:
+
+```bash
+micromamba create -n hap-parity -c conda-forge -c bioconda rtg-tools=3.12.1=hdfd78af_1
+micromamba activate hap-parity
+```
+
+Then run the gate:
 
 ```bash
 cargo build --release

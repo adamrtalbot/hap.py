@@ -117,7 +117,11 @@ process DIFF_OUTPUTS {
 
     def normalize_vcf(value):
         lines = value.decode('utf-8').splitlines()
-        normalized = [line for line in lines if not volatile_vcf_header.match(line)]
+        normalized = []
+        for line in lines:
+            if volatile_vcf_header.match(line) or line.startswith('##CL='):
+                continue
+            normalized.append(line)
         return ('\\n'.join(normalized) + '\\n').encode('utf-8') if normalized else b''
 
     def decode_bcf(path):

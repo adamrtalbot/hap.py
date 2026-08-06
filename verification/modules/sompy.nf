@@ -7,14 +7,14 @@ process SOMPY_LEGACY {
     publishDir { "${params.outdir}/sompy/${meta.id}/legacy" }, mode: 'copy', pattern: 'result*'
 
     input:
-    tuple val(meta), path(truth_vcf), path(query_vcf), path(reference), path(reference_fai), path(fp_bed), val(feature_table), val(args), path(bam), path(bam_index), val(has_bam)
+    tuple val(meta), path(truth_vcf, stageAs: 'truth/*'), path(query_vcf, stageAs: 'query/*'), path(reference), path(reference_fai), path(fp_bed), val(feature_table), val(args), path(bams), path(bam_indexes)
 
     output:
     tuple val(meta), path('result*'), emit: outputs
     path '.command.log', hidden: true, emit: runlogs
 
     script:
-    bam_args = has_bam ? "--bam ${bam}" : ''
+    def bam_args = bams.collect { bam -> "--bam ${bam}" }.join(' ')
     """
     som.py ${args} ${bam_args} ${truth_vcf} ${query_vcf} \\
         -o result \\
@@ -29,14 +29,14 @@ process SOMPY_RUST {
     publishDir { "${params.outdir}/sompy/${meta.id}/rust" }, mode: 'copy', pattern: 'result*'
 
     input:
-    tuple val(meta), path(truth_vcf), path(query_vcf), path(reference), path(reference_fai), path(fp_bed), val(feature_table), val(args), path(bam), path(bam_index), val(has_bam)
+    tuple val(meta), path(truth_vcf, stageAs: 'truth/*'), path(query_vcf, stageAs: 'query/*'), path(reference), path(reference_fai), path(fp_bed), val(feature_table), val(args), path(bams), path(bam_indexes)
 
     output:
     tuple val(meta), path('result*'), emit: outputs
     path '.command.log', hidden: true, emit: runlogs
 
     script:
-    bam_args = has_bam ? "--bam ${bam}" : ''
+    def bam_args = bams.collect { bam -> "--bam ${bam}" }.join(' ')
     """
     hap somatic ${args} ${bam_args} ${truth_vcf} ${query_vcf} \\
         -o result \\

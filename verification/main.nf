@@ -50,18 +50,15 @@ def fixture(rel) {
     file("${params.fixture_base}/${path}")
 }
 
-// Nextflow path inputs are intentionally uniform across compressed/indexed
-// and plain-text fixtures.  The process commands never reference the staged
-// index variables directly: htslib-compatible tools discover a real sibling
-// index by name, while plain-text inputs receive this harmless marker solely
-// to keep the tuple shape stable.
-def fixtureIndex(rel, marker) {
+// Stage real sibling indexes when the fixture format uses one. Plain-text
+// inputs use an empty collection so no placeholder file is required.
+def fixtureIndexes(rel) {
     def path = rel.toString()
     if (path.endsWith('.gz') || path.endsWith('.bcf')) {
         def suffix = path.endsWith('.bcf') ? '.csi' : '.tbi'
-        return fixture("${path}${suffix}")
+        return [fixture("${path}${suffix}")]
     }
-    file("${projectDir}/assets/no-index-${marker}")
+    []
 }
 
 def samples(samplesheet, transform) {
@@ -83,16 +80,20 @@ workflow {
     if (cases.contains('happy')) {
         happy_in = samples(params.happy_samplesheet) { row ->
             def meta = [id: row.sample_id, case_name: 'happy']
+            def stratificationFiles = [row.stratification_tsv, row.stratification_bed]
+                .findAll { path -> path }
+                .collect { path -> fixture(path) }
             tuple(
                 meta,
                 fixture(row.truth_vcf),
-                fixtureIndex(row.truth_vcf, 'truth'),
+                fixtureIndexes(row.truth_vcf),
                 fixture(row.query_vcf),
-                fixtureIndex(row.query_vcf, 'query'),
+                fixtureIndexes(row.query_vcf),
                 fixture(row.reference),
                 fixture("${row.reference}.fai"),
                 fixture(row.fp_bed),
-                fixtureIndex(row.fp_bed, 'fp'),
+                fixtureIndexes(row.fp_bed),
+                stratificationFiles,
                 (row.args ?: '').toString(),
             )
         }
@@ -115,6 +116,7 @@ workflow {
     if (cases.contains('sompy')) {
         sompy_in = samples(params.sompy_samplesheet) { row ->
             def meta = [id: row.sample_id, case_name: 'sompy']
+            def bamPaths = [row.bam, row.bam2].findAll { path -> path }
             tuple(
                 meta,
                 fixture(row.truth_vcf),
@@ -124,9 +126,8 @@ workflow {
                 fixture(row.fp_bed),
                 (row.feature_table ?: 'generic').toString(),
                 (row.args ?: '').toString(),
-                row.bam ? fixture(row.bam) : file("${projectDir}/assets/no-index-bam"),
-                row.bam ? fixture("${row.bam}.bai") : file("${projectDir}/assets/no-index-bam-index"),
-                row.bam ? true : false,
+                bamPaths.collect { path -> fixture(path) },
+                bamPaths.collect { path -> fixture("${path}.bai") },
             )
         }
 
@@ -151,11 +152,11 @@ workflow {
             tuple(
                 meta,
                 fixture(row.input_vcf),
-                fixtureIndex(row.input_vcf, 'input'),
+                fixtureIndexes(row.input_vcf),
                 fixture(row.reference),
                 fixture("${row.reference}.fai"),
                 fixture(row.regions_bed),
-                fixtureIndex(row.regions_bed, 'regions'),
+                fixtureIndexes(row.regions_bed),
                 (row.args ?: '').toString(),
             )
         }
@@ -178,14 +179,15 @@ workflow {
     if (cases.contains('ftxpy')) {
         ftxpy_in = samples(params.ftxpy_samplesheet) { row ->
             def meta = [id: row.sample_id, case_name: 'ftxpy']
+            def bamPaths = [row.bam, row.bam2].findAll { path -> path }
             tuple(
                 meta,
                 fixture(row.input_vcf),
                 fixture(row.reference),
                 fixture("${row.reference}.fai"),
-                row.bam ? fixture(row.bam) : file("${projectDir}/assets/no-index-bam"),
-                row.bam ? fixture("${row.bam}.bai") : file("${projectDir}/assets/no-index-bam-index"),
-                row.bam ? true : false,
+                bamPaths.collect { path -> fixture(path) },
+                bamPaths.collect { path -> fixture("${path}.bai") },
+                row.regions_bed ? [fixture(row.regions_bed)] : [],
                 (row.feature_table ?: 'generic').toString(),
                 (row.args ?: '').toString(),
             )
@@ -209,16 +211,20 @@ workflow {
     if (cases.contains('qfy')) {
         qfy_in = samples(params.qfy_samplesheet) { row ->
             def meta = [id: row.sample_id, case_name: 'qfy']
+            def stratificationFiles = [row.stratification_tsv, row.stratification_bed]
+                .findAll { path -> path }
+                .collect { path -> fixture(path) }
             tuple(
                 meta,
                 fixture(row.truth_vcf),
-                fixtureIndex(row.truth_vcf, 'truth'),
+                fixtureIndexes(row.truth_vcf),
                 fixture(row.query_vcf),
-                fixtureIndex(row.query_vcf, 'query'),
+                fixtureIndexes(row.query_vcf),
                 fixture(row.reference),
                 fixture("${row.reference}.fai"),
                 fixture(row.fp_bed),
-                fixtureIndex(row.fp_bed, 'fp'),
+                fixtureIndexes(row.fp_bed),
+                stratificationFiles,
                 (row.args ?: '').toString(),
             )
         }
@@ -245,6 +251,8 @@ workflow {
             tuple(
                 meta,
                 fixture(row.input_vcf),
+                fixtureIndexes(row.input_vcf),
+                (row.input_mode ?: 'positional').toString(),
                 (row.args ?: '').toString(),
             )
         }
