@@ -16,10 +16,10 @@ nextflow_pipeline {
             def expectedCounts = [
                 happy: 20,
                 sompy: 22,
-                prepy: 37,
+                prepy: 38,
                 ftxpy: 24,
                 qfy: 7,
-                vcfcheck: 9,
+                vcfcheck: 10,
             ]
             def selected = params.cases.toString().tokenize(',').collect { it.trim() }.findAll { it }
             def unknown = selected.toSet() - expectedCounts.keySet()

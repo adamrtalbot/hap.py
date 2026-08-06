@@ -1,0 +1,12 @@
+##fileformat=VCFv4.2
+##contig=<ID=1,length=100>
+##ALT=<ID=DEL,Description="Deletion">
+##ALT=<ID=NON_REF,Description="Represents any possible alternative allele at this location">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+1	10	star	A	*	.	PASS	.	GT:AD	0/1:12,3
+1	20	sv	A	<DEL>	.	PASS	END=25	GT:AD	0/1:10,7
+1	30	bnd	A	A]1:40]	.	PASS	.	GT:AD	1/1:0,11
+1	40	nocall	A	.	.	PASS	.	GT:AD	./.:9

@@ -1,0 +1,10 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrT,length=80>
+##ALT=<ID=INS,Description="Insertion">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+chrT	11	spanning	C	T,*	30	PASS	.	GT:AD	1/2:8,5,6
+chrT	21	breakend	G	G]chrT:41]	40	PASS	.	GT:AD	0/1:9,7
+chrT	31	symbolic_ins	T	<INS>	50	PASS	END=31	GT:AD	0/1:11,4

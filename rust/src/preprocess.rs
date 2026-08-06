@@ -296,7 +296,7 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                 // tolerate case when validating; now we normalise on output.
                 record.ref_allele = record.ref_allele.to_ascii_uppercase();
                 record.alt_allele = uppercase_alleles_preserving_breakends(&record.alt_allele);
-                let import_failed = materialize_breakend_import_failure(&mut record);
+                let import_failed = materialize_unsupported_import_failure(&mut record);
 
                 // Legacy `VariantWriter` emits FILTER=`.` for PASS records (htslib's
                 // `bcf_update_filter` treats an empty filter vector as `.`). Normalise
@@ -1409,7 +1409,13 @@ fn retain_called_alternates(record: &mut vcf::RawVcfRecord) -> bool {
             called.extend(
                 gt.split(['/', '|'])
                     .filter_map(|allele| allele.parse::<usize>().ok())
-                    .filter(|allele| *allele > 0 && *allele <= alts.len()),
+                    // `VariantCallsOnly` does not treat a spanning-deletion
+                    // (`*`) as an emitted variant. Its call is remapped to
+                    // reference when a concrete ALT remains, or the whole
+                    // record is discarded when it is the only ALT.
+                    .filter(|allele| {
+                        *allele > 0 && *allele <= alts.len() && alts[*allele - 1] != "*"
+                    }),
             );
         }
     }
@@ -1433,6 +1439,12 @@ fn retain_called_alternates(record: &mut vcf::RawVcfRecord) -> bool {
         let mut cells = sample.split(':').map(str::to_string).collect::<Vec<_>>();
         if let Some(gt) = cells.get_mut(gt_index) {
             *gt = remap_gt(gt, &mapping);
+            // VariantAlleleRemover canonicalizes an unphased REF/ALT call
+            // after projecting removed alleles. The regular writer path only
+            // sees this orientation for phased genotypes, so do it here.
+            if *gt == "1/0" {
+                *gt = "0/1".to_string();
+            }
         }
         if let Some(ad_index) = ad_index
             && let Some(ad) = cells.get_mut(ad_index)
@@ -2549,8 +2561,11 @@ fn uppercase_alleles_preserving_breakends(alts: &str) -> String {
         .join(",")
 }
 
-fn materialize_breakend_import_failure(record: &mut vcf::RawVcfRecord) -> bool {
-    if !record.alt_allele.contains(['[', ']']) {
+fn materialize_unsupported_import_failure(record: &mut vcf::RawVcfRecord) -> bool {
+    let unsupported = record.alt_allele.split(',').any(|alt| {
+        alt.contains(['[', ']']) || (alt.starts_with('<') && !matches!(alt, "<DEL>" | "<NON_REF>"))
+    });
+    if !unsupported {
         return false;
     }
 
@@ -2572,12 +2587,21 @@ fn materialize_breakend_import_failure(record: &mut vcf::RawVcfRecord) -> bool {
     let Some(gt_index) = record.format_keys().iter().position(|key| *key == "GT") else {
         return true;
     };
+    let ad_index = record.format_keys().iter().position(|key| *key == "AD");
     for sample in &mut record.samples {
         let mut fields = sample.split(':').map(str::to_string).collect::<Vec<_>>();
         if let Some(gt) = fields.get_mut(gt_index) {
             *gt = "0/0".to_string();
-            *sample = fields.join(":");
         }
+        // The failed BND import has no alternate allele. VariantWriter
+        // consequently writes just the reference AD value; retaining the old
+        // alternate depth would also make the generated ADO non-zero.
+        if let Some(ad_index) = ad_index
+            && let Some(ad) = fields.get_mut(ad_index)
+        {
+            *ad = ad.split(',').next().unwrap_or(".").to_string();
+        }
+        *sample = fields.join(":");
     }
     true
 }
@@ -3711,15 +3735,26 @@ mod tests {
         record.ref_allele = "T".to_string();
         record.alt_allele = "T]chr1:70]".to_string();
         record.info = "SVTYPE=BND".to_string();
-        record.format = Some("GT:GQ".to_string());
-        record.samples = vec!["0/1:45".to_string()];
+        record.format = Some("GT:AD:GQ".to_string());
+        record.samples = vec!["0/1:9,7:45".to_string()];
         normalize_bcftools_record(&mut record, b"ACGTACGTACGT");
         assert_eq!(record.alt_allele, "T]chr1:70]");
-        assert!(materialize_breakend_import_failure(&mut record));
+        assert!(materialize_unsupported_import_failure(&mut record));
         sort_info_keys(&mut record);
         assert_eq!(record.alt_allele, ".");
         assert_eq!(record.info, "END=40;IMPORT_FAIL;SVTYPE=BND");
-        assert_eq!(record.samples, ["0/0:45"]);
+        assert_eq!(record.samples, ["0/0:9:45"]);
+
+        let mut symbolic = make_record("END=31");
+        symbolic.pos = 31;
+        symbolic.ref_allele = "T".to_string();
+        symbolic.alt_allele = "<INS>".to_string();
+        symbolic.format = Some("GT:AD".to_string());
+        symbolic.samples = vec!["0/1:11,4".to_string()];
+        assert!(materialize_unsupported_import_failure(&mut symbolic));
+        assert_eq!(symbolic.alt_allele, ".");
+        assert_eq!(symbolic.info, "END=31;IMPORT_FAIL");
+        assert_eq!(symbolic.samples, ["0/0:11"]);
     }
 
     #[test]
@@ -4424,6 +4459,14 @@ mod tests {
         homref.format = Some("GT:AD".to_string());
         homref.samples = vec!["0/0:12,0,0".to_string()];
         assert!(!retain_called_alternates(&mut homref));
+
+        let mut spanning_deletion = make_record(".");
+        spanning_deletion.alt_allele = "T,*".to_string();
+        spanning_deletion.format = Some("GT:AD".to_string());
+        spanning_deletion.samples = vec!["1/2:8,5,6".to_string()];
+        assert!(retain_called_alternates(&mut spanning_deletion));
+        assert_eq!(spanning_deletion.alt_allele, "T");
+        assert_eq!(spanning_deletion.samples, ["0/1:8,5"]);
     }
 
     #[test]

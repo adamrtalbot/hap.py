@@ -25,6 +25,7 @@ tiny_bcftools_norm_default,local:assets/fixtures/pre-norm.vcf,local:assets/fixtu
 tiny_bcf_output,local:assets/fixtures/pre-somatic.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,--bcf
 tiny_verbose_log,local:assets/fixtures/pre-somatic.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,--verbose --logfile pre.log --force-interactive
 tiny_symbolic_del,local:assets/fixtures/pre-symbolic-del.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
+tiny_edge_alleles,local:assets/fixtures/pre-edge-alleles.vcf,local:assets/fixtures/tiny.fa,local:assets/fixtures/tiny.all.bed,
 matrix_location_postfix,local:assets/fixtures/pre-matrix/fixchr.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--fixchr -l chr1:2-2 --no-leftshift --no-decompose --gender none
 matrix_fixchr_auto,local:assets/fixtures/pre-matrix/fixchr.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--no-leftshift --no-decompose --gender none
 matrix_fixchr_disabled,local:assets/fixtures/pre-matrix/fixchr.vcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--no-fixchr --no-leftshift --no-decompose --gender none
