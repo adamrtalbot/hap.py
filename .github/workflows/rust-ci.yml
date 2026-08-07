@@ -73,10 +73,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
+      # Ubuntu 24.04 (noble) archive versions; update with the runner image.
+      BCFTOOLS_APT_VERSION: 1.19-1build2
       HAP_BIN: ${{ github.workspace }}/target/release/hap
       NXF_HOME: ${{ runner.temp }}/nextflow-home
       NXF_SYNTAX_PARSER: v2
       NXF_DISABLE_CHECK_LATEST: 'true'
+      TABIX_APT_VERSION: 1.19+ds-1.1build3
 
     steps:
       - name: Checkout
@@ -96,7 +99,9 @@ jobs:
       - name: Install indexed-VCF query tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes bcftools tabix
+          sudo apt-get install --yes \
+            "bcftools=${BCFTOOLS_APT_VERSION}" \
+            "tabix=${TABIX_APT_VERSION}"
 
       - name: Install integrity-pinned Nextflow and nf-test
         run: |

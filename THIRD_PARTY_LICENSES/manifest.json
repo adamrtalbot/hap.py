@@ -36,12 +36,10 @@
       "license": "Apache-2.0",
       "notice": "THIRD_PARTY_LICENSES/ebi-vcf-validator-apache-2.0.txt",
       "paths": [
-        "verification/assets/fixtures/external/ebi-vcf-validator/README.md",
         "verification/assets/fixtures/external/ebi-vcf-validator/failed_body_samples_ploidy_000.vcf",
         "verification/assets/fixtures/external/ebi-vcf-validator/passed_meta_format_P_1.vcf"
       ],
       "sha256": {
-        "verification/assets/fixtures/external/ebi-vcf-validator/README.md": "9a523a95277f0e6faf9521b3b792a785034fc34edf02b87c7a2bd0bddb5afc73",
         "verification/assets/fixtures/external/ebi-vcf-validator/failed_body_samples_ploidy_000.vcf": "92271c32027f458fb3a89fe13b11210d3a219beca50329327f4d243776e2c209",
         "verification/assets/fixtures/external/ebi-vcf-validator/passed_meta_format_P_1.vcf": "7a94657671a660a4d4525f6d01234d9d17ae0414cc367546617863180fcb7aba"
       }
