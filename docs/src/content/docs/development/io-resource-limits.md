@@ -11,10 +11,14 @@ resource error instead of splitting a larger connected cluster and changing
 its semantics. It externally orders 65,536-row chunks with the same bounded
 fan-in. Completed preprocess and comparison chunks are closed paths, so only
 the active merge's at most 32 readers are open. Comparison metadata is spooled
-per contig and rescanned over the actual emitted span, including left-shifted
-rows. Quantify uses a disk-backed transformed spool. Germline and somatic ROC
-observations use 16,384-record sorted chunks and bounded 32-way merge passes;
-there is no whole-genome observation or threshold-count cap. Somatic comparison
+per contig and consumed by a monotonic cursor with a 1,024-base lookbehind over
+the actual emitted span, including left-shifted rows. Quantify uses a disk-backed
+transformed spool. Germline and somatic ROC
+observations spill after 16,384 records. Germline observations use a disk-backed
+index that applies the same repeated libstdc++ introsort permutation as the
+legacy implementation, including equal-score ties and shared subtype snapshots;
+somatic observations use bounded 32-way merge passes. Observation counts are
+not capped. Somatic comparison
 closes each per-contig spool before opening the next and retains records for
 only the active contig; feature rows are written to five classification spools
 and renumbered with streaming passes. Validation writes `--errors-bed` records
@@ -31,6 +35,8 @@ declared payload:
 - Quantify records per active superlocus: 1,000,000
 - Somatic records per active contig and side: 10,000,000
 - Comparison variants per active cluster: 10,000
+- Rendered ROC thresholds/rows per report: 2,500,000
+- Legacy-compatible ROC metric-index keys: 500,000
 
 These limits are intentionally far above normal variant records but low enough
 to prevent corrupt length and count fields from causing unbounded allocations.
@@ -44,8 +50,11 @@ a whole-genome-scale 2,400,000-record input and uses the median of three runs
 by default. Complete `time` reports and the median table are preserved under
 `target/stream-memory-reports` (or `HAP_MEMORY_REPORT_DIR`) after input cleanup.
 The generated whole-genome case distributes records across 24 representative
-contigs. The script fails if a workflow or peak-RSS measurement fails, rejects
-missing or non-positive RSS values, and proves only that these named scenarios
-grow by no more than 64 MiB. Dense connected clusters, superloci, and somatic
-contigs are instead protected by the explicit limits above; ROC observation
-counts are handled by external sorting rather than rejected.
+contigs and cycles through 100,000 distinct `QQ` values across 2.4 million
+records, exercising high-cardinality threshold grouping and repeated equal-score
+ties well beyond the spill boundary. The
+script fails if a workflow or peak-RSS measurement fails, rejects missing or
+non-positive RSS values, and proves only that these named scenarios grow by no
+more than 64 MiB. Dense connected clusters, superloci, somatic contigs, and
+pathological output cardinality are protected by the explicit limits above;
+ROC observation counts are handled on disk rather than rejected.

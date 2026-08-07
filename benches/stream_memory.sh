@@ -40,6 +40,7 @@ make_vcf() {
       print "##contig=<ID=chr" chrom ",length=10000000>"
     print "##FILTER=<ID=LowQual,Description=\"Synthetic filtered call\">"
     print "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+    print "##FORMAT=<ID=QQ,Number=1,Type=Float,Description=\"High-cardinality ROC score\">"
     print "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE"
     emitted=0
     per_contig=int((records+contigs-1)/contigs)
@@ -47,7 +48,8 @@ make_vcf() {
       for (pos=1;pos<=per_contig && emitted<records;pos++) {
         emitted++
         filter=(filter_every && emitted%filter_every==0) ? "LowQual" : "PASS"
-        print "chr" chrom "\t" pos * 100 "\t.\tA\tC\t50\t" filter "\t.\tGT\t0/1"
+        score=emitted % 100000
+        print "chr" chrom "\t" pos * 100 "\t.\tA\tC\t" score "\t" filter "\t.\tGT:QQ\t0/1:" score
       }
     }
   }' > "$destination"

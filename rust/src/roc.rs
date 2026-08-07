@@ -23,17 +23,20 @@ use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const INDEL_SUBTYPES: [&str; 9] = [
     "C16_PLUS", "C1_5", "C6_15", "D16_PLUS", "D1_5", "D6_15", "I16_PLUS", "I1_5", "I6_15",
 ];
 const ROC_OBSERVATION_CHUNK: usize = 16_384;
-const ROC_MERGE_FAN_IN: usize = 32;
+const ROC_INDEX_ENTRY_BYTES: u64 = 24;
+const MAX_RENDERED_ROC_THRESHOLDS: usize = 2_500_000;
+const MAX_ROC_METRIC_INDEX_KEYS: usize = 500_000;
 
 /// Write `roc.all` and each non-empty Locations ROC file alongside `prefix`.
 #[derive(Clone, Debug, Default)]
@@ -144,7 +147,7 @@ where
     let groups = accumulate_impl(rows, options)?;
 
     if !groups.values().any(|group| group.records > 0) {
-        let all = empty_comparison_extended_lines(subset_size);
+        let all = RenderedRows::from_lines(empty_comparison_extended_lines(subset_size))?;
         write_gzip_csv(
             &suffixed_report_path(prefix, "roc.all.csv.gz"),
             &roc_header(options.ci_alpha),
@@ -284,13 +287,39 @@ where
     )
 }
 
+struct RenderedRows {
+    path: tempfile::TempPath,
+    len: usize,
+}
+
+impl RenderedRows {
+    fn from_lines(lines: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut file =
+            tempfile::NamedTempFile::new().context("failed to create rendered ROC report spool")?;
+        let mut len = 0usize;
+        for line in lines {
+            writeln!(file.as_file_mut(), "{line}")?;
+            len += 1;
+        }
+        file.as_file_mut().flush()?;
+        Ok(Self {
+            path: file.into_temp_path(),
+            len,
+        })
+    }
+
+    fn lines(&self) -> Result<std::io::Lines<BufReader<File>>> {
+        Ok(BufReader::new(File::open(&self.path)?).lines())
+    }
+}
+
 struct MetricRows<'a> {
-    all: &'a [String],
-    snp: &'a [String],
-    snp_pass: &'a [String],
-    indel: &'a [String],
-    indel_pass: &'a [String],
-    selective: &'a [(String, Vec<String>, &'a str)],
+    all: &'a RenderedRows,
+    snp: &'a RenderedRows,
+    snp_pass: &'a RenderedRows,
+    indel: &'a RenderedRows,
+    indel_pass: &'a RenderedRows,
+    selective: &'a [(String, RenderedRows, &'a str)],
 }
 
 fn build_metric_indices(
@@ -338,6 +367,7 @@ fn build_metric_indices(
             ]
         };
         let counts_only = !output_rocs || !is_aggregate_filter(&key.filter);
+        let mut sort_passes = 0usize;
         for (subtype, subtype_flag) in subtype_flags {
             for (genotype, genotype_flag) in [
                 ("het", Some("het")),
@@ -357,11 +387,13 @@ fn build_metric_indices(
                 if counts_only {
                     continue;
                 }
+                sort_passes += 1;
                 for level in legacy_masked_levels_store(
                     &accum.observations,
                     *subtype_flag,
                     genotype_flag,
                     delta,
+                    sort_passes,
                 )? {
                     let qq = format!("{level:.6}");
                     if !matches!(*subtype, "ti" | "tv") && genotype == "*" {
@@ -393,25 +425,18 @@ fn build_metric_indices(
         }
     }
 
+    table.ensure_within_limit()?;
     let raw = table.retained_order();
     let raw_positions = raw
         .iter()
         .enumerate()
-        .map(|(index, key)| (key.as_str(), index))
+        .map(|(index, key)| (key.clone(), index))
         .collect::<BTreeMap<_, _>>();
     // qfy's `--no-roc` prevents C++ from placing threshold rows in the raw
     // table. The public CSV is compacted to the same baseline-only set before
     // JSON serialization, so its retained pandas indices must be computed
     // against that compact set rather than falling back to 0..N.
-    let compact_all = (!output_rocs).then(|| {
-        rows.all
-            .iter()
-            .filter(|line| line.split(',').nth(6) == Some("*"))
-            .cloned()
-            .collect::<Vec<_>>()
-    });
-    let metric_all = compact_all.as_deref().unwrap_or(rows.all);
-    let all_indices = indices_for_lines(metric_all, &raw_positions);
+    let all_indices = indices_for_lines(metric_lines(rows.all, !output_rocs)?, &raw_positions)?;
 
     let mut available_tables = BTreeSet::from(["roc.all"]);
     for (id, lines) in [
@@ -420,12 +445,12 @@ fn build_metric_indices(
         ("roc.Locations.INDEL", rows.indel),
         ("roc.Locations.INDEL.PASS", rows.indel_pass),
     ] {
-        if !lines.is_empty() {
+        if lines.len != 0 {
             available_tables.insert(id);
         }
     }
     for (id, lines, _) in rows.selective {
-        if !lines.is_empty() {
+        if lines.len != 0 {
             available_tables.insert(id.as_str());
         }
     }
@@ -433,34 +458,25 @@ fn build_metric_indices(
 
     let mut tables = BTreeMap::new();
     tables.insert("roc.all".to_string(), all_indices.clone());
-    tables.insert(
-        "all.metrics".to_string(),
-        metric_all
-            .iter()
-            .zip(&all_indices)
-            .filter(|(line, _)| {
-                let fields = line.split(',').collect::<Vec<_>>();
-                fields.get(6) == Some(&"*") && matches!(fields.get(3), Some(&"ALL") | Some(&"PASS"))
-            })
-            .map(|(_, index)| *index)
-            .collect(),
-    );
-    tables.insert(
-        "summary.metrics".to_string(),
-        metric_all
-            .iter()
-            .zip(&all_indices)
-            .filter(|(line, _)| {
-                let fields = line.split(',').collect::<Vec<_>>();
-                fields.get(1) == Some(&"*")
-                    && fields.get(2) == Some(&"*")
-                    && matches!(fields.get(3), Some(&"ALL") | Some(&"PASS"))
-                    && fields.get(4) == Some(&"*")
-                    && fields.get(6) == Some(&"*")
-            })
-            .map(|(_, index)| *index)
-            .collect(),
-    );
+    let mut all_metrics = Vec::new();
+    let mut summary_metrics = Vec::new();
+    for (line, index) in metric_lines(rows.all, !output_rocs)?.zip(&all_indices) {
+        let line = line?;
+        let fields = line.split(',').collect::<Vec<_>>();
+        if fields.get(6) == Some(&"*") && matches!(fields.get(3), Some(&"ALL") | Some(&"PASS")) {
+            all_metrics.push(*index);
+        }
+        if fields.get(1) == Some(&"*")
+            && fields.get(2) == Some(&"*")
+            && matches!(fields.get(3), Some(&"ALL") | Some(&"PASS"))
+            && fields.get(4) == Some(&"*")
+            && fields.get(6) == Some(&"*")
+        {
+            summary_metrics.push(*index);
+        }
+    }
+    tables.insert("all.metrics".to_string(), all_metrics);
+    tables.insert("summary.metrics".to_string(), summary_metrics);
     for (id, lines, ty, filter) in [
         ("roc.Locations.SNP", rows.snp, "SNP", "ALL"),
         ("roc.Locations.SNP.PASS", rows.snp_pass, "SNP", "PASS"),
@@ -479,11 +495,11 @@ fn build_metric_indices(
                 && fields[4] == "*"
                 && fields[5] != "*"
             {
-                local.insert(raw_key.as_str(), next);
+                local.insert(raw_key.clone(), next);
                 next += 1;
             }
         }
-        tables.insert(id.to_string(), indices_for_lines(lines, &local));
+        tables.insert(id.to_string(), indices_for_lines(lines.lines()?, &local)?);
     }
     for (id, lines, ty) in rows.selective {
         let mut local = BTreeMap::new();
@@ -498,16 +514,27 @@ fn build_metric_indices(
                 && fields[4] == "*"
                 && fields[5] != "*"
             {
-                local.insert(raw_key.as_str(), next);
+                local.insert(raw_key.clone(), next);
                 next += 1;
             }
         }
-        tables.insert(id.clone(), indices_for_lines(lines, &local));
+        tables.insert(id.clone(), indices_for_lines(lines.lines()?, &local)?);
     }
     Ok(MetricIndices {
         tables,
         table_order,
     })
+}
+
+fn metric_lines(
+    rows: &RenderedRows,
+    baseline_only: bool,
+) -> Result<Box<dyn Iterator<Item = Result<String>>>> {
+    Ok(Box::new(rows.lines()?.filter_map(move |line| match line {
+        Ok(line) if !baseline_only || line.split(',').nth(6) == Some("*") => Some(Ok(line)),
+        Ok(_) => None,
+        Err(error) => Some(Err(error.into())),
+    })))
 }
 
 /// Reproduce the iteration order of the pinned Python 2.7 dictionary used by
@@ -631,14 +658,14 @@ fn csv_row_key(line: &str) -> String {
     legacy_row_key(fields[0], fields[1], fields[3], fields[2], fields[6])
 }
 
-fn indices_for_lines(lines: &[String], positions: &BTreeMap<&str, usize>) -> Vec<usize> {
+fn indices_for_lines(
+    lines: impl Iterator<Item = Result<String>>,
+    positions: &BTreeMap<String, usize>,
+) -> Result<Vec<usize>> {
     lines
-        .iter()
         .map(|line| {
-            positions
-                .get(csv_row_key(line).as_str())
-                .copied()
-                .unwrap_or(0)
+            let line = line?;
+            Ok(positions.get(&csv_row_key(&line)).copied().unwrap_or(0))
         })
         .collect()
 }
@@ -679,6 +706,7 @@ fn legacy_masked_levels_store(
     subtype: Option<&str>,
     genotype: Option<&str>,
     delta: f64,
+    sort_passes: usize,
 ) -> Result<Vec<f64>> {
     if !observations.is_disk_backed() {
         return Ok(legacy_masked_levels(
@@ -690,7 +718,7 @@ fn legacy_masked_levels_store(
     }
     let mut kept = Vec::new();
     let mut previous = None;
-    for observation in observations.sorted()? {
+    for observation in observations.sorted_with_passes(sort_passes)? {
         let observation = observation?;
         let subtype_matches = match subtype {
             None => true,
@@ -707,6 +735,11 @@ fn legacy_masked_levels_store(
         {
             previous = Some(observation.level);
             kept.push(observation.level);
+            if kept.len() > MAX_RENDERED_ROC_THRESHOLDS {
+                bail!(
+                    "ROC output exceeds the {MAX_RENDERED_ROC_THRESHOLDS} rendered-threshold resource limit"
+                );
+            }
         }
     }
     Ok(kept)
@@ -719,6 +752,7 @@ struct LegacyUnorderedRows {
     bucket_order: VecDeque<usize>,
     seen: HashSet<String>,
     typed: HashSet<String>,
+    overflow: bool,
 }
 
 impl LegacyUnorderedRows {
@@ -727,6 +761,10 @@ impl LegacyUnorderedRows {
             self.typed.insert(key.clone());
         }
         if self.seen.contains(&key) {
+            return;
+        }
+        if self.seen.len() >= MAX_ROC_METRIC_INDEX_KEYS {
+            self.overflow = true;
             return;
         }
         if self.bucket_count == 0 {
@@ -773,6 +811,13 @@ impl LegacyUnorderedRows {
             .into_iter()
             .filter(|key| self.typed.contains(key))
             .collect()
+    }
+
+    fn ensure_within_limit(&self) -> Result<()> {
+        if self.overflow {
+            bail!("ROC metric index exceeds the {MAX_ROC_METRIC_INDEX_KEYS} key resource limit");
+        }
+        Ok(())
     }
 }
 
@@ -835,6 +880,7 @@ impl LegacyRawTable {
     }
 
     fn write(&self, path: &Path) -> Result<()> {
+        self.order.ensure_within_limit()?;
         let retained = self.order.retained_order();
         let columns = retained
             .iter()
@@ -908,6 +954,7 @@ fn write_legacy_roc_table(
         // getLevels sorts the shared observation vector in-place on every
         // subtype/genotype call. Preserve that progressive tied-level order.
         let mut sorted_obs = accum.observations.small_records();
+        let mut sort_passes = 0usize;
         for subtype in subtypes {
             for genotype in ["het", "hetalt", "homalt", "*"] {
                 let totals = legacy_totals_store(&accum.observations, subtype, genotype)?;
@@ -926,8 +973,15 @@ fn write_legacy_roc_table(
                     &options.subset_confidence_sizes,
                 );
                 if !counts_only && options.output_rocs {
+                    sort_passes += 1;
                     let levels = if accum.observations.is_disk_backed() {
-                        legacy_levels_store(&accum.observations, subtype, genotype, options.delta)?
+                        legacy_levels_store(
+                            &accum.observations,
+                            subtype,
+                            genotype,
+                            options.delta,
+                            sort_passes,
+                        )?
                     } else {
                         introsort_libstdcpp(&mut sorted_obs);
                         legacy_levels(&sorted_obs, subtype, genotype, options.delta)
@@ -1059,12 +1113,13 @@ fn legacy_levels_store(
     subtype: &str,
     genotype: &str,
     delta: f64,
+    sort_passes: usize,
 ) -> Result<Vec<(String, Cumul)>> {
     let totals = legacy_totals_store(observations, subtype, genotype)?;
     let mut running = Cumul::default();
     let mut previous = None;
     let mut levels = Vec::new();
-    for observation in observations.sorted()? {
+    for observation in observations.sorted_with_passes(sort_passes)? {
         let observation = observation?;
         if !legacy_obs_matches(&observation, subtype, genotype) {
             continue;
@@ -1084,6 +1139,11 @@ fn legacy_levels_store(
                     fp_al: totals.fp_al.saturating_sub(running.fp_al),
                 },
             ));
+            if levels.len() > MAX_RENDERED_ROC_THRESHOLDS {
+                bail!(
+                    "verbose ROC table exceeds the {MAX_RENDERED_ROC_THRESHOLDS} rendered-threshold resource limit"
+                );
+            }
         }
     }
     Ok(levels)
@@ -1338,8 +1398,16 @@ struct StoredObs {
 struct ObservationStore {
     buffer: Vec<StoredObs>,
     chunks: Vec<tempfile::TempPath>,
+    disk: Option<DiskObservationStore>,
+    sorted_indices: RefCell<BTreeMap<usize, tempfile::TempPath>>,
     next_serial: u64,
     error: Option<String>,
+}
+
+struct DiskObservationStore {
+    data: tempfile::TempPath,
+    index: tempfile::TempPath,
+    len: usize,
 }
 
 impl ObservationStore {
@@ -1360,12 +1428,6 @@ impl ObservationStore {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        self.buffer.sort_by(|left, right| {
-            left.record
-                .level
-                .total_cmp(&right.record.level)
-                .then(left.serial.cmp(&right.serial))
-        });
         let mut chunk =
             tempfile::NamedTempFile::new().context("failed to create ROC observation chunk")?;
         {
@@ -1385,13 +1447,43 @@ impl ObservationStore {
         }
         if !self.chunks.is_empty() {
             self.flush_chunk()?;
-            self.chunks = collapse_observation_chunks(std::mem::take(&mut self.chunks))?;
+            let mut data = tempfile::NamedTempFile::new()
+                .context("failed to create ROC observation data spool")?;
+            let mut index = tempfile::NamedTempFile::new()
+                .context("failed to create ROC observation index spool")?;
+            let mut offset = 0u64;
+            let mut len = 0usize;
+            for chunk in std::mem::take(&mut self.chunks) {
+                for line in BufReader::new(File::open(&chunk)?).lines() {
+                    let line = line?;
+                    let observation = parse_observation(&line)?;
+                    let encoded = format!("{line}\n");
+                    data.as_file_mut().write_all(encoded.as_bytes())?;
+                    write_disk_index_entry(
+                        index.as_file_mut(),
+                        DiskIndexEntry {
+                            offset,
+                            len: encoded.len() as u64,
+                            level_bits: observation.record.level.to_bits(),
+                        },
+                    )?;
+                    offset += encoded.len() as u64;
+                    len += 1;
+                }
+            }
+            data.as_file_mut().flush()?;
+            index.as_file_mut().flush()?;
+            self.disk = Some(DiskObservationStore {
+                data: data.into_temp_path(),
+                index: index.into_temp_path(),
+                len,
+            });
         }
         Ok(())
     }
 
     fn is_disk_backed(&self) -> bool {
-        !self.chunks.is_empty()
+        self.disk.is_some() || !self.chunks.is_empty()
     }
 
     fn small_records(&self) -> Vec<ObsRecord> {
@@ -1401,33 +1493,45 @@ impl ObservationStore {
             .collect()
     }
 
-    fn sorted(&self) -> Result<ObservationMerge> {
-        if self.chunks.is_empty() {
-            let mut temporary =
-                tempfile::NamedTempFile::new().context("failed to create ROC observation view")?;
-            {
-                let mut writer = BufWriter::new(temporary.as_file_mut());
-                let mut observations = self.buffer.clone();
-                observations.sort_by(|left, right| {
-                    left.record
-                        .level
-                        .total_cmp(&right.record.level)
-                        .then(left.serial.cmp(&right.serial))
-                });
-                for observation in observations {
-                    write_observation(&mut writer, &observation)?;
-                }
-                writer.flush()?;
+    fn sorted(&self) -> Result<Box<dyn Iterator<Item = Result<ObsRecord>>>> {
+        self.sorted_with_passes(4)
+    }
+
+    fn sorted_with_passes(
+        &self,
+        passes: usize,
+    ) -> Result<Box<dyn Iterator<Item = Result<ObsRecord>>>> {
+        if let Some(disk) = &self.disk {
+            let (completed_passes, source) = self
+                .sorted_indices
+                .borrow()
+                .range(..=passes)
+                .next_back()
+                .map(|(completed, path)| (*completed, path.to_path_buf()))
+                .unwrap_or_else(|| (0, disk.index.to_path_buf()));
+            let index = copy_temp_path(&source)?;
+            let mut index_file = File::options().read(true).write(true).open(&index)?;
+            for _ in completed_passes..passes {
+                disk_introsort_libstdcpp(&mut index_file, disk.len)?;
             }
-            ObservationMerge::open(vec![temporary.into_temp_path()])
-        } else {
-            let copies = self
-                .chunks
-                .iter()
-                .map(copy_temp_path)
-                .collect::<Result<Vec<_>>>()?;
-            ObservationMerge::open(copies)
+            if !self.sorted_indices.borrow().contains_key(&passes) {
+                self.sorted_indices
+                    .borrow_mut()
+                    .insert(passes, copy_temp_path(&index)?);
+            }
+            return Ok(Box::new(DiskObservationIter {
+                _index_path: index,
+                sorted_index: index_file,
+                data: File::open(&disk.data)?,
+                position: 0,
+                len: disk.len,
+            }));
         }
+        let mut observations = self.small_records();
+        for _ in 0..passes {
+            introsort_libstdcpp(&mut observations);
+        }
+        Ok(Box::new(observations.into_iter().map(Ok)))
     }
 }
 
@@ -1438,58 +1542,77 @@ fn copy_temp_path(path: &Path) -> Result<tempfile::TempPath> {
     Ok(copy.into_temp_path())
 }
 
-struct ObservationMerge {
-    _chunks: Vec<tempfile::TempPath>,
-    readers: Vec<std::io::Lines<BufReader<File>>>,
-    current: Vec<Option<StoredObs>>,
-    heap: BinaryHeap<Reverse<(u64, u64, usize)>>,
+#[derive(Clone, Copy)]
+struct DiskIndexEntry {
+    offset: u64,
+    len: u64,
+    level_bits: u64,
 }
 
-impl ObservationMerge {
-    fn open(chunks: Vec<tempfile::TempPath>) -> Result<Self> {
-        let mut readers = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            readers.push(BufReader::new(File::open(chunk)?).lines());
-        }
-        let mut merge = Self {
-            current: (0..readers.len()).map(|_| None).collect(),
-            readers,
-            heap: BinaryHeap::new(),
-            _chunks: chunks,
-        };
-        for index in 0..merge.readers.len() {
-            merge.advance(index)?;
-        }
-        Ok(merge)
-    }
-
-    fn advance(&mut self, index: usize) -> Result<()> {
-        let Some(line) = self.readers[index].next() else {
-            return Ok(());
-        };
-        let observation = parse_observation(&line?)?;
-        self.heap.push(Reverse((
-            sortable_f64(observation.record.level),
-            observation.serial,
-            index,
-        )));
-        self.current[index] = Some(observation);
-        Ok(())
-    }
+fn write_disk_index_entry(file: &mut File, entry: DiskIndexEntry) -> Result<()> {
+    file.write_all(&entry.offset.to_le_bytes())?;
+    file.write_all(&entry.len.to_le_bytes())?;
+    file.write_all(&entry.level_bits.to_le_bytes())?;
+    Ok(())
 }
 
-impl Iterator for ObservationMerge {
+fn read_disk_index_entry(file: &mut File, position: usize) -> Result<DiskIndexEntry> {
+    file.seek(SeekFrom::Start(position as u64 * ROC_INDEX_ENTRY_BYTES))?;
+    let mut bytes = [0u8; ROC_INDEX_ENTRY_BYTES as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(DiskIndexEntry {
+        offset: u64::from_le_bytes(bytes[0..8].try_into().expect("offset bytes")),
+        len: u64::from_le_bytes(bytes[8..16].try_into().expect("length bytes")),
+        level_bits: u64::from_le_bytes(bytes[16..24].try_into().expect("level bytes")),
+    })
+}
+
+fn write_disk_index_at(file: &mut File, position: usize, entry: DiskIndexEntry) -> Result<()> {
+    file.seek(SeekFrom::Start(position as u64 * ROC_INDEX_ENTRY_BYTES))?;
+    write_disk_index_entry(file, entry)
+}
+
+fn swap_disk_index(file: &mut File, left: usize, right: usize) -> Result<()> {
+    if left == right {
+        return Ok(());
+    }
+    let left_entry = read_disk_index_entry(file, left)?;
+    let right_entry = read_disk_index_entry(file, right)?;
+    write_disk_index_at(file, left, right_entry)?;
+    write_disk_index_at(file, right, left_entry)
+}
+
+fn disk_level(file: &mut File, position: usize) -> Result<f64> {
+    Ok(f64::from_bits(
+        read_disk_index_entry(file, position)?.level_bits,
+    ))
+}
+
+struct DiskObservationIter {
+    _index_path: tempfile::TempPath,
+    sorted_index: File,
+    data: File,
+    position: usize,
+    len: usize,
+}
+
+impl Iterator for DiskObservationIter {
     type Item = Result<ObsRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Reverse((_, _, index)) = self.heap.pop()?;
-        let observation = self.current[index]
-            .take()
-            .expect("ROC merge heap entry has an observation");
-        if let Err(error) = self.advance(index) {
-            return Some(Err(error));
+        if self.position >= self.len {
+            return None;
         }
-        Some(Ok(observation.record))
+        let result = (|| {
+            let entry = read_disk_index_entry(&mut self.sorted_index, self.position)?;
+            self.position += 1;
+            self.data.seek(SeekFrom::Start(entry.offset))?;
+            let mut bytes = vec![0u8; entry.len as usize];
+            self.data.read_exact(&mut bytes)?;
+            let line = std::str::from_utf8(&bytes)?.trim_end_matches(['\r', '\n']);
+            Ok(parse_observation(line)?.record)
+        })();
+        Some(result)
     }
 }
 
@@ -1588,45 +1711,6 @@ fn parse_observation(line: &str) -> Result<StoredObs> {
     })
 }
 
-fn collapse_observation_chunks(
-    mut chunks: Vec<tempfile::TempPath>,
-) -> Result<Vec<tempfile::TempPath>> {
-    while chunks.len() > ROC_MERGE_FAN_IN {
-        let mut merged = Vec::with_capacity(chunks.len().div_ceil(ROC_MERGE_FAN_IN));
-        let mut remaining = chunks.into_iter();
-        loop {
-            let batch = remaining
-                .by_ref()
-                .take(ROC_MERGE_FAN_IN)
-                .collect::<Vec<_>>();
-            if batch.is_empty() {
-                break;
-            }
-            let mut output = tempfile::NamedTempFile::new()
-                .context("failed to create merged ROC observation chunk")?;
-            {
-                let mut writer = BufWriter::new(output.as_file_mut());
-                let mut merge = ObservationMerge::open(batch)?;
-                let mut serial = 0u64;
-                while let Some(observation) = merge.next() {
-                    write_observation(
-                        &mut writer,
-                        &StoredObs {
-                            serial,
-                            record: observation?,
-                        },
-                    )?;
-                    serial += 1;
-                }
-                writer.flush()?;
-            }
-            merged.push(output.into_temp_path());
-        }
-        chunks = merged;
-    }
-    Ok(chunks)
-}
-
 impl Cumul {
     fn add(&mut self, other: &Cumul) {
         add_bucket(&mut self.truth_tp, &other.truth_tp);
@@ -1678,8 +1762,8 @@ fn sum_buckets(a: &CountsBucket, b: &CountsBucket) -> CountsBucket {
 ///     bit-exact parity.
 /// `threshold_window` is only the bounded, pre-spill fast path. Once the
 /// observation chunk reaches `ROC_OBSERVATION_CHUNK`, observations are
-/// externally sorted and threshold/substat state is derived while merging;
-/// no per-threshold map grows with a whole-genome input.
+/// indexed on disk and threshold/substat state is derived through bounded
+/// streaming passes; no per-threshold map grows with a whole-genome input.
 #[derive(Default)]
 struct BoundedGroupAccum {
     baseline: Cumul,
@@ -1726,6 +1810,310 @@ struct EmittedRow {
     qq_str: String,
     cum: Cumul,
     substats: Option<SubstatAvail>,
+}
+
+struct SubstatSnapshotCursor {
+    _path: tempfile::TempPath,
+    lines: std::io::Lines<BufReader<File>>,
+    current: Option<ObsRecord>,
+}
+
+impl SubstatSnapshotCursor {
+    fn build(
+        source: &ObservationStore,
+        sort_passes: usize,
+        include: impl Fn(&ObsRecord) -> bool,
+    ) -> Result<Self> {
+        let mut file = tempfile::NamedTempFile::new()
+            .context("failed to create ROC substat snapshot spool")?;
+        let mut running = Cumul::default();
+        let mut previous = None;
+        let mut serial = 0u64;
+        for observation in source.sorted_with_passes(sort_passes)? {
+            let observation = observation?;
+            if !include(&observation) {
+                continue;
+            }
+            running.add(&observation.counts);
+            if previous != Some(observation.level) {
+                write_observation(
+                    file.as_file_mut(),
+                    &StoredObs {
+                        serial,
+                        record: ObsRecord {
+                            level: observation.level,
+                            counts: running.clone(),
+                            subtypes: vec!["*".to_string()],
+                            ti_flag: false,
+                            tv_flag: false,
+                            blt: None,
+                        },
+                    },
+                )?;
+                previous = Some(observation.level);
+                serial += 1;
+            }
+        }
+        file.as_file_mut().flush()?;
+        let path = file.into_temp_path();
+        let mut cursor = Self {
+            lines: BufReader::new(File::open(&path)?).lines(),
+            current: None,
+            _path: path,
+        };
+        cursor.advance()?;
+        Ok(cursor)
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.current = self
+            .lines
+            .next()
+            .transpose()?
+            .map(|line| parse_observation(&line).map(|stored| stored.record))
+            .transpose()?;
+        Ok(())
+    }
+
+    fn counts_at(&mut self, level: f64) -> Result<Option<Cumul>> {
+        while self
+            .current
+            .as_ref()
+            .is_some_and(|record| record.level < level)
+        {
+            self.advance()?;
+        }
+        Ok(self
+            .current
+            .as_ref()
+            .filter(|record| record.level == level)
+            .map(|record| record.counts.clone()))
+    }
+}
+
+enum EmittedRows {
+    Memory(std::vec::IntoIter<EmittedRow>),
+    Disk {
+        baseline: Option<EmittedRow>,
+        merge: EmittedRowMerge,
+    },
+}
+
+impl Iterator for EmittedRows {
+    type Item = Result<EmittedRow>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Memory(rows) => rows.next().map(Ok),
+            Self::Disk { baseline, merge } => baseline.take().map(Ok).or_else(|| merge.next()),
+        }
+    }
+}
+
+struct EmittedRowSpool {
+    buffer: Vec<(String, u64, EmittedRow)>,
+    chunks: Vec<tempfile::TempPath>,
+    serial: u64,
+}
+
+impl EmittedRowSpool {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            chunks: Vec::new(),
+            serial: 0,
+        }
+    }
+
+    fn push(&mut self, row: EmittedRow) -> Result<()> {
+        if self.serial as usize >= MAX_RENDERED_ROC_THRESHOLDS {
+            bail!(
+                "ROC output exceeds the {MAX_RENDERED_ROC_THRESHOLDS} rendered-threshold resource limit"
+            );
+        }
+        self.buffer.push((row.qq_str.clone(), self.serial, row));
+        self.serial += 1;
+        if self.buffer.len() >= ROC_OBSERVATION_CHUNK {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.buffer
+            .sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let mut chunk =
+            tempfile::NamedTempFile::new().context("failed to create rendered ROC row chunk")?;
+        {
+            let mut writer = BufWriter::new(chunk.as_file_mut());
+            for (_, serial, row) in self.buffer.drain(..) {
+                write_emitted_row(&mut writer, serial, &row)?;
+            }
+            writer.flush()?;
+        }
+        self.chunks.push(chunk.into_temp_path());
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<EmittedRowMerge> {
+        self.flush()?;
+        while self.chunks.len() > 32 {
+            let mut merged = Vec::new();
+            let mut remaining = self.chunks.into_iter();
+            loop {
+                let batch = remaining.by_ref().take(32).collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
+                }
+                let mut output =
+                    tempfile::NamedTempFile::new().context("failed to merge rendered ROC rows")?;
+                {
+                    let mut writer = BufWriter::new(output.as_file_mut());
+                    let mut merge = EmittedRowMerge::open(batch)?;
+                    while let Some(row) = merge.next_keyed() {
+                        let (serial, row) = row?;
+                        write_emitted_row(&mut writer, serial, &row)?;
+                    }
+                    writer.flush()?;
+                }
+                merged.push(output.into_temp_path());
+            }
+            self.chunks = merged;
+        }
+        EmittedRowMerge::open(self.chunks)
+    }
+}
+
+struct EmittedRowMerge {
+    _chunks: Vec<tempfile::TempPath>,
+    readers: Vec<std::io::Lines<BufReader<File>>>,
+    current: Vec<Option<(String, u64, EmittedRow)>>,
+    heap: BinaryHeap<Reverse<(String, u64, usize)>>,
+}
+
+impl EmittedRowMerge {
+    fn open(chunks: Vec<tempfile::TempPath>) -> Result<Self> {
+        let readers = chunks
+            .iter()
+            .map(|path| Ok(BufReader::new(File::open(path)?).lines()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut merge = Self {
+            current: (0..readers.len()).map(|_| None).collect(),
+            readers,
+            heap: BinaryHeap::new(),
+            _chunks: chunks,
+        };
+        for index in 0..merge.readers.len() {
+            merge.advance(index)?;
+        }
+        Ok(merge)
+    }
+
+    fn advance(&mut self, index: usize) -> Result<()> {
+        let Some(line) = self.readers[index].next() else {
+            return Ok(());
+        };
+        let (serial, row) = parse_emitted_row(&line?)?;
+        self.heap.push(Reverse((row.qq_str.clone(), serial, index)));
+        self.current[index] = Some((row.qq_str.clone(), serial, row));
+        Ok(())
+    }
+
+    fn next_keyed(&mut self) -> Option<Result<(u64, EmittedRow)>> {
+        let Reverse((_, _, index)) = self.heap.pop()?;
+        let (_, serial, row) = self.current[index]
+            .take()
+            .expect("rendered ROC merge entry has a row");
+        if let Err(error) = self.advance(index) {
+            return Some(Err(error));
+        }
+        Some(Ok((serial, row)))
+    }
+}
+
+impl Iterator for EmittedRowMerge {
+    type Item = Result<EmittedRow>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_keyed().map(|row| row.map(|(_, row)| row))
+    }
+}
+
+fn write_emitted_row(writer: &mut dyn Write, serial: u64, row: &EmittedRow) -> Result<()> {
+    write!(writer, "{}\t{serial}", row.qq_str)?;
+    for bucket in [
+        &row.cum.truth_tp,
+        &row.cum.truth_fn,
+        &row.cum.query_tp,
+        &row.cum.query_fp,
+        &row.cum.query_unk,
+    ] {
+        write!(
+            writer,
+            "\t{}\t{}\t{}\t{}\t{}",
+            bucket.total, bucket.ti, bucket.tv, bucket.het, bucket.homalt
+        )?;
+    }
+    let substats = row.substats.clone().unwrap_or_default();
+    writeln!(
+        writer,
+        "\t{}\t{}\t{}\t{}\t{}\t{}",
+        row.cum.fp_gt,
+        row.cum.fp_al,
+        u8::from(substats.ti),
+        u8::from(substats.tv),
+        u8::from(substats.het),
+        u8::from(substats.homalt)
+    )?;
+    Ok(())
+}
+
+fn parse_emitted_row(line: &str) -> Result<(u64, EmittedRow)> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 33 {
+        bail!(
+            "rendered ROC spool has {} fields, expected 33",
+            fields.len()
+        );
+    }
+    let mut index = 2usize;
+    let mut bucket = || -> Result<CountsBucket> {
+        let result = CountsBucket {
+            total: fields[index].parse()?,
+            ti: fields[index + 1].parse()?,
+            tv: fields[index + 2].parse()?,
+            het: fields[index + 3].parse()?,
+            homalt: fields[index + 4].parse()?,
+        };
+        index += 5;
+        Ok(result)
+    };
+    let cum = Cumul {
+        truth_tp: bucket()?,
+        truth_fn: bucket()?,
+        query_tp: bucket()?,
+        query_fp: bucket()?,
+        query_unk: bucket()?,
+        fp_gt: fields[index].parse()?,
+        fp_al: fields[index + 1].parse()?,
+    };
+    index += 2;
+    Ok((
+        fields[1].parse()?,
+        EmittedRow {
+            qq_str: fields[0].to_string(),
+            cum,
+            substats: Some(SubstatAvail {
+                ti: fields[index] == "1",
+                tv: fields[index + 1] == "1",
+                het: fields[index + 2] == "1",
+                homalt: fields[index + 3] == "1",
+            }),
+        },
+    ))
 }
 
 impl BoundedGroupAccum {
@@ -1898,11 +2286,18 @@ impl BoundedGroupAccum {
         self.emit_with_delta(0.5).expect("emit test rows")
     }
 
+    #[cfg(test)]
     fn emit_with_delta(&self, delta: f64) -> Result<Vec<EmittedRow>> {
+        self.stream_with_delta(delta)?.collect()
+    }
+
+    fn stream_with_delta(&self, delta: f64) -> Result<EmittedRows> {
         if self.observations.is_disk_backed() {
-            self.emit_disk_with_delta(delta)
+            self.emit_disk_with_delta_from(&self.observations, None, 4, delta)
         } else {
-            Ok(self.emit_internal(None, None, delta))
+            Ok(EmittedRows::Memory(
+                self.emit_internal(None, None, delta).into_iter(),
+            ))
         }
     }
 
@@ -1918,7 +2313,7 @@ impl BoundedGroupAccum {
         shared_sorted: &[ObsRecord],
         my_subtype: &str,
         delta: f64,
-    ) -> Result<Vec<EmittedRow>> {
+    ) -> Result<EmittedRows> {
         Ok(self.emit_internal(Some(shared_sorted), Some(my_subtype), delta))
     }
 
@@ -2170,13 +2565,27 @@ impl BoundedGroupAccum {
         out
     }
 
-    fn emit_disk_with_delta(&self, delta: f64) -> Result<Vec<EmittedRow>> {
+    fn emit_disk_with_delta_from(
+        &self,
+        source: &ObservationStore,
+        subtype: Option<&str>,
+        sort_passes: usize,
+        delta: f64,
+    ) -> Result<EmittedRows> {
         let truth_total_const = sum_buckets(&self.baseline.truth_tp, &self.baseline.truth_fn);
         let mut total = Cumul::default();
         let mut total_ti = Cumul::default();
         let mut total_tv = Cumul::default();
-        for observation in self.observations.sorted()? {
+        for observation in source.sorted_with_passes(sort_passes)? {
             let observation = observation?;
+            if subtype.is_some_and(|subtype| {
+                !observation
+                    .subtypes
+                    .iter()
+                    .any(|candidate| candidate == subtype)
+            }) {
+                continue;
+            }
             total.add(&observation.counts);
             if observation.ti_flag {
                 total_ti.add(&observation.counts);
@@ -2187,21 +2596,28 @@ impl BoundedGroupAccum {
         }
 
         let total_truth_fn = sub_buckets(&truth_total_const, &total.truth_tp);
-        let mut numeric_rows = Vec::new();
+        let mut numeric_rows = EmittedRowSpool::new();
         let mut running = Cumul::default();
-        let mut running_ti = Cumul::default();
-        let mut running_tv = Cumul::default();
+        let mut ti_snapshots = SubstatSnapshotCursor::build(source, 8, |row| {
+            row.ti_flag
+                && subtype
+                    .is_none_or(|subtype| row.subtypes.iter().any(|candidate| candidate == subtype))
+        })?;
+        let mut tv_snapshots = SubstatSnapshotCursor::build(source, 12, |row| {
+            row.tv_flag
+                && subtype
+                    .is_none_or(|subtype| row.subtypes.iter().any(|candidate| candidate == subtype))
+        })?;
         let mut previous_main: Option<f64> = None;
         let mut previous_ti: Option<f64> = None;
         let mut previous_tv: Option<f64> = None;
-        let mut current: Option<(f64, Cumul, Option<Cumul>, Option<Cumul>, bool, bool)> = None;
+        let mut current: Option<(f64, Cumul)> = None;
 
-        let mut emit_level = |level: f64,
-                              cum_through: Cumul,
-                              ti_through: Option<Cumul>,
-                              tv_through: Option<Cumul>,
-                              has_ti: bool,
-                              has_tv: bool| {
+        let mut emit_level = |level: f64, cum_through: Cumul| -> Result<()> {
+            let ti_through = ti_snapshots.counts_at(level)?;
+            let tv_through = tv_snapshots.counts_at(level)?;
+            let has_ti = ti_through.is_some();
+            let has_tv = tv_through.is_some();
             let keep_main = previous_main.is_none_or(|value| (level - value).abs() > delta);
             let keep_ti = has_ti && previous_ti.is_none_or(|value| (level - value).abs() > delta);
             let keep_tv = has_tv && previous_tv.is_none_or(|value| (level - value).abs() > delta);
@@ -2212,7 +2628,7 @@ impl BoundedGroupAccum {
                 previous_tv = Some(level);
             }
             if !keep_main {
-                return;
+                return Ok(());
             }
             previous_main = Some(level);
             let mut truth_tp = sub_buckets(&total.truth_tp, &cum_through.truth_tp);
@@ -2257,44 +2673,41 @@ impl BoundedGroupAccum {
                     het: false,
                     homalt: false,
                 }),
-            });
+            })?;
+            Ok(())
         };
 
-        for observation in self.observations.sorted()? {
+        for observation in source.sorted_with_passes(sort_passes)? {
             let observation = observation?;
+            if subtype.is_some_and(|subtype| {
+                !observation
+                    .subtypes
+                    .iter()
+                    .any(|candidate| candidate == subtype)
+            }) {
+                continue;
+            }
             if current
                 .as_ref()
                 .is_some_and(|entry| entry.0 != observation.level)
                 && let Some(entry) = current.take()
             {
-                emit_level(entry.0, entry.1, entry.2, entry.3, entry.4, entry.5);
+                emit_level(entry.0, entry.1)?;
             }
             running.add(&observation.counts);
-            let entry = current.get_or_insert_with(|| {
-                (observation.level, running.clone(), None, None, false, false)
-            });
-            if observation.ti_flag {
-                running_ti.add(&observation.counts);
-                entry.2.get_or_insert_with(|| running_ti.clone());
-                entry.4 = true;
-            }
-            if observation.tv_flag {
-                running_tv.add(&observation.counts);
-                entry.3.get_or_insert_with(|| running_tv.clone());
-                entry.5 = true;
-            }
+            current.get_or_insert_with(|| (observation.level, running.clone()));
         }
         if let Some(entry) = current {
-            emit_level(entry.0, entry.1, entry.2, entry.3, entry.4, entry.5);
+            emit_level(entry.0, entry.1)?;
         }
-        numeric_rows.sort_by(|left, right| left.qq_str.cmp(&right.qq_str));
-        let mut rows = vec![EmittedRow {
-            qq_str: "*".to_string(),
-            cum: self.baseline.clone(),
-            substats: None,
-        }];
-        rows.extend(numeric_rows);
-        Ok(rows)
+        Ok(EmittedRows::Disk {
+            baseline: Some(EmittedRow {
+                qq_str: "*".to_string(),
+                cum: self.baseline.clone(),
+                substats: None,
+            }),
+            merge: numeric_rows.finish()?,
+        })
     }
 }
 
@@ -2522,6 +2935,170 @@ fn sift_down(arr: &mut [ObsRecord], start: usize, first: usize, last: usize) {
             break;
         }
     }
+}
+
+fn disk_introsort_libstdcpp(file: &mut File, len: usize) -> Result<()> {
+    if len > 1 {
+        disk_introsort_loop(file, 0, len, lg_floor(len) * 2)?;
+        disk_final_insertion_sort(file, len)?;
+    }
+    Ok(())
+}
+
+fn disk_introsort_loop(
+    file: &mut File,
+    first: usize,
+    mut last: usize,
+    mut depth_limit: usize,
+) -> Result<()> {
+    while last - first > ROC_SORT_THRESHOLD {
+        if depth_limit == 0 {
+            return disk_heapsort_range(file, first, last);
+        }
+        depth_limit -= 1;
+        let cut = disk_unguarded_partition_pivot(file, first, last)?;
+        disk_introsort_loop(file, cut, last, depth_limit)?;
+        last = cut;
+    }
+    Ok(())
+}
+
+fn disk_unguarded_partition_pivot(file: &mut File, first: usize, last: usize) -> Result<usize> {
+    let mid = first + (last - first) / 2;
+    disk_move_median_to_first(file, first, first + 1, mid, last - 1)?;
+    disk_unguarded_partition(file, first + 1, last, first)
+}
+
+fn disk_move_median_to_first(
+    file: &mut File,
+    result: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+) -> Result<()> {
+    let av = disk_level(file, a)?;
+    let bv = disk_level(file, b)?;
+    let cv = disk_level(file, c)?;
+    let selected = if av < bv {
+        if bv < cv {
+            b
+        } else if av < cv {
+            c
+        } else {
+            a
+        }
+    } else if av < cv {
+        a
+    } else if bv < cv {
+        c
+    } else {
+        b
+    };
+    swap_disk_index(file, result, selected)
+}
+
+fn disk_unguarded_partition(
+    file: &mut File,
+    mut first: usize,
+    mut last: usize,
+    pivot: usize,
+) -> Result<usize> {
+    loop {
+        while disk_level(file, first)? < disk_level(file, pivot)? {
+            first += 1;
+        }
+        last -= 1;
+        while disk_level(file, pivot)? < disk_level(file, last)? {
+            last -= 1;
+        }
+        if first >= last {
+            return Ok(first);
+        }
+        swap_disk_index(file, first, last)?;
+        first += 1;
+    }
+}
+
+fn disk_final_insertion_sort(file: &mut File, len: usize) -> Result<()> {
+    if len > ROC_SORT_THRESHOLD {
+        disk_insertion_sort_range(file, 0, ROC_SORT_THRESHOLD)?;
+        disk_unguarded_insertion_sort_range(file, ROC_SORT_THRESHOLD, len)
+    } else {
+        disk_insertion_sort_range(file, 0, len)
+    }
+}
+
+fn disk_insertion_sort_range(file: &mut File, first: usize, last: usize) -> Result<()> {
+    if first == last {
+        return Ok(());
+    }
+    for i in (first + 1)..last {
+        if disk_level(file, i)? < disk_level(file, first)? {
+            let entry = read_disk_index_entry(file, i)?;
+            for position in (first..i).rev() {
+                let shifted = read_disk_index_entry(file, position)?;
+                write_disk_index_at(file, position + 1, shifted)?;
+            }
+            write_disk_index_at(file, first, entry)?;
+        } else {
+            let mut position = i;
+            while position > first && disk_level(file, position)? < disk_level(file, position - 1)?
+            {
+                swap_disk_index(file, position, position - 1)?;
+                position -= 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn disk_unguarded_insertion_sort_range(file: &mut File, first: usize, last: usize) -> Result<()> {
+    for i in first..last {
+        let mut position = i;
+        while position > 0 && disk_level(file, position)? < disk_level(file, position - 1)? {
+            swap_disk_index(file, position, position - 1)?;
+            position -= 1;
+        }
+    }
+    Ok(())
+}
+
+fn disk_heapsort_range(file: &mut File, first: usize, last: usize) -> Result<()> {
+    let len = last - first;
+    if len < 2 {
+        return Ok(());
+    }
+    for index in (0..len / 2).rev() {
+        disk_sift_down(file, first + index, first, last)?;
+    }
+    for index in (1..len).rev() {
+        swap_disk_index(file, first, first + index)?;
+        disk_sift_down(file, first, first, first + index)?;
+    }
+    Ok(())
+}
+
+fn disk_sift_down(file: &mut File, start: usize, first: usize, last: usize) -> Result<()> {
+    let mut root = start;
+    loop {
+        let left = first + 2 * (root - first) + 1;
+        if left >= last {
+            break;
+        }
+        let right = left + 1;
+        let child = if right < last && disk_level(file, left)? < disk_level(file, right)? {
+            right
+        } else {
+            left
+        };
+        if disk_level(file, root)? < disk_level(file, child)? {
+            swap_disk_index(file, root, child)?;
+            root = child;
+        } else {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3148,11 +3725,6 @@ fn build_star_sorted(
         BTreeMap::new();
     for (key, accum) in groups {
         if key.subtype == "*" && key.genotype == "*" && !accum.observations.is_disk_backed() {
-            let max_count = match key.ty.as_str() {
-                "SNP" => 12,
-                "INDEL" => 40,
-                _ => 4,
-            };
             let mut obs = accum.observations.small_records();
             let mut current_count: usize = 0;
             // Insert per-subtype snapshots at every 4-sort boundary.
@@ -3187,10 +3759,24 @@ fn build_star_sorted(
                     obs.clone(),
                 );
             }
-            let _ = max_count; // silence unused warning when not needed
         }
     }
     star_sorted
+}
+
+fn legacy_subtype_sort_passes(ty: &str, subtype: &str) -> usize {
+    let order: &[&str] = if ty == "SNP" {
+        &["*", "ti", "tv"]
+    } else {
+        &[
+            "*", "I1_5", "I6_15", "I16_PLUS", "D1_5", "D6_15", "D16_PLUS", "C1_5", "C6_15",
+            "C16_PLUS",
+        ]
+    };
+    order
+        .iter()
+        .position(|candidate| *candidate == subtype)
+        .map_or(4, |index| (index + 1) * 4)
 }
 
 fn render_rows(
@@ -3198,8 +3784,11 @@ fn render_rows(
     star_sorted: &BTreeMap<(String, String, String, String), Vec<ObsRecord>>,
     row_filter: RowFilter<'_>,
     config: RenderConfig<'_>,
-) -> Result<Vec<String>> {
-    let mut out = Vec::new();
+) -> Result<RenderedRows> {
+    let mut output =
+        tempfile::NamedTempFile::new().context("failed to create rendered ROC report spool")?;
+    let mut out = BufWriter::new(output.as_file_mut());
+    let mut row_count = 0usize;
     // `accumulate` pre-seeds empty subtype buckets for types that are present,
     // because legacy reports zero-valued subtype baselines for an observed
     // type. It does not, however, emit a second family of rows for a wholly
@@ -3228,19 +3817,42 @@ fn render_rows(
             }
         }
         let is_filter_tier = !is_aggregate_filter(&key.filter);
-        let emitted_rows: Vec<EmittedRow> = if key.subtype == "*" {
-            accum.emit_with_delta(config.delta)?
+        let wildcard_key = RowKey {
+            ty: key.ty.clone(),
+            subtype: "*".to_string(),
+            subset: key.subset.clone(),
+            filter: key.filter.clone(),
+            genotype: key.genotype.clone(),
+            qq_field: key.qq_field.clone(),
+        };
+        let emitted_rows = if key.subtype == "*" {
+            accum.stream_with_delta(config.delta)?
+        } else if let Some(wildcard) = groups
+            .get(&wildcard_key)
+            .filter(|wildcard| wildcard.observations.is_disk_backed())
+        {
+            accum.emit_disk_with_delta_from(
+                &wildcard.observations,
+                Some(&key.subtype),
+                legacy_subtype_sort_passes(&key.ty, &key.subtype),
+                config.delta,
+            )?
         } else if let Some(shared) = star_sorted.get(&(
             key.ty.clone(),
             key.subtype.clone(),
             key.subset.clone(),
             key.filter.clone(),
         )) {
-            accum.emit_with_shared_sort_and_delta(shared, &key.subtype, config.delta)?
+            EmittedRows::Memory(
+                accum
+                    .emit_with_shared_sort_and_delta(shared, &key.subtype, config.delta)?
+                    .into_iter(),
+            )
         } else {
-            accum.emit_with_delta(config.delta)?
+            accum.stream_with_delta(config.delta)?
         };
         for emitted in emitted_rows {
+            let emitted = emitted?;
             if matches!(row_filter, RowFilter::Locations { .. }) && emitted.qq_str == "*" {
                 // Legacy's Locations file drops the baseline row.
                 continue;
@@ -3251,20 +3863,35 @@ fn render_rows(
                 // real numeric buckets that may have landed here.
                 continue;
             }
-            out.push(render_row(
-                key,
-                &emitted,
-                config.subset_size,
-                config.whole_reference_size,
-                config.conf_size,
-                config.subset_sizes,
-                config.subset_confidence_sizes,
-                is_filter_tier && config.filter_counts_only,
-                config.ci_alpha,
-            ));
+            writeln!(
+                out,
+                "{}",
+                render_row(
+                    key,
+                    &emitted,
+                    config.subset_size,
+                    config.whole_reference_size,
+                    config.conf_size,
+                    config.subset_sizes,
+                    config.subset_confidence_sizes,
+                    is_filter_tier && config.filter_counts_only,
+                    config.ci_alpha,
+                )
+            )?;
+            row_count += 1;
+            if row_count > MAX_RENDERED_ROC_THRESHOLDS {
+                bail!(
+                    "ROC report exceeds the {MAX_RENDERED_ROC_THRESHOLDS} rendered-row resource limit"
+                );
+            }
         }
     }
-    Ok(out)
+    out.flush()?;
+    drop(out);
+    Ok(RenderedRows {
+        path: output.into_temp_path(),
+        len: row_count,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3577,20 +4204,20 @@ fn subset_size_cells(
 // Gzipped CSV output
 // ---------------------------------------------------------------------------
 
-fn write_gzip_csv(path: &Path, header: &str, rows: &[String]) -> Result<()> {
+fn write_gzip_csv(path: &Path, header: &str, rows: &RenderedRows) -> Result<()> {
     let file = std::fs::File::create(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     let mut writer = GzEncoder::new(file, Compression::default());
     writeln!(writer, "{header}")?;
-    for row in rows {
-        writeln!(writer, "{row}")?;
+    for row in rows.lines()? {
+        writeln!(writer, "{}", row?)?;
     }
     writer.finish()?;
     Ok(())
 }
 
-fn write_optional_gzip_csv(path: &Path, header: &str, rows: &[String]) -> Result<()> {
-    if rows.is_empty() {
+fn write_optional_gzip_csv(path: &Path, header: &str, rows: &RenderedRows) -> Result<()> {
+    if rows.len == 0 {
         // Reusing an output prefix must not retain a stale table from a prior
         // run where this variant type was present.
         if path.exists() {
@@ -4492,7 +5119,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(rendered.iter().any(|line| {
+        assert!(rendered.lines().unwrap().any(|line| {
+            let line = line.unwrap();
             let fields = line.split(',').collect::<Vec<_>>();
             fields[3] == "LowQual" && fields[6] != "*"
         }));

@@ -10,7 +10,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::borrow::Borrow;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -255,39 +255,112 @@ fn spool_comparison_contigs(path: &Path) -> Result<BTreeMap<String, ComparisonCo
     Ok(spools)
 }
 
-fn collect_spooled_comparison_metadata(
-    spool: Option<&ComparisonContigSpool>,
+const COMPARISON_METADATA_LOOKBEHIND: usize = 1_024;
+
+struct ComparisonMetadataCursor {
+    reader: vcf::RawVcfReader,
+    retained: VecDeque<RawVcfRecord>,
+    pending: Option<RawVcfRecord>,
+    furthest_start: usize,
+}
+
+struct ActiveComparisonMetadata {
+    chrom: String,
+    truth: Option<ComparisonMetadataCursor>,
+    query: Option<ComparisonMetadataCursor>,
+}
+
+impl ComparisonMetadataCursor {
+    fn open(spool: &ComparisonContigSpool) -> Result<Self> {
+        Ok(Self {
+            reader: vcf::open_raw_vcf(&spool.path)?,
+            retained: VecDeque::new(),
+            pending: None,
+            furthest_start: 0,
+        })
+    }
+
+    fn collect(
+        &mut self,
+        chrom: &str,
+        start: usize,
+        end: usize,
+        filtered_truth_keys: &mut BTreeSet<VariantKey>,
+        decorations: &mut DecorationIndex,
+        preserve_info: bool,
+        roc_field: &str,
+        collect_filtered: bool,
+    ) -> Result<()> {
+        if start.saturating_add(COMPARISON_METADATA_LOOKBEHIND) < self.furthest_start {
+            bail!(
+                "comparison metadata range for {chrom}:{start}-{end} moved more than {} bases behind the streaming cursor",
+                COMPARISON_METADATA_LOOKBEHIND
+            );
+        }
+        self.furthest_start = self.furthest_start.max(start);
+        let retain_from = self
+            .furthest_start
+            .saturating_sub(COMPARISON_METADATA_LOOKBEHIND);
+        while self
+            .retained
+            .front()
+            .is_some_and(|record| record.pos < retain_from)
+        {
+            self.retained.pop_front();
+        }
+
+        loop {
+            let record = match self.pending.take() {
+                Some(record) => record,
+                None => match self.reader.next() {
+                    Some(record) => record?,
+                    None => break,
+                },
+            };
+            if record.pos > end {
+                self.pending = Some(record);
+                break;
+            }
+            self.retained.push_back(record);
+        }
+
+        for record in self
+            .retained
+            .iter()
+            .filter(|record| record.pos >= start && record.pos <= end)
+        {
+            collect_comparison_metadata_record(
+                record,
+                chrom,
+                filtered_truth_keys,
+                decorations,
+                preserve_info,
+                roc_field,
+                collect_filtered,
+            );
+        }
+        Ok(())
+    }
+}
+
+fn collect_comparison_metadata_record(
+    record: &RawVcfRecord,
     chrom: &str,
-    start: usize,
-    end: usize,
     filtered_truth_keys: &mut BTreeSet<VariantKey>,
     decorations: &mut DecorationIndex,
     preserve_info: bool,
     roc_field: &str,
     collect_filtered: bool,
-) -> Result<()> {
-    let Some(spool) = spool else {
-        return Ok(());
-    };
-    for record in vcf::open_raw_vcf(&spool.path)? {
-        let record = record?;
-        if record.pos > end {
-            break;
-        }
-        if record.pos < start {
-            continue;
-        }
-        if collect_filtered && !record.is_pass() {
-            filtered_truth_keys.insert(VariantKey {
-                chrom: chrom.to_string(),
-                pos: record.pos,
-                ref_allele: record.ref_allele.clone(),
-                alt_allele: record.alt_allele.clone(),
-            });
-        }
-        decorations.observe(&record, preserve_info, roc_field);
+) {
+    if collect_filtered && !record.is_pass() {
+        filtered_truth_keys.insert(VariantKey {
+            chrom: chrom.to_string(),
+            pos: record.pos,
+            ref_allele: record.ref_allele.clone(),
+            alt_allele: record.alt_allele.clone(),
+        });
     }
-    Ok(())
+    decorations.observe(record, preserve_info, roc_field);
 }
 
 impl ComparisonRowFile {
@@ -1076,8 +1149,27 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     } else {
         BTreeMap::new()
     };
+    let mut active_metadata: Option<ActiveComparisonMetadata> = None;
     for cluster in clusters {
         let cluster = cluster?;
+        if active_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.chrom != cluster.chrom)
+        {
+            let truth_cursor = truth_metadata
+                .get(&cluster.chrom)
+                .map(ComparisonMetadataCursor::open)
+                .transpose()?;
+            let query_cursor = query_metadata
+                .get(&cluster.chrom)
+                .map(ComparisonMetadataCursor::open)
+                .transpose()?;
+            active_metadata = Some(ActiveComparisonMetadata {
+                chrom: cluster.chrom.clone(),
+                truth: truth_cursor,
+                query: query_cursor,
+            });
+        }
         contigs_in_play.insert(cluster.chrom.clone());
         for variant in &cluster.truth {
             add_variant_stats(
@@ -1133,20 +1225,11 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         }
         let mut filtered_truth_keys = BTreeSet::new();
         let mut decorations = DecorationIndex::default();
-        collect_spooled_comparison_metadata(
-            truth_metadata.get(&cluster.chrom),
-            &cluster.chrom,
-            emitted_start,
-            emitted_end,
-            &mut filtered_truth_keys,
-            &mut decorations,
-            args.preserve_info,
-            &args.roc,
-            true,
-        )?;
-        if needs_decoration {
-            collect_spooled_comparison_metadata(
-                query_metadata.get(&cluster.chrom),
+        let metadata = active_metadata
+            .as_mut()
+            .expect("comparison metadata cursor was initialized");
+        if let Some(truth_cursor) = &mut metadata.truth {
+            truth_cursor.collect(
                 &cluster.chrom,
                 emitted_start,
                 emitted_end,
@@ -1154,8 +1237,22 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
                 &mut decorations,
                 args.preserve_info,
                 &args.roc,
-                false,
+                true,
             )?;
+        }
+        if needs_decoration {
+            if let Some(query_cursor) = &mut metadata.query {
+                query_cursor.collect(
+                    &cluster.chrom,
+                    emitted_start,
+                    emitted_end,
+                    &mut filtered_truth_keys,
+                    &mut decorations,
+                    args.preserve_info,
+                    &args.roc,
+                    false,
+                )?;
+            }
         }
         for mut row in cluster_rows {
             let sort_line = row.line.clone();
