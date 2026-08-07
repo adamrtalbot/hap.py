@@ -17,23 +17,31 @@ pub fn read_index(path: &Path) -> Result<BTreeMap<String, usize>> {
     };
     let mut contigs = BTreeMap::new();
     for (line_number, line) in text.lines().enumerate() {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() < 2 || fields[0].is_empty() {
+        let mut fields = line.split('\t');
+        let name = fields.next().unwrap_or_default();
+        let Some(raw_length) = fields.next() else {
+            bail!(
+                "invalid FASTA index line {} in {}",
+                line_number + 1,
+                index_path.display()
+            );
+        };
+        if name.is_empty() {
             bail!(
                 "invalid FASTA index line {} in {}",
                 line_number + 1,
                 index_path.display()
             );
         }
-        let length = fields[1].parse::<usize>().with_context(|| {
+        let length = raw_length.parse::<usize>().with_context(|| {
             format!(
                 "invalid FASTA index length '{}' on line {} in {}",
-                fields[1],
+                raw_length,
                 line_number + 1,
                 index_path.display()
             )
         })?;
-        contigs.insert(fields[0].to_string(), length);
+        contigs.insert(name.to_string(), length);
     }
     Ok(contigs)
 }
@@ -54,21 +62,26 @@ pub fn read_sequences(path: &Path) -> Result<BTreeMap<String, String>> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix('>') {
             if let Some(name) = current_name.take() {
-                contigs.insert(name, current_seq.clone());
+                insert_contig(&mut contigs, name, std::mem::take(&mut current_seq), path)?;
             }
             let name = rest
                 .split_whitespace()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("invalid FASTA header in {}", path.display()))?;
             current_name = Some(name.to_string());
-            current_seq.clear();
         } else {
+            if current_name.is_none() && !line.trim().is_empty() {
+                bail!(
+                    "sequence data precedes the first FASTA header in {}",
+                    path.display()
+                );
+            }
             current_seq.push_str(line.trim());
         }
     }
 
     if let Some(name) = current_name {
-        contigs.insert(name, current_seq);
+        insert_contig(&mut contigs, name, current_seq, path)?;
     }
 
     if contigs.is_empty() {
@@ -76,6 +89,18 @@ pub fn read_sequences(path: &Path) -> Result<BTreeMap<String, String>> {
     }
 
     Ok(contigs)
+}
+
+fn insert_contig(
+    contigs: &mut BTreeMap<String, String>,
+    name: String,
+    sequence: String,
+    path: &Path,
+) -> Result<()> {
+    if contigs.insert(name.clone(), sequence).is_some() {
+        bail!("duplicate FASTA contig '{name}' in {}", path.display());
+    }
+    Ok(())
 }
 
 pub fn contig_lengths(path: &Path) -> Result<BTreeMap<String, usize>> {
@@ -149,6 +174,29 @@ mod tests {
         assert_eq!(
             read_index(&reference)?,
             BTreeMap::from([("chr1".to_string(), 5)])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_sequences_rejects_ambiguous_fasta_structure() -> Result<()> {
+        let directory = tempdir()?;
+        let reference = directory.path().join("ref.fa");
+
+        fs::write(&reference, "ACGT\n>chr1\nACGT\n")?;
+        assert!(
+            read_sequences(&reference)
+                .unwrap_err()
+                .to_string()
+                .contains("precedes the first FASTA header")
+        );
+
+        fs::write(&reference, ">chr1\nAC\n>chr1\nGT\n")?;
+        assert!(
+            read_sequences(&reference)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate FASTA contig")
         );
         Ok(())
     }

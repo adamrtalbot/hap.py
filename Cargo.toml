@@ -18,6 +18,9 @@ include = [
     "/THIRD_PARTY_LICENSES/**",
     "/rust/src/**",
     "/tests/**",
+    "/verification/assets/fixtures/ftx-bam/input.vcf",
+    "/verification/assets/fixtures/ftx-bam/reads.bam",
+    "/verification/assets/fixtures/ftx-bam/reads.bam.bai",
 ]
 
 [lib]
@@ -30,7 +33,7 @@ path = "rust/src/main.rs"
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.53", features = ["derive"] }
-flate2 = "1.1.5"
+flate2 = { version = "1.1.5", default-features = false, features = ["zlib-rs"] }
 noodles-bgzf = "0.46.0"
 
 [dev-dependencies]

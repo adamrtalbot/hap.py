@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// pinned reference container resolves this to `"som.py-"` (trailing hyphen with
 /// nothing after). We reproduce the exact literal so stats.csv byte-matches.
 const SOM_VERSION: &str = "som.py-";
+const MAX_AF_BINS: usize = 10_000;
 const STATS_TYPE_ROWS: [(usize, &str); 4] =
     [(0, "indels"), (1, "SNVs"), (6, "MNPs"), (7, "others")];
 static SOMATIC_SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
@@ -1842,7 +1843,7 @@ fn parse_af_bins(raw: &str) -> Vec<(f64, f64)> {
         .filter_map(|part| part.parse::<f64>().ok())
         .collect::<Vec<_>>();
     let mut out = Vec::new();
-    let mut start = 0.0;
+    let mut start: f64 = 0.0;
     let mut idx = 0usize;
     while start < 1.0 && !bins.is_empty() {
         let mut end = start + bins[idx];
@@ -2785,11 +2786,31 @@ fn validate_af_bins(raw: &str) -> Result<()> {
     if bins.is_empty() || bins.iter().any(|bin| bin.trim().is_empty()) {
         bail!("AF bin size list must not be empty");
     }
-    for bin in bins {
-        bin.parse::<f64>()
-            .with_context(|| format!("failed to parse AF bin size '{bin}'"))?;
+    let parsed = bins
+        .into_iter()
+        .map(|bin| {
+            bin.parse::<f64>()
+                .with_context(|| format!("failed to parse AF bin size '{bin}'"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut start: f64 = 0.0;
+    let mut index = 0usize;
+    for _ in 0..MAX_AF_BINS {
+        if !start.is_finite() || start >= 1.0 || parsed.is_empty() {
+            return Ok(());
+        }
+        let mut end = start + parsed[index];
+        if end >= 1.0 {
+            end = 1.000_000_01;
+        }
+        if start >= end {
+            return Ok(());
+        }
+        start = end;
+        index = (index + 1) % parsed.len();
     }
-    Ok(())
+    bail!("AF bin sizes produce more than {MAX_AF_BINS} bins")
 }
 
 fn classification_bed_chrom(
@@ -4312,6 +4333,13 @@ mod tests {
             args.af_strat_binsize = raw.to_string();
             assert!(validate_args(&args).is_err());
         }
+        let tiny = parsed_somatic(&["--af-binsize", "1e-12"]);
+        assert!(
+            validate_args(&tiny)
+                .unwrap_err()
+                .to_string()
+                .contains("more than 10000 bins")
+        );
 
         assert!(parse_af_bins("0").is_empty());
         assert!(parse_af_bins("-0.1").is_empty());

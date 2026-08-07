@@ -235,25 +235,6 @@ fn timestamp_now() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-pub fn write_metrics_gz(
-    path: &Path,
-    name: &str,
-    commandline: &str,
-    tables: &[(&str, &str, &Path)],
-) -> Result<()> {
-    write_metrics_gz_for_module(path, name, "hap.py", commandline, tables)
-}
-
-pub fn write_metrics_gz_for_module(
-    path: &Path,
-    name: &str,
-    module: &str,
-    commandline: &str,
-    tables: &[(&str, &str, &Path)],
-) -> Result<()> {
-    write_metrics_gz_for_module_with_indices(path, name, module, commandline, tables, None)
-}
-
 pub fn write_metrics_gz_for_module_with_indices(
     path: &Path,
     name: &str,
@@ -272,31 +253,6 @@ pub fn write_metrics_gz_for_module_with_indices(
     )?;
     encoder.finish()?;
     Ok(())
-}
-
-pub fn write_metrics_json(
-    path: &Path,
-    name: &str,
-    commandline: &str,
-    tables: &[(&str, &str, &Path)],
-) -> Result<()> {
-    create_parent(path)?;
-    fs::write(path, metrics_json(name, commandline, tables)?)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
-fn metrics_json(name: &str, commandline: &str, tables: &[(&str, &str, &Path)]) -> Result<String> {
-    metrics_json_for_module(name, "hap.py", commandline, tables)
-}
-
-fn metrics_json_for_module(
-    name: &str,
-    module: &str,
-    commandline: &str,
-    tables: &[(&str, &str, &Path)],
-) -> Result<String> {
-    metrics_json_for_module_with_indices(name, module, commandline, tables, None)
 }
 
 fn metrics_json_for_module_with_indices(
@@ -921,10 +877,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let csv = dir.path().join("summary.csv");
         fs::write(&csv, "Type,TRUTH.TOTAL\nSNP,1\n").unwrap();
-        let json = metrics_json(
+        let json = metrics_json_for_module_with_indices(
             "hap.py.comparison",
+            "hap.py",
             "hap germline truth query",
             &[("summary.metrics", "summary.metrics", csv.as_path())],
+            None,
         )
         .unwrap();
 

@@ -299,6 +299,7 @@ impl CompareArgs {
     /// CLI parsing supplies the same defaults through clap; keeping fixture
     /// runners on this constructor prevents newly ported switches from
     /// silently acquiring test-only values.
+    #[cfg(test)]
     pub fn with_paths(
         truth: String,
         query: String,
@@ -911,9 +912,11 @@ pub struct SomaticArgs {
     /// Retained for source compatibility with internal fixture builders; the
     /// public `--fix-chr-*` spellings are aliases of `--fixchr-*` above.
     #[arg(skip)]
+    #[allow(dead_code, reason = "retained for legacy fixture compatibility")]
     pub fix_chr_truth: Option<bool>,
 
     #[arg(skip)]
+    #[allow(dead_code, reason = "retained for legacy fixture compatibility")]
     pub fix_chr_query: Option<bool>,
 
     #[arg(

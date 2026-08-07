@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const WARNING_REFPADDING: usize = 0;
 const WARNING_OVERLAP: usize = 1;
@@ -73,6 +73,7 @@ pub fn run(args: ValidateArgs) -> Result<()> {
 }
 
 fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Result<()> {
+    validate_output_paths(&args)?;
     let reference_contigs = if let Some(reference) = &args.reference {
         fasta::contig_lengths(Path::new(reference))?
             .into_keys()
@@ -284,6 +285,53 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
     }
 
     Ok(())
+}
+
+fn validate_output_paths(args: &ValidateArgs) -> Result<()> {
+    let outputs = [args.output_json.as_deref(), args.errors_bed.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(|path| Ok((path, resolved_path(path)?)))
+        .collect::<Result<Vec<_>>>()?;
+    if outputs.len() == 2 && outputs[0].1 == outputs[1].1 {
+        bail!("validation outputs must use distinct paths");
+    }
+
+    let inputs = [
+        Some(args.input.as_str()),
+        args.reference.as_deref(),
+        args.regions_bedfile.as_deref(),
+        args.targets_bedfile.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|path| Ok((path, resolved_path(path)?)))
+    .collect::<Result<Vec<_>>>()?;
+    for (output, output_path) in &outputs {
+        if let Some((input, _)) = inputs
+            .iter()
+            .find(|(_, input_path)| input_path == output_path)
+        {
+            bail!("validation output '{output}' would overwrite input '{input}'");
+        }
+    }
+    Ok(())
+}
+
+fn resolved_path(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("path has no file name: {}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    Ok(parent.join(file_name))
 }
 
 impl VcfHeader {
@@ -862,6 +910,33 @@ mod tests {
         assert!(diagnostics.contains("[PROGRESS] chr1:3"));
         assert!(!diagnostics.contains("chr1:2"));
         assert!(!diagnostics.contains("chr1:4"));
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_output_path_collisions_before_writing() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("result.txt");
+        write_vcf(&input, &["chr1\t1\t.\tA\tC\t.\tPASS\t.\tGT\t0/1"])?;
+
+        let mut colliding_outputs = args(&input, &output);
+        colliding_outputs.errors_bed = Some(output.display().to_string());
+        assert!(
+            run_with_diagnostics(colliding_outputs, &mut Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("distinct paths")
+        );
+
+        let overwrite_input = args(&input, &input);
+        assert!(
+            run_with_diagnostics(overwrite_input, &mut Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("would overwrite input")
+        );
+        assert!(fs::read_to_string(&input)?.starts_with("##fileformat"));
         Ok(())
     }
 

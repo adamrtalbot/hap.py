@@ -36,12 +36,6 @@ impl Variant {
         self.filter == "PASS" || self.filter == "."
     }
 
-    pub fn is_snp(&self) -> bool {
-        self.key.ref_allele.len() == self.key.alt_allele.len()
-            && self.key.alt_allele != "."
-            && !self.key.alt_allele.contains(',')
-    }
-
     pub fn is_single_base_snp(&self) -> bool {
         let active = self.active_alts();
         if active.is_empty() {
@@ -146,11 +140,6 @@ impl Variant {
         }
         let zero_count = alleles.iter().filter(|a| **a == 0).count();
         zero_count == 1
-    }
-
-    pub fn alt_copy_count(&self) -> usize {
-        let alleles = parse_gt_usize(&self.gt);
-        alleles.iter().filter(|a| **a > 0).count()
     }
 }
 
@@ -1274,13 +1263,6 @@ pub fn parse_locations(
         }
     }
     Ok(filters)
-}
-
-pub fn group_by_key(variants: Vec<Variant>) -> BTreeMap<VariantKey, Variant> {
-    variants
-        .into_iter()
-        .map(|variant| (variant.key.clone(), variant))
-        .collect()
 }
 
 #[cfg(test)]

@@ -958,11 +958,6 @@ fn newton_then_maybe_ihalve(
     )
 }
 
-// Public entry: matches scipy.special.btdtri(a, b, p).
-pub fn btdtri(a: f64, b: f64, p: f64) -> f64 {
-    incbi(a, b, p)
-}
-
 /// Deterministic positive-finite power used by legacy confidence-interval
 /// edge formulas. This follows the same glibc 2.39 FMA path as the elementary
 /// operations used internally by the Cephes port.

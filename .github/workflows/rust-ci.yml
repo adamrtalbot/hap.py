@@ -5,6 +5,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust-tests:
     runs-on: ubuntu-latest
@@ -15,24 +22,42 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run Clippy with warnings denied
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run Rust tests
-        run: cargo test --release --all-targets
+        run: cargo test --locked --all-targets
 
       - name: Build release binary
-        run: cargo build --release --bin hap
+        run: cargo build --locked --release --bin hap
 
       - name: Verify single-binary package installation
         run: |
           cargo package --locked
-          cargo install --locked --path . --root "$RUNNER_TEMP/hap-install" --bin hap
+          package_dir="$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'hap-rs-*' -print -quit)"
+          test -n "$package_dir"
+          cargo test --locked --all-targets --manifest-path "$package_dir/Cargo.toml"
+          cargo install --locked --path "$package_dir" --root "$RUNNER_TEMP/hap-install" --bin hap
           "$RUNNER_TEMP/hap-install/bin/hap" --version
+
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust 1.89.0
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Check the declared minimum Rust version
+        run: cargo check --locked --all-targets
 
   nextflow-parity:
     runs-on: ubuntu-latest
@@ -78,7 +103,7 @@ jobs:
 
       - name: Build release binary
         run: |
-          cargo build --release --bin hap
+          cargo build --locked --release --bin hap
           echo "${{ github.workspace }}/target/release" >> "$GITHUB_PATH"
 
       - name: Validate and format-check Nextflow

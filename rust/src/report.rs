@@ -1,6 +1,6 @@
 use crate::compare::{AnnotatedRow, TypeCounts};
 use crate::vcf;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -92,7 +92,9 @@ pub fn write_summary(
     all_fp: &BTreeMap<String, (usize, usize)>,
     pass_fp: &BTreeMap<String, (usize, usize)>,
 ) -> Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+    );
     writeln!(
         writer,
         "Type,Filter,TRUTH.TOTAL,TRUTH.TP,TRUTH.FN,QUERY.TOTAL,QUERY.FP,QUERY.UNK,FP.gt,FP.al,METRIC.Recall,METRIC.Precision,METRIC.Frac_NA,METRIC.F1_Score,TRUTH.TOTAL.TiTv_ratio,QUERY.TOTAL.TiTv_ratio,TRUTH.TOTAL.het_hom_ratio,QUERY.TOTAL.het_hom_ratio"
@@ -101,7 +103,9 @@ pub fn write_summary(
         for variant_type in ["INDEL", "SNP"] {
             writeln!(writer, "{variant_type},ALL,0,0,0,0,0,0,0,0,,,,,,,,")?;
         }
-        return Ok(());
+        return writer
+            .flush()
+            .with_context(|| format!("failed to flush {}", path.display()));
     }
     let mut variant_types: Vec<&String> = all_counts.keys().chain(pass_counts.keys()).collect();
     variant_types.sort();
@@ -150,7 +154,9 @@ pub fn write_summary(
             )?;
         }
     }
-    Ok(())
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {}", path.display()))
 }
 
 #[allow(clippy::too_many_arguments)] // Each map is a distinct legacy report axis/tier.
@@ -176,21 +182,23 @@ pub fn write_extended(
     all_subset_subtype_fp: &SubsetSubtypeFpCounts,
     pass_subset_subtype_fp: &SubsetSubtypeFpCounts,
 ) -> Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+    );
     writeln!(writer, "{}", EXTENDED_HEADER.join(","))?;
 
     if all_counts.is_empty() && pass_counts.is_empty() {
         for row in empty_comparison_extended_lines(subset_size) {
             writeln!(writer, "{row}")?;
         }
-        return Ok(());
+        return writer
+            .flush()
+            .with_context(|| format!("failed to flush {}", path.display()));
     }
 
     let mut variant_types: Vec<&String> = all_counts.keys().chain(pass_counts.keys()).collect();
     variant_types.sort();
     variant_types.dedup();
-    let empty = TypeCounts::default();
-
     let pick = |filter: &str,
                 counts: &BTreeMap<String, TypeCounts>,
                 pass: &BTreeMap<String, TypeCounts>,
@@ -211,8 +219,6 @@ pub fn write_extended(
             .cloned()
             .unwrap_or_default()
     };
-    let _ = &empty; // silence unused var warning in case of dead path
-
     // Legacy `qfy.py` emits extended.csv rows in the lex-ASC tuple order
     // `(Type, Subtype, Subset, Filter)`. Each Subtype's full Subset/Filter
     // rectangle is emitted before moving to the next Subtype — i.e. the
@@ -407,7 +413,9 @@ pub fn write_extended(
             }
         }
     }
-    Ok(())
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {}", path.display()))
 }
 
 pub(crate) fn empty_comparison_extended_lines(subset_size: usize) -> Vec<String> {

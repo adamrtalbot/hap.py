@@ -48,7 +48,8 @@ use std::collections::BTreeMap;
 /// records that match the legacy primitive splitter's output, each suitable
 /// for the existing `insert_ado_format` + `reorder_format_fields` final
 /// canonicalization.
-pub fn primitive_split(record: &RawVcfRecord, reference: &[u8]) -> Vec<RawVcfRecord> {
+#[cfg(test)]
+fn primitive_split(record: &RawVcfRecord, reference: &[u8]) -> Vec<RawVcfRecord> {
     primitive_split_with_floor(record, reference, 0)
 }
 
@@ -201,15 +202,6 @@ fn shift_primitive_record(record: &mut RawVcfRecord, reference: &[u8], current_m
     record.pos = rv.start;
     record.ref_allele = new_ref;
     record.alt_allele = rv.alt;
-}
-
-/// Canonicalise hetalt GT entries (e.g. `1/2`) into legacy's reversed
-/// `<later>/<earlier>` form (e.g. `2/1`) for every sample on this record.
-/// Mirrors what `VariantLocationAggregator::addAlleleToVariant` produces
-/// when it merges sibling alt half-calls into a multi-allelic record under
-/// `MAX_GT = 2`. Hom and het-with-ref cases pass through unchanged.
-pub fn canonicalize_hetalt_gt_public(record: &mut RawVcfRecord) {
-    canonicalize_hetalt_gt(record)
 }
 
 fn canonicalize_hetalt_gt(record: &mut RawVcfRecord) {
@@ -457,6 +449,13 @@ fn canonical_split_gt(gt: &str, target: u32) -> String {
         }
     }
     let target_i = target as i32;
+    if separator == '|' {
+        return tokens
+            .iter()
+            .map(|allele| if *allele == target_i { "1" } else { "0" })
+            .collect::<Vec<_>>()
+            .join("|");
+    }
     let count_target = tokens.iter().filter(|t| **t == target_i).count();
     let count_ref = tokens.iter().filter(|t| **t == 0).count();
     let total = tokens.len();
@@ -595,41 +594,23 @@ fn merge_records(
             }
         }
 
-        // Combined GT: choose the highest-positional combo from any sample
-        // call. For a het+het pair (0/1, 0/1) the merged form is 1/2.
+        // Combined GT: reconstruct phased haplotypes position-by-position.
+        // Unphased calls retain the legacy later/earlier ordering.
         if let Some(gi) = gt_index {
-            let mut alt_calls: Vec<u32> = Vec::new();
-            for (i, rec) in sorted.iter().enumerate() {
-                let gt_cell = rec
-                    .samples
-                    .get(s)
-                    .map(|c| c.split(':').nth(gi).unwrap_or(".").to_string())
-                    .unwrap_or_default();
-                let separator = if gt_cell.contains('|') { '|' } else { '/' };
-                for tok in gt_cell.split(['/', '|']) {
-                    if tok == "1" {
-                        alt_calls.push((i + 1) as u32);
-                    }
-                }
-                let _ = separator;
-            }
-            let separator = '/';
-            let merged_gt = if alt_calls.is_empty() {
-                "0/0".to_string()
-            } else if alt_calls.len() == 1 {
-                format!("0{separator}{}", alt_calls[0])
+            let gt_cells = sorted
+                .iter()
+                .map(|record| {
+                    record
+                        .samples
+                        .get(s)
+                        .and_then(|sample| sample.split(':').nth(gi))
+                        .unwrap_or(".")
+                })
+                .collect::<Vec<_>>();
+            let merged_gt = if gt_cells.iter().any(|gt| gt.contains('|')) {
+                merge_phased_genotypes(&gt_cells)
             } else {
-                // Multiple alt calls in this sample (hetalt). Legacy's
-                // `VariantLocationAggregator` merges by adding incoming
-                // alleles into the LAST zero slot of `gt[]` (with MAX_GT=2
-                // — see `Variant.hh`'s `#define MAX_GT 2`). Starting from
-                // a het-shaped seed `[0, 1]` for the first allele, the
-                // second allele's `addAlleleToVariant` finds `gt[0] == 0`
-                // and writes there, producing `[<later>, <earlier>]` —
-                // i.e. `2/1`, not `1/2`. Mirror that ordering here so
-                // multi-allelic byte output matches.
-                alt_calls.sort();
-                format!("{}{separator}{}", alt_calls[1], alt_calls[0])
+                merge_unphased_genotypes(&gt_cells)
             };
             if let Some(cell) = cells.get_mut(gi) {
                 *cell = merged_gt;
@@ -639,6 +620,51 @@ fn merge_records(
     }
     base.samples = new_samples;
     base
+}
+
+fn merge_phased_genotypes(genotypes: &[&str]) -> String {
+    let ploidy = genotypes
+        .iter()
+        .find(|genotype| genotype.contains('|'))
+        .map_or(2, |genotype| genotype.split('|').count());
+    let mut haplotypes = vec![0usize; ploidy];
+    for (alternate_index, genotype) in genotypes.iter().enumerate() {
+        let alleles = genotype.split('|').collect::<Vec<_>>();
+        if alleles.len() != ploidy {
+            return genotype.to_string();
+        }
+        for (haplotype, allele) in alleles.iter().enumerate() {
+            if *allele == "1" {
+                haplotypes[haplotype] = alternate_index + 1;
+            }
+        }
+    }
+    haplotypes
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn merge_unphased_genotypes(genotypes: &[&str]) -> String {
+    let mut alt_calls: Vec<u32> = Vec::new();
+    for (alternate_index, genotype) in genotypes.iter().enumerate() {
+        for token in genotype.split('/') {
+            if token == "1" {
+                alt_calls.push((alternate_index + 1) as u32);
+            }
+        }
+    }
+    if alt_calls.is_empty() {
+        "0/0".to_string()
+    } else if alt_calls.len() == 1 {
+        format!("0/{}", alt_calls[0])
+    } else {
+        // `VariantLocationAggregator` fills the last zero slot first,
+        // yielding the later alternate before the earlier one.
+        alt_calls.sort_unstable();
+        format!("{}/{}", alt_calls[1], alt_calls[0])
+    }
 }
 
 #[cfg(test)]
@@ -817,6 +843,29 @@ mod tests {
     }
 
     #[test]
+    fn split_genotypes_preserve_phased_haplotype_assignment() {
+        assert_eq!(canonical_split_gt("1|2", 1), "1|0");
+        assert_eq!(canonical_split_gt("1|2", 2), "0|1");
+        assert_eq!(canonical_split_gt("2|1", 1), "0|1");
+        assert_eq!(canonical_split_gt("2|1", 2), "1|0");
+    }
+
+    #[test]
+    fn phased_insertions_remain_phased_after_alt_reordering() {
+        let reference = windowed_ref(11_101_380, b"NNNNNNTNNNN");
+        for (input_gt, expected_gt) in [("1|2", "2|1"), ("2|1", "1|2")] {
+            let sample = format!("{input_gt}:2,36,137");
+            let record = make_record("chr21", 11_101_386, "T", "TTG,TG", "GT:AD", &sample);
+
+            let output = primitive_split(&record, &reference);
+
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].alt_allele, "TG,TTG");
+            assert_eq!(output[0].samples[0].split(':').next(), Some(expected_gt));
+        }
+    }
+
+    #[test]
     fn t_tg_ttg_aggregates_into_canonical_multi_allelic() {
         // Replicates `chr21:11101386 T → TTG,TG` (input order) which legacy
         // emits as `T → TG,TTG` after primitive split + aggregation.
@@ -908,8 +957,8 @@ mod tests {
         assert_eq!(canonical_split_gt("1/2", 2), "0/1");
         // Hom-alt of target stays homozygous.
         assert_eq!(canonical_split_gt("1/1", 1), "1/1");
-        // Phased separator preserved.
-        assert_eq!(canonical_split_gt("1|2", 1), "0|1");
+        // Phased haplotype assignment and separator are preserved.
+        assert_eq!(canonical_split_gt("1|2", 1), "1|0");
         // No-call passes through.
         assert_eq!(canonical_split_gt("./.", 1), "./.");
     }

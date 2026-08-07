@@ -2585,7 +2585,9 @@ fn write_quantify_summary(
     all_counts: &BTreeMap<String, QuantifyTypeCounts>,
     pass_counts: &BTreeMap<String, QuantifyTypeCounts>,
 ) -> Result<()> {
-    let mut writer = BufWriter::new(fs::File::create(path)?);
+    let mut writer = BufWriter::new(
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+    );
     writeln!(
         writer,
         "Type,Filter,TRUTH.TOTAL,TRUTH.TP,TRUTH.FN,QUERY.TOTAL,QUERY.FP,QUERY.UNK,FP.gt,FP.al,METRIC.Recall,METRIC.Precision,METRIC.Frac_NA,METRIC.F1_Score,TRUTH.TOTAL.TiTv_ratio,QUERY.TOTAL.TiTv_ratio,TRUTH.TOTAL.het_hom_ratio,QUERY.TOTAL.het_hom_ratio"
@@ -2594,7 +2596,9 @@ fn write_quantify_summary(
         for variant_type in ["INDEL", "SNP"] {
             writeln!(writer, "{variant_type},ALL,0,0,0,0,0,0,0,0,,,,,,,,")?;
         }
-        return Ok(());
+        return writer
+            .flush()
+            .with_context(|| format!("failed to flush {}", path.display()));
     }
     for variant_type in ["INDEL", "SNP"].into_iter().filter(|variant_type| {
         all_counts.contains_key(*variant_type) || pass_counts.contains_key(*variant_type)
@@ -2604,7 +2608,9 @@ fn write_quantify_summary(
         write_summary_row(&mut writer, variant_type, "ALL", &all)?;
         write_summary_row(&mut writer, variant_type, "PASS", &pass)?;
     }
-    Ok(())
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {}", path.display()))
 }
 
 fn write_summary_row<W: Write>(
@@ -2658,7 +2664,9 @@ fn write_quantify_extended(
     subsets_present: &BTreeMap<String, BTreeSet<String>>,
     options: &ExtendedTableOptions<'_>,
 ) -> Result<()> {
-    let mut writer = BufWriter::new(fs::File::create(path)?);
+    let mut writer = BufWriter::new(
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+    );
     let mut header = report::EXTENDED_HEADER
         .iter()
         .map(|value| value.to_string())
@@ -2684,7 +2692,9 @@ fn write_quantify_extended(
             row.resize(header.len(), String::new());
             writeln!(writer, "{}", row.join(","))?;
         }
-        return Ok(());
+        return writer
+            .flush()
+            .with_context(|| format!("failed to flush {}", path.display()));
     }
     let confidence_size_value = options.confidence_size;
     let confidence_size = confidence_size_value
@@ -2850,7 +2860,9 @@ fn write_quantify_extended(
         }
     }
 
-    Ok(())
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {}", path.display()))
 }
 
 fn named_subset_report_sizes(

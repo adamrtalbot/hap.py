@@ -30,10 +30,6 @@ pub const SCMP_HEADER_DECLARATIONS: [&str; 9] = [
     "##FORMAT=<ID=BLT,Number=1,Type=String,Description=\"High-level location type (het|homref|hetalt|homalt|nocall).\">",
 ];
 
-pub fn scmp_header_declarations() -> &'static [&'static str] {
-    &SCMP_HEADER_DECLARATIONS
-}
-
 pub fn compare_files(
     truth: &Path,
     query: &Path,

@@ -795,7 +795,9 @@ impl LegacyRawTable {
                     .join("\t")
             )?;
         }
-        Ok(())
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush {}", path.display()))
     }
 }
 

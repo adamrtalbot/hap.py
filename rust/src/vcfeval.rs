@@ -102,7 +102,7 @@ pub fn compare_files(
     let (truth_headers, truth_records) = vcf::load_raw_vcf(truth_path)?;
     let (query_headers, query_records) = vcf::load_raw_vcf(query_path)?;
     let references = crate::fasta::read_sequences(reference_path)?;
-    let mut merged = merge_records_rtg(
+    let (mut merged, query_sources) = merge_records_rtg(
         &truth_headers,
         &truth_records,
         &query_headers,
@@ -121,7 +121,12 @@ pub fn compare_files(
     apply_allele_matches(&calls, &references, &mut verdicts)?;
     apply_loose_matches(&calls, options.loose_match_distance, &mut verdicts);
 
-    let qq = query_scores(&merged.records, &query_records, options.roc_field)?;
+    let qq = query_scores(
+        &merged.records,
+        &query_records,
+        &query_sources,
+        options.roc_field,
+    )?;
     annotate_records(&mut merged.records, &calls, &verdicts, &qq);
     let headers = output_headers(&query_headers, &references, options.loose_match_distance);
     vcf::write_raw_vcf(output_path, &headers, &merged.records)
@@ -135,7 +140,7 @@ fn merge_records_rtg(
     truth: &[RawVcfRecord],
     query_headers: &[String],
     query: &[RawVcfRecord],
-) -> Result<scmp::MergedVcf> {
+) -> Result<(scmp::MergedVcf, Vec<Option<usize>>)> {
     let mut used_query = vec![false; query.len()];
     let mut tagged = Vec::with_capacity(truth.len() + query.len());
     for truth_record in truth {
@@ -153,27 +158,43 @@ fn merge_records_rtg(
                 query_headers,
                 std::slice::from_ref(&query[index]),
             )?;
-            tagged.extend(merged.records.into_iter().map(|record| (record, 0usize)));
+            tagged.extend(
+                merged
+                    .records
+                    .into_iter()
+                    .map(|record| (record, 0usize, Some(index))),
+            );
         } else {
-            tagged.push((simple_two_sample_record(truth_record, Side::Truth), 1));
+            tagged.push((simple_two_sample_record(truth_record, Side::Truth), 1, None));
         }
     }
     for (index, query_record) in query.iter().enumerate() {
         if !used_query[index] {
-            tagged.push((simple_two_sample_record(query_record, Side::Query), 0));
+            tagged.push((
+                simple_two_sample_record(query_record, Side::Query),
+                0,
+                Some(index),
+            ));
         }
     }
-    tagged.sort_by(|(left, left_side), (right, right_side)| {
+    tagged.sort_by(|(left, left_side, _), (right, right_side, _)| {
         left.chrom
             .cmp(&right.chrom)
             .then(left.pos.cmp(&right.pos))
             .then(left_side.cmp(right_side))
             .then(left.ref_allele.len().cmp(&right.ref_allele.len()))
     });
-    Ok(scmp::MergedVcf {
-        headers: Vec::new(),
-        records: tagged.into_iter().map(|(record, _)| record).collect(),
-    })
+    let (records, query_sources) = tagged
+        .into_iter()
+        .map(|(record, _, query_source)| (record, query_source))
+        .unzip();
+    Ok((
+        scmp::MergedVcf {
+            headers: Vec::new(),
+            records,
+        },
+        query_sources,
+    ))
 }
 
 fn simple_two_sample_record(record: &RawVcfRecord, side: Side) -> RawVcfRecord {
@@ -348,9 +369,6 @@ fn compare_cluster(
             best_delta = delta;
             best_truth = truth_candidate.included.clone();
             best_query = query_candidate.included.clone();
-        } else if score == best_score && delta == best_delta {
-            best_truth.extend(truth_candidate.included.iter().copied());
-            best_query.extend(query_candidate.included.iter().copied());
         }
     }
     let truth_sync = truth.iter().map(|call_id| calls[*call_id].pos).min();
@@ -377,11 +395,8 @@ fn enumerate_paths(
     let mut states = vec![SearchState::default()];
     for call_id in call_ids {
         let call = &calls[*call_id];
-        let choices = call_choices(call)?;
-        let projected = states.len().saturating_mul(choices.len());
-        if projected > RTG_MAX_PATHS {
-            return Ok(reference_only_path(reference, region_start, region_end)?);
-        }
+        let choices = call_choices(call);
+        let projected = checked_state_count(states.len(), choices.len())?;
         let mut next = Vec::with_capacity(projected);
         for state in &states {
             next.push(state.clone());
@@ -414,9 +429,7 @@ fn enumerate_paths(
         };
         let count = state.included.len();
         match paths.get_mut(&signature) {
-            Some(candidate) if candidate.count == count => {
-                candidate.included.extend(state.included);
-            }
+            Some(candidate) if candidate.count == count => {}
             Some(candidate) if candidate.count > count => {}
             _ => {
                 paths.insert(
@@ -432,28 +445,31 @@ fn enumerate_paths(
     Ok(paths)
 }
 
-fn reference_only_path(
-    reference: &str,
-    region_start: usize,
-    region_end: usize,
-) -> Result<BTreeMap<String, Candidate>> {
-    let signature = render_signature(reference, region_start, region_end, &[], &[])?
-        .expect("an edit-free path is valid");
-    Ok(BTreeMap::from([(signature, Candidate::default())]))
+fn checked_state_count(state_count: usize, choice_count: usize) -> Result<usize> {
+    let branch_count = choice_count
+        .checked_add(1)
+        .context("vcfeval path branch count overflow")?;
+    let projected = state_count
+        .checked_mul(branch_count)
+        .context("vcfeval path count overflow")?;
+    if projected > RTG_MAX_PATHS {
+        bail!("vcfeval cluster requires {projected} paths, exceeding the limit of {RTG_MAX_PATHS}");
+    }
+    Ok(projected)
 }
 
-fn call_choices(call: &Call) -> Result<Vec<(usize, usize)>> {
+fn call_choices(call: &Call) -> Vec<(usize, usize)> {
     let called = call.gt.iter().flatten().copied().collect::<Vec<_>>();
     let (left, right) = match called.as_slice() {
         [allele] => (*allele, *allele),
         [left, right] => (*left, *right),
-        _ => return Ok(Vec::new()),
+        _ => return Vec::new(),
     };
     let mut choices = vec![(left, right)];
     if left != right {
         choices.push((right, left));
     }
-    Ok(choices)
+    choices
 }
 
 fn allele_edit(call: &Call, allele: usize) -> Option<Edit> {
@@ -512,15 +528,17 @@ fn apply_edits(
             return Ok(None);
         }
         output.push_str(
-            std::str::from_utf8(&reference.as_bytes()[cursor - 1..edit.pos - 1])
-                .context("reference is not UTF-8")?,
+            reference
+                .get(cursor - 1..edit.pos - 1)
+                .context("reference positions are not UTF-8 boundaries")?,
         );
         output.push_str(&edit.alternate.to_ascii_uppercase());
         cursor = edit_end + 1;
     }
     output.push_str(
-        std::str::from_utf8(&reference.as_bytes()[cursor - 1..region_end])
-            .context("reference is not UTF-8")?,
+        reference
+            .get(cursor - 1..region_end)
+            .context("reference positions are not UTF-8 boundaries")?,
     );
     Ok(Some(output.to_ascii_uppercase()))
 }
@@ -609,8 +627,12 @@ fn apply_loose_matches(calls: &[Call], distance: usize, verdicts: &mut [Verdict]
 fn query_scores(
     merged: &[RawVcfRecord],
     query: &[RawVcfRecord],
+    query_sources: &[Option<usize>],
     field: &str,
 ) -> Result<BTreeMap<usize, String>> {
+    if merged.len() != query_sources.len() {
+        bail!("vcfeval query provenance does not match merged records");
+    }
     let mut scores = BTreeMap::new();
     for (record_index, record) in merged.iter().enumerate() {
         if !record.sample_map(1).get("GT").is_some_and(|gt| {
@@ -620,13 +642,12 @@ fn query_scores(
         }) {
             continue;
         }
-        let candidate = query
-            .iter()
-            .filter(|source| source.chrom == record.chrom && source.pos == record.pos)
-            .max_by_key(|source| usize::from(source.ref_allele == record.ref_allele));
-        let Some(source) = candidate else {
+        let Some(source_index) = query_sources[record_index] else {
             continue;
         };
+        let source = query.get(source_index).with_context(|| {
+            format!("vcfeval query provenance index {source_index} is out of bounds")
+        })?;
         let value = if field == "QUAL" {
             Some(source.qual.clone())
         } else if let Some(key) = field.strip_prefix("INFO.") {
@@ -838,10 +859,79 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 mod tests {
     use super::*;
 
+    fn call(side: Side, record_index: usize, pos: usize, alternate: &str) -> Call {
+        Call {
+            record_index,
+            side,
+            chrom: "chr1".to_string(),
+            pos,
+            ref_allele: "A".to_string(),
+            alts: vec![alternate.to_string()],
+            gt: vec![Some(1), Some(1)],
+            skipped: false,
+        }
+    }
+
     #[test]
     fn civil_date_matches_unix_epoch() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_671), (2026, 8, 6));
+    }
+
+    #[test]
+    fn duplicate_equivalent_calls_do_not_create_an_impossible_match_set() -> Result<()> {
+        let calls = vec![
+            call(Side::Truth, 0, 2, "C"),
+            call(Side::Truth, 1, 2, "C"),
+            call(Side::Query, 2, 2, "C"),
+        ];
+        let cluster = Cluster {
+            chrom: "chr1".to_string(),
+            start: 2,
+            end: 2,
+            calls: vec![0, 1, 2],
+        };
+        let mut verdicts = vec![Verdict::default(); calls.len()];
+
+        compare_cluster(&cluster, &calls, "AAAA", &mut verdicts)?;
+
+        assert_eq!(
+            verdicts[..2]
+                .iter()
+                .filter(|verdict| verdict.gt_match)
+                .count(),
+            1
+        );
+        assert!(verdicts[2].gt_match);
+        Ok(())
+    }
+
+    #[test]
+    fn path_budget_exhaustion_is_an_explicit_error() {
+        assert_eq!(
+            checked_state_count(RTG_MAX_PATHS, 0).unwrap(),
+            RTG_MAX_PATHS
+        );
+        let error = checked_state_count(RTG_MAX_PATHS, 1).unwrap_err();
+        assert!(error.to_string().contains("exceeding the limit"));
+    }
+
+    #[test]
+    fn query_scores_follow_source_provenance_at_duplicate_coordinates() -> Result<()> {
+        let path = Path::new("scores.vcf");
+        let low = RawVcfRecord::from_line("chr1\t2\t.\tA\tC\t10\tPASS\t.\tGT\t1/1", path)?;
+        let high = RawVcfRecord::from_line("chr1\t2\t.\tA\tG\t99\tPASS\t.\tGT\t1/1", path)?;
+        let query = vec![low.clone(), high.clone()];
+        let merged = vec![
+            simple_two_sample_record(&high, Side::Query),
+            simple_two_sample_record(&low, Side::Query),
+        ];
+
+        let scores = query_scores(&merged, &query, &[Some(1), Some(0)], "QUAL")?;
+
+        assert_eq!(scores.get(&0).map(String::as_str), Some("99.0"));
+        assert_eq!(scores.get(&1).map(String::as_str), Some("10.0"));
+        Ok(())
     }
 
     #[test]
