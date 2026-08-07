@@ -12,7 +12,7 @@ process DIFF_OUTPUTS {
 
     script:
     """
-    python3 - '${case_name}' '${meta.id}' '${prefix}' <<'PY'
+    python3 - '${case_name}' '${meta.id}' '${prefix}' '${meta.strict_roc_order ?: false}' <<'PY'
     import csv
     from collections import Counter
     import gzip
@@ -24,7 +24,8 @@ process DIFF_OUTPUTS {
     import subprocess
     import sys
 
-    lane, case_id, prefix = sys.argv[1:]
+    lane, case_id, prefix = sys.argv[1:4]
+    strict_roc_order = sys.argv[4].lower() == 'true'
     observed = {}
     differences = []
 
@@ -69,7 +70,10 @@ process DIFF_OUTPUTS {
         if any(len(column['values']) != row_count for column in columns):
             return value
         synthetic_index = next((column for column in columns if column.get('id') == 'types'), None)
-        if str(value.get('id', '')).startswith('roc.'):
+        is_roc_table = str(value.get('id', '')).startswith('roc.')
+        if is_roc_table and strict_roc_order:
+            return value
+        if is_roc_table:
             content_columns = [column for column in columns if column is not synthetic_index]
             order = sorted(
                 range(row_count),
@@ -274,7 +278,16 @@ process DIFF_OUTPUTS {
                 location, expected_value, actual_value = text_diff
                 difference.update(kind='bcf', location=location, expected=expected_value, actual=actual_value, reason='ordered BCF content differs')
             elif is_roc_csv(artifact):
-                csv_diff = csv_multiset_difference(legacy_content, rust_content)
+                if strict_roc_order:
+                    csv_diff = text_difference(
+                        normalize_csv(legacy_content),
+                        normalize_csv(rust_content),
+                    )
+                    if csv_diff is not None:
+                        location, expected_value, actual_value = csv_diff
+                        csv_diff = location, expected_value, actual_value, 'ordered ROC rows differ'
+                else:
+                    csv_diff = csv_multiset_difference(legacy_content, rust_content)
                 if csv_diff is None:
                     continue
                 location, expected_value, actual_value, reason = csv_diff

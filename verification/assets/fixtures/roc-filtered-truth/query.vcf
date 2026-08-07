@@ -1,0 +1,11 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100>
+##FILTER=<ID=LowQual,Description="Low quality">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	QUERY
+chr1	5	query-58	A	G	58	PASS	.	GT	0/1
+chr1	17	query-53	A	C	53	PASS	.	GT	0/1
+chr1	29	query-filtered-match	A	T	48	PASS	.	GT	0/1
+chr1	53	query-38	A	G	38	PASS	.	GT	0/1
+chr1	89	query-23	A	G	23	PASS	.	GT	0/1
+chr1	97	query-only-20	A	T	20	PASS	.	GT	0/1

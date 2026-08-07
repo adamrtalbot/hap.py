@@ -275,96 +275,7 @@ fn build_metric_indices(
     delta: f64,
     output_rocs: bool,
 ) -> MetricIndices {
-    let mut rocs = BTreeMap::<String, (&RowKey, &GroupAccum)>::new();
-    let active_types = groups
-        .iter()
-        .filter(|(_, accum)| !accum.obs.is_empty())
-        .map(|(key, _)| key.ty.as_str())
-        .collect::<HashSet<_>>();
-    for (key, accum) in groups {
-        if key.subtype != "*" || !active_types.contains(key.ty.as_str()) {
-            continue;
-        }
-        let name = if key.subset != "*" {
-            format!("s|{}:{}:{}", key.subset, key.ty, key.filter)
-        } else if is_aggregate_filter(&key.filter) {
-            format!("a:{}:{}", key.ty, key.filter)
-        } else {
-            format!("f:{}:{}", key.ty, key.filter)
-        };
-        rocs.insert(name, (key, accum));
-    }
-
-    let mut table = LegacyUnorderedRows::default();
-    for (_, (key, accum)) in rocs {
-        let subtype_flags: &[(&str, Option<&str>)] = if key.ty == "SNP" {
-            &[("*", None), ("ti", Some("ti")), ("tv", Some("tv"))]
-        } else {
-            &[
-                ("*", None),
-                ("I1_5", Some("I1_5")),
-                ("I6_15", Some("I6_15")),
-                ("I16_PLUS", Some("I16_PLUS")),
-                ("D1_5", Some("D1_5")),
-                ("D6_15", Some("D6_15")),
-                ("D16_PLUS", Some("D16_PLUS")),
-                ("C1_5", Some("C1_5")),
-                ("C6_15", Some("C6_15")),
-                ("C16_PLUS", Some("C16_PLUS")),
-            ]
-        };
-        let counts_only = !output_rocs || !is_aggregate_filter(&key.filter);
-        for (subtype, subtype_flag) in subtype_flags {
-            for (genotype, genotype_flag) in [
-                ("het", Some("het")),
-                ("hetalt", Some("hetalt")),
-                ("homalt", Some("homalt")),
-                ("*", None),
-            ] {
-                let baseline = legacy_row_key(&key.ty, subtype, &key.filter, &key.subset, "*");
-                if !matches!(*subtype, "ti" | "tv") {
-                    table.set(baseline, genotype == "*");
-                } else if genotype == "*" {
-                    table.set(
-                        legacy_row_key(&key.ty, "*", &key.filter, &key.subset, "*"),
-                        false,
-                    );
-                }
-                if counts_only {
-                    continue;
-                }
-                for level in legacy_masked_levels(&accum.obs, *subtype_flag, genotype_flag, delta) {
-                    let qq = format!("{level:.6}");
-                    if !matches!(*subtype, "ti" | "tv") && genotype == "*" {
-                        table.set(
-                            legacy_row_key(&key.ty, subtype, &key.filter, &key.subset, &qq),
-                            true,
-                        );
-                    } else if matches!(*subtype, "ti" | "tv") && genotype == "*" {
-                        table.set(
-                            legacy_row_key(&key.ty, "*", &key.filter, &key.subset, &qq),
-                            false,
-                        );
-                    } else if !matches!(*subtype, "ti" | "tv") {
-                        // Preserve the extra empty field in the legacy
-                        // genotype aggregation prefix. These rows are removed
-                        // by dropRowsWithMissing(Type), but their insertion can
-                        // trigger an unordered_map rehash and therefore affects
-                        // the pandas indices of retained rows.
-                        table.set(
-                            format!(
-                                "{}\t{}\t*\t\t{}\t{}\t{}",
-                                key.ty, subtype, key.filter, key.subset, qq
-                            ),
-                            false,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let raw = table.retained_order();
+    let raw = legacy_metric_raw_order(groups, delta, output_rocs);
     let raw_positions = raw
         .iter()
         .enumerate()
@@ -479,6 +390,112 @@ fn build_metric_indices(
         tables,
         table_order,
     }
+}
+
+/// Recreate the retained row order of the pinned legacy quantifier's
+/// `std::unordered_map` before pandas builds the metrics tables.
+///
+/// This is intentionally coupled to the pinned image's 64-bit libstdc++ hash,
+/// prime rehash policy, bucket traversal, and front insertion. Untyped
+/// genotype/substat rows are eventually dropped, but their earlier insertion
+/// can trigger a rehash that moves typed threshold rows. Replacing this with a
+/// Rust map or sorting only the retained keys changes JSON indexes and the
+/// order in which the legacy pandas metrics tables are assembled.
+fn legacy_metric_raw_order(
+    groups: &BTreeMap<RowKey, GroupAccum>,
+    delta: f64,
+    output_rocs: bool,
+) -> Vec<String> {
+    let mut rocs = BTreeMap::<String, (&RowKey, &GroupAccum)>::new();
+    let active_types = groups
+        .iter()
+        .filter(|(_, accum)| !accum.obs.is_empty())
+        .map(|(key, _)| key.ty.as_str())
+        .collect::<HashSet<_>>();
+    for (key, accum) in groups {
+        if key.subtype != "*" || !active_types.contains(key.ty.as_str()) {
+            continue;
+        }
+        let name = if key.subset != "*" {
+            format!("s|{}:{}:{}", key.subset, key.ty, key.filter)
+        } else if is_aggregate_filter(&key.filter) {
+            format!("a:{}:{}", key.ty, key.filter)
+        } else {
+            format!("f:{}:{}", key.ty, key.filter)
+        };
+        rocs.insert(name, (key, accum));
+    }
+
+    let mut table = LegacyUnorderedRows::default();
+    for (_, (key, accum)) in rocs {
+        let subtype_flags: &[(&str, Option<&str>)] = if key.ty == "SNP" {
+            &[("*", None), ("ti", Some("ti")), ("tv", Some("tv"))]
+        } else {
+            &[
+                ("*", None),
+                ("I1_5", Some("I1_5")),
+                ("I6_15", Some("I6_15")),
+                ("I16_PLUS", Some("I16_PLUS")),
+                ("D1_5", Some("D1_5")),
+                ("D6_15", Some("D6_15")),
+                ("D16_PLUS", Some("D16_PLUS")),
+                ("C1_5", Some("C1_5")),
+                ("C6_15", Some("C6_15")),
+                ("C16_PLUS", Some("C16_PLUS")),
+            ]
+        };
+        let counts_only = !output_rocs || !is_aggregate_filter(&key.filter);
+        for (subtype, subtype_flag) in subtype_flags {
+            for (genotype, genotype_flag) in [
+                ("het", Some("het")),
+                ("hetalt", Some("hetalt")),
+                ("homalt", Some("homalt")),
+                ("*", None),
+            ] {
+                let baseline = legacy_row_key(&key.ty, subtype, &key.filter, &key.subset, "*");
+                if !matches!(*subtype, "ti" | "tv") {
+                    table.set(baseline, genotype == "*");
+                } else if genotype == "*" {
+                    table.set(
+                        legacy_row_key(&key.ty, "*", &key.filter, &key.subset, "*"),
+                        false,
+                    );
+                }
+                if counts_only {
+                    continue;
+                }
+                for level in legacy_masked_levels(&accum.obs, *subtype_flag, genotype_flag, delta) {
+                    let qq = format!("{level:.6}");
+                    if !matches!(*subtype, "ti" | "tv") && genotype == "*" {
+                        table.set(
+                            legacy_row_key(&key.ty, subtype, &key.filter, &key.subset, &qq),
+                            true,
+                        );
+                    } else if matches!(*subtype, "ti" | "tv") && genotype == "*" {
+                        table.set(
+                            legacy_row_key(&key.ty, "*", &key.filter, &key.subset, &qq),
+                            false,
+                        );
+                    } else if !matches!(*subtype, "ti" | "tv") {
+                        // Preserve the extra empty field in the legacy
+                        // genotype aggregation prefix. These rows are removed
+                        // by dropRowsWithMissing(Type), but their insertion can
+                        // trigger an unordered_map rehash and therefore affects
+                        // the pandas indices of retained rows.
+                        table.set(
+                            format!(
+                                "{}\t{}\t*\t\t{}\t{}\t{}",
+                                key.ty, subtype, key.filter, key.subset, qq
+                            ),
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    table.retained_order()
 }
 
 /// Reproduce the iteration order of the pinned Python 2.7 dictionary used by
@@ -3039,6 +3056,138 @@ mod tests {
         let key = "SNP\t*\t*\tPASS\tTS_contained\t379.290009";
         assert_eq!(legacy_string_hash(key), 0x1dac_92aa_2553_6c1f);
         assert_eq!(legacy_string_hash(key) % 10_273, 5_747);
+    }
+
+    #[test]
+    fn filtered_truth_threshold_retention_matches_legacy() {
+        // Reduced from the --usefiltered-truth parity lane. The NOCALL/FP
+        // and FN/NOCALL pairs are the annotated handoff produced by retained
+        // filtered truth calls; together with four TP pairs they exercise the
+        // temporary untyped genotype rows and multiple raw-table rehashes.
+        let rows = vec![
+            annotated(
+                "chr1",
+                5,
+                "60",
+                "0/1:TP:gm:ti:SNP:het:58",
+                "0/1:TP:gm:ti:SNP:het:58",
+                "",
+                true,
+                None,
+            ),
+            annotated(
+                "chr1",
+                17,
+                "55",
+                "0/1:TP:gm:tv:SNP:het:53",
+                "0/1:TP:gm:tv:SNP:het:53",
+                "",
+                true,
+                None,
+            ),
+            annotated(
+                "chr1",
+                29,
+                "48",
+                "./.:.:.:.:NOCALL:nocall:.",
+                "0/1:FP:.:tv:SNP:het:48",
+                "",
+                true,
+                None,
+            ),
+            annotated(
+                "chr1",
+                53,
+                "40",
+                "0/1:TP:gm:ti:SNP:het:38",
+                "0/1:TP:gm:ti:SNP:het:38",
+                "",
+                true,
+                None,
+            ),
+            annotated(
+                "chr1",
+                65,
+                "35",
+                "0/1:FN:.:tv:SNP:het:.",
+                "./.:.:.:.:NOCALL:nocall:0",
+                "",
+                true,
+                None,
+            ),
+            annotated(
+                "chr1",
+                89,
+                "25",
+                "0/1:TP:gm:ti:SNP:het:23",
+                "0/1:TP:gm:ti:SNP:het:23",
+                "",
+                true,
+                None,
+            ),
+            annotated(
+                "chr1",
+                97,
+                "20",
+                "./.:.:.:.:NOCALL:nocall:.",
+                "0/1:FP:.:tv:SNP:het:20",
+                "",
+                true,
+                None,
+            ),
+        ];
+        let groups = accumulate(&rows);
+        let key = RowKey::new("SNP", "*", "*", "ALL");
+        let emitted = groups[&key].emit();
+
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|row| {
+                    (
+                        row.qq_str.as_str(),
+                        row.cum.truth_tp.total,
+                        row.cum.truth_fn.total,
+                        row.cum.query_tp.total,
+                        row.cum.query_fp.total,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("*", 4, 1, 4, 2),
+                ("0.000000", 4, 1, 4, 2),
+                ("20.000000", 4, 1, 4, 1),
+                ("23.000000", 3, 2, 4, 1),
+                ("38.000000", 2, 3, 3, 1),
+                ("48.000000", 2, 3, 2, 0),
+                ("53.000000", 1, 4, 2, 0),
+                ("58.000000", 0, 5, 1, 0),
+            ]
+        );
+
+        let retained = legacy_metric_raw_order(&groups, 0.5, true);
+        assert_eq!(
+            retained,
+            [
+                "SNP\t*\t*\tALL\t*\t48.000000",
+                "SNP\t*\t*\tALL\t*\t38.000000",
+                "SNP\t*\t*\tALL\t*\t23.000000",
+                "SNP\t*\t*\tALL\t*\t20.000000",
+                "SNP\t*\t*\tPASS\t*\t58.000000",
+                "SNP\t*\t*\tPASS\t*\t53.000000",
+                "SNP\t*\t*\tPASS\t*\t20.000000",
+                "SNP\t*\t*\tPASS\t*\t*",
+                "SNP\t*\t*\tALL\t*\t0.000000",
+                "SNP\t*\t*\tALL\t*\t*",
+                "SNP\t*\t*\tALL\t*\t53.000000",
+                "SNP\t*\t*\tPASS\t*\t38.000000",
+                "SNP\t*\t*\tALL\t*\t58.000000",
+                "SNP\t*\t*\tPASS\t*\t48.000000",
+                "SNP\t*\t*\tPASS\t*\t0.000000",
+                "SNP\t*\t*\tPASS\t*\t23.000000",
+            ]
+            .map(str::to_string)
+        );
     }
 
     #[test]
