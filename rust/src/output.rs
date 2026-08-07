@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -15,7 +17,23 @@ static PUBLICATION_MUTEX: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 thread_local! {
     static FAIL_PUBLICATION_AFTER: std::cell::Cell<isize> = const { std::cell::Cell::new(-1) };
-    static FAIL_BACKUP_CLEANUP_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_BACKUP_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactId(String);
+
+impl ArtifactId {
+    fn new(value: &str) -> Result<Self> {
+        validate_artifact_component("output artifact", value)?;
+        Ok(Self(value.to_string()))
+    }
+}
+
+impl AsRef<str> for ArtifactId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug)]
@@ -69,11 +87,11 @@ impl OutputTransaction {
         );
         let suffixes = suffixes
             .into_iter()
-            .map(|suffix| suffix.as_ref().to_string())
-            .collect::<Vec<_>>();
+            .map(|suffix| ArtifactId::new(suffix.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
         let prospective = suffixes
             .iter()
-            .map(|suffix| append_suffix(prefix, format!(".{suffix}").as_ref()))
+            .map(|suffix| append_suffix(prefix, format!(".{}", suffix.as_ref()).as_ref()))
             .collect::<Vec<_>>();
         validate_plan(&inputs, prospective.iter())?;
         ensure_output_parents(&prospective)?;
@@ -82,7 +100,7 @@ impl OutputTransaction {
         let targets = suffixes
             .into_iter()
             .map(|suffix| {
-                let suffix = format!(".{suffix}");
+                let suffix = format!(".{}", suffix.as_ref());
                 Target {
                     destination: append_suffix(&prefix, suffix.as_ref()),
                     staged: append_suffix(&staged_prefix, suffix.as_ref()),
@@ -242,6 +260,21 @@ pub(crate) fn benchmark_artifacts(labels: impl IntoIterator<Item = String>) -> V
     suffixes
 }
 
+fn validate_artifact_component(kind: &str, value: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || path.is_absolute()
+        || path.components().count() != 1
+    {
+        bail!("invalid {kind} '{value}': expected a safe single path component");
+    }
+    Ok(())
+}
+
 pub(crate) fn stratification_inputs(
     tsv: Option<&str>,
     specs: &[String],
@@ -288,6 +321,7 @@ pub(crate) fn stratification_inputs(
         }
         let fixed = raw_name.starts_with('=');
         let name = raw_name.trim_start_matches('=').to_string();
+        validate_artifact_component("stratification name", &name)?;
         labels.insert(name.clone());
         let text = crate::vcf::read_text(&path).with_context(|| {
             format!("failed to preflight stratification BED {}", path.display())
@@ -298,6 +332,7 @@ pub(crate) fn stratification_inputs(
                 .filter(|line| !line.is_empty() && !line.starts_with('#'))
             {
                 if let Some(label) = line.split('\t').nth(3).filter(|label| !label.is_empty()) {
+                    validate_artifact_component("stratification BED label", label)?;
                     labels.insert(format!("{name}_{label}"));
                 }
             }
@@ -668,13 +703,7 @@ fn publish_generation(publications: &[(PathBuf, PathBuf)], owned: &[PathBuf]) ->
         }
         published.push((destination.clone(), staged.clone()));
     }
-    // Publication is the commit point. Cleanup cannot turn a visible complete
-    // generation into a reported failure; an undeleted backup remains an
-    // adjacent, recoverable copy rather than causing a false command failure.
-    for (backup, _) in &backups {
-        cleanup_backup(backup);
-    }
-    Ok(())
+    cleanup_backups_or_rollback(&backups, &published)
 }
 
 #[cfg(test)]
@@ -685,21 +714,169 @@ fn publication_failure_injected(index: usize) -> bool {
 fn publication_failure_injected(_: usize) -> bool {
     false
 }
-fn cleanup_backup(path: &Path) {
+fn cleanup_backups_or_rollback(
+    backups: &[(PathBuf, PathBuf)],
+    published: &[(PathBuf, PathBuf)],
+) -> Result<()> {
     #[cfg(test)]
-    if FAIL_BACKUP_CLEANUP_ONCE.replace(false) {
-        // Exercise the retry path without turning a committed generation into
-        // an error.
-    } else {
-        if fs::remove_file(path).is_ok() {
-            return;
+    if FAIL_BACKUP_CLEANUP.get() {
+        let error = anyhow::anyhow!("injected persistent backup cleanup failure");
+        return rollback_after_cleanup_failure(backups, published, None, error);
+    }
+
+    let snapshots = match backups
+        .iter()
+        .map(|(backup, _)| BackupSnapshot::capture(backup))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(snapshots) => snapshots,
+        Err(error) => return rollback_after_cleanup_failure(backups, published, None, error),
+    };
+    for (index, (backup, _)) in backups.iter().enumerate() {
+        if let Err(error) = fs::remove_file(backup) {
+            return rollback_after_cleanup_failure(
+                backups,
+                published,
+                Some(&snapshots),
+                error.context(format!(
+                    "failed to remove transaction backup {}",
+                    backup.display()
+                )),
+            );
+        }
+        debug_assert!(!backup.exists(), "backup {index} was not removed");
+    }
+    Ok(())
+}
+
+fn rollback_after_cleanup_failure(
+    backups: &[(PathBuf, PathBuf)],
+    published: &[(PathBuf, PathBuf)],
+    snapshots: Option<&[BackupSnapshot]>,
+    error: anyhow::Error,
+) -> Result<()> {
+    let mut rollback_errors = Vec::new();
+    for (destination, staged) in published.iter().rev() {
+        if let Err(rollback) = fs::rename(destination, staged) {
+            rollback_errors.push(format!(
+                "failed to unpublish {}: {rollback}",
+                destination.display()
+            ));
         }
     }
-    #[cfg(not(test))]
-    if fs::remove_file(path).is_ok() {
-        return;
+    for (index, (backup, destination)) in backups.iter().enumerate().rev() {
+        let restored = if backup.exists() {
+            fs::rename(backup, destination).map_err(anyhow::Error::from)
+        } else if let Some(snapshot) = snapshots.and_then(|values| values.get(index)) {
+            snapshot.restore(destination)
+        } else {
+            Err(anyhow::anyhow!("transaction backup disappeared"))
+        };
+        if let Err(rollback) = restored {
+            rollback_errors.push(format!(
+                "failed to restore {}: {rollback:#}",
+                destination.display()
+            ));
+        }
     }
-    let _ = fs::remove_file(path);
+    if rollback_errors.is_empty() {
+        Err(error)
+    } else {
+        Err(error.context(format!(
+            "cleanup rollback errors: {}",
+            rollback_errors.join("; ")
+        )))
+    }
+}
+
+enum BackupSnapshot {
+    File {
+        #[cfg(unix)]
+        source: File,
+        #[cfg(not(unix))]
+        contents: Vec<u8>,
+        permissions: fs::Permissions,
+    },
+    Symlink(PathBuf),
+}
+
+impl BackupSnapshot {
+    fn capture(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect transaction backup {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            Ok(Self::Symlink(fs::read_link(path).with_context(|| {
+                format!(
+                    "failed to read transaction backup symlink {}",
+                    path.display()
+                )
+            })?))
+        } else {
+            Ok(Self::File {
+                #[cfg(unix)]
+                source: File::open(path).with_context(|| {
+                    format!("failed to open transaction backup {}", path.display())
+                })?,
+                #[cfg(not(unix))]
+                contents: fs::read(path).with_context(|| {
+                    format!("failed to snapshot transaction backup {}", path.display())
+                })?,
+                permissions: metadata.permissions(),
+            })
+        }
+    }
+
+    fn restore(&self, destination: &Path) -> Result<()> {
+        match self {
+            Self::File {
+                #[cfg(unix)]
+                source,
+                #[cfg(not(unix))]
+                contents,
+                permissions,
+            } => {
+                #[cfg(unix)]
+                {
+                    let mut source = source.try_clone().with_context(|| {
+                        format!("failed to clone backup for {}", destination.display())
+                    })?;
+                    source.seek(SeekFrom::Start(0))?;
+                    let mut output = File::create(destination).with_context(|| {
+                        format!("failed to recreate output {}", destination.display())
+                    })?;
+                    std::io::copy(&mut source, &mut output).with_context(|| {
+                        format!("failed to restore output {}", destination.display())
+                    })?;
+                    output.sync_all().with_context(|| {
+                        format!("failed to sync restored output {}", destination.display())
+                    })?;
+                }
+                #[cfg(not(unix))]
+                fs::write(destination, contents).with_context(|| {
+                    format!("failed to restore output {}", destination.display())
+                })?;
+                fs::set_permissions(destination, permissions.clone()).with_context(|| {
+                    format!(
+                        "failed to restore permissions for {}",
+                        destination.display()
+                    )
+                })
+            }
+            Self::Symlink(target) => restore_symlink(target, destination),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restore_symlink(target: &Path, destination: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, destination)
+        .with_context(|| format!("failed to restore output symlink {}", destination.display()))
+}
+
+#[cfg(windows)]
+fn restore_symlink(target: &Path, destination: &Path) -> Result<()> {
+    std::os::windows::fs::symlink_file(target, destination)
+        .with_context(|| format!("failed to restore output symlink {}", destination.display()))
 }
 fn restore_backups(backups: &[(PathBuf, PathBuf)], errors: &mut Vec<String>) {
     for (backup, destination) in backups.iter().rev() {
@@ -715,6 +892,16 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::tempdir;
+
+    #[test]
+    fn artifact_components_reject_traversal_and_separators() {
+        for invalid in ["", ".", "..", "../escape", "a/b", "a\\b", "/absolute"] {
+            assert!(validate_artifact_component("test artifact", invalid).is_err());
+        }
+        for valid in ["summary.csv", "roc.Locations.SNP.csv.gz", "region_name"] {
+            assert!(validate_artifact_component("test artifact", valid).is_ok());
+        }
+    }
 
     #[test]
     fn explicit_family_preserves_unowned_siblings() -> Result<()> {
@@ -775,15 +962,23 @@ mod tests {
     }
 
     #[test]
-    fn backup_cleanup_failure_is_retried_after_the_commit_point() -> Result<()> {
+    fn persistent_backup_cleanup_failure_rolls_back_without_leaks() -> Result<()> {
         let dir = tempdir()?;
         let output = dir.path().join("report.csv");
         fs::write(&output, "old")?;
         let tx = OutputTransaction::files(Vec::<PathBuf>::new(), [&output])?;
         fs::write(tx.staged_file(&output)?, "new")?;
-        FAIL_BACKUP_CLEANUP_ONCE.set(true);
-        tx.commit()?;
-        assert_eq!(fs::read_to_string(output)?, "new");
+        FAIL_BACKUP_CLEANUP.set(true);
+        let error = tx
+            .commit()
+            .expect_err("persistent cleanup failure must fail");
+        FAIL_BACKUP_CLEANUP.set(false);
+        assert!(
+            error
+                .to_string()
+                .contains("persistent backup cleanup failure")
+        );
+        assert_eq!(fs::read_to_string(output)?, "old");
         assert!(fs::read_dir(dir.path())?.all(|entry| {
             !entry
                 .expect("directory entry")

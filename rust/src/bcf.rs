@@ -692,7 +692,7 @@ pub(crate) fn write(path: &Path, headers: &[String], records: &[RawVcfRecord]) -
     let csi_path = path.with_extension("bcf.csi");
     let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [path, &csi_path])?;
     let staged = transaction.staged_file(path)?.to_path_buf();
-    write_inner(&staged, headers, records).map_err(|error| {
+    write_inner(&staged, path, &csi_path, headers, records).map_err(|error| {
         anyhow::anyhow!(
             "failed to write BCF destination {}: {error:#}",
             path.display()
@@ -701,7 +701,13 @@ pub(crate) fn write(path: &Path, headers: &[String], records: &[RawVcfRecord]) -
     transaction.commit()
 }
 
-fn write_inner(path: &Path, headers: &[String], records: &[RawVcfRecord]) -> Result<()> {
+fn write_inner(
+    path: &Path,
+    logical_bcf: &Path,
+    logical_csi: &Path,
+    headers: &[String],
+    records: &[RawVcfRecord],
+) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -738,12 +744,18 @@ fn write_inner(path: &Path, headers: &[String], records: &[RawVcfRecord]) -> Res
         }
         writer
             .finish()
-            .with_context(|| format!("failed to finish BCF encoder for {}", path.display()))?
+            .with_context(|| format!("failed to finish BCF encoder for {}", logical_bcf.display()))?
             .sync_all()
-            .with_context(|| format!("failed to sync BCF artifact {}", path.display()))?;
+            .with_context(|| format!("failed to sync BCF artifact {}", logical_bcf.display()))?;
         write_csi(&temp_csi, &chunks, &record_counts)
-            .with_context(|| format!("failed to write CSI artifact {}", csi_path.display()))?;
-        replace_pair(&temp_bcf, path, &temp_csi, &csi_path)
+            .with_context(|| format!("failed to write CSI artifact {}", logical_csi.display()))?;
+        replace_pair(&temp_bcf, path, &temp_csi, &csi_path).with_context(|| {
+            format!(
+                "failed to finalize BCF artifact {} and CSI artifact {}",
+                logical_bcf.display(),
+                logical_csi.display()
+            )
+        })
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_bcf);

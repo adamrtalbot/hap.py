@@ -281,21 +281,9 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     let destination_prefix = PathBuf::from(&args.output);
     let inputs = somatic_inputs(&args);
     let logfile = args.logfile.as_ref().map(PathBuf::from);
-    let transaction = OutputTransaction::family(
-        &inputs,
-        &destination_prefix,
-        [
-            "ambiclasses.csv",
-            "ambireasons.csv",
-            "features.csv",
-            "roc.csv",
-            "stats.csv",
-            "metrics.json",
-            "summary.csv",
-            "extended.csv",
-        ],
-    )?
-    .with_files(logfile.iter())?;
+    let artifacts = somatic_artifacts(&args);
+    let transaction = OutputTransaction::family(&inputs, &destination_prefix, artifacts)?
+        .with_files(logfile.iter())?;
     if let Some(path) = logfile.as_deref() {
         args.logfile = Some(
             transaction
@@ -312,6 +300,31 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         )
     })?;
     transaction.commit()
+}
+
+fn somatic_artifacts(args: &SomaticArgs) -> Vec<String> {
+    let mut artifacts = [
+        "ambiclasses.csv",
+        "ambireasons.csv",
+        "features.csv",
+        "roc.csv",
+        "stats.csv",
+        "metrics.json",
+        "summary.csv",
+        "extended.csv",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if args.af_strat {
+        for (start, end) in parse_af_bins(&args.af_strat_binsize) {
+            let interval = format_af_interval(start, end);
+            for prefix in ["records", "SNVs", "indels"] {
+                artifacts.push(format!("{prefix}.{interval}.roc.csv"));
+            }
+        }
+    }
+    artifacts
 }
 
 fn somatic_inputs(args: &SomaticArgs) -> Vec<PathBuf> {
@@ -4400,6 +4413,18 @@ mod tests {
         assert_eq!(format_af_interval(nan[0].0, nan[0].1), "0.000000-nan");
         assert_eq!(parse_af_bins("inf"), vec![(0.0, 1.000_000_01)]);
         assert_eq!(format_af_interval(0.0, 1.000_000_01), "0.000000-1.000000");
+    }
+
+    #[test]
+    fn af_roc_artifacts_are_declared_in_the_transaction_plan() {
+        let mut args = parsed_somatic(&["--bin-afs", "--af-binsize", "0.5"]);
+        args.roc = Some("generic".to_string());
+        let artifacts = somatic_artifacts(&args);
+        for prefix in ["records", "SNVs", "indels"] {
+            for interval in ["0.000000-0.500000", "0.500000-1.000000"] {
+                assert!(artifacts.contains(&format!("{prefix}.{interval}.roc.csv")));
+            }
+        }
     }
 
     #[test]
