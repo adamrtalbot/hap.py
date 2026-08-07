@@ -107,8 +107,7 @@ mod tests {
             [0]
         );
         assert!(
-            location_stream_groups(LocationStreamPolicy::SetUnion, &filters, "chr2", 75)
-                .is_empty()
+            location_stream_groups(LocationStreamPolicy::SetUnion, &filters, "chr2", 75).is_empty()
         );
     }
 

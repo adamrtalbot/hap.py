@@ -55,6 +55,10 @@ fn index_path(path: &Path) -> PathBuf {
 pub(crate) fn read_sequences(path: &Path) -> Result<BTreeMap<String, String>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read FASTA {}", path.display()))?;
+    parse_sequences(&text, path)
+}
+
+pub(crate) fn parse_sequences(text: &str, path: &Path) -> Result<BTreeMap<String, String>> {
     let mut contigs = BTreeMap::new();
     let mut current_name: Option<String> = None;
     let mut current_seq = String::new();
@@ -113,7 +117,29 @@ pub(crate) fn contig_lengths(path: &Path) -> Result<BTreeMap<String, usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tempfile::tempdir;
+
+    proptest! {
+        #[test]
+        fn fasta_wrapping_is_semantically_idempotent(
+            name in "[A-Za-z][A-Za-z0-9_]{0,15}",
+            sequence in "[ACGTN]{1,256}",
+            width in 1usize..32,
+        ) {
+            let wrapped = sequence
+                .as_bytes()
+                .chunks(width)
+                .map(|chunk| std::str::from_utf8(chunk).expect("generated DNA is UTF-8"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let parsed = parse_sequences(
+                &format!(">{name} generated\n{wrapped}\n"),
+                Path::new("property.fa"),
+            ).expect("generated FASTA parses");
+            prop_assert_eq!(parsed.get(&name), Some(&sequence));
+        }
+    }
 
     #[test]
     fn read_index_rejects_malformed_names_and_lengths() -> Result<()> {

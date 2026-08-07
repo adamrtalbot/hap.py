@@ -1,9 +1,9 @@
 //! Cohesive responsibility extracted from the command façade.
 
+use super::allele_frequency::parse_af_bins;
 use super::features::csv_join;
 use super::features::write_simple_table;
 use super::metrics::python2_counter_indices;
-use super::allele_frequency::parse_af_bins;
 use super::{AmbiguousInterval, FilteredRawRecord, QueryClass};
 use crate::adapters::report;
 use crate::adapters::vcf;
