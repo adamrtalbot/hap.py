@@ -170,6 +170,7 @@ fn legacy_alias_version_delimiter_and_unknown_option_contracts_are_pinned() {
         ("preprocess", 0),
         ("prepy", 0),
         ("ftx", 2),
+        ("ftxpy", 2),
         ("quantify", 0),
         ("qfy", 0),
         ("validate", 2),
@@ -186,6 +187,26 @@ fn legacy_alias_version_delimiter_and_unknown_option_contracts_are_pinned() {
         assert!(delimiter.stdout.is_empty(), "{alias}");
         assert!(
             String::from_utf8_lossy(&delimiter.stderr).contains("Error:"),
+            "{alias}"
+        );
+    }
+
+    for alias in ["germline", "compare"] {
+        let delimiter = run(&[alias, "--", "--version", "query.vcf"]);
+        assert_eq!(delimiter.status.code(), Some(1), "{alias}");
+        assert!(delimiter.stdout.is_empty(), "{alias}");
+        assert!(
+            String::from_utf8_lossy(&delimiter.stderr).contains("required arguments"),
+            "{alias}"
+        );
+    }
+
+    for alias in ["quantify", "qfy"] {
+        let delimiter = run(&[alias, "--", "--version"]);
+        assert_eq!(delimiter.status.code(), Some(2), "{alias}");
+        assert!(delimiter.stdout.is_empty(), "{alias}");
+        assert!(
+            String::from_utf8_lossy(&delimiter.stderr).contains("required arguments"),
             "{alias}"
         );
     }

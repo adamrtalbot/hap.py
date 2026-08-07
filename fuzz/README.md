@@ -2,8 +2,9 @@
 
 The five targets exercise the native VCF, BCF, FASTA, BED, and location
 parsers. Named corpus entries are tracked regression inputs and bounded CI
-smoke starts from them. The BCF smoke corpus also includes the repository's
-valid native BCF fixture, so the decoder is exercised beyond its magic header.
+smoke starts from them. The BCF corpus includes a valid uncompressed record
+plus derivatives with a complete header and truncated or invalid record data,
+so the native decoder is exercised beyond its magic bytes.
 
 Run all targets with the same bounded gate used by CI:
 
@@ -32,7 +33,8 @@ When libFuzzer writes a reproducer under `fuzz/artifacts/<target>`:
 The hash-named working corpus and `fuzz/artifacts` stay ignored. The current
 named regressions retain truncated VCF fields, FASTA sequence before a header,
 reversed BED coordinates, overflowing locations, truncated BCF header/record
-cases, and a mutated BGZF block discovered by the bounded smoke.
+cases after a valid native header, an invalid record contig, and a mutated BGZF
+block discovered by the bounded smoke.
 Only the byte-exact valid BGZF fixture is decompressed by the harness; arbitrary
 BCF mutations exercise the native uncompressed decoder without exposing the
 dependency's unchecked malformed-block path. CI uploads the ignored
