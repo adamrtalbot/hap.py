@@ -991,21 +991,18 @@ mod tests {
 
     #[test]
     fn exact_pairing_preserves_duplicate_occurrences() {
-        let record = raw_record("chr1\t10\t.\tA\tC\t.\tPASS\t.");
-        let filtered = |record: RawVcfRecord| FilteredRawRecord {
-            key: vcf::VariantKey {
-                chrom: record.chrom.clone(),
-                pos: record.pos,
-                ref_allele: record.ref_allele.clone(),
-                alt_allele: record.alt_allele.clone(),
-            },
-            record,
-        };
-        let truth = vec![filtered(record.clone()), filtered(record.clone())];
-        let query = vec![filtered(record.clone()), filtered(record)];
+        let first = raw_record("chr1\t10\t.\tA\tC\t.\tPASS\t.");
+        let second = raw_record("chr1\t20\t.\tG\tT\t.\tPASS\t.");
+        let filtered = |record: RawVcfRecord| FilteredRawRecord { record };
+        let truth = vec![
+            filtered(second.clone()),
+            filtered(first.clone()),
+            filtered(first.clone()),
+        ];
+        let query = vec![filtered(first.clone()), filtered(second), filtered(first)];
         let (truth_matches, query_matches) = pair_exact_records(&truth, &query);
-        assert_eq!(truth_matches, vec![Some(0), Some(1)]);
-        assert_eq!(query_matches, vec![Some(0), Some(1)]);
+        assert_eq!(truth_matches, vec![Some(1), Some(0), Some(2)]);
+        assert_eq!(query_matches, vec![Some(1), Some(0), Some(2)]);
     }
 
     #[test]

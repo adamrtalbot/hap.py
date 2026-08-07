@@ -272,8 +272,8 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
         BlocksplitSelection::default()
     };
 
-    let mut output = PreprocessSpool::new(normalization_enabled)?;
     let job_count = blocksplit_selection.jobs.as_ref().map_or(1, Vec::len);
+    let mut output = PreprocessSpool::new(normalization_enabled, job_count)?;
     for job_index in 0..job_count {
         let job = blocksplit_selection
             .jobs
@@ -286,7 +286,7 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
             std::collections::HashMap::new();
         let mut prepared_record_index = 0usize;
         for record in vcf::open_validated_vcf(input_path)? {
-            let mut record = record?.raw().clone();
+            let mut record = record?.into_raw();
             if fixchr {
                 record.chrom = add_legacy_chr_prefix(&record.chrom);
             }
@@ -397,10 +397,13 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
                     prev_end_by_chrom.remove(&record.chrom);
                 }
                 if !normalization_enabled {
-                    output.push(vcf::ValidatedVcfRecord::try_from_raw(
-                        record,
-                        QueryProvenance::Unavailable,
-                    )?)?;
+                    output.push(
+                        vcf::ValidatedVcfRecord::try_from_raw(
+                            record,
+                            QueryProvenance::Unavailable,
+                        )?,
+                        job_index,
+                    )?;
                     continue;
                 }
                 if args.convert_gvcf_to_vcf {
@@ -576,10 +579,13 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
                         // string_fmts` loop order in `VariantWriter.cpp` combined with
                         // dynamic per-value type detection.
                         reorder_format_fields(&mut split);
-                        output.push(vcf::ValidatedVcfRecord::try_from_raw(
-                            split,
-                            QueryProvenance::Unavailable,
-                        )?)?;
+                        output.push(
+                            vcf::ValidatedVcfRecord::try_from_raw(
+                                split,
+                                QueryProvenance::Unavailable,
+                            )?,
+                            job_index,
+                        )?;
                     }
                 }
                 // Advance the per-chromosome boundary so the next variant cannot

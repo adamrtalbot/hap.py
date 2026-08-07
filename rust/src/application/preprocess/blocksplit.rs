@@ -53,7 +53,7 @@ where
     let mut normalized_seen = HashSet::new();
 
     for record in records {
-        let mut record = record?.raw().clone();
+        let mut record = record?.into_raw();
         if fixchr {
             record.chrom = add_legacy_chr_prefix(&record.chrom);
         }

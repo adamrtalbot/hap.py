@@ -265,7 +265,6 @@ struct SomaticCounts {
 
 #[derive(Clone, Debug)]
 struct FilteredRawRecord {
-    key: vcf::VariantKey,
     record: RawVcfRecord,
 }
 
@@ -391,11 +390,20 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
     // when it must derive an automatic reference-sized FP denominator. Plain
     // allele comparison with an explicit/FP-BED denominator must therefore
     // remain usable even when the default hg19 path is absent.
-    let mut reference_sequences = if normalize_truth || normalize_query {
+    let reference_sequences = if normalize_truth || normalize_query {
         Some(fasta::read_sequences(Path::new(&args.reference))?)
     } else {
         None
     };
+    let mut reference_lengths: BTreeMap<String, usize> = reference_sequences
+        .as_ref()
+        .map(|sequences| {
+            sequences
+                .iter()
+                .map(|(name, sequence)| (name.clone(), sequence.len()))
+                .collect()
+        })
+        .unwrap_or_default();
     let reference_contigs: BTreeSet<String> = reference_sequences
         .as_ref()
         .map(|sequences| sequences.keys().cloned().collect())
@@ -640,8 +648,8 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             // even for symbolic and gVCF records. INFO/END and FORMAT/LEN are used
             // by bcftools -R preprocessing, not by this classification step.
             let class = classify_query(
-                &query_record.key.chrom,
-                query_record.key.pos,
+                &query_record.record.chrom,
+                query_record.record.pos,
                 query_record.record.end_pos(),
                 fp_regions.as_deref().unwrap_or(&[]),
                 &ambiguous_regions,
@@ -650,8 +658,8 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             );
             if args.explain_ambiguous {
                 record_ambiguous_explanation(
-                    &query_record.key.chrom,
-                    query_record.key.pos,
+                    &query_record.record.chrom,
+                    query_record.record.pos,
                     query_record.record.end_pos(),
                     &explanation_regions,
                     ambi_fp,
@@ -831,22 +839,21 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         args.fp_region_size.as_deref(),
         fp_regions.as_deref().unwrap_or(&[]),
         &ambiguous_regions,
-    ) && reference_sequences.is_none()
+    ) && reference_lengths.is_empty()
     {
-        reference_sequences = Some(fasta::read_sequences(Path::new(&args.reference))?);
+        reference_lengths = fasta::contig_lengths(Path::new(&args.reference))?;
     }
     validate_legacy_fp_location_denominator(
         args.fp_region_size.as_deref(),
         args.location.as_deref(),
         has_automatic_fp_bases(fp_regions.as_deref().unwrap_or(&[]), &ambiguous_regions),
     )?;
-    let empty_reference = BTreeMap::new();
     let fp_region_size = calculate_fp_region_size_for_contigs(
         args.fp_region_size.as_deref(),
         fp_regions.as_deref().unwrap_or(&[]),
         &ambiguous_regions,
         locations.as_deref(),
-        reference_sequences.as_ref().unwrap_or(&empty_reference),
+        &reference_lengths,
         &truth_contigs,
     );
 

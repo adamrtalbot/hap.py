@@ -1,10 +1,11 @@
 //! Bounded-memory preprocessing spools and external record ordering.
 
+use super::LEFT_SHIFT_WINDOW;
 use crate::adapters::vcf::{ValidatedVcfReader, ValidatedVcfRecord};
 use crate::domain::{QueryProvenance, RawVcfRecord};
 use anyhow::{Context, Result};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -12,11 +13,19 @@ use std::path::Path;
 const PREPROCESS_SORT_CHUNK_RECORDS: usize = 65_536;
 const PREPROCESS_SORT_MERGE_FAN_IN: usize = 32;
 
+#[derive(Default)]
+struct StreamPositionState {
+    maximum_position: usize,
+    ordinals: BTreeMap<usize, usize>,
+}
+
 pub(super) struct PreprocessSpool {
     sorted: bool,
     unsorted: tempfile::NamedTempFile,
     chunks: Vec<tempfile::TempPath>,
-    buffer: Vec<(usize, usize, usize, ValidatedVcfRecord)>,
+    buffer: Vec<(usize, usize, usize, RawVcfRecord)>,
+    stream_count: usize,
+    stream_position_states: Vec<HashMap<String, StreamPositionState>>,
     contig_ranks: HashMap<String, usize>,
     emitted_contig_set: HashSet<String>,
     pub(super) emitted_contigs: Vec<String>,
@@ -25,13 +34,15 @@ pub(super) struct PreprocessSpool {
 }
 
 impl PreprocessSpool {
-    pub(super) fn new(sorted: bool) -> Result<Self> {
+    pub(super) fn new(sorted: bool, stream_count: usize) -> Result<Self> {
         Ok(Self {
             sorted,
             unsorted: tempfile::NamedTempFile::new()
                 .context("failed to create preprocess spool")?,
             chunks: Vec::new(),
             buffer: Vec::new(),
+            stream_count: stream_count.max(1),
+            stream_position_states: (0..stream_count.max(1)).map(|_| HashMap::new()).collect(),
             contig_ranks: HashMap::new(),
             emitted_contig_set: HashSet::new(),
             emitted_contigs: Vec::new(),
@@ -40,29 +51,67 @@ impl PreprocessSpool {
         })
     }
 
-    pub(super) fn push(&mut self, record: ValidatedVcfRecord) -> Result<()> {
-        if self.emitted_contig_set.insert(record.chrom.clone()) {
+    pub(super) fn push(&mut self, record: ValidatedVcfRecord, stream_index: usize) -> Result<()> {
+        let record = record.into_raw();
+        if !self.emitted_contig_set.contains(record.chrom.as_str()) {
+            self.emitted_contig_set.insert(record.chrom.clone());
             self.emitted_contigs.push(record.chrom.clone());
         }
         if !self.sorted {
-            writeln!(self.unsorted.as_file_mut(), "{}", record.raw().to_line())?;
+            writeln!(self.unsorted.as_file_mut(), "{}", record.to_line())?;
             self.serial += 1;
             return Ok(());
         }
-        let rank = *self
-            .contig_ranks
-            .entry(record.chrom.clone())
-            .or_insert_with(|| {
-                let rank = self.next_rank;
-                self.next_rank += 1;
-                rank
-            });
-        self.buffer.push((rank, record.pos, self.serial, record));
+        let rank = if let Some(rank) = self.contig_ranks.get(record.chrom.as_str()) {
+            *rank
+        } else {
+            let rank = self.next_rank;
+            self.next_rank += 1;
+            self.contig_ranks.insert(record.chrom.clone(), rank);
+            rank
+        };
+        let stream_states = self
+            .stream_position_states
+            .get_mut(stream_index)
+            .context("preprocess stream index is out of bounds")?;
+        if !stream_states.contains_key(record.chrom.as_str()) {
+            stream_states.insert(record.chrom.clone(), StreamPositionState::default());
+        }
+        let position_state = stream_states
+            .get_mut(record.chrom.as_str())
+            .context("preprocess stream contig state was just created")?;
+        position_state.maximum_position = position_state.maximum_position.max(record.pos);
+        let minimum_retained_position = position_state
+            .maximum_position
+            .saturating_sub(LEFT_SHIFT_WINDOW);
+        while position_state
+            .ordinals
+            .first_key_value()
+            .is_some_and(|(position, _)| *position < minimum_retained_position)
+        {
+            position_state.ordinals.pop_first();
+        }
+        let ordinal = position_state.ordinals.entry(record.pos).or_default();
+        let tie_break = ordinal
+            .checked_mul(self.stream_count)
+            .and_then(|value| value.checked_add(stream_index))
+            .context("preprocess stream ordering overflow")?;
+        *ordinal += 1;
+        self.buffer.push((rank, record.pos, tie_break, record));
         self.serial += 1;
         if self.buffer.len() >= PREPROCESS_SORT_CHUNK_RECORDS {
             self.flush_chunk()?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_position_count(&self) -> usize {
+        self.stream_position_states
+            .iter()
+            .flat_map(HashMap::values)
+            .map(|state| state.ordinals.len())
+            .sum()
     }
 
     fn flush_chunk(&mut self) -> Result<()> {
@@ -77,7 +126,7 @@ impl PreprocessSpool {
             writeln!(
                 chunk.as_file_mut(),
                 "{rank}\t{pos}\t{serial}\t{}",
-                record.raw().to_line()
+                record.to_line()
             )?;
         }
         chunk.as_file_mut().flush()?;

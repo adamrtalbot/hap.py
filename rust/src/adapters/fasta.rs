@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+#[cfg(any(test, feature = "fuzzing"))]
+use std::io::Cursor;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn read_index(path: &Path) -> Result<BTreeMap<String, usize>> {
@@ -53,20 +56,46 @@ fn index_path(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn read_sequences(path: &Path) -> Result<BTreeMap<String, String>> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read FASTA {}", path.display()))?;
-    parse_sequences(&text, path)
+    let file =
+        File::open(path).with_context(|| format!("failed to read FASTA {}", path.display()))?;
+    parse_fasta(BufReader::new(file), path, |sequence: &mut String, line| {
+        sequence.push_str(line);
+        Ok(())
+    })
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn parse_sequences(text: &str, path: &Path) -> Result<BTreeMap<String, String>> {
+    parse_fasta(Cursor::new(text), path, |sequence: &mut String, line| {
+        sequence.push_str(line);
+        Ok(())
+    })
+}
+
+fn parse_fasta<R, T, F>(
+    reader: R,
+    path: &Path,
+    mut append_sequence: F,
+) -> Result<BTreeMap<String, T>>
+where
+    R: BufRead,
+    T: Default,
+    F: FnMut(&mut T, &str) -> Result<()>,
+{
     let mut contigs = BTreeMap::new();
     let mut current_name: Option<String> = None;
-    let mut current_seq = String::new();
+    let mut current_sequence = T::default();
 
-    for line in text.lines() {
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read FASTA {}", path.display()))?;
         if let Some(rest) = line.strip_prefix('>') {
             if let Some(name) = current_name.take() {
-                insert_contig(&mut contigs, name, std::mem::take(&mut current_seq), path)?;
+                insert_contig(
+                    &mut contigs,
+                    name,
+                    std::mem::take(&mut current_sequence),
+                    path,
+                )?;
             }
             let name = rest
                 .split_whitespace()
@@ -74,18 +103,19 @@ pub(crate) fn parse_sequences(text: &str, path: &Path) -> Result<BTreeMap<String
                 .ok_or_else(|| anyhow::anyhow!("invalid FASTA header in {}", path.display()))?;
             current_name = Some(name.to_string());
         } else {
-            if current_name.is_none() && !line.trim().is_empty() {
+            let line = line.trim();
+            if current_name.is_none() && !line.is_empty() {
                 bail!(
                     "sequence data precedes the first FASTA header in {}",
                     path.display()
                 );
             }
-            current_seq.push_str(line.trim());
+            append_sequence(&mut current_sequence, line)?;
         }
     }
 
     if let Some(name) = current_name {
-        insert_contig(&mut contigs, name, current_seq, path)?;
+        insert_contig(&mut contigs, name, current_sequence, path)?;
     }
 
     if contigs.is_empty() {
@@ -95,10 +125,10 @@ pub(crate) fn parse_sequences(text: &str, path: &Path) -> Result<BTreeMap<String
     Ok(contigs)
 }
 
-fn insert_contig(
-    contigs: &mut BTreeMap<String, String>,
+fn insert_contig<T>(
+    contigs: &mut BTreeMap<String, T>,
     name: String,
-    sequence: String,
+    sequence: T,
     path: &Path,
 ) -> Result<()> {
     if contigs.insert(name.clone(), sequence).is_some() {
@@ -108,10 +138,21 @@ fn insert_contig(
 }
 
 pub(crate) fn contig_lengths(path: &Path) -> Result<BTreeMap<String, usize>> {
-    Ok(read_sequences(path)?
-        .into_iter()
-        .map(|(name, sequence)| (name, sequence.len()))
-        .collect())
+    if index_path(path)
+        .try_exists()
+        .with_context(|| format!("failed to inspect FASTA index for {}", path.display()))?
+    {
+        return read_index(path);
+    }
+
+    let file =
+        File::open(path).with_context(|| format!("failed to open FASTA {}", path.display()))?;
+    parse_fasta(BufReader::new(file), path, |length: &mut usize, line| {
+        *length = length
+            .checked_add(line.len())
+            .with_context(|| format!("FASTA contig length overflow in {}", path.display()))?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -223,6 +264,19 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate FASTA contig")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn contig_lengths_streams_wrapped_unindexed_fasta() -> Result<()> {
+        let directory = tempdir()?;
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, ">chr1 description\nAC\nGT\n>chr2\nA\n")?;
+
+        assert_eq!(
+            contig_lengths(&reference)?,
+            BTreeMap::from([("chr1".to_string(), 4), ("chr2".to_string(), 1)])
         );
         Ok(())
     }

@@ -327,7 +327,7 @@ pub(super) fn prepare_somatic_cache(
 ) -> Result<()> {
     if !normalize {
         let records = vcf::open_validated_vcf(source)?
-            .map(|record| record.map(|record| record.raw().clone()));
+            .map(|record| record.map(vcf::ValidatedVcfRecord::into_raw));
         return vcf::write_raw_vcf_iter(cache, headers, records);
     }
     let reference_sequences = reference_sequences.context("normalization requires a reference")?;
@@ -340,7 +340,7 @@ pub(super) fn prepare_somatic_cache(
         let mut current_chrom: Option<String> = None;
         let mut contig_records = Vec::new();
         for record in vcf::open_validated_vcf(source)? {
-            let record = record?.raw().clone();
+            let record = record?.into_raw();
             if current_chrom
                 .as_deref()
                 .is_some_and(|chrom| chrom != record.chrom)
@@ -365,7 +365,7 @@ pub(super) fn prepare_somatic_cache(
         writer.flush()?;
     }
     let records = vcf::open_validated_vcf(spool.path())?
-        .map(|record| record.map(|record| record.raw().clone()));
+        .map(|record| record.map(vcf::ValidatedVcfRecord::into_raw));
     vcf::write_raw_vcf_iter(cache, headers, records)
 }
 
@@ -391,15 +391,8 @@ impl ContigSpool {
     pub(super) fn load(&self) -> Result<Vec<FilteredRawRecord>> {
         vcf::open_validated_vcf(&self.path)?
             .map(|record| {
-                let record = record?.raw().clone();
                 Ok(FilteredRawRecord {
-                    key: vcf::VariantKey {
-                        chrom: record.chrom.clone(),
-                        pos: record.pos,
-                        ref_allele: record.ref_allele.clone(),
-                        alt_allele: record.alt_allele.clone(),
-                    },
-                    record,
+                    record: record?.into_raw(),
                 })
             })
             .collect()
@@ -415,12 +408,12 @@ pub(super) fn spool_filtered_contigs(
     let mut closed = BTreeSet::new();
     let mut active: Option<(String, tempfile::NamedTempFile, usize)> = None;
     for record in vcf::open_validated_vcf(path)? {
-        let Some(record) = filter_raw_record(record?.raw().clone(), source_path, options)? else {
+        let Some(record) = filter_raw_record(record?.into_raw(), source_path, options)? else {
             continue;
         };
         if active
             .as_ref()
-            .is_none_or(|(chrom, _, _)| chrom != &record.key.chrom)
+            .is_none_or(|(chrom, _, _)| chrom != &record.record.chrom)
         {
             if let Some((chrom, mut file, count)) = active.take() {
                 file.as_file_mut().flush()?;
@@ -431,15 +424,15 @@ pub(super) fn spool_filtered_contigs(
                     count,
                 });
             }
-            if closed.contains(&record.key.chrom) {
+            if closed.contains(&record.record.chrom) {
                 bail!(
                     "somatic records for chromosome {} are not contiguous in {}",
-                    record.key.chrom,
+                    record.record.chrom,
                     path.display()
                 );
             }
             active = Some((
-                record.key.chrom.clone(),
+                record.record.chrom.clone(),
                 tempfile::NamedTempFile::new().context("failed to create somatic contig spool")?,
                 0,
             ));
@@ -561,13 +554,8 @@ pub(super) fn filter_raw_record(
     let mut normalized = record;
     normalized.chrom = key.chrom.clone();
     let normalized =
-        vcf::ValidatedVcfRecord::try_from_raw(normalized, QueryProvenance::Unavailable)?
-            .raw()
-            .clone();
-    Ok(Some(FilteredRawRecord {
-        key,
-        record: normalized,
-    }))
+        vcf::ValidatedVcfRecord::try_from_raw(normalized, QueryProvenance::Unavailable)?.into_raw();
+    Ok(Some(FilteredRawRecord { record: normalized }))
 }
 
 pub(super) fn somatic_chrom(

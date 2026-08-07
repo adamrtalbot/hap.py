@@ -1892,9 +1892,13 @@ impl SubstatSnapshotCursor {
         Ok(self
             .current
             .as_ref()
-            .filter(|record| record.level == level)
+            .filter(|record| rendered_roc_level(record.level) == rendered_roc_level(level))
             .map(|record| record.counts.clone()))
     }
+}
+
+fn rendered_roc_level(level: f64) -> String {
+    format!("{:.6}", level as f32 as f64)
 }
 
 enum EmittedRows {
@@ -2152,7 +2156,7 @@ impl BoundedGroupAccum {
         // characteristic 7-sig-fig formatted strings (`1001.340027`
         // rather than `1001.340000`).
         let q32 = q as f32 as f64;
-        let key = format!("{q32:.6}");
+        let key = rendered_roc_level(q32);
         if !self.observations.is_disk_backed() {
             let entry = self
                 .threshold_window
@@ -2527,7 +2531,7 @@ impl BoundedGroupAccum {
             // bucket-key cardinality (e.g. `1001.340027` rather than
             // `1001.340000`).
             let level_f32 = *level as f32 as f64;
-            let qq_str = format!("{level_f32:.6}");
+            let qq_str = rendered_roc_level(level_f32);
             numeric_rows.push(EmittedRow {
                 qq_str,
                 cum,
@@ -2668,7 +2672,7 @@ impl BoundedGroupAccum {
                     .saturating_sub(cumulative.query_unk.tv);
             }
             numeric_rows.push(EmittedRow {
-                qq_str: format!("{:.6}", level as f32 as f64),
+                qq_str: rendered_roc_level(level),
                 cum: Cumul {
                     truth_tp,
                     truth_fn,
@@ -4247,6 +4251,36 @@ fn write_optional_gzip_csv(path: &Path, header: &str, rows: &RenderedRows) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn substat_cursor_matches_public_roc_bucket_identity() -> Result<()> {
+        let mut source = ObservationStore::default();
+        source.push(ObsRecord {
+            level: f64::MIN_POSITIVE,
+            counts: Cumul {
+                truth_fn: CountsBucket {
+                    total: 1,
+                    tv: 1,
+                    ..CountsBucket::default()
+                },
+                ..Cumul::default()
+            },
+            subtypes: vec!["*".to_string()],
+            ti_flag: false,
+            tv_flag: true,
+            blt: None,
+        });
+
+        let mut cursor = SubstatSnapshotCursor::build(&source, 8, |row| row.tv_flag)?;
+        let counts = cursor
+            .counts_at(0.0)?
+            .expect("private zero levels share one rendered ROC bucket");
+
+        assert_eq!(rendered_roc_level(0.0), "0.000000");
+        assert_eq!(rendered_roc_level(f64::MIN_POSITIVE), "0.000000");
+        assert_eq!(counts.truth_fn.tv, 1);
+        Ok(())
+    }
 
     #[test]
     fn half_call_is_not_counted_as_heterozygous_in_roc_stats() {

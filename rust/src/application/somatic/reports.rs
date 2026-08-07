@@ -10,7 +10,7 @@ use super::{
 use crate::adapters::vcf;
 use crate::domain::{Interval, RawVcfRecord};
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -822,7 +822,7 @@ pub(super) fn raw_type_label(record: &RawVcfRecord) -> Option<&'static str> {
 pub(super) fn contigs_in_truth(truth: &[FilteredRawRecord]) -> BTreeSet<String> {
     truth
         .iter()
-        .map(|record| record.key.chrom.clone())
+        .map(|record| record.record.chrom.clone())
         .collect()
 }
 
@@ -901,12 +901,16 @@ pub(super) fn calculate_fp_region_size(
     reference_sequences: &BTreeMap<String, String>,
     truth: &[FilteredRawRecord],
 ) -> usize {
+    let reference_lengths = reference_sequences
+        .iter()
+        .map(|(name, sequence)| (name.clone(), sequence.len()))
+        .collect();
     calculate_fp_region_size_for_contigs(
         requested,
         fp_regions,
         ambiguous_regions,
         locations,
-        reference_sequences,
+        &reference_lengths,
         &contigs_in_truth(truth),
     )
 }
@@ -916,7 +920,7 @@ pub(super) fn calculate_fp_region_size_for_contigs(
     fp_regions: &[Interval],
     ambiguous_regions: &[AmbiguousInterval],
     locations: Option<&[vcf::LocationFilter]>,
-    reference_sequences: &BTreeMap<String, String>,
+    reference_lengths: &BTreeMap<String, usize>,
     truth_contigs: &BTreeSet<String>,
 ) -> usize {
     if let Some(size) = requested.and_then(|value| value.parse::<usize>().ok()) {
@@ -940,13 +944,12 @@ pub(super) fn calculate_fp_region_size_for_contigs(
         return locations
             .iter()
             .map(|location| match location {
-                vcf::LocationFilter::Contig(chrom) => reference_sequences
-                    .get(chrom)
-                    .map_or(0, |sequence| sequence.len()),
+                vcf::LocationFilter::Contig(chrom) => {
+                    reference_lengths.get(chrom).copied().unwrap_or(0)
+                }
                 vcf::LocationFilter::Range { chrom, start, end } => {
-                    reference_sequences.get(chrom).map_or(0, |sequence| {
-                        end.min(&sequence.len())
-                            .saturating_sub(start.saturating_sub(1))
+                    reference_lengths.get(chrom).map_or(0, |length| {
+                        end.min(length).saturating_sub(start.saturating_sub(1))
                     })
                 }
             })
@@ -955,11 +958,7 @@ pub(super) fn calculate_fp_region_size_for_contigs(
 
     truth_contigs
         .iter()
-        .filter_map(|contig| {
-            reference_sequences
-                .get(contig)
-                .map(|sequence| sequence.len())
-        })
+        .filter_map(|contig| reference_lengths.get(contig).copied())
         .sum()
 }
 
@@ -967,27 +966,41 @@ pub(super) fn pair_exact_records(
     truth: &[FilteredRawRecord],
     query: &[FilteredRawRecord],
 ) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
-    let mut query_by_key: BTreeMap<vcf::VariantKey, VecDeque<usize>> = BTreeMap::new();
-    for (index, record) in query.iter().enumerate() {
-        query_by_key
-            .entry(record.key.clone())
-            .or_default()
-            .push_back(index);
-    }
-
+    let mut truth_order = (0..truth.len()).collect::<Vec<_>>();
+    truth_order.sort_unstable_by(|left, right| {
+        exact_record_key_cmp(&truth[*left].record, &truth[*right].record).then(left.cmp(right))
+    });
+    let mut query_order = (0..query.len()).collect::<Vec<_>>();
+    query_order.sort_unstable_by(|left, right| {
+        exact_record_key_cmp(&query[*left].record, &query[*right].record).then(left.cmp(right))
+    });
     let mut truth_matches = vec![None; truth.len()];
     let mut query_matches = vec![None; query.len()];
-    for (truth_index, truth_record) in truth.iter().enumerate() {
-        let Some(query_index) = query_by_key
-            .get_mut(&truth_record.key)
-            .and_then(VecDeque::pop_front)
-        else {
-            continue;
-        };
-        truth_matches[truth_index] = Some(query_index);
-        query_matches[query_index] = Some(truth_index);
+    let mut truth_position = 0usize;
+    let mut query_position = 0usize;
+    while truth_position < truth_order.len() && query_position < query_order.len() {
+        let truth_index = truth_order[truth_position];
+        let query_index = query_order[query_position];
+        match exact_record_key_cmp(&truth[truth_index].record, &query[query_index].record) {
+            std::cmp::Ordering::Less => truth_position += 1,
+            std::cmp::Ordering::Greater => query_position += 1,
+            std::cmp::Ordering::Equal => {
+                truth_matches[truth_index] = Some(query_index);
+                query_matches[query_index] = Some(truth_index);
+                truth_position += 1;
+                query_position += 1;
+            }
+        }
     }
     (truth_matches, query_matches)
+}
+
+fn exact_record_key_cmp(left: &RawVcfRecord, right: &RawVcfRecord) -> std::cmp::Ordering {
+    left.chrom
+        .cmp(&right.chrom)
+        .then(left.pos.cmp(&right.pos))
+        .then(left.ref_allele.cmp(&right.ref_allele))
+        .then(left.alt_allele.cmp(&right.alt_allele))
 }
 
 pub(super) fn render_row(

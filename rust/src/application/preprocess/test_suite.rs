@@ -1319,6 +1319,65 @@ mod tests {
     }
 
     #[test]
+    fn parallel_location_streams_merge_equal_normalized_positions_roundwise() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let output = directory.path().join("output.vcf.gz");
+        let reference = directory.path().join("ref.fa");
+        fs::write(&reference, format!(">chr1\n{}\n", "A".repeat(20)))?;
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=20>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n",
+                "chr1\t3\tbarrier\tA\tC\t30\tPASS\t.\tGT\t0/1\n",
+                "chr1\t5\trepeat_deletion\tAA\tA\t30\tPASS\t.\tGT\t0/1\n",
+            ),
+        )?;
+
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.gender = PreprocessGender::None;
+        args.locations = Some("chr1:1-10,chr1:3-20".to_string());
+        args.threads = Some(2);
+        args.window_size = 1;
+        run(args)?;
+
+        let alleles = vcf::load_raw_vcf(&output)?
+            .1
+            .into_iter()
+            .map(|record| (record.pos, record.ref_allele, record.alt_allele))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            alleles,
+            [
+                (3, "A".to_string(), "C".to_string()),
+                (3, "A".to_string(), "C".to_string()),
+                (3, "AA".to_string(), "A".to_string()),
+                (3, "AA".to_string(), "A".to_string()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preprocess_stream_tie_break_state_respects_left_shift_window() -> Result<()> {
+        let mut spool = PreprocessSpool::new(true, 1)?;
+        for pos in 1..=4_096 {
+            let mut record = make_record(".");
+            record.pos = pos;
+            spool.push(
+                vcf::ValidatedVcfRecord::try_from_raw(record, QueryProvenance::Unavailable)?,
+                0,
+            )?;
+        }
+
+        assert!(spool.retained_position_count() <= LEFT_SHIFT_WINDOW + 1);
+        Ok(())
+    }
+
+    #[test]
     fn normative_set_union_multiblock_keeps_records_selected_only_by_later_range() {
         let locations = [
             vcf::LocationFilter::Range {
