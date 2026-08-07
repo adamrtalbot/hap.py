@@ -12,6 +12,7 @@ mod application;
 mod cli_compat;
 mod domain;
 mod engines;
+mod output;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, error::ErrorKind};

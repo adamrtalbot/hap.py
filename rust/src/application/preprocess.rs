@@ -3,6 +3,7 @@ use crate::domain::{Interval, RawVcfRecord};
 use crate::{
     adapters::{fasta, vcf},
     engines::{partial_credit, variant_pipeline},
+    output::OutputTransaction,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeSet, HashSet};
@@ -92,18 +93,82 @@ impl BlocksplitSelection {
     }
 }
 
-pub(crate) fn run(args: PreprocessArgs) -> Result<()> {
+pub(crate) fn run(mut args: PreprocessArgs) -> Result<()> {
     if args.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let mut logger = PreprocessLogger::new(&args)?;
-    logger.info(&format!("Preprocessing {}", args.input))?;
-    let output_path = if args.bcf && !args.output.ends_with(".bcf") {
+    if args.reference.is_none() {
+        args.reference = Some(resolve_reference(None)?.to_string_lossy().into_owned());
+    }
+    let output_path = preprocess_output_path(&args);
+    let index_path = if output_path.extension().and_then(|value| value.to_str()) == Some("bcf") {
+        output_path.with_extension("bcf.csi")
+    } else if output_path.extension().and_then(|value| value.to_str()) == Some("gz") {
+        PathBuf::from(format!("{}.tbi", output_path.display()))
+    } else {
+        PathBuf::new()
+    };
+    let inputs = preprocess_inputs(&args);
+    let outputs = std::iter::once(output_path.clone())
+        .chain((!index_path.as_os_str().is_empty()).then_some(index_path.clone()))
+        .chain(args.logfile.as_ref().map(PathBuf::from))
+        .collect::<Vec<_>>();
+    let transaction = OutputTransaction::files(&inputs, &outputs)?;
+    let staged_output = transaction.staged_file(&output_path)?.to_path_buf();
+    args.output = staged_output.to_string_lossy().into_owned();
+    if let Some(logfile) = args.logfile.as_mut() {
+        *logfile = transaction
+            .staged_file(Path::new(logfile))?
+            .to_string_lossy()
+            .into_owned();
+    }
+    run_inner(args).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to produce preprocess output {}: {error:#}",
+            output_path.display()
+        )
+    })?;
+    if !index_path.as_os_str().is_empty() {
+        let produced_index =
+            if output_path.extension().and_then(|value| value.to_str()) == Some("bcf") {
+                staged_output.with_extension("bcf.csi")
+            } else {
+                PathBuf::from(format!("{}.tbi", staged_output.display()))
+            };
+        let planned_index = transaction.staged_file(&index_path)?;
+        fs::rename(&produced_index, planned_index).with_context(|| {
+            format!(
+                "failed to stage index destination {} from {}",
+                index_path.display(),
+                produced_index.display()
+            )
+        })?;
+    }
+    transaction.commit()
+}
+
+fn preprocess_output_path(args: &PreprocessArgs) -> PathBuf {
+    if args.bcf && !args.output.ends_with(".bcf") {
         PathBuf::from(format!("{}.bcf", args.output))
     } else {
         PathBuf::from(&args.output)
-    };
+    }
+}
+
+fn preprocess_inputs(args: &PreprocessArgs) -> Vec<PathBuf> {
+    std::iter::once(args.input.as_str())
+        .chain(args.reference.as_deref())
+        .chain(args.regions_bedfile.as_deref())
+        .chain(args.targets_bedfile.as_deref())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn run_inner(args: PreprocessArgs) -> Result<()> {
+    let mut logger = PreprocessLogger::new(&args)?;
+    logger.info(&format!("Preprocessing {}", args.input))?;
+    let output_path = preprocess_output_path(&args);
     require_output_parent(&output_path)?;
     let reference_path = resolve_reference(args.reference.as_deref())?;
     let (mut headers, records) = vcf::load_raw_vcf(Path::new(&args.input))?;

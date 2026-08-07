@@ -1,4 +1,5 @@
 use crate::domain::RawVcfRecord;
+use crate::output::{FailureOperation, OutputTransaction, fail_operation};
 use anyhow::{Context, Result, bail};
 use noodles_bgzf as bgzf;
 use std::collections::BTreeMap;
@@ -688,6 +689,25 @@ fn decode_length(cursor: &mut Cursor<'_>) -> Result<usize> {
 }
 
 pub(crate) fn write(path: &Path, headers: &[String], records: &[RawVcfRecord]) -> Result<()> {
+    let csi_path = path.with_extension("bcf.csi");
+    let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [path, &csi_path])?;
+    let staged = transaction.staged_file(path)?.to_path_buf();
+    write_inner(&staged, path, &csi_path, headers, records).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to write BCF destination {}: {error:#}",
+            path.display()
+        )
+    })?;
+    transaction.commit()
+}
+
+fn write_inner(
+    path: &Path,
+    logical_bcf: &Path,
+    logical_csi: &Path,
+    headers: &[String],
+    records: &[RawVcfRecord],
+) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -699,6 +719,7 @@ pub(crate) fn write(path: &Path, headers: &[String], records: &[RawVcfRecord]) -
     let csi_path = path.with_extension("bcf.csi");
     let temp_csi = temporary_path(&csi_path);
     let result = (|| {
+        fail_operation(FailureOperation::Writer, logical_bcf)?;
         let mut writer = bgzf::io::Writer::new(File::create(&temp_bcf)?);
         writer.write_all(BCF_MAGIC)?;
         writer.write_all(&(encoded_header.text.len() as u32).to_le_bytes())?;
@@ -722,9 +743,22 @@ pub(crate) fn write(path: &Path, headers: &[String], records: &[RawVcfRecord]) -
             chunks[rid as usize].get_or_insert((start, end)).1 = end;
             record_counts[rid as usize] += 1;
         }
-        writer.finish()?.sync_all()?;
-        write_csi(&temp_csi, &chunks, &record_counts)?;
-        replace_pair(&temp_bcf, path, &temp_csi, &csi_path)
+        fail_operation(FailureOperation::Encoder, logical_bcf)?;
+        writer
+            .finish()
+            .with_context(|| format!("failed to finish BCF encoder for {}", logical_bcf.display()))?
+            .sync_all()
+            .with_context(|| format!("failed to sync BCF artifact {}", logical_bcf.display()))?;
+        fail_operation(FailureOperation::Index, logical_csi)?;
+        write_csi(&temp_csi, &chunks, &record_counts)
+            .with_context(|| format!("failed to write CSI artifact {}", logical_csi.display()))?;
+        replace_pair(&temp_bcf, path, &temp_csi, &csi_path).with_context(|| {
+            format!(
+                "failed to finalize BCF artifact {} and CSI artifact {}",
+                logical_bcf.display(),
+                logical_csi.display()
+            )
+        })
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_bcf);
@@ -1191,6 +1225,61 @@ mod tests {
         let indexed = read_indexed_records(&output, &csi)?;
         assert_eq!(indexed["chr1"].len(), 1);
         assert_eq!(indexed["chr1"][0].to_line(), records[0].to_line());
+        Ok(())
+    }
+
+    #[test]
+    fn encoder_failure_preserves_existing_bcf_generation() -> Result<()> {
+        let directory = tempdir()?;
+        let output = directory.path().join("preserve.bcf");
+        let index = output.with_extension("bcf.csi");
+        fs::write(&output, "old-bcf")?;
+        fs::write(&index, "old-csi")?;
+        let headers = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##contig=<ID=chr1,length=10>".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO".to_string(),
+        ];
+        let record = RawVcfRecord::from_line("chr2\t1\t.\tA\tC\t.\tPASS\t.", Path::new("in.vcf"))?;
+        let error = write(&output, &headers, &[record]).expect_err("unknown contig must fail");
+        assert!(error.to_string().contains(&output.display().to_string()));
+        assert_eq!(fs::read_to_string(output)?, "old-bcf");
+        assert_eq!(fs::read_to_string(index)?, "old-csi");
+        Ok(())
+    }
+
+    #[test]
+    fn injected_bcf_operations_preserve_generation_and_cleanup() -> Result<()> {
+        let directory = tempdir()?;
+        let output = directory.path().join("preserve.bcf");
+        let index = output.with_extension("bcf.csi");
+        let headers = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##contig=<ID=chr1,length=10>".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO".to_string(),
+        ];
+        let record = RawVcfRecord::from_line("chr1\t1\t.\tA\tC\t.\tPASS\t.", Path::new("in.vcf"))?;
+        for operation in [
+            FailureOperation::Writer,
+            FailureOperation::Encoder,
+            FailureOperation::Index,
+        ] {
+            fs::write(&output, "old-bcf")?;
+            fs::write(&index, "old-csi")?;
+            crate::output::set_failure_operation(Some(operation));
+            let error = write(&output, &headers, std::slice::from_ref(&record))
+                .expect_err("injected BCF operation must fail");
+            crate::output::set_failure_operation(None);
+            let logical = if operation == FailureOperation::Index {
+                &index
+            } else {
+                &output
+            };
+            assert!(error.to_string().contains(&logical.display().to_string()));
+            assert_eq!(fs::read_to_string(&output)?, "old-bcf");
+            assert_eq!(fs::read_to_string(&index)?, "old-csi");
+            assert_eq!(fs::read_dir(directory.path())?.count(), 2);
+        }
         Ok(())
     }
 }

@@ -12,6 +12,7 @@ use crate::engines::partial_credit::RefVar;
 use crate::{
     adapters::{fasta, vcf},
     engines::partial_credit,
+    output::{FailureOperation, OutputTransaction, fail_operation},
 };
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -81,7 +82,43 @@ impl Drop for ScratchRun {
     }
 }
 
-pub(crate) fn run(args: FtxArgs) -> Result<()> {
+pub(crate) fn run(mut args: FtxArgs) -> Result<()> {
+    if args.normalize {
+        args.reference = Some(resolve_legacy_reference(args.reference.as_deref()).context(
+            "no reference file found for --normalize; pass --reference or set HG19/HGREF",
+        )?);
+    }
+    let output = ftx_output_path(&args.output);
+    let inputs = std::iter::once(args.input.as_str())
+        .chain(args.reference.as_deref())
+        .chain(args.regions_bedfile.as_deref())
+        .chain(args.targets_bedfile.as_deref())
+        .chain(args.bams.iter().map(String::as_str))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let transaction = OutputTransaction::files(&inputs, [&output])?;
+    args.output = transaction
+        .staged_file(&output)?
+        .to_string_lossy()
+        .into_owned();
+    run_inner(args).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to produce feature table {}: {error:#}",
+            output.display()
+        )
+    })?;
+    transaction.commit()
+}
+
+fn ftx_output_path(output: &str) -> PathBuf {
+    if output.ends_with(".csv") {
+        PathBuf::from(output)
+    } else {
+        PathBuf::from(format!("{output}.csv"))
+    }
+}
+
+fn run_inner(args: FtxArgs) -> Result<()> {
     let label = legacy_feature_label(&args.input, args.label.as_deref());
 
     // Legacy passes the reference only to `bcftools norm`; ordinary feature
@@ -117,11 +154,8 @@ pub(crate) fn run(args: FtxArgs) -> Result<()> {
         (!bam_depths.is_empty()).then_some(&bam_depths),
     )?;
 
-    let output = if args.output.ends_with(".csv") {
-        PathBuf::from(&args.output)
-    } else {
-        PathBuf::from(format!("{}.csv", args.output))
-    };
+    let output = ftx_output_path(&args.output);
+    fail_operation(FailureOperation::Writer, &output)?;
     fs::write(&output, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("failed to write {}", output.display()))?;
 
@@ -485,6 +519,7 @@ fn pad_normalized_allele(mut variant: RefVar, reference: &[u8]) -> RefVar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::{FailureOperation, set_failure_operation};
     use std::thread;
 
     fn args(input: &Path, reference: &Path) -> FtxArgs {
@@ -531,6 +566,33 @@ mod tests {
 
         assert!(!first_path.exists());
         assert!(!second_path.exists());
+    }
+
+    #[test]
+    fn injected_csv_writer_preserves_generation_and_cleanup() -> Result<()> {
+        let (scratch, input, reference) = fixture(
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\nchr1\t1\t.\tA\tC\t60\tPASS\t.\n",
+            ">chr1\nAAAA\n",
+        );
+        let output = scratch.path().join("features.csv");
+        fs::write(&output, "old-csv")?;
+        let mut arguments = args(&input, &reference);
+        arguments.output = output.to_string_lossy().into_owned();
+
+        set_failure_operation(Some(FailureOperation::Writer));
+        let error = run(arguments).expect_err("injected CSV writer operation must fail");
+        set_failure_operation(None);
+
+        assert!(error.to_string().contains(&output.display().to_string()));
+        assert_eq!(fs::read_to_string(&output)?, "old-csv");
+        assert!(fs::read_dir(scratch.path())?.all(|entry| {
+            !entry
+                .expect("scratch entry must be readable")
+                .file_name()
+                .to_string_lossy()
+                .contains("hap-rs")
+        }));
+        Ok(())
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use crate::adapters::report::suffixed_report_path;
 use crate::domain::AnnotatedRow;
 use crate::engines::roc::{self, MetricIndices, RocOptions};
+use crate::output::{FailureOperation, fail_operation};
 use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -52,6 +53,7 @@ fn publish(prefix: &Path, artifacts: roc::Artifacts) -> Result<MetricIndices> {
 }
 
 fn write_gzip_csv(path: &Path, header: &str, rows: &[String]) -> Result<()> {
+    fail_operation(FailureOperation::Writer, path)?;
     let file = std::fs::File::create(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     let mut writer = GzEncoder::new(file, Compression::default());
@@ -59,6 +61,40 @@ fn write_gzip_csv(path: &Path, header: &str, rows: &[String]) -> Result<()> {
     for row in rows {
         writeln!(writer, "{row}")?;
     }
-    writer.finish()?;
+    fail_operation(FailureOperation::Encoder, path)?;
+    writer
+        .finish()
+        .with_context(|| format!("failed to finish ROC artifact {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::{FailureOperation, OutputTransaction, set_failure_operation};
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn injected_roc_operations_preserve_generation_and_cleanup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("report.roc.all.csv.gz");
+
+        for operation in [FailureOperation::Writer, FailureOperation::Encoder] {
+            fs::write(&output, "old-roc")?;
+            let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [&output])?;
+            let staged = transaction.staged_file(&output)?.to_path_buf();
+            set_failure_operation(Some(operation));
+            let result = write_gzip_csv(&staged, "header", &["row".to_string()])
+                .with_context(|| format!("failed to write ROC table {}", output.display()));
+            set_failure_operation(None);
+            let error = result.expect_err("injected ROC operation must fail");
+            drop(transaction);
+
+            assert!(error.to_string().contains(&output.display().to_string()));
+            assert_eq!(fs::read_to_string(&output)?, "old-roc");
+            assert_eq!(fs::read_dir(directory.path())?.count(), 1);
+        }
+        Ok(())
+    }
 }

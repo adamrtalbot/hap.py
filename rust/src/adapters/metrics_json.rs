@@ -1,3 +1,4 @@
+use crate::output::{FailureOperation, fail_operation};
 use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -75,6 +76,7 @@ pub(crate) fn write_compare_runinfo(
     commandline: &str,
     args: &CompareRunArgs<'_>,
 ) -> Result<()> {
+    fail_operation(FailureOperation::Writer, path)?;
     create_parent(path)?;
 
     let mut body = String::new();
@@ -243,6 +245,7 @@ pub(crate) fn write_metrics_gz_for_module_with_indices(
     tables: &[(&str, &str, &Path)],
     indices: Option<&BTreeMap<String, Vec<usize>>>,
 ) -> Result<()> {
+    fail_operation(FailureOperation::Writer, path)?;
     create_parent(path)?;
     let file =
         fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
@@ -251,7 +254,10 @@ pub(crate) fn write_metrics_gz_for_module_with_indices(
         metrics_json_for_module_with_indices(name, module, commandline, tables, indices)?
             .as_bytes(),
     )?;
-    encoder.finish()?;
+    fail_operation(FailureOperation::Encoder, path)?;
+    encoder
+        .finish()
+        .with_context(|| format!("failed to finish metrics JSON artifact {}", path.display()))?;
     Ok(())
 }
 
@@ -719,7 +725,9 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::{FailureOperation, OutputTransaction, set_failure_operation};
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn metrics_table_uses_legacy_column_types_and_nulls() {
@@ -766,6 +774,36 @@ mod tests {
             table_json_with_indices("all.metrics", "all.metrics", &csv, Some(&[9, 3]), None)
                 .unwrap();
         assert!(indexed.contains("\"values\":[9,3],\"type\":\"string\",\"id\":\"types\""));
+    }
+
+    #[test]
+    fn injected_metrics_json_operations_preserve_generation_and_cleanup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("report.metrics.json.gz");
+
+        for operation in [FailureOperation::Writer, FailureOperation::Encoder] {
+            fs::write(&output, "old-json")?;
+            let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [&output])?;
+            let staged = transaction.staged_file(&output)?.to_path_buf();
+            set_failure_operation(Some(operation));
+            let result = write_metrics_gz_for_module_with_indices(
+                &staged,
+                "test",
+                "hap.py",
+                "hap.py test",
+                &[],
+                None,
+            )
+            .with_context(|| format!("failed to write metrics JSON {}", output.display()));
+            set_failure_operation(None);
+            let error = result.expect_err("injected metrics JSON operation must fail");
+            drop(transaction);
+
+            assert!(error.to_string().contains(&output.display().to_string()));
+            assert_eq!(fs::read_to_string(&output)?, "old-json");
+            assert_eq!(fs::read_dir(directory.path())?.count(), 1);
+        }
+        Ok(())
     }
 
     #[test]

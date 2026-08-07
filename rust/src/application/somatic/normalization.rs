@@ -3,7 +3,8 @@
 use super::features::csv_join;
 use super::features::write_simple_table;
 use super::metrics::python2_counter_indices;
-use super::{AmbiguousInterval, FilteredRawRecord, MAX_AF_BINS, QueryClass};
+use super::allele_frequency::parse_af_bins;
+use super::{AmbiguousInterval, FilteredRawRecord, QueryClass};
 use crate::adapters::report;
 use crate::adapters::vcf;
 use crate::cli_compat::cli::SomaticArgs;
@@ -45,35 +46,7 @@ pub(super) fn selected_normalizations(args: &SomaticArgs) -> (bool, bool) {
 }
 
 pub(super) fn validate_af_bins(raw: &str) -> Result<()> {
-    let bins = raw.split(',').collect::<Vec<_>>();
-    if bins.is_empty() || bins.iter().any(|bin| bin.trim().is_empty()) {
-        bail!("AF bin size list must not be empty");
-    }
-    let parsed = bins
-        .into_iter()
-        .map(|bin| {
-            bin.parse::<f64>()
-                .with_context(|| format!("failed to parse AF bin size '{bin}'"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut start: f64 = 0.0;
-    let mut index = 0usize;
-    for _ in 0..MAX_AF_BINS {
-        if !start.is_finite() || start >= 1.0 || parsed.is_empty() {
-            return Ok(());
-        }
-        let mut end = start + parsed[index];
-        if end >= 1.0 {
-            end = 1.000_000_01;
-        }
-        if start >= end {
-            return Ok(());
-        }
-        start = end;
-        index = (index + 1) % parsed.len();
-    }
-    bail!("AF bin sizes produce more than {MAX_AF_BINS} bins")
+    parse_af_bins(raw).map(|_| ())
 }
 
 pub(super) fn classification_bed_chrom(

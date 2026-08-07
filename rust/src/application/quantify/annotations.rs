@@ -1068,7 +1068,9 @@ pub(super) fn compact_no_roc_outputs(prefix: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", all_path.display()))?;
     let mut encoder = GzEncoder::new(file, Compression::default());
     writeln!(encoder, "{}", rows.join("\n"))?;
-    encoder.finish()?;
+    encoder
+        .finish()
+        .with_context(|| format!("failed to finish ROC artifact {}", all_path.display()))?;
 
     for suffix in [
         "roc.Locations.SNP.csv.gz",
@@ -1101,7 +1103,9 @@ pub(super) fn apply_stratification_levels(
         .with_context(|| format!("failed to create {}", csv_path.display()))?;
     let mut encoder = GzEncoder::new(csv_file, Compression::default());
     encoder.write_all(csv.as_bytes())?;
-    encoder.finish()?;
+    encoder
+        .finish()
+        .with_context(|| format!("failed to finish ROC artifact {}", csv_path.display()))?;
 
     if preserve_raw_table {
         let raw_path = suffixed_report_path(prefix, "roc.tsv");

@@ -5,6 +5,7 @@ use crate::{
     adapters::{fasta, vcf},
     application::ftx,
     engines::strelka,
+    output::{FailureOperation, OutputTransaction, fail_operation},
 };
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -33,7 +34,7 @@ use reports::*;
 /// pinned reference container resolves this to `"som.py-"` (trailing hyphen with
 /// nothing after). We reproduce the exact literal so stats.csv byte-matches.
 const SOM_VERSION: &str = "som.py-";
-const MAX_AF_BINS: usize = 10_000;
+const MAX_AF_BINS: usize = 100;
 const STATS_TYPE_ROWS: [(usize, &str); 4] =
     [(0, "indels"), (1, "SNVs"), (6, "MNPs"), (7, "others")];
 static SOMATIC_SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
@@ -297,12 +298,76 @@ enum QueryClass {
 }
 
 pub(crate) fn run(mut args: SomaticArgs) -> Result<()> {
+    let destination_prefix = PathBuf::from(&args.output);
+    let inputs = somatic_inputs(&args);
+    let logfile = args.logfile.as_ref().map(PathBuf::from);
+    let artifacts =
+        somatic_artifacts(&args).context("failed to plan somatic AF-bin ROC artifacts")?;
+    let transaction = OutputTransaction::family(&inputs, &destination_prefix, artifacts)?
+        .with_files(logfile.iter())?;
+    if let Some(path) = logfile.as_deref() {
+        args.logfile = Some(
+            transaction
+                .staged_file(path)?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    args.output = transaction.staged_prefix()?.to_string_lossy().into_owned();
+    run_inner(args).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to produce somatic report generation {}: {error:#}",
+            destination_prefix.display()
+        )
+    })?;
+    transaction.commit()
+}
+
+fn somatic_artifacts(args: &SomaticArgs) -> Result<Vec<String>> {
+    let mut artifacts = [
+        "ambiclasses.csv",
+        "ambireasons.csv",
+        "features.csv",
+        "roc.csv",
+        "stats.csv",
+        "metrics.json",
+        "summary.csv",
+        "extended.csv",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if args.af_strat {
+        for (start, end) in parse_af_bins(&args.af_strat_binsize)? {
+            let interval = format_af_interval(start, end);
+            for prefix in ["records", "SNVs", "indels"] {
+                artifacts.push(format!("{prefix}.{interval}.roc.csv"));
+            }
+        }
+    }
+    Ok(artifacts)
+}
+
+fn somatic_inputs(args: &SomaticArgs) -> Vec<PathBuf> {
+    std::iter::once(args.truth.as_str())
+        .chain(std::iter::once(args.query.as_str()))
+        .chain(std::iter::once(args.reference.as_str()))
+        .chain(args.regions_bedfile.as_deref())
+        .chain(args.targets_bedfile.as_deref())
+        .chain(args.fp_bedfile.as_deref())
+        .chain(args.ambiguous_beds.iter().map(String::as_str))
+        .chain(args.bams.iter().map(String::as_str))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn run_inner(mut args: SomaticArgs) -> Result<()> {
     if let Some(config) = args.roc.as_deref().and_then(somatic_roc_config) {
         args.feature_table = Some(config.feature_table.to_string());
     }
     validate_args(&args)?;
     let af_bins = if args.af_strat {
-        parse_af_bins(&args.af_strat_binsize)
+        parse_af_bins(&args.af_strat_binsize)?
     } else {
         Vec::new()
     };
@@ -867,11 +932,13 @@ pub(crate) fn run(mut args: SomaticArgs) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    fail_operation(FailureOperation::Writer, &output)?;
     fs::write(&output, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("failed to write {}", output.display()))?;
     controls.print_default_summary(&lines);
 
     let metrics_json = suffixed_report_path(Path::new(&args.output), "metrics.json");
+    fail_operation(FailureOperation::Writer, &metrics_json)?;
     let explanation_enabled = args.explain_ambiguous && !args.ambiguous_beds.is_empty();
     write_legacy_metrics_json(
         &metrics_json,

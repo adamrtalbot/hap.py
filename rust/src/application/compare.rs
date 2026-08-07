@@ -4,6 +4,7 @@ use crate::application::{comparison_io, preprocess, roc_publication};
 use crate::cli_compat::cli::{CompareArgs, CompareEngine, PreprocessArgs};
 use crate::domain::{AnnotatedRow, CountsBucket, Interval, RawVcfRecord, TypeCounts};
 use crate::engines::partial_credit;
+use crate::output::{OutputTransaction, benchmark_artifacts, stratification_inputs};
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -371,10 +372,67 @@ pub(crate) fn run(mut args: CompareArgs) -> Result<()> {
     }
     ensure_aggregate_roc_region(&mut args.roc_regions);
     normalize_engine_preprocessing(&mut args);
+    let destination_prefix = PathBuf::from(&args.report_prefix);
+    let (inputs, mut labels) = compare_inputs(&args)?;
+    labels.extend(
+        args.roc_regions
+            .iter()
+            .filter(|label| label.as_str() != "*")
+            .cloned(),
+    );
+    let published_logfile = args.logfile.clone();
+    let logfile = args.logfile.as_ref().map(PathBuf::from);
+    let transaction =
+        OutputTransaction::family(&inputs, &destination_prefix, benchmark_artifacts(labels))?
+            .with_files(logfile.iter())?;
+    if let Some(path) = logfile.as_deref() {
+        args.logfile = Some(
+            transaction
+                .staged_file(path)?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let staged_prefix = transaction.staged_prefix()?.to_path_buf();
+    run_inner(
+        args,
+        explicit_bcf,
+        &staged_prefix,
+        published_logfile.as_deref(),
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to produce report generation {}: {error:#}",
+            destination_prefix.display()
+        )
+    })?;
+    transaction.commit()
+}
+
+fn compare_inputs(args: &CompareArgs) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let (indirect, labels) = stratification_inputs(args.strat_tsv.as_deref(), &args.strat_regions)?;
+    let mut inputs = std::iter::once(args.truth.as_str())
+        .chain(std::iter::once(args.query.as_str()))
+        .chain(std::iter::once(args.reference.as_str()))
+        .chain(args.regions_bedfile.as_deref())
+        .chain(args.targets_bedfile.as_deref())
+        .chain(args.fp_bedfile.as_deref())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    inputs.extend(indirect);
+    Ok((inputs, labels))
+}
+
+fn run_inner(
+    args: CompareArgs,
+    explicit_bcf: bool,
+    output_prefix: &Path,
+    published_logfile: Option<&str>,
+) -> Result<()> {
     initialize_compare_log(&args)?;
     log_compare_info(&args, "Starting germline comparison")?;
     let reference_path = Path::new(&args.reference);
-    let prefix = Path::new(&args.report_prefix);
+    let prefix = output_prefix;
     let reference_sequences = fasta::read_sequences(reference_path)?;
     let contig_lengths: BTreeMap<String, usize> = reference_sequences
         .iter()
@@ -496,6 +554,7 @@ pub(crate) fn run(mut args: CompareArgs) -> Result<()> {
             &query_prep,
             prefix,
             scratch,
+            published_logfile,
         );
     }
     if matches!(
@@ -510,6 +569,7 @@ pub(crate) fn run(mut args: CompareArgs) -> Result<()> {
             &query_prep,
             prefix,
             scratch,
+            published_logfile,
         );
     }
 
@@ -1014,6 +1074,7 @@ fn run_vcfeval(
     query_prep: &Path,
     prefix: &Path,
     scratch: ScratchRun,
+    published_logfile: Option<&str>,
 ) -> Result<()> {
     let mut strat_regions = args.strat_regions.clone();
     if args.adjust_conf_regions
@@ -1121,7 +1182,7 @@ fn run_vcfeval(
         )?;
     }
     let commandline = std::env::args().collect::<Vec<_>>().join(" ");
-    write_runinfo_for_args(args, explicit_bcf, prefix, &commandline)?;
+    write_runinfo_for_args(args, explicit_bcf, prefix, &commandline, published_logfile)?;
     rewrite_compare_metrics(args, prefix, &commandline, &roc_indices)?;
     publish_bcf_output(args, prefix)?;
     log_compare_info(args, "Germline comparison completed successfully")?;
@@ -1136,6 +1197,7 @@ fn run_scmp(
     query_prep: &Path,
     prefix: &Path,
     scratch: ScratchRun,
+    published_logfile: Option<&str>,
 ) -> Result<()> {
     let comparison_vcf = scratch.path().join("scmp.comparison.vcf.gz");
     let mut strat_regions = args.strat_regions.clone();
@@ -1217,7 +1279,7 @@ fn run_scmp(
         },
     )?;
     let commandline = std::env::args().collect::<Vec<_>>().join(" ");
-    write_runinfo_for_args(args, explicit_bcf, prefix, &commandline)?;
+    write_runinfo_for_args(args, explicit_bcf, prefix, &commandline, published_logfile)?;
     rewrite_compare_metrics(args, prefix, &commandline, &roc_indices)?;
     publish_bcf_output(args, prefix)?;
     log_compare_info(args, "Germline comparison completed successfully")?;
@@ -1302,6 +1364,7 @@ fn write_runinfo_for_args(
     explicit_bcf: bool,
     prefix: &Path,
     commandline: &str,
+    published_logfile: Option<&str>,
 ) -> Result<()> {
     let write_counts = args.write_counts && !args.no_write_counts;
     let run_args = metrics_json::CompareRunArgs {

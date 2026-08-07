@@ -550,18 +550,30 @@ mod tests {
             validate_args(&tiny)
                 .unwrap_err()
                 .to_string()
-                .contains("more than 10000 bins")
+                .contains("more than 100 bins")
         );
 
-        assert!(parse_af_bins("0").is_empty());
-        assert!(parse_af_bins("-0.1").is_empty());
-        let nan = parse_af_bins("nan");
+        assert!(parse_af_bins("0").unwrap().is_empty());
+        assert!(parse_af_bins("-0.1").unwrap().is_empty());
+        let nan = parse_af_bins("nan").unwrap();
         assert_eq!(nan.len(), 1);
         assert_eq!(nan[0].0, 0.0);
         assert!(nan[0].1.is_nan());
         assert_eq!(format_af_interval(nan[0].0, nan[0].1), "0.000000-nan");
-        assert_eq!(parse_af_bins("inf"), vec![(0.0, 1.000_000_01)]);
+        assert_eq!(parse_af_bins("inf").unwrap(), vec![(0.0, 1.000_000_01)]);
         assert_eq!(format_af_interval(0.0, 1.000_000_01), "0.000000-1.000000");
+    }
+
+    #[test]
+    fn af_roc_artifacts_are_declared_in_the_transaction_plan() {
+        let mut args = parsed_somatic(&["--bin-afs", "--af-binsize", "0.5"]);
+        args.roc = Some("generic".to_string());
+        let artifacts = somatic_artifacts(&args).unwrap();
+        for prefix in ["records", "SNVs", "indels"] {
+            for interval in ["0.000000-0.500000", "0.500000-1.000000"] {
+                assert!(artifacts.contains(&format!("{prefix}.{interval}.roc.csv")));
+            }
+        }
     }
 
     #[test]

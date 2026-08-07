@@ -144,7 +144,7 @@ pub(super) fn write_happy_style_extended(
         _ => "NA",
     };
 
-    for (start, end) in parse_af_bins(bin_sizes) {
+    for (start, end) in parse_af_bins(bin_sizes)? {
         let inclusive_last = end >= 1.0;
         let subset = if inclusive_last {
             format!("[{start:.2},1.00]")
@@ -282,7 +282,7 @@ pub(super) fn calculate_af_stats(
         .collect::<Vec<_>>();
 
     let mut output = Vec::new();
-    for (start, end) in parse_af_bins(bin_sizes) {
+    for (start, end) in parse_af_bins(bin_sizes)? {
         let in_bin = |row: &[String], index: usize| {
             row.get(index)
                 .and_then(|value| value.parse::<f64>().ok())
