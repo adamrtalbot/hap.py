@@ -1,6 +1,22 @@
 //! Cohesive preprocessing responsibility.
 
-use super::*;
+use super::alleles::{
+    calls_non_ref_allele, convert_gvcf_record, convert_somatic_record,
+    finalize_somatic_for_pipeline, materialize_symbolic_deletion, trim_uncalled_non_ref,
+};
+use super::canonical::validate_record_reference;
+use super::normalization::{normalize_bcftools_record, record_reference_matches};
+use super::options::{add_legacy_chr_prefix, has_non_reference_genotype, passes_filters_only};
+use super::{
+    BlocksplitContigState, BlocksplitJob, BlocksplitObservation, BlocksplitSelection,
+    LEGACY_MIN_BLOCK_VARIANTS,
+};
+use crate::adapters::vcf;
+use crate::cli_compat::cli::{PreprocessArgs, SomaticGtMode};
+use crate::domain::{Interval, RawVcfRecord};
+use anyhow::Result;
+use std::collections::HashSet;
+use std::path::Path;
 
 pub(super) fn collect_blocksplit_observations(
     records: &[RawVcfRecord],

@@ -1,6 +1,17 @@
 //! Cohesive responsibility extracted from the command façade.
 
-use super::*;
+use super::features::csv_join;
+use super::features::write_simple_table;
+use super::metrics::python2_counter_indices;
+use super::{AmbiguousInterval, FilteredRawRecord, MAX_AF_BINS, QueryClass};
+use crate::adapters::report;
+use crate::adapters::vcf;
+use crate::cli_compat::cli::SomaticArgs;
+use crate::domain::{Interval, RawVcfRecord};
+use anyhow::{Context, Result, bail};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
 
 pub(super) fn validate_args(args: &SomaticArgs) -> Result<()> {
     if args.af_strat && args.feature_table.is_none() {
@@ -289,18 +300,6 @@ pub(super) fn classify_query(
     } else {
         QueryClass::Fp
     }
-}
-
-pub(super) fn ratio(numerator: usize, denominator: usize) -> f64 {
-    if denominator == 0 {
-        0.0
-    } else {
-        numerator as f64 / denominator as f64
-    }
-}
-
-pub(super) fn py_float(value: f64) -> String {
-    crate::adapters::report::python_repr_float(value)
 }
 
 pub(super) fn normalize_somatic_records(

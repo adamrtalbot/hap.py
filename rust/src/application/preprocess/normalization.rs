@@ -1,6 +1,10 @@
 //! Reference-aware left-shift and trimming.
 
-use super::*;
+use super::LEFT_SHIFT_WINDOW;
+use super::canonical::STALE_INFO_KEYS;
+use super::genotype::expand_haploid_gt;
+use crate::domain::RawVcfRecord;
+use crate::engines::partial_credit;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_left_shift(record: &mut RawVcfRecord, reference: &[u8], neighbor_end: usize) {
@@ -283,17 +287,4 @@ pub(super) fn expand_male_sex_chromosome_genotypes(record: &mut RawVcfRecord) {
         }
         *sample = cells.join(":");
     }
-}
-
-/// Case-insensitive DNA byte-slice equality with IUPAC `N` treated as a wildcard.
-/// Mirrors the tolerance of the legacy hap.py / bcftools preprocessing pass.
-pub(super) fn ref_bytes_equal(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).all(|(x, y)| {
-        let xu = x.to_ascii_uppercase();
-        let yu = y.to_ascii_uppercase();
-        xu == yu || xu == b'N' || yu == b'N'
-    })
 }

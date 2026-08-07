@@ -979,29 +979,31 @@ fn sort_comparison_rows(rows: &mut [AnnotatedRow], filtered_truth_keys: &BTreeSe
             })
             .then(left.sort_key.2.cmp(&right.sort_key.2))
             .then(left.sort_key.3.cmp(&right.sort_key.3))
-            .then_with(|| left.record.cmp(&right.record))
+            .then_with(|| {
+                (
+                    &left.record.ref_allele,
+                    &left.record.alt_allele,
+                    &left.record.filter,
+                    &left.record.info,
+                    &left.record.samples,
+                )
+                    .cmp(&(
+                        &right.record.ref_allele,
+                        &right.record.alt_allele,
+                        &right.record.filter,
+                        &right.record.info,
+                        &right.record.samples,
+                    ))
+            })
     });
 }
 
 fn row_matches_variant_key(row: &AnnotatedRow, keys: &BTreeSet<VariantKey>) -> bool {
-    let mut fields = row.record.split('\t');
-    let (Some(chrom), Some(pos), Some(_id), Some(ref_allele), Some(alt_allele)) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
-        return false;
-    };
-    let Ok(pos) = pos.parse::<usize>() else {
-        return false;
-    };
     keys.contains(&VariantKey {
-        chrom: chrom.to_string(),
-        pos,
-        ref_allele: ref_allele.to_string(),
-        alt_allele: alt_allele.to_string(),
+        chrom: row.record.chrom.clone(),
+        pos: row.record.pos,
+        ref_allele: row.record.ref_allele.clone(),
+        alt_allele: row.record.alt_allele.clone(),
     })
 }
 

@@ -1,6 +1,13 @@
 //! Cohesive preprocessing responsibility.
 
-use super::*;
+use crate::adapters::vcf;
+use crate::cli_compat::cli::{PreprocessArgs, PreprocessGender};
+use crate::domain::RawVcfRecord;
+use anyhow::{Context, Result, bail};
+use std::collections::BTreeSet;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 pub(super) fn sort_normalized_records(records: &mut [RawVcfRecord]) {
     let mut contig_ranks = std::collections::HashMap::new();

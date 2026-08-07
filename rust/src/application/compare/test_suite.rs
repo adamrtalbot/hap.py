@@ -5,6 +5,10 @@ mod scratch_tests {
     use super::super::*;
     use std::thread;
 
+    fn comparison_record(line: &str) -> RawVcfRecord {
+        RawVcfRecord::from_line(line, Path::new("comparison-test.vcf")).unwrap()
+    }
+
     #[test]
     fn comparison_headers_merge_inputs_and_append_legacy_annotations() {
         let truth = vec![
@@ -502,7 +506,7 @@ mod scratch_tests {
     fn subset_derivation_stops_regions_at_the_next_info_field() {
         let rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            record: vcf::comparison_record_from_line(
+            record: comparison_record(
                 &concat!(
                     "chr1\t7\t.\tA\tC\t30\tPASS\t",
                     "BS=7;Regions=CONF,TS_boundary,TS_contained;AF=0.5;VTC=nuc__s\t",
@@ -533,7 +537,7 @@ mod scratch_tests {
     fn requantify_handoff_drops_only_provisional_truth_set_membership() {
         let rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            record: vcf::comparison_record_from_line(
+            record: comparison_record(
                 &concat!(
                     "chr1\t7\t.\tA\tC\t30\tPASS\t",
                     "BS=7;Regions=CONF,TS_boundary,EXTRA,TS_contained;RegionsExtent=7-7\t",
@@ -552,15 +556,17 @@ mod scratch_tests {
         assert!(
             rows[0]
                 .record
+                .info
                 .contains("Regions=CONF,TS_boundary,EXTRA,TS_contained")
         );
         assert!(
             sanitized[0]
                 .record
+                .info
                 .contains("BS=7;Regions=CONF,EXTRA;RegionsExtent=7-7")
         );
-        assert!(!sanitized[0].record.contains("TS_boundary"));
-        assert!(!sanitized[0].record.contains("TS_contained"));
+        assert!(!sanitized[0].record.info.contains("TS_boundary"));
+        assert!(!sanitized[0].record.info.contains("TS_contained"));
     }
 
     #[test]
@@ -684,7 +690,7 @@ mod scratch_tests {
         .unwrap();
         let mut rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            record: vcf::comparison_record_from_line(
+            record: comparison_record(
                 &concat!(
                     "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
                     "GT:BD:BK:BVT:BLT:QQ\t",
@@ -699,14 +705,14 @@ mod scratch_tests {
         }];
         decorate_output_rows(&mut rows, &[source], &[], true, true, "QUAL").unwrap();
         assert!(
-            rows[0].record.contains(concat!(
+            rows[0].record.info.contains(concat!(
                 "BS=7;IQQ=30;SCORE=9;ctype=simple:match;gtt1=gt_het;",
                 "gtt2=gt_het;kind=match;type=TP;Regions=CONF;RegionsExtent=7-7;",
                 "XCMP=TP:match:gt_het:gt_het:simple:match;",
                 "VTC=nuc__s,al__s,het__rs"
             )),
             "{}",
-            rows[0].record
+            rows[0].record.info
         );
         let headers = build_vcf_headers(&[], &[], false, true, true, "QUAL");
         assert!(
@@ -744,7 +750,7 @@ mod scratch_tests {
         .unwrap();
         let mut rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            record: vcf::comparison_record_from_line(
+            record: comparison_record(
                 &concat!(
                     "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
                     "GT:BD:BK:BVT:BLT:QQ\t",
@@ -760,8 +766,7 @@ mod scratch_tests {
 
         decorate_output_rows(&mut rows, &[source], &[], true, false, "INFO.SCORE").unwrap();
 
-        let record =
-            RawVcfRecord::from_line(&rows[0].record.to_line(), Path::new("output.vcf")).unwrap();
+        let record = &rows[0].record;
         assert!(record.info.contains("SCORE=9"));
         assert!(!record.info.contains("INFO.SCORE="));
         assert!(!record.info.contains("IQQ="));
@@ -1186,14 +1191,13 @@ mod memory_guards {
         let truth = variant(25, "A", "G", "1/1").with_qual("60");
         let query = variant(25, "A", "G", "1/1").with_qual("55");
         let row = tp_combined_row(&truth, &query, "A", 25, "");
-        let fields = row.record.split('\t').collect::<Vec<_>>();
-        assert_eq!(fields[5], "60");
-        assert!(fields[9].ends_with(":55"));
-        assert!(fields[10].ends_with(":55"));
+        assert_eq!(row.record.qual, "60");
+        assert!(row.record.samples[0].ends_with(":55"));
+        assert!(row.record.samples[1].ends_with(":55"));
 
         let higher_query = query.with_qual("65");
         let row = tp_combined_row(&truth, &higher_query, "A", 25, "");
-        assert_eq!(row.record.split('\t').nth(5), Some("65"));
+        assert_eq!(row.record.qual, "65");
     }
 
     #[test]
@@ -1285,7 +1289,7 @@ mod memory_guards {
     fn filtered_truth_counterpart_sorts_first_at_shared_locus() {
         let row = |alt: &str, side_rank| AnnotatedRow {
             sort_key: ("chr21".to_string(), 15576177, side_rank, 0),
-            record: vcf::comparison_record_from_line(&format!(
+            record: comparison_record(&format!(
                 "chr21\t15576177\t.\tG\t{alt}\t0\t.\tBS=15576177\tGT\t./.\t0/1"
             )),
             query_pass: true,
@@ -1303,7 +1307,7 @@ mod memory_guards {
 
         sort_comparison_rows(&mut rows, &keys);
 
-        assert!(rows[0].record.contains("\tG\tA\t"));
+        assert!(rows[0].record.alt_allele == "A");
     }
 
     #[test]

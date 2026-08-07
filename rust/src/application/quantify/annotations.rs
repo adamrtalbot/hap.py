@@ -1,6 +1,17 @@
 //! Cohesive quantify annotations responsibility.
 
-use super::*;
+use super::{BenchmarkSamples, RegionLevels};
+use crate::adapters::report::{self, suffixed_report_path};
+use crate::adapters::vcf;
+use crate::domain::RawVcfRecord;
+use crate::engines::roc;
+use anyhow::{Context, Result, bail};
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct Ga4ghAnnotation {

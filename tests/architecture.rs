@@ -65,29 +65,56 @@ fn flatten_use(tree: &UseTree, prefix: &mut Vec<String>, output: &mut Vec<Vec<St
     }
 }
 
+fn contains_glob(tree: &UseTree) -> bool {
+    match tree {
+        UseTree::Path(path) => contains_glob(&path.tree),
+        UseTree::Group(group) => group.items.iter().any(contains_glob),
+        UseTree::Glob(_) => true,
+        UseTree::Name(_) | UseTree::Rename(_) => false,
+    }
+}
+
 struct DependencyVisitor {
     current: Vec<String>,
-    references: Vec<Vec<String>>,
+    references: Vec<(Vec<String>, Vec<String>)>,
 }
 
 impl<'ast> Visit<'ast> for DependencyVisitor {
     fn visit_item_use(&mut self, node: &'ast ItemUse) {
-        flatten_use(&node.tree, &mut Vec::new(), &mut self.references);
+        let mut paths = Vec::new();
+        flatten_use(&node.tree, &mut Vec::new(), &mut paths);
+        self.references
+            .extend(paths.into_iter().map(|path| (self.current.clone(), path)));
         visit::visit_item_use(self, node);
     }
 
     fn visit_path(&mut self, node: &'ast syn::Path) {
-        self.references.push(
+        self.references.push((
+            self.current.clone(),
             node.segments
                 .iter()
                 .map(|segment| segment.ident.to_string())
                 .collect(),
-        );
+        ));
         visit::visit_path(self, node);
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if let Some((_, items)) = &node.content {
+            self.current.push(node.ident.to_string());
+            for item in items {
+                self.visit_item(item);
+            }
+            self.current.pop();
+        }
     }
 }
 
-fn canonical_reference(current: &[String], raw: &[String]) -> Option<String> {
+fn canonical_reference(
+    current: &[String],
+    raw: &[String],
+    modules: &BTreeSet<String>,
+) -> Option<String> {
     if raw.is_empty() {
         return None;
     }
@@ -106,21 +133,16 @@ fn canonical_reference(current: &[String], raw: &[String]) -> Option<String> {
             }
         }
         first if LAYERS.contains(&first) => resolved.clear(),
-        _ => return None,
+        _ => {}
     }
     resolved.extend(raw[index..].iter().cloned());
-    if resolved.len() < 2 || !LAYERS.contains(&resolved[0].as_str()) {
+    if resolved.is_empty() || !LAYERS.contains(&resolved[0].as_str()) {
         return None;
     }
-    Some(format!("{}::{}", resolved[0], resolved[1]))
-}
-
-fn owner(module: &[String]) -> String {
-    format!(
-        "{}::{}",
-        module[0],
-        module.get(1).map(String::as_str).unwrap_or("__root")
-    )
+    (1..=resolved.len()).rev().find_map(|length| {
+        let candidate = resolved[..length].join("::");
+        modules.contains(&candidate).then_some(candidate)
+    })
 }
 
 fn allowed_dependency(from: &str, to: &str) -> bool {
@@ -138,31 +160,52 @@ fn allowed_dependency(from: &str, to: &str) -> bool {
 
 fn dependency_graph() -> BTreeMap<String, BTreeSet<String>> {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("rust/src");
-    let mut graph = BTreeMap::<String, BTreeSet<String>>::new();
-    for layer in LAYERS {
-        for path in rust_files(&source_root.join(layer)) {
-            let module = module_path(&source_root, &path);
-            let source_owner = owner(&module);
-            let source = fs::read_to_string(&path).expect("Rust source is readable");
-            let syntax = syn::parse_file(&source)
-                .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
-            let mut visitor = DependencyVisitor {
-                current: module,
-                references: Vec::new(),
-            };
-            visitor.visit_file(&syntax);
-            let edges = graph.entry(source_owner.clone()).or_default();
-            for raw in visitor.references {
-                if let Some(target) = canonical_reference(&visitor.current, &raw)
-                    && target != source_owner
-                {
+    let files = LAYERS
+        .iter()
+        .flat_map(|layer| rust_files(&source_root.join(layer)))
+        .collect::<Vec<_>>();
+    let modules = files
+        .iter()
+        .map(|path| module_path(&source_root, path).join("::"))
+        .collect::<BTreeSet<_>>();
+    let mut graph = modules
+        .iter()
+        .cloned()
+        .map(|module| (module, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for path in files {
+        let module = module_path(&source_root, &path);
+        let source_owner = module.join("::");
+        let source = fs::read_to_string(&path).expect("Rust source is readable");
+        let syntax = syn::parse_file(&source)
+            .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+        if module.len() >= 3 {
+            for item in &syntax.items {
+                if let syn::Item::Use(item_use) = item {
                     assert!(
-                        allowed_dependency(&source_owner, &target),
-                        "forbidden architectural dependency {source_owner} -> {target} in {}",
+                        !contains_glob(&item_use.tree),
+                        "extracted module {} must use explicit imports",
                         path.display()
                     );
-                    edges.insert(target);
                 }
+            }
+        }
+        let mut visitor = DependencyVisitor {
+            current: module,
+            references: Vec::new(),
+        };
+        visitor.visit_file(&syntax);
+        let edges = graph.entry(source_owner.clone()).or_default();
+        for (context, raw) in visitor.references {
+            if let Some(target) = canonical_reference(&context, &raw, &modules)
+                && target != source_owner
+            {
+                assert!(
+                    allowed_dependency(&source_owner, &target),
+                    "forbidden architectural dependency {source_owner} -> {target} in {}",
+                    path.display()
+                );
+                edges.insert(target);
             }
         }
     }
@@ -186,11 +229,26 @@ fn visit_node(
     visiting.push(node.to_string());
     if let Some(edges) = graph.get(node) {
         for target in edges {
-            visit_node(target, graph, visiting, complete);
+            if !is_facade_containment_edge(node, target) {
+                visit_node(target, graph, visiting, complete);
+            }
         }
     }
     visiting.pop();
     complete.insert(node.to_string());
+}
+
+fn is_facade_containment_edge(left: &str, right: &str) -> bool {
+    let left = left.split("::").collect::<Vec<_>>();
+    let right = right.split("::").collect::<Vec<_>>();
+    let (facade, child) = if left.len() == 2 && right.len() > 2 {
+        (&left, &right)
+    } else if right.len() == 2 && left.len() > 2 {
+        (&right, &left)
+    } else {
+        return false;
+    };
+    child.starts_with(facade)
 }
 
 #[test]

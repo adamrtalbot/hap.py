@@ -1,6 +1,19 @@
 //! Cohesive responsibility extracted from the command façade.
 
-use super::*;
+use super::allele_frequency::{parse_af_bins, round_four, rounded_metric};
+use super::features::{csv_join, write_simple_table};
+use super::metrics::{jeffreys_ci, py_float, ratio};
+use super::{
+    AmbiguousInterval, FilteredCounts, FilteredRawRecord, SOM_VERSION, SomaticCounts,
+    StatsRowContext, somatic_roc_config,
+};
+use crate::adapters::vcf;
+use crate::domain::{Interval, RawVcfRecord};
+use anyhow::{Context, Result};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 
 pub(super) fn write_happy_style_summary(
     path: &Path,

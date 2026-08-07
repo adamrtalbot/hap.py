@@ -56,7 +56,7 @@ pub(super) fn format_af_interval(start: f64, end: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{format_af_interval, parse_af_bins};
 
     #[test]
     fn bins_include_one_using_the_legacy_epsilon() {

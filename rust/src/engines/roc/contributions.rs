@@ -1,6 +1,8 @@
 //! Cohesive ROC contributions responsibility.
 
-use super::*;
+use super::model::{Cumul, RowKey, Sample};
+use super::{INDEL_SUBTYPES, RocOptions};
+use crate::domain::{AnnotatedRow, CountsBucket};
 
 pub(super) fn emit_contributions_with_options<
     F: FnMut(RowKey, Option<f64>, &Cumul, &[String], Option<&str>, Option<&str>),
@@ -9,17 +11,21 @@ pub(super) fn emit_contributions_with_options<
     options: &RocOptions,
     mut emit: F,
 ) {
-    let fields: Vec<&str> = row.record.split('\t').collect();
-    if fields.len() < 11 {
+    let Some(format) = row.record.format.as_deref() else {
         return;
-    }
+    };
+    let (Some(truth_sample), Some(query_sample)) =
+        (row.record.samples.first(), row.record.samples.get(1))
+    else {
+        return;
+    };
 
-    let info = fields[7];
+    let info = row.record.info.as_str();
     let subsets = extract_subsets(info);
 
-    let format_keys: Vec<&str> = fields[8].split(':').collect();
-    let truth_parts: Vec<&str> = fields[9].split(':').collect();
-    let query_parts: Vec<&str> = fields[10].split(':').collect();
+    let format_keys: Vec<&str> = format.split(':').collect();
+    let truth_parts: Vec<&str> = truth_sample.split(':').collect();
+    let query_parts: Vec<&str> = query_sample.split(':').collect();
     let truth = Sample::new(&format_keys, &truth_parts);
     let query = Sample::new(&format_keys, &query_parts);
 
@@ -28,10 +34,12 @@ pub(super) fn emit_contributions_with_options<
     // xcmp output sets QUAL=0 while still writing the matched per-side
     // quality into FORMAT.QQ.
     let score_field = options.score_field.as_deref().unwrap_or(&options.qq_field);
-    let truth_qq = truth.roc_value(score_field, fields[5], info);
-    let query_qq = query.roc_value(score_field, fields[5], info);
+    let truth_qq = truth.roc_value(score_field, &row.record.qual, info);
+    let query_qq = query.roc_value(score_field, &row.record.qual, info);
 
-    let filter_tags = fields[6]
+    let filter_tags = row
+        .record
+        .filter
         .split(';')
         .filter(|tag| !tag.is_empty() && *tag != "." && *tag != "PASS")
         .collect::<Vec<_>>();

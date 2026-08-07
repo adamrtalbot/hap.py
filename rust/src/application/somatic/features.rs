@@ -1,6 +1,12 @@
 //! Cohesive responsibility extracted from the command façade.
 
-use super::*;
+use crate::application::ftx;
+use crate::domain::RawVcfRecord;
+use crate::engines::strelka;
+use anyhow::{Context, Result, bail};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
 
 pub(super) fn renumber_feature_rows(groups: &[Vec<String>]) -> Vec<String> {
     let mut out = Vec::new();

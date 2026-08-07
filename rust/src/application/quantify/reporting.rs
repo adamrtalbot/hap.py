@@ -1,6 +1,15 @@
 //! Cohesive quantify reporting responsibility.
 
-use super::*;
+use super::{ExtendedTableOptions, INDEL_SUBTYPES, QuantifyCountMaps, QuantifyTypeCounts};
+use crate::adapters::metrics_json;
+use crate::adapters::report::{self, suffixed_report_path};
+use crate::domain::{CountsBucket, TypeCounts};
+use crate::engines::roc;
+use anyhow::{Context, Result};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 pub(super) fn write_quantify_summary(
     path: &Path,

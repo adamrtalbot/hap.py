@@ -4,6 +4,10 @@
 mod tests {
     use super::super::*;
 
+    fn comparison_record(line: &str) -> crate::domain::RawVcfRecord {
+        crate::domain::RawVcfRecord::from_line(line, std::path::Path::new("roc-test.vcf")).unwrap()
+    }
+
     #[test]
     fn half_call_is_not_counted_as_heterozygous_in_roc_stats() {
         let format = ["GT", "BD", "BI", "BVT", "BLT", "QQ"];
@@ -100,7 +104,7 @@ mod tests {
         );
         AnnotatedRow {
             sort_key: (chrom.to_string(), pos, 1, 0),
-            record: crate::adapters::vcf::comparison_record_from_line(&line),
+            record: comparison_record(&line),
             query_pass,
             fp_class,
             xcmp_ctype: None,
@@ -759,7 +763,7 @@ mod tests {
             true,
             None,
         );
-        first.record = first.record.replace("BS=1", "BS=1;SCORE=10.0");
+        first.record.info = first.record.info.replace("BS=1", "BS=1;SCORE=10.0");
         let mut second = annotated(
             "chr1",
             200,
@@ -770,7 +774,7 @@ mod tests {
             true,
             None,
         );
-        second.record = second.record.replace("BS=1", "BS=1;SCORE=10.4");
+        second.record.info = second.record.info.replace("BS=1", "BS=1;SCORE=10.4");
         let options = RocOptions {
             qq_field: "SCORE".to_string(),
             delta: 0.0,
@@ -843,7 +847,7 @@ mod tests {
             false,
             None,
         );
-        row.record = row.record.replacen("\t.\tBS=1", "\tLowQual\tBS=1", 1);
+        row.record.filter = "LowQual".to_string();
         let options = RocOptions {
             ignored_filters: HashSet::from(["LowQual".to_string()]),
             ..RocOptions::default()
@@ -872,7 +876,7 @@ mod tests {
             false,
             None,
         );
-        row.record = row.record.replacen("\t.\tBS=1", "\tLowQual\tBS=1", 1);
+        row.record.filter = "LowQual".to_string();
         let options = RocOptions {
             roc_regions: HashSet::from(["TS_contained".to_string()]),
             ..RocOptions::default()

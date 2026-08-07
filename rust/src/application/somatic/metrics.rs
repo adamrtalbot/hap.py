@@ -1,6 +1,22 @@
 //! Metrics JSON and confidence calculations.
 
-use super::*;
+use anyhow::{Context, Result};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(super) fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+pub(super) fn py_float(value: f64) -> String {
+    crate::adapters::report::python_repr_float(value)
+}
 
 pub(super) fn write_legacy_metrics_json(
     path: &Path,

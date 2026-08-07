@@ -1,54 +1,11 @@
 //! Cohesive ROC accumulation responsibility.
 
-use super::*;
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(super) struct RowKey {
-    // Legacy sort order: (Type, Subtype, Subset, Filter, Genotype, QQ.Field)
-    // all ascending. Derive Ord via field order.
-    pub(super) ty: String,
-    pub(super) subtype: String,
-    pub(super) subset: String,
-    pub(super) filter: String,
-    pub(super) genotype: String,
-    pub(super) qq_field: String,
-}
-
-impl RowKey {
-    #[cfg(test)]
-    pub(super) fn new(ty: &str, subtype: &str, subset: &str, filter: &str) -> Self {
-        Self::new_with_qq_field(ty, subtype, subset, filter, "QUAL")
-    }
-
-    pub(super) fn new_with_qq_field(
-        ty: &str,
-        subtype: &str,
-        subset: &str,
-        filter: &str,
-        qq_field: &str,
-    ) -> Self {
-        Self {
-            ty: ty.to_string(),
-            subtype: subtype.to_string(),
-            subset: subset.to_string(),
-            filter: filter.to_string(),
-            genotype: "*".to_string(),
-            qq_field: qq_field.to_string(),
-        }
-    }
-}
-
-/// Aggregated counts for one cumulative ROC row (or baseline).
-#[derive(Clone, Debug, Default)]
-pub(super) struct Cumul {
-    pub(super) truth_tp: CountsBucket,
-    pub(super) truth_fn: CountsBucket,
-    pub(super) query_tp: CountsBucket,
-    pub(super) query_fp: CountsBucket,
-    pub(super) query_unk: CountsBucket,
-    pub(super) fp_gt: usize,
-    pub(super) fp_al: usize,
-}
+use super::contributions::emit_contributions_with_options;
+use super::model::{Cumul, RowKey};
+use super::{EXTENDED_HEADER, RocOptions};
+use crate::domain::{AnnotatedRow, CountsBucket};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Per-record observation that mirrors a single legacy `roc::Observation`
 /// entry. Each call into `emit_contributions` produces exactly one such
@@ -80,27 +37,6 @@ pub(super) struct ObsRecord {
     pub(super) ti_flag: bool,
     pub(super) tv_flag: bool,
     pub(super) blt: Option<String>,
-}
-
-impl Cumul {
-    pub(super) fn add(&mut self, other: &Cumul) {
-        add_bucket(&mut self.truth_tp, &other.truth_tp);
-        add_bucket(&mut self.truth_fn, &other.truth_fn);
-        add_bucket(&mut self.query_tp, &other.query_tp);
-        add_bucket(&mut self.query_fp, &other.query_fp);
-        add_bucket(&mut self.query_unk, &other.query_unk);
-        self.fp_gt += other.fp_gt;
-        self.fp_al += other.fp_al;
-    }
-
-    pub(super) fn truth_total(&self) -> CountsBucket {
-        sum_buckets(&self.truth_tp, &self.truth_fn)
-    }
-
-    pub(super) fn query_total(&self) -> CountsBucket {
-        let a = sum_buckets(&self.query_tp, &self.query_fp);
-        sum_buckets(&a, &self.query_unk)
-    }
 }
 
 pub(super) fn add_bucket(dst: &mut CountsBucket, src: &CountsBucket) {
@@ -988,98 +924,4 @@ pub(super) fn roc_header(ci_alpha: f64) -> String {
 
 pub(super) fn is_aggregate_filter(filter: &str) -> bool {
     matches!(filter, "ALL" | "PASS" | "SEL")
-}
-
-// ---------------------------------------------------------------------------
-// Per-row contribution emission
-// ---------------------------------------------------------------------------
-
-/// Lightweight VCF sample parser (reads the handful of FORMAT keys roc.rs
-/// cares about). Mirrors `compare::SampleView` without introducing a
-/// cross-module dep on the private struct.
-pub(super) struct Sample<'a> {
-    pub(super) format_keys: &'a [&'a str],
-    pub(super) parts: &'a [&'a str],
-    pub(super) gt: Option<&'a str>,
-    pub(super) bd: Option<&'a str>,
-    pub(super) bi: Option<&'a str>,
-    pub(super) bvt: Option<&'a str>,
-    pub(super) blt: Option<&'a str>,
-    pub(super) qq: Option<&'a str>,
-}
-
-impl<'a> Sample<'a> {
-    pub(super) fn new(format_keys: &'a [&'a str], parts: &'a [&'a str]) -> Self {
-        let lookup = |name: &str| -> Option<&'a str> {
-            format_keys
-                .iter()
-                .position(|key| *key == name)
-                .and_then(|index| parts.get(index).copied())
-        };
-        Self {
-            format_keys,
-            parts,
-            gt: lookup("GT"),
-            bd: lookup("BD"),
-            bi: lookup("BI"),
-            bvt: lookup("BVT"),
-            blt: lookup("BLT"),
-            qq: lookup("QQ"),
-        }
-    }
-
-    pub(super) fn variant_type(&self) -> Option<&'a str> {
-        self.bvt.filter(|value| matches!(*value, "SNP" | "INDEL"))
-    }
-
-    /// Per-side ROC threshold value: legacy hap.py uses each sample's
-    /// FORMAT.QQ for its own ROC sweep, **not** the record's QUAL column.
-    /// This matters on multi-allelic indels where xcmp emits `QUAL=0`
-    /// at the record level but writes the matched query's quality into
-    /// each sample's QQ field — meaning truth-side and query-side ROC
-    /// thresholds can differ for the same record. Reading QUAL would
-    /// drop ~800 chr21 records into the QQ=0 bucket and shift their
-    /// cumulative TPs out of the > QUAL>0 thresholds, breaking ROC
-    /// parity at the upper end.
-    pub(super) fn roc_qq(&self) -> Option<f64> {
-        self.qq.and_then(|raw| raw.parse::<f64>().ok())
-    }
-
-    pub(super) fn roc_value(&self, field: &str, record_qual: &str, info: &str) -> Option<f64> {
-        // QUAL has already been propagated into FORMAT/QQ by xcmp, including
-        // the truth-side superlocus minimum adjustment. Reading QQ here is
-        // therefore required for parity rather than using the record column.
-        if field == "QUAL" || field == "QQ" {
-            return self.roc_qq();
-        }
-        if field == "." {
-            return None;
-        }
-        if let Some(value) = info.split(';').find_map(|entry| {
-            entry
-                .split_once('=')
-                .filter(|(key, _)| *key == field)
-                .map(|(_, value)| value)
-        }) {
-            return parse_roc_number(value);
-        }
-        self.format_keys
-            .iter()
-            .position(|key| *key == field)
-            .and_then(|index| self.parts.get(index).copied())
-            .and_then(parse_roc_number)
-            .or_else(|| {
-                (field == "QUAL")
-                    .then(|| parse_roc_number(record_qual))
-                    .flatten()
-            })
-    }
-}
-
-pub(super) fn parse_roc_number(raw: &str) -> Option<f64> {
-    raw.split(',')
-        .next()
-        .filter(|value| !matches!(*value, "" | "."))
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
 }

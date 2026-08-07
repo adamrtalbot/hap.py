@@ -1,6 +1,11 @@
 //! Cohesive preprocessing responsibility.
 
-use super::*;
+use super::genotype::{bcf_encoded_gt, project_split_ad, project_split_genotype, remap_gt};
+use super::options::SymbolicDeletionMaterialization;
+use crate::cli_compat::cli::{PreprocessArgs, SomaticGtMode};
+use crate::domain::RawVcfRecord;
+use anyhow::{Result, bail};
+use std::collections::BTreeSet;
 
 pub(super) fn materialize_symbolic_deletion(
     record: &mut RawVcfRecord,

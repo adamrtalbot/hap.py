@@ -1,6 +1,8 @@
 //! Cohesive quantify counting responsibility.
 
-use super::*;
+use super::{ClassifiedVariant, INDEL_SUBTYPES, QuantifyCountMaps, QuantifyTypeCounts};
+use crate::domain::{CountsBucket, RawVcfRecord, TypeCounts};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn contigs_in_input(records: &[RawVcfRecord]) -> BTreeSet<String> {
     records.iter().map(|record| record.chrom.clone()).collect()

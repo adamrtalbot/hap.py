@@ -362,10 +362,7 @@ fn run_with_metric_indices_mode(
         .filter_map(|(index, record)| {
             Some(AnnotatedRow {
                 sort_key: (record.chrom.clone(), record.pos, index, 0),
-                record: vcf::comparison_record_from_line(&roc_record_line(
-                    record,
-                    benchmark_samples,
-                )?),
+                record: roc_record(record, benchmark_samples)?,
                 query_pass: record.is_pass(),
                 fp_class: benchmark_samples
                     .query
@@ -466,13 +463,13 @@ fn benchmark_sample_indices(headers: &[String]) -> BenchmarkSamples {
     }
 }
 
-fn roc_record_line(record: &RawVcfRecord, samples: BenchmarkSamples) -> Option<String> {
+fn roc_record(record: &RawVcfRecord, samples: BenchmarkSamples) -> Option<RawVcfRecord> {
     let mut normalized = record.clone();
     normalized.samples = vec![
         record.samples.get(samples.truth?)?.clone(),
         record.samples.get(samples.query?)?.clone(),
     ];
-    Some(normalized.to_line())
+    Some(normalized)
 }
 
 fn legacy_roc_delta(delta: f64) -> f64 {

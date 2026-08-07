@@ -1,6 +1,14 @@
 //! Cohesive ROC legacy responsibility.
 
-use super::*;
+use super::accumulation::{
+    GroupAccum, ObsRecord, add_buckets_total, introsort_libstdcpp, is_aggregate_filter, sub_buckets,
+};
+use super::model::{Cumul, RowKey};
+use super::rendering::subset_size_cells;
+use super::{MetricIndices, RocOptions};
+use crate::domain::CountsBucket;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 pub(super) struct MetricRows<'a> {
     pub(super) all: &'a [String],

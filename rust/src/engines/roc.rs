@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 mod accumulation;
 mod contributions;
 mod legacy;
+mod model;
 mod rendering;
 
 #[cfg(test)]
@@ -33,6 +34,7 @@ use crate::domain::jeffreys_interval;
 use accumulation::*;
 use contributions::*;
 use legacy::*;
+use model::*;
 use rendering::*;
 
 const INDEL_SUBTYPES: [&str; 9] = [

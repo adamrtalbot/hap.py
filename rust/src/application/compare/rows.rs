@@ -1,6 +1,37 @@
 //! Extracted cohesive responsibility from the command façade.
 
-use super::*;
+use super::{
+    AnnotatedRow, Cluster, Side, Variant, comparison_info, fp_class_from_bk, genotype_label,
+    query_type_rank,
+};
+use crate::adapters::vcf::VariantKey;
+use crate::domain::RawVcfRecord;
+use crate::engines::partial_credit;
+use std::collections::BTreeSet;
+
+fn comparison_record(
+    variant: &Variant,
+    reference: String,
+    alternate: String,
+    quality: String,
+    filter: String,
+    info: String,
+    truth_sample: String,
+    query_sample: String,
+) -> RawVcfRecord {
+    RawVcfRecord {
+        chrom: variant.key.chrom.clone(),
+        pos: variant.key.pos,
+        id: ".".to_string(),
+        ref_allele: reference,
+        alt_allele: alternate,
+        qual: quality,
+        filter,
+        info,
+        format: Some("GT:BD:BK:BI:BVT:BLT:QQ".to_string()),
+        samples: vec![truth_sample, query_sample],
+    }
+}
 
 pub(super) fn combined_record_qual<'a>(truth: &'a Variant, query: &'a Variant) -> &'a str {
     let numeric = |qual: &str| {
@@ -30,24 +61,28 @@ pub(super) fn tp_combined_row(
         fp_class: None,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        record: vcf::comparison_record_from_line(&format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:TP:gm:{info}:{type_label}:{truth_loc}:{qq}\t{query_gt}:TP:gm:{info}:{type_label}:{query_loc}:{qq}",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = combined_record_qual(truth, query),
-            filter = filter_for_output(&query.filter),
-            bs = block_start,
-            regions = regions,
-            truth_gt = truth.gt,
-            query_gt = query.gt,
-            info = info,
-            type_label = truth.primary_type(),
-            truth_loc = genotype_label(truth),
-            query_loc = genotype_label(query),
-            qq = query.qual,
-        )),
+        record: comparison_record(
+            truth,
+            display_ref(truth, reference),
+            display_alt(truth),
+            combined_record_qual(truth, query).to_string(),
+            filter_for_output(&query.filter).to_string(),
+            format!("BS={block_start}{regions}"),
+            format!(
+                "{}:TP:gm:{info}:{}:{}:{}",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth),
+                query.qual
+            ),
+            format!(
+                "{}:TP:gm:{info}:{}:{}:{}",
+                query.gt,
+                truth.primary_type(),
+                genotype_label(query),
+                query.qual
+            ),
+        ),
     }
 }
 
@@ -72,24 +107,27 @@ pub(super) fn unk_combined_row(
         fp_class: None,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        record: vcf::comparison_record_from_line(&format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:UNK:lm:{info}:{type_label}:{truth_loc}:.\t{query_gt}:UNK:lm:{info}:{type_label}:{query_loc}:{qq}",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = combined_record_qual(truth, query),
-            filter = filter_for_output(&query.filter),
-            bs = block_start,
-            regions = regions,
-            truth_gt = truth.gt,
-            query_gt = query.gt,
-            info = info,
-            type_label = truth.primary_type(),
-            truth_loc = genotype_label(truth),
-            query_loc = genotype_label(query),
-            qq = query.qual,
-        )),
+        record: comparison_record(
+            truth,
+            display_ref(truth, reference),
+            display_alt(truth),
+            combined_record_qual(truth, query).to_string(),
+            filter_for_output(&query.filter).to_string(),
+            format!("BS={block_start}{regions}"),
+            format!(
+                "{}:UNK:lm:{info}:{}:{}:.",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth)
+            ),
+            format!(
+                "{}:UNK:lm:{info}:{}:{}:{}",
+                query.gt,
+                truth.primary_type(),
+                genotype_label(query),
+                query.qual
+            ),
+        ),
     }
 }
 
@@ -170,26 +208,22 @@ pub(super) fn tp_single_side_row(
             fp_class: None,
             xcmp_ctype: None,
             xcmp_hap_match: false,
-            record: vcf::comparison_record_from_line(&format!(
-                "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{gt}:TP:gm:{info}:{type_label}:{loc}:{qq}\t./.:.:.:.:NOCALL:nocall:0",
-                chrom = variant.key.chrom,
-                pos = variant.key.pos,
-                ref = display_ref(variant, reference),
-                alt = display_alt(variant),
-                qual = variant.qual,
-                filter = truth_filter,
-                bs = block_start,
-                regions = regions,
-                gt = variant.gt,
-                info = info,
-                type_label = variant.primary_type(),
-                loc = genotype_label(variant),
-                // Truth carries QQ=. in its input VCF (qual column is "0");
-                // legacy propagates the matched query's QQ into the truth-
-                // side sample column. Accept a shared value from the caller
-                // that holds the cluster-level pairing context.
-                qq = shared_qq.unwrap_or(variant.qual.as_str()),
-            )),
+            record: comparison_record(
+                variant,
+                display_ref(variant, reference),
+                display_alt(variant),
+                variant.qual.clone(),
+                truth_filter.to_string(),
+                format!("BS={block_start}{regions}"),
+                format!(
+                    "{}:TP:gm:{info}:{}:{}:{}",
+                    variant.gt,
+                    variant.primary_type(),
+                    genotype_label(variant),
+                    shared_qq.unwrap_or(variant.qual.as_str())
+                ),
+                "./.:.:.:.:NOCALL:nocall:0".to_string(),
+            ),
         },
         Side::Query => AnnotatedRow {
             sort_key: (
@@ -205,22 +239,22 @@ pub(super) fn tp_single_side_row(
             fp_class: None,
             xcmp_ctype: None,
             xcmp_hap_match: false,
-            record: vcf::comparison_record_from_line(&format!(
-                "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t./.:.:.:.:NOCALL:nocall:.\t{gt}:TP:gm:{info}:{type_label}:{loc}:{qq}",
-                chrom = variant.key.chrom,
-                pos = variant.key.pos,
-                ref = display_ref(variant, reference),
-                alt = display_alt(variant),
-                qual = variant.qual,
-                filter = filter_for_output(&variant.filter),
-                bs = block_start,
-                regions = regions,
-                gt = variant.gt,
-                info = info,
-                type_label = variant.primary_type(),
-                loc = genotype_label(variant),
-                qq = variant.qual,
-            )),
+            record: comparison_record(
+                variant,
+                display_ref(variant, reference),
+                display_alt(variant),
+                variant.qual.clone(),
+                filter_for_output(&variant.filter).to_string(),
+                format!("BS={block_start}{regions}"),
+                "./.:.:.:.:NOCALL:nocall:.".to_string(),
+                format!(
+                    "{}:TP:gm:{info}:{}:{}:{}",
+                    variant.gt,
+                    variant.primary_type(),
+                    genotype_label(variant),
+                    variant.qual
+                ),
+            ),
         },
     }
 }
@@ -272,28 +306,27 @@ pub(super) fn fn_fp_combined_row(
         fp_class,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        record: vcf::comparison_record_from_line(&format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:{truth_bd}:{bk}:{truth_info}:{type_label}:{truth_loc}:.\t{query_gt}:{query_bd}:{bk}:{query_info}:{type_label}:{query_loc}:{qq}",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = combined_record_qual(truth, query),
-            filter = filter_for_output(&query.filter),
-            bs = block_start,
-            regions = regions,
-            truth_gt = truth.gt,
-            query_gt = query.gt,
-            truth_info = truth_info,
-            query_info = query_info,
-            type_label = truth.primary_type(),
-            truth_loc = genotype_label(truth),
-            query_loc = genotype_label(query),
-            qq = query.qual,
-            truth_bd = truth_bd,
-            query_bd = query_bd,
-            bk = bk,
-        )),
+        record: comparison_record(
+            truth,
+            display_ref(truth, reference),
+            display_alt(truth),
+            combined_record_qual(truth, query).to_string(),
+            filter_for_output(&query.filter).to_string(),
+            format!("BS={block_start}{regions}"),
+            format!(
+                "{}:{truth_bd}:{bk}:{truth_info}:{}:{}:.",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth)
+            ),
+            format!(
+                "{}:{query_bd}:{bk}:{query_info}:{}:{}:{}",
+                query.gt,
+                truth.primary_type(),
+                genotype_label(query),
+                query.qual
+            ),
+        ),
     }
 }
 
@@ -314,21 +347,21 @@ pub(super) fn fn_row(
         fp_class: None,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        record: vcf::comparison_record_from_line(&format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{gt}:FN:{bk}:{info}:{type_label}:{loc}:.\t./.:.:.:.:NOCALL:nocall:0",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = truth.qual,
-            bs = block_start,
-            regions = regions,
-            gt = truth.gt,
-            bk = bk,
-            info = info,
-            type_label = truth.primary_type(),
-            loc = genotype_label(truth),
-        )),
+        record: comparison_record(
+            truth,
+            display_ref(truth, reference),
+            display_alt(truth),
+            truth.qual.clone(),
+            ".".to_string(),
+            format!("BS={block_start}{regions}"),
+            format!(
+                "{}:FN:{bk}:{info}:{}:{}:.",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth)
+            ),
+            "./.:.:.:.:NOCALL:nocall:0".to_string(),
+        ),
     }
 }
 
@@ -354,21 +387,21 @@ pub(super) fn unk_truth_row(
         fp_class: None,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        record: vcf::comparison_record_from_line(&format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{gt}:UNK:{bk}:{info}:{type_label}:{loc}:.\t./.:.:.:.:NOCALL:nocall:0",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = truth.qual,
-            bs = block_start,
-            regions = regions,
-            gt = truth.gt,
-            bk = bk,
-            info = info,
-            type_label = truth.primary_type(),
-            loc = genotype_label(truth),
-        )),
+        record: comparison_record(
+            truth,
+            display_ref(truth, reference),
+            display_alt(truth),
+            truth.qual.clone(),
+            ".".to_string(),
+            format!("BS={block_start}{regions}"),
+            format!(
+                "{}:UNK:{bk}:{info}:{}:{}:.",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth)
+            ),
+            "./.:.:.:.:NOCALL:nocall:0".to_string(),
+        ),
     }
 }
 
@@ -759,24 +792,22 @@ pub(super) fn fp_like_row(
         fp_class,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        record: vcf::comparison_record_from_line(&format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t./.:.:.:.:NOCALL:nocall:.\t{gt}:{bd}:{bk}:{info}:{type_label}:{loc}:{qq}",
-            chrom = query.key.chrom,
-            pos = query.key.pos,
-            ref = display_ref(query, reference),
-            alt = display_alt(query),
-            qual = query.qual,
-            filter = filter_for_output(&query.filter),
-            bs = block_start,
-            regions = regions,
-            gt = query.gt,
-            bd = bd,
-            bk = bk,
-            info = info,
-            type_label = query.primary_type(),
-            loc = genotype_label(query),
-            qq = query.qual,
-        )),
+        record: comparison_record(
+            query,
+            display_ref(query, reference),
+            display_alt(query),
+            query.qual.clone(),
+            filter_for_output(&query.filter).to_string(),
+            format!("BS={block_start}{regions}"),
+            "./.:.:.:.:NOCALL:nocall:.".to_string(),
+            format!(
+                "{}:{bd}:{bk}:{info}:{}:{}:{}",
+                query.gt,
+                query.primary_type(),
+                genotype_label(query),
+                query.qual
+            ),
+        ),
     }
 }
 

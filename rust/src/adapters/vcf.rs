@@ -1,4 +1,4 @@
-use crate::domain::{ComparisonRecord, Interval, RawVcfRecord};
+use crate::domain::{Interval, RawVcfRecord};
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use noodles_bgzf as bgzf;
@@ -9,42 +9,6 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
-
-pub(crate) fn comparison_record_from_line(line: &str) -> ComparisonRecord {
-    ComparisonRecord {
-        columns: line.split('\t').map(str::to_string).collect(),
-    }
-}
-
-impl ComparisonRecord {
-    pub(crate) fn to_line(&self) -> String {
-        self.columns.join("\t")
-    }
-
-    pub(crate) fn split(&self, delimiter: char) -> impl Iterator<Item = &str> {
-        debug_assert_eq!(delimiter, '\t');
-        self.columns.iter().map(String::as_str)
-    }
-
-    pub(crate) fn contains(&self, needle: &str) -> bool {
-        self.to_line().contains(needle)
-    }
-
-    pub(crate) fn replace(&self, from: &str, to: &str) -> Self {
-        comparison_record_from_line(&self.to_line().replace(from, to))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn replacen(&self, from: &str, to: &str, count: usize) -> Self {
-        comparison_record_from_line(&self.to_line().replacen(from, to, count))
-    }
-}
-
-impl std::fmt::Display for ComparisonRecord {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.to_line())
-    }
-}
 
 const TBI_MAX_POSITION: usize = 1 << 29;
 const TBI_LINEAR_SHIFT: usize = 14;

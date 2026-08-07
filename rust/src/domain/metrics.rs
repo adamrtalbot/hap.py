@@ -20,17 +20,11 @@ pub(crate) struct TypeCounts {
     pub(crate) query_unk: CountsBucket,
 }
 
-/// Typed comparison columns independent of VCF text serialization.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ComparisonRecord {
-    pub(crate) columns: Vec<String>,
-}
-
 /// A comparison record plus the domain facts needed by report engines.
 #[derive(Clone, Debug)]
 pub(crate) struct AnnotatedRow {
     pub(crate) sort_key: (String, usize, usize, usize),
-    pub(crate) record: ComparisonRecord,
+    pub(crate) record: super::RawVcfRecord,
     /// Whether the originating query variant was PASS-filtered.
     pub(crate) query_pass: bool,
     /// False-positive subclass (`gt` or `al`) when this is an FP row.

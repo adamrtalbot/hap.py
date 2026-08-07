@@ -1,6 +1,20 @@
 //! Extracted cohesive responsibility from the command façade.
 
-use super::*;
+use super::genotype::parse_gt_alleles;
+use super::matching::{build_clusters_with_gap, effective_refrange};
+use super::metrics::info_list_values;
+use super::{AnnotatedRow, CLUSTER_GAP_BP, Cluster, Variant, VariantKey};
+use crate::adapters::{
+    metrics_json,
+    report::suffixed_report_path,
+    vcf::{self},
+};
+use crate::application::preprocess;
+use crate::cli_compat::cli::CompareArgs;
+use crate::domain::RawVcfRecord;
+use anyhow::{Result, bail};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 pub(super) fn rewrite_compare_metrics(
     args: &CompareArgs,
@@ -130,8 +144,7 @@ pub(super) fn decorate_output_rows(
         }
     }
     for row in rows {
-        let mut record =
-            RawVcfRecord::from_line(&row.record.to_line(), Path::new("comparison-output"))?;
+        let record = &mut row.record;
         let key = (
             record.chrom.clone(),
             record.pos,
@@ -232,7 +245,6 @@ pub(super) fn decorate_output_rows(
         } else {
             info.join(";")
         };
-        row.record = vcf::comparison_record_from_line(&record.to_line());
     }
     Ok(())
 }
@@ -255,13 +267,10 @@ pub(super) fn sanitize_requantify_handoff_rows(rows: &[AnnotatedRow]) -> Vec<Ann
     rows.iter()
         .cloned()
         .map(|mut row| {
-            let mut fields = row
-                .record
-                .split('\t')
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            if let Some(info) = fields.get_mut(7) {
-                let entries = info
+            {
+                let entries = row
+                    .record
+                    .info
                     .split(';')
                     .filter_map(|entry| {
                         let Some(regions) = entry.strip_prefix("Regions=") else {
@@ -274,12 +283,11 @@ pub(super) fn sanitize_requantify_handoff_rows(rows: &[AnnotatedRow]) -> Vec<Ann
                         (!retained.is_empty()).then(|| format!("Regions={}", retained.join(",")))
                     })
                     .collect::<Vec<_>>();
-                *info = if entries.is_empty() {
+                row.record.info = if entries.is_empty() {
                     ".".to_string()
                 } else {
                     entries.join(";")
                 };
-                row.record = vcf::comparison_record_from_line(&fields.join("\t"));
             }
             row
         })
@@ -552,7 +560,7 @@ pub(super) fn decorate_existing_comparison_vcf(
         .into_iter()
         .map(|record| AnnotatedRow {
             sort_key: (record.chrom.clone(), record.pos, 0, 0),
-            record: vcf::comparison_record_from_line(&record.to_line()),
+            record,
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -579,10 +587,7 @@ pub(super) fn decorate_existing_comparison_vcf(
             }
         }
     }
-    let decorated = rows
-        .iter()
-        .map(|row| RawVcfRecord::from_line(&row.record.to_line(), output_path))
-        .collect::<Result<Vec<_>>>()?;
+    let decorated = rows.into_iter().map(|row| row.record).collect::<Vec<_>>();
     vcf::write_raw_vcf(output_path, &headers, &decorated)
 }
 

@@ -102,7 +102,9 @@ pub(super) fn expand_haploid_gt(gt: &str, sex_chromosome: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        bcf_encoded_gt, expand_haploid_gt, project_split_ad, project_split_genotype, remap_gt,
+    };
 
     #[test]
     fn projects_genotypes_without_vcf_or_filesystem_state() {

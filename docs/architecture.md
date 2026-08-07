@@ -14,9 +14,23 @@ domain <- adapters <- engines <- application <- crate root
 surface; application commands consume those private request types. The crate
 root performs process-level parsing and dispatch.
 
-`tests/architecture.rs` parses the crate with `syn`, resolves grouped,
-absolute, re-exported, and relative paths to canonical module owners, rejects
-outward dependencies, and detects cycles between modules in every layer.
+`tests/architecture.rs` parses the crate with `syn`. A graph node is the full
+source-module path (`application::compare::matching`, not the former
+`application::compare` alias). Each grouped, absolute, re-exported, `self`,
+`super`, or unqualified local path resolves to the longest source-module
+prefix that exists in the crate. Item names are therefore discarded only
+after their canonical owning module has been found. Every resolved edge is
+checked against the layer direction above.
+
+Cycle traversal uses those full paths and therefore sees dependencies between
+children and siblings in the same feature. The directory module at
+`layer::feature` is an orchestration/ownership facade: direct edges between
+that facade and its descendants describe containment and are excluded from
+cycle traversal. They remain in the canonical graph and still receive the
+layer-direction check. All other module edges, including child-to-child and
+cross-feature edges in one layer, participate in cycle detection. Top-level
+glob imports are rejected in extracted child modules so their contracts remain
+explicit and the graph cannot be hidden behind `use super::*`.
 
 | Layer | Directory | Ownership |
 |---|---|---|
@@ -48,8 +62,9 @@ filesystem-free responsibilities to child modules:
 - `quantify/{annotations,counting,reporting,stratification,regions}.rs`:
   GA4GH annotation, counting, table rendering, subset assignment, and interval
   arithmetic.
-- `roc/{accumulation,contributions,legacy,rendering}.rs`: observation
-  accumulation, axis expansion, legacy ordering, and in-memory CSV rendering.
+- `roc/{model,accumulation,contributions,legacy,rendering}.rs`: neutral ROC
+  records, observation accumulation, axis expansion, legacy ordering, and
+  in-memory CSV rendering.
 
 Focused unit tests use strings, numbers, or in-memory domain records; command
 regression suites are isolated in each façade's `test_suite.rs`. VCF/BCF/FASTA

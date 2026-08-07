@@ -1,6 +1,19 @@
 //! Cohesive preprocessing responsibility.
 
-use super::*;
+use super::genotype::remap_gt;
+use crate::domain::RawVcfRecord;
+use anyhow::{Result, bail};
+use std::collections::BTreeSet;
+
+/// Case-insensitive DNA byte-slice equality with IUPAC `N` as a wildcard.
+pub(super) fn ref_bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            let left = left.to_ascii_uppercase();
+            let right = right.to_ascii_uppercase();
+            left == right || left == b'N' || right == b'N'
+        })
+}
 
 pub(super) fn validate_record_reference(
     record: &RawVcfRecord,

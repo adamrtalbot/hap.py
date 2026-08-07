@@ -1,6 +1,16 @@
 //! Cohesive ROC rendering responsibility.
 
-use super::*;
+use super::EXTENDED_HEADER;
+use super::accumulation::{
+    EmittedRow, GroupAccum, ObsRecord, introsort_libstdcpp, is_aggregate_filter,
+};
+use super::model::RowKey;
+use crate::adapters::report::{
+    append_ci_cells, append_stats_with_missing, f1_score, format_count, het_hom_ratio,
+    metric_ratio, ti_tv_ratio,
+};
+use crate::domain::CountsBucket;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RowFilter<'a> {

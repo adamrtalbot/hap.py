@@ -1,6 +1,17 @@
 //! Cohesive quantify stratification responsibility.
 
-use super::*;
+use super::annotations::{
+    effective_reference_range, has_region, info_value, merge_region_tags, move_region_to_front,
+    propagate_ga4gh_superlocus_for_samples, remove_region_tag, set_format_value,
+};
+use super::{BenchmarkSamples, LoadedRegions, RegionLevels, RegionMap};
+use crate::adapters::vcf;
+use crate::cli_compat::cli::QuantifyArgs;
+use crate::domain::{Interval, RawVcfRecord};
+use anyhow::{Context, Result, bail};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub(super) fn load_regions(
     args: &QuantifyArgs,

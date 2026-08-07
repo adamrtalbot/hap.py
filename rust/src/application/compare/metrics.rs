@@ -1,6 +1,26 @@
 //! Extracted cohesive responsibility from the command façade.
 
-use super::*;
+use super::AnnotatedRow;
+use crate::adapters::vcf::{self, Variant};
+use crate::domain::{CountsBucket, RawVcfRecord, TypeCounts};
+use std::collections::{BTreeMap, BTreeSet};
+
+struct ComparisonSamples<'a> {
+    format: Vec<&'a str>,
+    truth: Vec<&'a str>,
+    query: Vec<&'a str>,
+}
+
+fn comparison_samples(record: &RawVcfRecord) -> Option<ComparisonSamples<'_>> {
+    let format = record.format.as_deref()?.split(':').collect();
+    let truth = record.samples.first()?.split(':').collect();
+    let query = record.samples.get(1)?.split(':').collect();
+    Some(ComparisonSamples {
+        format,
+        truth,
+        query,
+    })
+}
 
 pub(super) fn collect_contigs(
     truth: &[Variant],
@@ -80,11 +100,10 @@ pub(super) fn derive_subset_counts(
 ) -> BTreeMap<String, BTreeMap<String, TypeCounts>> {
     let mut subsets: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
     for row in rows {
-        let fields: Vec<&str> = row.record.split('\t').collect();
-        if fields.len() < 11 {
+        let Some(samples) = comparison_samples(&row.record) else {
             continue;
-        }
-        let subset_tags = info_list_values(fields[7], "Regions")
+        };
+        let subset_tags = info_list_values(&row.record.info, "Regions")
             .into_iter()
             .filter(|tag| *tag != "CONF")
             .collect::<Vec<_>>();
@@ -92,12 +111,8 @@ pub(super) fn derive_subset_counts(
             continue;
         }
 
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let truth_parts: Vec<&str> = fields[9].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-
-        let truth_sample = SampleView::new(&format_keys, &truth_parts);
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let truth_sample = SampleView::new(&samples.format, &samples.truth);
+        let query_sample = SampleView::new(&samples.format, &samples.query);
         let filtered_out = pass_only && !row.query_pass;
 
         for subset in subset_tags {
@@ -131,13 +146,10 @@ pub(super) fn derive_fp_classes(
         let Some(class) = row.fp_class else {
             continue;
         };
-        let fields: Vec<&str> = row.record.split('\t').collect();
-        if fields.len() < 11 {
+        let Some(samples) = comparison_samples(&row.record) else {
             continue;
-        }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        };
+        let query_sample = SampleView::new(&samples.format, &samples.query);
         let Some(variant_type) = query_sample.variant_type() else {
             continue;
         };
@@ -167,20 +179,17 @@ pub(super) fn derive_subset_fp_classes(
         let Some(class) = row.fp_class else {
             continue;
         };
-        let fields: Vec<&str> = row.record.split('\t').collect();
-        if fields.len() < 11 {
+        let Some(samples) = comparison_samples(&row.record) else {
             continue;
-        }
-        let subset_tags = info_list_values(fields[7], "Regions")
+        };
+        let subset_tags = info_list_values(&row.record.info, "Regions")
             .into_iter()
             .filter(|tag| *tag != "CONF")
             .collect::<Vec<_>>();
         if subset_tags.is_empty() {
             continue;
         }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let query_sample = SampleView::new(&samples.format, &samples.query);
         let Some(variant_type) = query_sample.variant_type() else {
             continue;
         };
@@ -222,13 +231,10 @@ pub(super) fn derive_subtype_fp_classes(
         let Some(class) = row.fp_class else {
             continue;
         };
-        let fields: Vec<&str> = row.record.split('\t').collect();
-        if fields.len() < 11 {
+        let Some(samples) = comparison_samples(&row.record) else {
             continue;
-        }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        };
+        let query_sample = SampleView::new(&samples.format, &samples.query);
         let Some((variant_type, subtypes)) = query_sample.variant_type_and_subtypes() else {
             continue;
         };
@@ -263,20 +269,17 @@ pub(super) fn derive_subset_subtype_fp_classes(
         let Some(class) = row.fp_class else {
             continue;
         };
-        let fields: Vec<&str> = row.record.split('\t').collect();
-        if fields.len() < 11 {
+        let Some(samples) = comparison_samples(&row.record) else {
             continue;
-        }
-        let subset_tags = info_list_values(fields[7], "Regions")
+        };
+        let subset_tags = info_list_values(&row.record.info, "Regions")
             .into_iter()
             .filter(|tag| *tag != "CONF")
             .collect::<Vec<_>>();
         if subset_tags.is_empty() {
             continue;
         }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let query_sample = SampleView::new(&samples.format, &samples.query);
         let Some((variant_type, subtypes)) = query_sample.variant_type_and_subtypes() else {
             continue;
         };
@@ -306,16 +309,12 @@ pub(super) fn derive_total_counts(
 ) -> BTreeMap<String, TypeCounts> {
     let mut totals: BTreeMap<String, TypeCounts> = BTreeMap::new();
     for row in rows {
-        let fields: Vec<&str> = row.record.split('\t').collect();
-        if fields.len() < 11 {
+        let Some(samples) = comparison_samples(&row.record) else {
             continue;
-        }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let truth_parts: Vec<&str> = fields[9].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
+        };
 
-        let truth_sample = SampleView::new(&format_keys, &truth_parts);
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let truth_sample = SampleView::new(&samples.format, &samples.truth);
+        let query_sample = SampleView::new(&samples.format, &samples.query);
         let filtered_out = pass_only && !row.query_pass;
 
         if let Some(variant_type) = truth_sample.variant_type() {
@@ -341,11 +340,10 @@ pub(super) fn derive_subset_subtype_counts(
 ) -> BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>> {
     let mut out: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>> = BTreeMap::new();
     for row in rows {
-        let fields: Vec<&str> = row.record.split('\t').collect();
-        if fields.len() < 11 {
+        let Some(samples) = comparison_samples(&row.record) else {
             continue;
-        }
-        let subset_tags = info_list_values(fields[7], "Regions")
+        };
+        let subset_tags = info_list_values(&row.record.info, "Regions")
             .into_iter()
             .filter(|tag| *tag != "CONF")
             .collect::<Vec<_>>();
@@ -353,12 +351,8 @@ pub(super) fn derive_subset_subtype_counts(
             continue;
         }
 
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let truth_parts: Vec<&str> = fields[9].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-
-        let truth_sample = SampleView::new(&format_keys, &truth_parts);
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let truth_sample = SampleView::new(&samples.format, &samples.truth);
+        let query_sample = SampleView::new(&samples.format, &samples.query);
         let filtered_out = pass_only && !row.query_pass;
 
         for subset in &subset_tags {
@@ -396,16 +390,12 @@ pub(super) fn derive_subtype_counts(
 ) -> BTreeMap<String, BTreeMap<String, TypeCounts>> {
     let mut subtypes: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
     for row in rows {
-        let fields: Vec<&str> = row.record.split('\t').collect();
-        if fields.len() < 11 {
+        let Some(samples) = comparison_samples(&row.record) else {
             continue;
-        }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let truth_parts: Vec<&str> = fields[9].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
+        };
 
-        let truth_sample = SampleView::new(&format_keys, &truth_parts);
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let truth_sample = SampleView::new(&samples.format, &samples.truth);
+        let query_sample = SampleView::new(&samples.format, &samples.query);
         let filtered_out = pass_only && !row.query_pass;
 
         if let Some((variant_type, sub_list)) = truth_sample.variant_type_and_subtypes() {

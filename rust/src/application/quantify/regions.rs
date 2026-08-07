@@ -64,7 +64,7 @@ pub(super) fn region_intersection_size(left: &[Interval], right: &[Interval]) ->
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Interval, region_intersection_size, region_size};
 
     fn interval(start: usize, end: usize) -> Interval {
         Interval {

@@ -1,6 +1,23 @@
 //! Extracted cohesive responsibility from the command façade.
 
-use super::*;
+use super::genotype::{equivalent_gt, parse_gt_alleles};
+use super::metrics::{add_variant_stats, add_variant_stats_subtype};
+use super::rows::{
+    almismatch_same_locus, bk_for_row, cluster_query_filter, fn_fp_combined_row, fn_row,
+    fp_like_row, split_query_primitives_with_neighbors, tp_combined_row, tp_single_side_row,
+    trim_variant, unk_combined_row, unk_truth_row,
+};
+use super::{
+    AnnotatedRow, Cluster, ComparisonConfig, Entry, Event, MAX_CLUSTER_VARIANTS, RegionState,
+    SPLIT_LEFT_SHIFT_WINDOW, Side, XCMP_ENUMERATION_THRESHOLD, row_matches_variant_key,
+};
+use crate::adapters::vcf::{Variant, VariantKey};
+use crate::domain::{Interval, TypeCounts};
+use crate::engines::partial_credit;
+use anyhow::{Result, bail};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 pub(super) fn build_clusters_with_gap(
     truth: &[Variant],
@@ -289,8 +306,8 @@ pub(super) fn process_cluster(
     // their BK=lm hardcode is what legacy emits in those shapes.
     if allow_haplotype_match && !hap_mismatch {
         for row in &mut rows[exact_match_pre_count..exact_match_post_count] {
-            if row.record.contains(":UNK:lm:") {
-                row.record = row.record.replace(":UNK:lm:", ":UNK:.:");
+            if row.record.sample_values_contain(":UNK:lm:") {
+                row.record.replace_sample_values(":UNK:lm:", ":UNK:.:");
             }
         }
     }
@@ -356,8 +373,8 @@ pub(super) fn process_cluster(
     if !legacy_hap_promotions.is_empty() {
         for row in &mut rows[exact_match_post_count..] {
             if row_matches_variant_key(row, &legacy_hap_promotions)
-                && row.record.contains(":FN:am:")
-                && row.record.contains(":FP:am:")
+                && row.record.sample_values_contain(":FN:am:")
+                && row.record.sample_values_contain(":FP:am:")
             {
                 let key = legacy_hap_promotions
                     .iter()
@@ -442,8 +459,8 @@ pub(super) fn degrade_identical_exact_unk_rows(
     keys: &BTreeSet<VariantKey>,
 ) {
     for row in rows {
-        if row_matches_variant_key(row, keys) && row.record.contains(":UNK:lm:") {
-            row.record = row.record.replace(":UNK:lm:", ":UNK:.:");
+        if row_matches_variant_key(row, keys) && row.record.sample_values_contain(":UNK:lm:") {
+            row.record.replace_sample_values(":UNK:lm:", ":UNK:.:");
         }
     }
 }
@@ -482,11 +499,12 @@ pub(super) fn legacy_preprocessed_snp_first_positions(cluster: &Cluster) -> BTre
 }
 
 pub(super) fn annotated_row_is_snp(row: &AnnotatedRow) -> bool {
-    let fields = row.record.split('\t').collect::<Vec<_>>();
-    fields.get(3).is_some_and(|reference| reference.len() == 1)
-        && fields
-            .get(4)
-            .is_some_and(|alternate| alternate.split(',').all(|allele| allele.len() == 1))
+    row.record.ref_allele.len() == 1
+        && row
+            .record
+            .alt_allele
+            .split(',')
+            .all(|allele| allele.len() == 1)
 }
 
 pub(super) fn legacy_repetitive_indel_hap_promotions(
@@ -552,15 +570,14 @@ pub(super) fn set_xcmp_context(rows: &mut [AnnotatedRow], ctype: &'static str, h
 }
 
 pub(super) fn annotated_row_has_unreconciled_allele(row: &AnnotatedRow) -> bool {
-    let fields = row.record.split('\t').collect::<Vec<_>>();
-    if fields.len() < 11 {
+    let Some(format) = row.record.format.as_deref() else {
         return false;
-    }
-    let format = fields[8].split(':').collect::<Vec<_>>();
+    };
+    let format = format.split(':').collect::<Vec<_>>();
     let Some(bk_index) = format.iter().position(|key| *key == "BK") else {
         return false;
     };
-    for sample in [&fields[9], &fields[10]] {
+    for sample in &row.record.samples {
         let values = sample.split(':').collect::<Vec<_>>();
         if values
             .get(bk_index)

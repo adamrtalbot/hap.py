@@ -16,7 +16,7 @@ pub(super) fn equivalent_gt(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{equivalent_gt, parse_gt_alleles};
 
     #[test]
     fn genotype_equivalence_is_unphased_and_tolerates_missing_tokens() {
