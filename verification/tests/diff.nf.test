@@ -136,7 +136,7 @@ nextflow_process {
         }
     }
 
-    test("accepts bounded Rust ROC thresholds omitted by malformed legacy output") {
+    test("rejects malformed and additional ROC rows") {
 
         when {
             process {
@@ -161,8 +161,9 @@ nextflow_process {
         then {
             def comparison = new groovy.json.JsonSlurper().parse(new File(process.out.comparison[0][2]))
             assert process.success
-            assert comparison.ok
-            assert comparison.differences.isEmpty()
+            assert !comparison.ok
+            assert comparison.differences*.artifact as Set == ['result.metrics.json', 'result.roc.all.csv'] as Set
+            assert comparison.differences.find { it.artifact == 'result.roc.all.csv' }.reason == 'CSV row multiplicities differ'
         }
     }
 
@@ -214,7 +215,7 @@ nextflow_process {
             assert !comparison.ok
             assert comparison.differences.size() == 1
             assert comparison.differences[0].kind == 'csv'
-            assert comparison.differences[0].reason == 'additional threshold is not bounded by legacy ROC points'
+            assert comparison.differences[0].reason == 'CSV row multiplicities differ'
         }
     }
 

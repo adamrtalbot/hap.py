@@ -106,7 +106,8 @@ comparisons, each with `ok: true` and an empty `differences` list.
 
 - Add verification coverage before changing production behavior.
 - Use focused lanes for diagnosis and the complete matrix for the final check.
-- Fix product differences in Rust. Leave the Nextflow comparator unchanged.
+- Fix product differences in Rust. Change comparison normalization only for a
+  proven representation difference, with positive and negative regression cases.
 - Keep failing comparisons until the Rust output matches.
 - Keep the pinned legacy images unchanged.
 
