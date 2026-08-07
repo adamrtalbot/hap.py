@@ -1161,14 +1161,6 @@ pub fn validate_legacy_germline_version_arguments(
         .map(|_| ())
 }
 
-pub fn legacy_unknown_argument_exit_code(arguments: &[std::ffi::OsString]) -> Option<i32> {
-    match arguments.get(1).and_then(|value| value.to_str())? {
-        "germline" | "compare" => Some(1),
-        "pre" | "preprocess" | "prepy" | "quantify" | "qfy" => Some(0),
-        _ => None,
-    }
-}
-
 /// qfy.py validates its required arguments before honoring its version flag.
 /// This predicate is therefore consumed only after clap parsing succeeds.
 pub fn requests_quantify_version(arguments: &[std::ffi::OsString]) -> bool {

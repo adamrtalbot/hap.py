@@ -70,6 +70,7 @@ export default defineConfig({
         {
           label: "Project",
           items: [
+            { label: "Compatibility", slug: "project/compatibility" },
             { label: "Verification", slug: "project/verification" },
             { label: "Contributing", slug: "project/contributing" },
             { label: "License & Attribution", slug: "project/license" },

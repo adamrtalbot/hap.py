@@ -341,6 +341,10 @@ fn merge_coordinate_group(
             // first record from each input carrying that ALT. Its count array
             // is reused without clearing newly reintroduced slots; this
             // historical quirk affects duplicate indel positions.
+            crate::compatibility::begin_allele_count_table(
+                crate::compatibility::AlleleCountArrayPolicy::LegacyReuse,
+                &mut allele_counts,
+            );
             let mut allele_order = Vec::<AlleleKey>::new();
             let mut first_record = true;
             for record in truth_ids
@@ -353,18 +357,14 @@ fn merge_coordinate_group(
                         Some(slot) => slot,
                         None => {
                             allele_order.push(key);
-                            let slot = allele_order.len() - 1;
-                            if allele_counts.len() <= slot {
-                                allele_counts.push(0);
-                            }
-                            slot
+                            allele_order.len() - 1
                         }
                     };
-                    if first_record {
-                        allele_counts[slot] = 1;
-                    } else {
-                        allele_counts[slot] += 1;
-                    }
+                    crate::compatibility::record_allele_count(
+                        &mut allele_counts,
+                        slot,
+                        first_record,
+                    );
                 }
                 first_record = false;
             }
@@ -1158,7 +1158,15 @@ fn extract_occurrences(
         } else {
             (*raw_alt).to_string()
         };
-        let end = start + i64::try_from(alt.len())? - 1;
+        // Pinned SCMP constructs RefVar.end from ALT length. Keep that governed
+        // emulation at the VCF-to-RefVar adapter instead of teaching the
+        // normalization and matching algorithms the malformed span rule.
+        let end = crate::compatibility::scmp_refvar_end(
+            crate::compatibility::ScmpRefVarSpanPolicy::LegacyAltLength,
+            start,
+            record.ref_allele.len(),
+            alt.len(),
+        )?;
         occurrences.push(Occurrence {
             record_index,
             var: RefVar { start, end, alt },
@@ -1547,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn allele_mode_preserves_legacy_alt_length_refvar_bug() -> Result<()> {
+    fn legacy_only_allele_mode_preserves_alt_length_refvar_bug() -> Result<()> {
         // Ordinary VCF normalization makes these homopolymer insertions
         // equivalent. Legacy SCMP instead builds RefVar.end from ALT length,
         // so C>CA at POS 1 and A>AA at POS 2 remain distinct.
@@ -1810,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_indels_preserve_bcftools_reused_count_order() -> Result<()> {
+    fn legacy_only_duplicate_indels_preserve_bcftools_reused_count_order() -> Result<()> {
         let headers = vec![
             "##contig=<ID=chr1,length=100>".to_string(),
             "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">".to_string(),

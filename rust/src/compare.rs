@@ -1096,11 +1096,6 @@ fn run_vcfeval(
         }
         strat_regions.push(format!("CONF_VARS:{}", padding_path.display()));
     }
-    if args.engine_vcfeval.is_some() || args.engine_vcfeval_template.is_some() {
-        eprintln!(
-            "warning: --engine-vcfeval-path and --engine-vcfeval-template are deprecated and ignored; --engine vcfeval is native Rust"
-        );
-    }
     let vcfeval_vcf = scratch.path().join("vcfeval.comparison.vcf.gz");
     crate::vcfeval::compare_files(
         truth_prep,

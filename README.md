@@ -32,7 +32,7 @@ Rust and verified against pinned legacy releases.
   existing workflows use.
 - **Common genomics formats:** read VCF, BGZF-compressed VCF, and BCF with
   Tabix or CSI indexes.
-- **Measured parity:** 153 comparisons cover all six commands.
+- **Measured parity:** 155 comparisons cover all six commands.
 
 ## Commands
 
