@@ -23,18 +23,17 @@ use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::borrow::Borrow;
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::io::{BufWriter, Write};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 const INDEL_SUBTYPES: [&str; 9] = [
     "C16_PLUS", "C1_5", "C6_15", "D16_PLUS", "D1_5", "D6_15", "I16_PLUS", "I1_5", "I6_15",
 ];
-const MAX_ROC_OBSERVATIONS_PER_GROUP: usize = 1_000_000;
-const MAX_ROC_THRESHOLDS_PER_GROUP: usize = 1_000_000;
-const MAX_ROC_GROUPS: usize = 100_000;
-const MAX_ROC_TOTAL_OBSERVATIONS: usize = 4_000_000;
+const ROC_OBSERVATION_CHUNK: usize = 16_384;
+const ROC_MERGE_FAN_IN: usize = 32;
 
 /// Write `roc.all` and each non-empty Locations ROC file alongside `prefix`.
 #[derive(Clone, Debug, Default)]
@@ -183,7 +182,7 @@ where
         filter_counts_only: options.roc_regions.contains("*"),
     };
     // `roc.all`: every row from every group, no filtering.
-    let all = render_rows(&groups, &star_sorted, RowFilter::All, render_config);
+    let all = render_rows(&groups, &star_sorted, RowFilter::All, render_config)?;
     write_gzip_csv(
         &suffixed_report_path(prefix, "roc.all.csv.gz"),
         &header,
@@ -202,7 +201,7 @@ where
             filter: "ALL",
         },
         render_config,
-    );
+    )?;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.SNP.csv.gz"),
         &header,
@@ -216,7 +215,7 @@ where
             filter: "PASS",
         },
         render_config,
-    );
+    )?;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.SNP.PASS.csv.gz"),
         &header,
@@ -230,7 +229,7 @@ where
             filter: "ALL",
         },
         render_config,
-    );
+    )?;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.INDEL.csv.gz"),
         &header,
@@ -244,7 +243,7 @@ where
             filter: "PASS",
         },
         render_config,
-    );
+    )?;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.INDEL.PASS.csv.gz"),
         &header,
@@ -259,7 +258,7 @@ where
                 &star_sorted,
                 RowFilter::Locations { ty, filter: "SEL" },
                 render_config,
-            );
+            )?;
             let id = format!("roc.Locations.{ty}.SEL");
             write_optional_gzip_csv(
                 &suffixed_report_path(prefix, &format!("roc.Locations.{ty}.SEL.csv.gz")),
@@ -270,7 +269,7 @@ where
         }
     }
 
-    Ok(build_metric_indices(
+    build_metric_indices(
         &groups,
         MetricRows {
             all: &all,
@@ -282,7 +281,7 @@ where
         },
         options.delta,
         options.output_rocs,
-    ))
+    )
 }
 
 struct MetricRows<'a> {
@@ -299,7 +298,7 @@ fn build_metric_indices(
     rows: MetricRows<'_>,
     delta: f64,
     output_rocs: bool,
-) -> MetricIndices {
+) -> Result<MetricIndices> {
     let mut rocs = BTreeMap::<String, (&RowKey, &BoundedGroupAccum)>::new();
     let active_types = groups
         .iter()
@@ -358,12 +357,12 @@ fn build_metric_indices(
                 if counts_only {
                     continue;
                 }
-                for level in legacy_masked_levels(
-                    &accum.observation_window,
+                for level in legacy_masked_levels_store(
+                    &accum.observations,
                     *subtype_flag,
                     genotype_flag,
                     delta,
-                ) {
+                )? {
                     let qq = format!("{level:.6}");
                     if !matches!(*subtype, "ti" | "tv") && genotype == "*" {
                         table.set(
@@ -505,10 +504,10 @@ fn build_metric_indices(
         }
         tables.insert(id.clone(), indices_for_lines(lines, &local));
     }
-    MetricIndices {
+    Ok(MetricIndices {
         tables,
         table_order,
-    }
+    })
 }
 
 /// Reproduce the iteration order of the pinned Python 2.7 dictionary used by
@@ -673,6 +672,44 @@ fn legacy_masked_levels(
         }
     }
     kept
+}
+
+fn legacy_masked_levels_store(
+    observations: &ObservationStore,
+    subtype: Option<&str>,
+    genotype: Option<&str>,
+    delta: f64,
+) -> Result<Vec<f64>> {
+    if !observations.is_disk_backed() {
+        return Ok(legacy_masked_levels(
+            &observations.small_records(),
+            subtype,
+            genotype,
+            delta,
+        ));
+    }
+    let mut kept = Vec::new();
+    let mut previous = None;
+    for observation in observations.sorted()? {
+        let observation = observation?;
+        let subtype_matches = match subtype {
+            None => true,
+            Some("ti") => observation.ti_flag,
+            Some("tv") => observation.tv_flag,
+            Some(value) => observation
+                .subtypes
+                .iter()
+                .any(|candidate| candidate == value),
+        };
+        if subtype_matches
+            && genotype.is_none_or(|value| observation.blt.as_deref() == Some(value))
+            && previous.is_none_or(|value: f64| (observation.level - value).abs() > delta)
+        {
+            previous = Some(observation.level);
+            kept.push(observation.level);
+        }
+    }
+    Ok(kept)
 }
 
 #[derive(Default)]
@@ -870,10 +907,10 @@ fn write_legacy_roc_table(
             !is_aggregate_filter(&key.filter) && options.roc_regions.contains(key.subset.as_str());
         // getLevels sorts the shared observation vector in-place on every
         // subtype/genotype call. Preserve that progressive tied-level order.
-        let mut sorted_obs = accum.observation_window.clone();
+        let mut sorted_obs = accum.observations.small_records();
         for subtype in subtypes {
             for genotype in ["het", "hetalt", "homalt", "*"] {
-                let totals = legacy_totals(&accum.observation_window, subtype, genotype);
+                let totals = legacy_totals_store(&accum.observations, subtype, genotype)?;
                 add_legacy_level(
                     &mut table,
                     key,
@@ -889,9 +926,13 @@ fn write_legacy_roc_table(
                     &options.subset_confidence_sizes,
                 );
                 if !counts_only && options.output_rocs {
-                    introsort_libstdcpp(&mut sorted_obs);
-                    for (qq, level) in legacy_levels(&sorted_obs, subtype, genotype, options.delta)
-                    {
+                    let levels = if accum.observations.is_disk_backed() {
+                        legacy_levels_store(&accum.observations, subtype, genotype, options.delta)?
+                    } else {
+                        introsort_libstdcpp(&mut sorted_obs);
+                        legacy_levels(&sorted_obs, subtype, genotype, options.delta)
+                    };
+                    for (qq, level) in levels {
                         add_legacy_level(
                             &mut table,
                             key,
@@ -933,6 +974,28 @@ fn legacy_totals(obs: &[ObsRecord], subtype: &str, genotype: &str) -> Cumul {
         totals.add(&record.counts);
     }
     totals
+}
+
+fn legacy_totals_store(
+    observations: &ObservationStore,
+    subtype: &str,
+    genotype: &str,
+) -> Result<Cumul> {
+    if !observations.is_disk_backed() {
+        return Ok(legacy_totals(
+            &observations.small_records(),
+            subtype,
+            genotype,
+        ));
+    }
+    let mut totals = Cumul::default();
+    for observation in observations.sorted()? {
+        let observation = observation?;
+        if legacy_obs_matches(&observation, subtype, genotype) {
+            totals.add(&observation.counts);
+        }
+    }
+    Ok(totals)
 }
 
 fn legacy_levels(
@@ -989,6 +1052,41 @@ fn legacy_levels(
         .into_iter()
         .map(|(level, counts)| (format!("{level:.6}"), counts))
         .collect()
+}
+
+fn legacy_levels_store(
+    observations: &ObservationStore,
+    subtype: &str,
+    genotype: &str,
+    delta: f64,
+) -> Result<Vec<(String, Cumul)>> {
+    let totals = legacy_totals_store(observations, subtype, genotype)?;
+    let mut running = Cumul::default();
+    let mut previous = None;
+    let mut levels = Vec::new();
+    for observation in observations.sorted()? {
+        let observation = observation?;
+        if !legacy_obs_matches(&observation, subtype, genotype) {
+            continue;
+        }
+        running.add(&observation.counts);
+        if previous.is_none_or(|value: f64| (observation.level - value).abs() > delta) {
+            previous = Some(observation.level);
+            levels.push((
+                format!("{:.6}", observation.level as f32 as f64),
+                Cumul {
+                    truth_tp: sub_buckets(&totals.truth_tp, &running.truth_tp),
+                    truth_fn: add_buckets_total(&totals.truth_fn, &running.truth_tp),
+                    query_tp: sub_buckets(&totals.query_tp, &running.query_tp),
+                    query_fp: sub_buckets(&totals.query_fp, &running.query_fp),
+                    query_unk: sub_buckets(&totals.query_unk, &running.query_unk),
+                    fp_gt: totals.fp_gt.saturating_sub(running.fp_gt),
+                    fp_al: totals.fp_al.saturating_sub(running.fp_al),
+                },
+            ));
+        }
+    }
+    Ok(levels)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1230,6 +1328,305 @@ struct ObsRecord {
     blt: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct StoredObs {
+    serial: u64,
+    record: ObsRecord,
+}
+
+#[derive(Default)]
+struct ObservationStore {
+    buffer: Vec<StoredObs>,
+    chunks: Vec<tempfile::TempPath>,
+    next_serial: u64,
+    error: Option<String>,
+}
+
+impl ObservationStore {
+    fn push(&mut self, record: ObsRecord) {
+        self.buffer.push(StoredObs {
+            serial: self.next_serial,
+            record,
+        });
+        self.next_serial += 1;
+        if self.buffer.len() >= ROC_OBSERVATION_CHUNK {
+            if let Err(error) = self.flush_chunk() {
+                self.error.get_or_insert_with(|| error.to_string());
+            }
+        }
+    }
+
+    fn flush_chunk(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.buffer.sort_by(|left, right| {
+            left.record
+                .level
+                .total_cmp(&right.record.level)
+                .then(left.serial.cmp(&right.serial))
+        });
+        let mut chunk =
+            tempfile::NamedTempFile::new().context("failed to create ROC observation chunk")?;
+        {
+            let mut writer = BufWriter::new(chunk.as_file_mut());
+            for observation in self.buffer.drain(..) {
+                write_observation(&mut writer, &observation)?;
+            }
+            writer.flush()?;
+        }
+        self.chunks.push(chunk.into_temp_path());
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(error) = self.error.take() {
+            bail!("failed to spool ROC observations: {error}");
+        }
+        if !self.chunks.is_empty() {
+            self.flush_chunk()?;
+            self.chunks = collapse_observation_chunks(std::mem::take(&mut self.chunks))?;
+        }
+        Ok(())
+    }
+
+    fn is_disk_backed(&self) -> bool {
+        !self.chunks.is_empty()
+    }
+
+    fn small_records(&self) -> Vec<ObsRecord> {
+        self.buffer
+            .iter()
+            .map(|observation| observation.record.clone())
+            .collect()
+    }
+
+    fn sorted(&self) -> Result<ObservationMerge> {
+        if self.chunks.is_empty() {
+            let mut temporary =
+                tempfile::NamedTempFile::new().context("failed to create ROC observation view")?;
+            {
+                let mut writer = BufWriter::new(temporary.as_file_mut());
+                let mut observations = self.buffer.clone();
+                observations.sort_by(|left, right| {
+                    left.record
+                        .level
+                        .total_cmp(&right.record.level)
+                        .then(left.serial.cmp(&right.serial))
+                });
+                for observation in observations {
+                    write_observation(&mut writer, &observation)?;
+                }
+                writer.flush()?;
+            }
+            ObservationMerge::open(vec![temporary.into_temp_path()])
+        } else {
+            let copies = self
+                .chunks
+                .iter()
+                .map(copy_temp_path)
+                .collect::<Result<Vec<_>>>()?;
+            ObservationMerge::open(copies)
+        }
+    }
+}
+
+fn copy_temp_path(path: &Path) -> Result<tempfile::TempPath> {
+    let mut copy = tempfile::NamedTempFile::new().context("failed to copy ROC spool")?;
+    std::io::copy(&mut File::open(path)?, copy.as_file_mut())?;
+    copy.as_file_mut().flush()?;
+    Ok(copy.into_temp_path())
+}
+
+struct ObservationMerge {
+    _chunks: Vec<tempfile::TempPath>,
+    readers: Vec<std::io::Lines<BufReader<File>>>,
+    current: Vec<Option<StoredObs>>,
+    heap: BinaryHeap<Reverse<(u64, u64, usize)>>,
+}
+
+impl ObservationMerge {
+    fn open(chunks: Vec<tempfile::TempPath>) -> Result<Self> {
+        let mut readers = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            readers.push(BufReader::new(File::open(chunk)?).lines());
+        }
+        let mut merge = Self {
+            current: (0..readers.len()).map(|_| None).collect(),
+            readers,
+            heap: BinaryHeap::new(),
+            _chunks: chunks,
+        };
+        for index in 0..merge.readers.len() {
+            merge.advance(index)?;
+        }
+        Ok(merge)
+    }
+
+    fn advance(&mut self, index: usize) -> Result<()> {
+        let Some(line) = self.readers[index].next() else {
+            return Ok(());
+        };
+        let observation = parse_observation(&line?)?;
+        self.heap.push(Reverse((
+            sortable_f64(observation.record.level),
+            observation.serial,
+            index,
+        )));
+        self.current[index] = Some(observation);
+        Ok(())
+    }
+}
+
+impl Iterator for ObservationMerge {
+    type Item = Result<ObsRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Reverse((_, _, index)) = self.heap.pop()?;
+        let observation = self.current[index]
+            .take()
+            .expect("ROC merge heap entry has an observation");
+        if let Err(error) = self.advance(index) {
+            return Some(Err(error));
+        }
+        Some(Ok(observation.record))
+    }
+}
+
+fn sortable_f64(value: f64) -> u64 {
+    let bits = value.to_bits();
+    if bits & (1 << 63) == 0 {
+        bits ^ (1 << 63)
+    } else {
+        !bits
+    }
+}
+
+fn write_observation(writer: &mut dyn Write, observation: &StoredObs) -> Result<()> {
+    let counts = &observation.record.counts;
+    write!(
+        writer,
+        "{}\t{}\t{}",
+        sortable_f64(observation.record.level),
+        observation.serial,
+        observation.record.level.to_bits()
+    )?;
+    for bucket in [
+        &counts.truth_tp,
+        &counts.truth_fn,
+        &counts.query_tp,
+        &counts.query_fp,
+        &counts.query_unk,
+    ] {
+        write!(
+            writer,
+            "\t{}\t{}\t{}\t{}\t{}",
+            bucket.total, bucket.ti, bucket.tv, bucket.het, bucket.homalt
+        )?;
+    }
+    writeln!(
+        writer,
+        "\t{}\t{}\t{}\t{}\t{}\t{}",
+        counts.fp_gt,
+        counts.fp_al,
+        observation.record.subtypes.join("|"),
+        u8::from(observation.record.ti_flag),
+        u8::from(observation.record.tv_flag),
+        observation.record.blt.as_deref().unwrap_or(".")
+    )?;
+    Ok(())
+}
+
+fn parse_observation(line: &str) -> Result<StoredObs> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 34 {
+        bail!(
+            "ROC observation spool has {} fields, expected 34",
+            fields.len()
+        );
+    }
+    let mut index = 1usize;
+    let serial = fields[index].parse()?;
+    index += 1;
+    let level = f64::from_bits(fields[index].parse()?);
+    index += 1;
+    let mut next_bucket = || -> Result<CountsBucket> {
+        let bucket = CountsBucket {
+            total: fields[index].parse()?,
+            ti: fields[index + 1].parse()?,
+            tv: fields[index + 2].parse()?,
+            het: fields[index + 3].parse()?,
+            homalt: fields[index + 4].parse()?,
+        };
+        index += 5;
+        Ok(bucket)
+    };
+    let counts = Cumul {
+        truth_tp: next_bucket()?,
+        truth_fn: next_bucket()?,
+        query_tp: next_bucket()?,
+        query_fp: next_bucket()?,
+        query_unk: next_bucket()?,
+        fp_gt: fields[index].parse()?,
+        fp_al: fields[index + 1].parse()?,
+    };
+    index += 2;
+    let subtypes = fields[index].split('|').map(str::to_string).collect();
+    let ti_flag = fields[index + 1] == "1";
+    let tv_flag = fields[index + 2] == "1";
+    let blt = (fields[index + 3] != ".").then(|| fields[index + 3].to_string());
+    Ok(StoredObs {
+        serial,
+        record: ObsRecord {
+            level,
+            counts,
+            subtypes,
+            ti_flag,
+            tv_flag,
+            blt,
+        },
+    })
+}
+
+fn collapse_observation_chunks(
+    mut chunks: Vec<tempfile::TempPath>,
+) -> Result<Vec<tempfile::TempPath>> {
+    while chunks.len() > ROC_MERGE_FAN_IN {
+        let mut merged = Vec::with_capacity(chunks.len().div_ceil(ROC_MERGE_FAN_IN));
+        let mut remaining = chunks.into_iter();
+        loop {
+            let batch = remaining
+                .by_ref()
+                .take(ROC_MERGE_FAN_IN)
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            let mut output = tempfile::NamedTempFile::new()
+                .context("failed to create merged ROC observation chunk")?;
+            {
+                let mut writer = BufWriter::new(output.as_file_mut());
+                let mut merge = ObservationMerge::open(batch)?;
+                let mut serial = 0u64;
+                while let Some(observation) = merge.next() {
+                    write_observation(
+                        &mut writer,
+                        &StoredObs {
+                            serial,
+                            record: observation?,
+                        },
+                    )?;
+                    serial += 1;
+                }
+                writer.flush()?;
+            }
+            merged.push(output.into_temp_path());
+        }
+        chunks = merged;
+    }
+    Ok(chunks)
+}
+
 impl Cumul {
     fn add(&mut self, other: &Cumul) {
         add_bucket(&mut self.truth_tp, &other.truth_tp);
@@ -1279,19 +1676,16 @@ fn sum_buckets(a: &CountsBucket, b: &CountsBucket) -> CountsBucket {
 ///     ROC rows. This is the only path that can reproduce legacy's
 ///     std::sort instability on equal-level (truth, query) pairs at
 ///     bit-exact parity.
-/// Both structures below are hard-capped before insertion. Consequently a
-/// malformed or adversarial cardinality cannot turn either into a full-input
-/// accumulator; callers receive a contextual resource-limit error instead.
-///   • `threshold_window`: per-`{:.6}` bucket aggregate, retained for
-///     the per-substat (ti/tv/het/homalt) roc-delta sweeps and for
-///     bookkeeping helpers like `bucket_has_ti`.
+/// `threshold_window` is only the bounded, pre-spill fast path. Once the
+/// observation chunk reaches `ROC_OBSERVATION_CHUNK`, observations are
+/// externally sorted and threshold/substat state is derived while merging;
+/// no per-threshold map grows with a whole-genome input.
 #[derive(Default)]
 struct BoundedGroupAccum {
     baseline: Cumul,
-    observation_window: Vec<ObsRecord>,
+    observations: ObservationStore,
     threshold_window: BTreeMap<String, NumericBucket>,
     records: usize,
-    limit_error: Option<String>,
 }
 
 struct NumericBucket {
@@ -1349,14 +1743,6 @@ impl BoundedGroupAccum {
         if !track_thresholds {
             return;
         }
-        if self.observation_window.len() >= MAX_ROC_OBSERVATIONS_PER_GROUP {
-            self.limit_error.get_or_insert_with(|| {
-                format!(
-                    "ROC group exceeds the {MAX_ROC_OBSERVATIONS_PER_GROUP} observation resource limit"
-                )
-            });
-            return;
-        }
         // Legacy `BlockQuantify::observe` maps NaN-level obs to level=0
         // (`if(std::isnan(qq)) qq = 0`) before any further processing.
         // Mirror that by treating None / non-finite QQ as 0 for sorting
@@ -1371,53 +1757,42 @@ impl BoundedGroupAccum {
         // rather than `1001.340000`).
         let q32 = q as f32 as f64;
         let key = format!("{q32:.6}");
-        if !self.threshold_window.contains_key(&key)
-            && self.threshold_window.len() >= MAX_ROC_THRESHOLDS_PER_GROUP
-        {
-            self.limit_error.get_or_insert_with(|| {
-                format!(
-                    "ROC group exceeds the {MAX_ROC_THRESHOLDS_PER_GROUP} threshold resource limit"
-                )
-            });
-            return;
-        }
-        let entry = self
-            .threshold_window
-            .entry(key)
-            .or_insert_with(|| NumericBucket {
-                qq: q32,
-                counts: Cumul::default(),
-                has_ti: false,
-                has_tv: false,
-            });
-        entry.counts.add(counts);
-        // Track substat-flag presence: any obs at this level with ti/tv
-        // contribution flags this bucket for substat sweep. Detected from
-        // either counts.{*}.ti/tv (sample_bucket sets these from bi) OR
-        // bi parameter (handles filter-failed phantoms whose counts are
-        // zero but who carry bi flags per legacy's BlockQuantify::observe).
-        if counts.truth_tp.ti > 0
-            || counts.truth_fn.ti > 0
-            || counts.query_tp.ti > 0
-            || counts.query_fp.ti > 0
-            || counts.query_unk.ti > 0
-        {
-            entry.has_ti = true;
-        }
-        if counts.truth_tp.tv > 0
-            || counts.truth_fn.tv > 0
-            || counts.query_tp.tv > 0
-            || counts.query_fp.tv > 0
-            || counts.query_unk.tv > 0
-        {
-            entry.has_tv = true;
-        }
-        if let Some(bi_str) = bi {
-            for tok in bi_str.split(',') {
-                match tok {
-                    "ti" => entry.has_ti = true,
-                    "tv" => entry.has_tv = true,
-                    _ => {}
+        if !self.observations.is_disk_backed() {
+            let entry = self
+                .threshold_window
+                .entry(key)
+                .or_insert_with(|| NumericBucket {
+                    qq: q32,
+                    counts: Cumul::default(),
+                    has_ti: false,
+                    has_tv: false,
+                });
+            entry.counts.add(counts);
+            // Track substat-flag presence while the in-memory fast path is
+            // active. Disk-backed groups derive the same flags while merging.
+            if counts.truth_tp.ti > 0
+                || counts.truth_fn.ti > 0
+                || counts.query_tp.ti > 0
+                || counts.query_fp.ti > 0
+                || counts.query_unk.ti > 0
+            {
+                entry.has_ti = true;
+            }
+            if counts.truth_tp.tv > 0
+                || counts.truth_fn.tv > 0
+                || counts.query_tp.tv > 0
+                || counts.query_fp.tv > 0
+                || counts.query_unk.tv > 0
+            {
+                entry.has_tv = true;
+            }
+            if let Some(bi_str) = bi {
+                for tok in bi_str.split(',') {
+                    match tok {
+                        "ti" => entry.has_ti = true,
+                        "tv" => entry.has_tv = true,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1476,7 +1851,7 @@ impl BoundedGroupAccum {
         {
             tv_flag = true;
         }
-        self.observation_window.push(ObsRecord {
+        self.observations.push(ObsRecord {
             level: obs_level,
             counts: counts.clone(),
             subtypes: subtypes.to_vec(),
@@ -1484,6 +1859,9 @@ impl BoundedGroupAccum {
             tv_flag,
             blt: blt.map(str::to_string),
         });
+        if self.observations.is_disk_backed() {
+            self.threshold_window.clear();
+        }
     }
 
     /// Emit (qq_string, cumulative_counts) pairs in the legacy output order:
@@ -1511,16 +1889,21 @@ impl BoundedGroupAccum {
     /// `getLevels(flag_mask)` × `dropRowsWithMissing("Type")` pipeline
     /// where substat-only levels get filtered out and substat values are
     /// written only into prefixes the main sweep already visited.
-    /// Standard emit — sorts self.observation_window with libstdc++ introsort.
+    /// Standard emit — sorts the bounded in-memory observation chunk with
+    /// libstdc++ introsort; spilled groups use the external merge path.
     /// Used for the `Subtype="*"` group and as a fallback for callers
     /// that don't have a pre-sorted obs vector to share.
     #[cfg(test)]
     fn emit(&self) -> Vec<EmittedRow> {
-        self.emit_with_delta(0.5)
+        self.emit_with_delta(0.5).expect("emit test rows")
     }
 
-    fn emit_with_delta(&self, delta: f64) -> Vec<EmittedRow> {
-        self.emit_internal(None, None, delta)
+    fn emit_with_delta(&self, delta: f64) -> Result<Vec<EmittedRow>> {
+        if self.observations.is_disk_backed() {
+            self.emit_disk_with_delta(delta)
+        } else {
+            Ok(self.emit_internal(None, None, delta))
+        }
     }
 
     /// Emit using a pre-sorted obs vector (typically from the `(*)`
@@ -1535,8 +1918,8 @@ impl BoundedGroupAccum {
         shared_sorted: &[ObsRecord],
         my_subtype: &str,
         delta: f64,
-    ) -> Vec<EmittedRow> {
-        self.emit_internal(Some(shared_sorted), Some(my_subtype), delta)
+    ) -> Result<Vec<EmittedRow>> {
+        Ok(self.emit_internal(Some(shared_sorted), Some(my_subtype), delta))
     }
 
     fn emit_internal(
@@ -1595,7 +1978,7 @@ impl BoundedGroupAccum {
                     .collect();
                 (filtered, true)
             }
-            _ => (self.observation_window.clone(), false),
+            _ => (self.observations.small_records(), false),
         };
 
         // Match legacy's `OBS_FLAG_TI` / `OBS_FLAG_TV` masks: the flag is
@@ -1785,6 +2168,133 @@ impl BoundedGroupAccum {
         numeric_rows.sort_by(|a, b| a.qq_str.cmp(&b.qq_str));
         out.extend(numeric_rows);
         out
+    }
+
+    fn emit_disk_with_delta(&self, delta: f64) -> Result<Vec<EmittedRow>> {
+        let truth_total_const = sum_buckets(&self.baseline.truth_tp, &self.baseline.truth_fn);
+        let mut total = Cumul::default();
+        let mut total_ti = Cumul::default();
+        let mut total_tv = Cumul::default();
+        for observation in self.observations.sorted()? {
+            let observation = observation?;
+            total.add(&observation.counts);
+            if observation.ti_flag {
+                total_ti.add(&observation.counts);
+            }
+            if observation.tv_flag {
+                total_tv.add(&observation.counts);
+            }
+        }
+
+        let total_truth_fn = sub_buckets(&truth_total_const, &total.truth_tp);
+        let mut numeric_rows = Vec::new();
+        let mut running = Cumul::default();
+        let mut running_ti = Cumul::default();
+        let mut running_tv = Cumul::default();
+        let mut previous_main: Option<f64> = None;
+        let mut previous_ti: Option<f64> = None;
+        let mut previous_tv: Option<f64> = None;
+        let mut current: Option<(f64, Cumul, Option<Cumul>, Option<Cumul>, bool, bool)> = None;
+
+        let mut emit_level = |level: f64,
+                              cum_through: Cumul,
+                              ti_through: Option<Cumul>,
+                              tv_through: Option<Cumul>,
+                              has_ti: bool,
+                              has_tv: bool| {
+            let keep_main = previous_main.is_none_or(|value| (level - value).abs() > delta);
+            let keep_ti = has_ti && previous_ti.is_none_or(|value| (level - value).abs() > delta);
+            let keep_tv = has_tv && previous_tv.is_none_or(|value| (level - value).abs() > delta);
+            if keep_ti {
+                previous_ti = Some(level);
+            }
+            if keep_tv {
+                previous_tv = Some(level);
+            }
+            if !keep_main {
+                return;
+            }
+            previous_main = Some(level);
+            let mut truth_tp = sub_buckets(&total.truth_tp, &cum_through.truth_tp);
+            let mut truth_fn = add_buckets_total(&total_truth_fn, &cum_through.truth_tp);
+            let mut query_tp = sub_buckets(&total.query_tp, &cum_through.query_tp);
+            let mut query_fp = sub_buckets(&total.query_fp, &cum_through.query_fp);
+            let mut query_unk = sub_buckets(&total.query_unk, &cum_through.query_unk);
+            if let Some(cumulative) = ti_through {
+                truth_tp.ti = total_ti.truth_tp.ti.saturating_sub(cumulative.truth_tp.ti);
+                truth_fn.ti = total_truth_fn.ti + cumulative.truth_tp.ti;
+                query_tp.ti = total_ti.query_tp.ti.saturating_sub(cumulative.query_tp.ti);
+                query_fp.ti = total_ti.query_fp.ti.saturating_sub(cumulative.query_fp.ti);
+                query_unk.ti = total_ti
+                    .query_unk
+                    .ti
+                    .saturating_sub(cumulative.query_unk.ti);
+            }
+            if let Some(cumulative) = tv_through {
+                truth_tp.tv = total_tv.truth_tp.tv.saturating_sub(cumulative.truth_tp.tv);
+                truth_fn.tv = total_truth_fn.tv + cumulative.truth_tp.tv;
+                query_tp.tv = total_tv.query_tp.tv.saturating_sub(cumulative.query_tp.tv);
+                query_fp.tv = total_tv.query_fp.tv.saturating_sub(cumulative.query_fp.tv);
+                query_unk.tv = total_tv
+                    .query_unk
+                    .tv
+                    .saturating_sub(cumulative.query_unk.tv);
+            }
+            numeric_rows.push(EmittedRow {
+                qq_str: format!("{:.6}", level as f32 as f64),
+                cum: Cumul {
+                    truth_tp,
+                    truth_fn,
+                    query_tp,
+                    query_fp,
+                    query_unk,
+                    fp_gt: total.fp_gt.saturating_sub(cum_through.fp_gt),
+                    fp_al: total.fp_al.saturating_sub(cum_through.fp_al),
+                },
+                substats: Some(SubstatAvail {
+                    ti: keep_ti,
+                    tv: keep_tv,
+                    het: false,
+                    homalt: false,
+                }),
+            });
+        };
+
+        for observation in self.observations.sorted()? {
+            let observation = observation?;
+            if current
+                .as_ref()
+                .is_some_and(|entry| entry.0 != observation.level)
+                && let Some(entry) = current.take()
+            {
+                emit_level(entry.0, entry.1, entry.2, entry.3, entry.4, entry.5);
+            }
+            running.add(&observation.counts);
+            let entry = current.get_or_insert_with(|| {
+                (observation.level, running.clone(), None, None, false, false)
+            });
+            if observation.ti_flag {
+                running_ti.add(&observation.counts);
+                entry.2.get_or_insert_with(|| running_ti.clone());
+                entry.4 = true;
+            }
+            if observation.tv_flag {
+                running_tv.add(&observation.counts);
+                entry.3.get_or_insert_with(|| running_tv.clone());
+                entry.5 = true;
+            }
+        }
+        if let Some(entry) = current {
+            emit_level(entry.0, entry.1, entry.2, entry.3, entry.4, entry.5);
+        }
+        numeric_rows.sort_by(|left, right| left.qq_str.cmp(&right.qq_str));
+        let mut rows = vec![EmittedRow {
+            qq_str: "*".to_string(),
+            cum: self.baseline.clone(),
+            substats: None,
+        }];
+        rows.extend(numeric_rows);
+        Ok(rows)
     }
 }
 
@@ -2033,8 +2543,6 @@ where
 {
     let mut groups: BTreeMap<RowKey, BoundedGroupAccum> = BTreeMap::new();
     let track_thresholds = options.output_rocs || options.preserve_raw_table;
-    let mut total_observations = 0usize;
-    let mut accumulation_error: Option<String> = None;
 
     // Named stratifications are configured lanes, not merely observed axes.
     // QuantifyRegions registers each one when it loads the BED, so an empty
@@ -2061,22 +2569,6 @@ where
             row,
             options,
             |key, qq, counts, subtypes: &[String], bi: Option<&str>, blt: Option<&str>| {
-                if !groups.contains_key(&key) && groups.len() >= MAX_ROC_GROUPS {
-                    accumulation_error.get_or_insert_with(|| {
-                        format!(
-                            "ROC accumulation exceeds the {MAX_ROC_GROUPS} group resource limit"
-                        )
-                    });
-                    return;
-                }
-                if track_thresholds && total_observations >= MAX_ROC_TOTAL_OBSERVATIONS {
-                    accumulation_error.get_or_insert_with(|| {
-                        format!(
-                            "ROC accumulation exceeds the {MAX_ROC_TOTAL_OBSERVATIONS} total-observation resource limit"
-                        )
-                    });
-                    return;
-                }
                 observed_subsets.insert(key.subset.clone());
                 if key.filter != "ALL" && key.filter != "PASS" {
                     observed_filters_per_ty
@@ -2088,20 +2580,8 @@ where
                     .entry(key)
                     .or_default()
                     .add(qq, counts, subtypes, bi, blt, track_thresholds);
-                if track_thresholds {
-                    total_observations += 1;
-                }
             },
         );
-    }
-    if let Some(error) = accumulation_error {
-        bail!("{error}");
-    }
-    if let Some(error) = groups
-        .values()
-        .find_map(|group| group.limit_error.as_deref())
-    {
-        bail!("{error}");
     }
 
     // Pre-seed baseline rows for every (type, subtype, subset, filter)
@@ -2160,6 +2640,9 @@ where
         }
     }
 
+    for group in groups.values_mut() {
+        group.observations.finish()?;
+    }
     Ok(groups)
 }
 
@@ -2664,13 +3147,13 @@ fn build_star_sorted(
     let mut star_sorted: BTreeMap<(String, String, String, String), Vec<ObsRecord>> =
         BTreeMap::new();
     for (key, accum) in groups {
-        if key.subtype == "*" && key.genotype == "*" {
+        if key.subtype == "*" && key.genotype == "*" && !accum.observations.is_disk_backed() {
             let max_count = match key.ty.as_str() {
                 "SNP" => 12,
                 "INDEL" => 40,
                 _ => 4,
             };
-            let mut obs = accum.observation_window.clone();
+            let mut obs = accum.observations.small_records();
             let mut current_count: usize = 0;
             // Insert per-subtype snapshots at every 4-sort boundary.
             let snapshots: &[(usize, &str)] = match key.ty.as_str() {
@@ -2715,7 +3198,7 @@ fn render_rows(
     star_sorted: &BTreeMap<(String, String, String, String), Vec<ObsRecord>>,
     row_filter: RowFilter<'_>,
     config: RenderConfig<'_>,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
     // `accumulate` pre-seeds empty subtype buckets for types that are present,
     // because legacy reports zero-valued subtype baselines for an observed
@@ -2746,16 +3229,16 @@ fn render_rows(
         }
         let is_filter_tier = !is_aggregate_filter(&key.filter);
         let emitted_rows: Vec<EmittedRow> = if key.subtype == "*" {
-            accum.emit_with_delta(config.delta)
+            accum.emit_with_delta(config.delta)?
         } else if let Some(shared) = star_sorted.get(&(
             key.ty.clone(),
             key.subtype.clone(),
             key.subset.clone(),
             key.filter.clone(),
         )) {
-            accum.emit_with_shared_sort_and_delta(shared, &key.subtype, config.delta)
+            accum.emit_with_shared_sort_and_delta(shared, &key.subtype, config.delta)?
         } else {
-            accum.emit_with_delta(config.delta)
+            accum.emit_with_delta(config.delta)?
         };
         for emitted in emitted_rows {
             if matches!(row_filter, RowFilter::Locations { .. }) && emitted.qq_str == "*" {
@@ -2781,7 +3264,7 @@ fn render_rows(
             ));
         }
     }
-    out
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3651,7 +4134,7 @@ mod tests {
         // Legacy rocEvaluate calls addROCValue only for TP/FP/UNK query
         // decisions. A filtered record with BD=. must not create an N
         // observation or shift the roc-delta threshold sequence.
-        assert_eq!(pass.observation_window.len(), 1);
+        assert_eq!(pass.observations.next_serial, 1);
         let qq: Vec<_> = pass.emit().into_iter().map(|row| row.qq_str).collect();
         assert_eq!(qq, vec!["*", "10.000000"]);
     }
@@ -3892,7 +4375,7 @@ mod tests {
         };
         let groups = accumulate_with_options(&[first, second], &options);
         let key = RowKey::new_with_qq_field("SNP", "*", "*", "ALL", "SCORE");
-        let rows = groups[&key].emit_with_delta(options.delta);
+        let rows = groups[&key].emit_with_delta(options.delta).unwrap();
         assert_eq!(
             rows.iter()
                 .map(|row| row.qq_str.as_str())
@@ -3935,7 +4418,7 @@ mod tests {
 
         let groups = accumulate_with_options(&[row], &options);
         let key = RowKey::new_with_qq_field("SNP", "*", "*", "ALL", "INFO.SCORE");
-        let rows = groups[&key].emit_with_delta(options.delta);
+        let rows = groups[&key].emit_with_delta(options.delta).unwrap();
 
         assert_eq!(
             rows.iter()
@@ -4007,7 +4490,8 @@ mod tests {
                 ci_alpha: 0.0,
                 filter_counts_only: options.roc_regions.contains("*"),
             },
-        );
+        )
+        .unwrap();
         assert!(rendered.iter().any(|line| {
             let fields = line.split(',').collect::<Vec<_>>();
             fields[3] == "LowQual" && fields[6] != "*"

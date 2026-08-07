@@ -18,23 +18,37 @@ hap_bin="$root/target/release/hap"
 
 make_reference() {
   destination=$1
-  bases=$2
-  awk -v bases="$bases" 'BEGIN { print ">chr1"; for (i=0;i<bases;i++) printf "A"; print "" }' > "$destination"
+  contigs=$2
+  bases=$3
+  awk -v contigs="$contigs" -v bases="$bases" 'BEGIN {
+    for (chrom=1;chrom<=contigs;chrom++) {
+      print ">chr" chrom
+      for (i=0;i<bases;i++) printf "A"
+      print ""
+    }
+  }' > "$destination"
 }
 
 make_vcf() {
   destination=$1
   records=$2
   filter_every=${3:-0}
-  awk -v records="$records" -v filter_every="$filter_every" 'BEGIN {
+  contigs=${4:-1}
+  awk -v records="$records" -v filter_every="$filter_every" -v contigs="$contigs" 'BEGIN {
     print "##fileformat=VCFv4.2"
-    print "##contig=<ID=chr1,length=250000000>"
+    for (chrom=1;chrom<=contigs;chrom++)
+      print "##contig=<ID=chr" chrom ",length=10000000>"
     print "##FILTER=<ID=LowQual,Description=\"Synthetic filtered call\">"
     print "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
     print "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE"
-    for (i=1;i<=records;i++) {
-      filter=(filter_every && i%filter_every==0) ? "LowQual" : "PASS"
-      print "chr1\t" i "\t.\tA\tC\t50\t" filter "\t.\tGT\t0/1"
+    emitted=0
+    per_contig=int((records+contigs-1)/contigs)
+    for (chrom=1;chrom<=contigs && emitted<records;chrom++) {
+      for (pos=1;pos<=per_contig && emitted<records;pos++) {
+        emitted++
+        filter=(filter_every && emitted%filter_every==0) ? "LowQual" : "PASS"
+        print "chr" chrom "\t" pos * 100 "\t.\tA\tC\t50\t" filter "\t.\tGT\t0/1"
+      }
     }
   }' > "$destination"
 }
@@ -43,12 +57,25 @@ peak_rss() {
   report=$1
   shift
   if [[ $(uname -s) == Darwin ]]; then
-    /usr/bin/time -l "$@" >/dev/null 2> "$report"
-    awk '/maximum resident set size/ {print $1}' "$report"
+    if ! /usr/bin/time -l "$@" >/dev/null 2> "$report"; then
+      printf 'workflow failed; time report: %s\n' "$report" >&2
+      cat "$report" >&2
+      return 1
+    fi
+    rss=$(awk '/maximum resident set size/ {print $1}' "$report")
   else
-    /usr/bin/time -v "$@" >/dev/null 2> "$report"
-    awk -F ': ' '/Maximum resident set size/ {print $2 * 1024}' "$report"
+    if ! /usr/bin/time -v "$@" >/dev/null 2> "$report"; then
+      printf 'workflow failed; time report: %s\n' "$report" >&2
+      cat "$report" >&2
+      return 1
+    fi
+    rss=$(awk -F ': ' '/Maximum resident set size/ {printf "%.0f", $2 * 1024}' "$report")
   fi
+  if [[ ! $rss =~ ^[0-9]+$ ]] || (( rss <= 0 )); then
+    printf 'invalid peak RSS %q in %s\n' "$rss" "$report" >&2
+    return 1
+  fi
+  printf '%s\n' "$rss"
 }
 
 median() {
@@ -63,40 +90,53 @@ run_repeated() {
   : > "$rss_file"
   for run in $(seq 1 "$runs"); do
     report="$reports/$workflow.$size.run-$run.time.txt"
-    peak_rss "$report" "$@" >> "$rss_file"
+    rss=$(peak_rss "$report" "$@") || return 1
+    printf '%s\n' "$rss" >> "$rss_file"
   done
-  median < "$rss_file"
+  result=$(median < "$rss_file")
+  if [[ ! $result =~ ^[0-9]+$ ]] || (( result <= 0 )); then
+    printf 'invalid median RSS for %s/%s: %q\n' "$workflow" "$size" "$result" >&2
+    return 1
+  fi
+  printf '%s\n' "$result"
 }
 
 reference="$work/reference.fa"
-make_reference "$reference" 2500000
+make_reference "$reference" 24 10000000
 
 benchmark_size() {
   size=$1
   records=$2
+  contigs=$3
   input="$work/$size.vcf"
   query="$work/$size.query.vcf"
-  make_vcf "$input" "$records" 17
-  make_vcf "$query" "$records" 0
+  make_vcf "$input" "$records" 17 "$contigs"
+  make_vcf "$query" "$records" 0 "$contigs"
 
-  printf 'validate\t%s\n' "$(run_repeated validate "$size" "$hap_bin" validate "$input" -r "$reference" \
-    --errors-bed "$work/$size.errors.bed" -o "$work/$size.validate.json")"
-  printf 'preprocess\t%s\n' "$(run_repeated preprocess "$size" "$hap_bin" pre "$input" "$work/$size.pre.vcf.gz" \
-    -r "$reference")"
-  printf 'compare\t%s\n' "$(run_repeated compare "$size" "$hap_bin" germline "$input" "$query" -r "$reference" \
-    -o "$work/$size.compare" --usefiltered-truth --no-roc --no-write-counts)"
-  printf 'quantify_no_roc\t%s\n' "$(run_repeated quantify_no_roc "$size" "$hap_bin" quantify \
+  measurement=$(run_repeated validate "$size" "$hap_bin" validate "$input" -r "$reference" \
+    --errors-bed "$work/$size.errors.bed" -o "$work/$size.validate.json") || return 1
+  printf 'validate\t%s\n' "$measurement"
+  measurement=$(run_repeated preprocess "$size" "$hap_bin" pre "$input" "$work/$size.pre.vcf.gz" \
+    -r "$reference") || return 1
+  printf 'preprocess\t%s\n' "$measurement"
+  measurement=$(run_repeated compare "$size" "$hap_bin" germline "$input" "$query" -r "$reference" \
+    -o "$work/$size.compare" --usefiltered-truth --no-roc --no-write-counts) || return 1
+  printf 'compare\t%s\n' "$measurement"
+  measurement=$(run_repeated quantify_no_roc "$size" "$hap_bin" quantify \
     "$work/$size.compare.vcf.gz" -o "$work/$size.qfy-no-roc" -r "$reference" \
-    --type ga4gh --no-roc)"
-  printf 'quantify_roc\t%s\n' "$(run_repeated quantify_roc "$size" "$hap_bin" quantify \
+    --type ga4gh --no-roc) || return 1
+  printf 'quantify_no_roc\t%s\n' "$measurement"
+  measurement=$(run_repeated quantify_roc "$size" "$hap_bin" quantify \
     "$work/$size.compare.vcf.gz" -o "$work/$size.qfy-roc" -r "$reference" \
-    --type ga4gh --roc QQ)"
-  printf 'somatic_features\t%s\n' "$(run_repeated somatic_features "$size" "$hap_bin" somatic "$input" "$query" \
-    -r "$reference" -o "$work/$size.somatic" --feature-table generic --happy-stats)"
+    --type ga4gh --roc QQ) || return 1
+  printf 'quantify_roc\t%s\n' "$measurement"
+  measurement=$(run_repeated somatic_features "$size" "$hap_bin" somatic "$input" "$query" \
+    -r "$reference" -o "$work/$size.somatic" --feature-table generic --happy-stats) || return 1
+  printf 'somatic_features\t%s\n' "$measurement"
 }
 
-benchmark_size chromosome 100000 > "$work/chromosome.medians"
-benchmark_size whole_genome 2400000 > "$work/whole-genome.medians"
+benchmark_size chromosome 100000 1 > "$work/chromosome.medians"
+benchmark_size whole_genome 2400000 24 > "$work/whole-genome.medians"
 paste "$work/chromosome.medians" "$work/whole-genome.medians" > "$reports/median-rss.tsv"
 
 limit=$((64 * 1024 * 1024))

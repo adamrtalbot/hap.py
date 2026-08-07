@@ -122,7 +122,7 @@ type ComparisonSortKey = (String, usize, u8, usize, usize, String, usize);
 
 struct ComparisonRowSpool {
     buffer: Vec<(ComparisonSortKey, AnnotatedRow)>,
-    chunks: Vec<tempfile::NamedTempFile>,
+    chunks: Vec<tempfile::TempPath>,
     serial: usize,
 }
 
@@ -172,7 +172,7 @@ impl ComparisonRowSpool {
             }
             writer.flush()?;
         }
-        self.chunks.push(chunk);
+        self.chunks.push(chunk.into_temp_path());
         Ok(())
     }
 
@@ -200,6 +200,96 @@ struct ComparisonRowFile {
     path: tempfile::TempPath,
 }
 
+struct ComparisonContigSpool {
+    path: tempfile::TempPath,
+}
+
+fn spool_comparison_contigs(path: &Path) -> Result<BTreeMap<String, ComparisonContigSpool>> {
+    let mut spools = BTreeMap::new();
+    let mut active: Option<(String, tempfile::NamedTempFile)> = None;
+    for record in vcf::open_raw_vcf(path)? {
+        let record = record?;
+        if active
+            .as_ref()
+            .is_none_or(|(chrom, _)| chrom != &record.chrom)
+        {
+            if let Some((chrom, mut file)) = active.take() {
+                file.as_file_mut().flush()?;
+                if spools
+                    .insert(
+                        chrom.clone(),
+                        ComparisonContigSpool {
+                            path: file.into_temp_path(),
+                        },
+                    )
+                    .is_some()
+                {
+                    bail!("comparison records for chromosome {chrom} are not contiguous");
+                }
+            }
+            active = Some((
+                record.chrom.clone(),
+                tempfile::NamedTempFile::new()
+                    .context("failed to create comparison metadata spool")?,
+            ));
+        }
+        writeln!(
+            active
+                .as_mut()
+                .expect("comparison metadata spool was just created")
+                .1
+                .as_file_mut(),
+            "{}",
+            record.to_line()
+        )?;
+    }
+    if let Some((chrom, mut file)) = active {
+        file.as_file_mut().flush()?;
+        spools.insert(
+            chrom,
+            ComparisonContigSpool {
+                path: file.into_temp_path(),
+            },
+        );
+    }
+    Ok(spools)
+}
+
+fn collect_spooled_comparison_metadata(
+    spool: Option<&ComparisonContigSpool>,
+    chrom: &str,
+    start: usize,
+    end: usize,
+    filtered_truth_keys: &mut BTreeSet<VariantKey>,
+    decorations: &mut DecorationIndex,
+    preserve_info: bool,
+    roc_field: &str,
+    collect_filtered: bool,
+) -> Result<()> {
+    let Some(spool) = spool else {
+        return Ok(());
+    };
+    for record in vcf::open_raw_vcf(&spool.path)? {
+        let record = record?;
+        if record.pos > end {
+            break;
+        }
+        if record.pos < start {
+            continue;
+        }
+        if collect_filtered && !record.is_pass() {
+            filtered_truth_keys.insert(VariantKey {
+                chrom: chrom.to_string(),
+                pos: record.pos,
+                ref_allele: record.ref_allele.clone(),
+                alt_allele: record.alt_allele.clone(),
+            });
+        }
+        decorations.observe(&record, preserve_info, roc_field);
+    }
+    Ok(())
+}
+
 impl ComparisonRowFile {
     fn rows(&self) -> Result<ComparisonRowReader> {
         Ok(ComparisonRowReader {
@@ -224,17 +314,17 @@ impl Iterator for ComparisonRowReader {
 }
 
 struct ComparisonRowMerge {
-    _chunks: Vec<tempfile::NamedTempFile>,
+    _chunks: Vec<tempfile::TempPath>,
     readers: Vec<std::io::Lines<BufReader<File>>>,
     current: Vec<Option<(ComparisonSortKey, AnnotatedRow)>>,
     heap: BinaryHeap<Reverse<(ComparisonSortKey, usize)>>,
 }
 
 impl ComparisonRowMerge {
-    fn open(chunks: Vec<tempfile::NamedTempFile>) -> Result<Self> {
+    fn open(chunks: Vec<tempfile::TempPath>) -> Result<Self> {
         let mut readers = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
-            readers.push(BufReader::new(File::open(chunk.path())?).lines());
+            readers.push(BufReader::new(File::open(chunk)?).lines());
         }
         let mut merge = Self {
             current: (0..readers.len()).map(|_| None).collect(),
@@ -395,8 +485,8 @@ fn hex_decode(value: &str) -> Result<Vec<u8>> {
 }
 
 fn collapse_comparison_chunks(
-    mut chunks: Vec<tempfile::NamedTempFile>,
-) -> Result<Vec<tempfile::NamedTempFile>> {
+    mut chunks: Vec<tempfile::TempPath>,
+) -> Result<Vec<tempfile::TempPath>> {
     while chunks.len() > COMPARISON_MERGE_FAN_IN {
         let mut merged = Vec::with_capacity(chunks.len().div_ceil(COMPARISON_MERGE_FAN_IN));
         let mut remaining = chunks.into_iter();
@@ -419,7 +509,7 @@ fn collapse_comparison_chunks(
                 }
                 writer.flush()?;
             }
-            merged.push(output);
+            merged.push(output.into_temp_path());
         }
         chunks = merged;
     }
@@ -480,10 +570,11 @@ const CLUSTER_GAP_BP: usize = 50;
 #[cfg(test)]
 const XCMP_ENUMERATION_THRESHOLD: usize = 16_768;
 
-/// Upper bound on variants admitted to a single cluster. Once exceeded we
-/// force-split the cluster even if the inter-variant gap is under 50 bp. This
-/// protects `apply_events`/`cluster_signature` paths from pathological inputs
-/// that would otherwise allocate multi-GB strings. Legacy xcmp's `finish_block`
+/// Upper bound on variants admitted to a single cluster. A connected cluster
+/// above this limit returns a contextual resource error; it is never silently
+/// split because that would alter comparison semantics. This protects
+/// `apply_events`/`cluster_signature` paths from pathological inputs that would
+/// otherwise allocate multi-GB strings. Legacy xcmp's `finish_block`
 /// has no record-count cap — only a position gap (`hb_window = 50 bp`) — so
 /// matching legacy BS grouping requires admitting very large clusters when
 /// records are tightly packed (e.g. `chr21:10697903` has 67 variants within
@@ -871,26 +962,6 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     let query_headers = query_reader.headers().to_vec();
     drop(truth_reader);
     drop(query_reader);
-    let mut stream_contig_ranks = header_contig_ranks(&truth_headers);
-    for (chrom, _) in header_contig_ranks(&query_headers) {
-        let rank = stream_contig_ranks.len();
-        stream_contig_ranks.entry(chrom).or_insert(rank);
-    }
-
-    let mut filtered_truth = vcf::open_variants(
-        &truth_prep,
-        &contig_set,
-        false,
-        regions.as_deref(),
-        targets.as_deref(),
-        locations.as_deref(),
-    )?
-    .filter_map(|variant| match variant {
-        Ok(variant) if !variant.is_pass() => Some(Ok(variant)),
-        Ok(_) => None,
-        Err(error) => Some(Err(error)),
-    })
-    .peekable();
     // CONF insertion padding is derived from the preprocessed truth stream,
     // including filtered records retained by `--usefiltered-truth`. xcmp
     // excludes those records as calls below, but gvcf2bed sees them first;
@@ -997,76 +1068,16 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     let mut counts: BTreeMap<String, TypeCounts> = BTreeMap::new();
     let mut subtype_counts: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
     let mut row_spool = ComparisonRowSpool::new();
-    let mut finished_filtered_contigs = BTreeSet::new();
-    let mut previous_cluster_chrom: Option<String> = None;
     let needs_decoration =
         args.preserve_info || args.output_vtc || !matches!(args.roc.as_str(), "QUAL" | "QQ");
-    let mut truth_decorations = needs_decoration
-        .then(|| vcf::open_raw_vcf(&truth_prep))
-        .transpose()?
-        .map(Iterator::peekable);
-    let mut query_decorations = needs_decoration
-        .then(|| vcf::open_raw_vcf(&query_prep))
-        .transpose()?
-        .map(Iterator::peekable);
+    let truth_metadata = spool_comparison_contigs(&truth_prep)?;
+    let query_metadata = if needs_decoration {
+        spool_comparison_contigs(&query_prep)?
+    } else {
+        BTreeMap::new()
+    };
     for cluster in clusters {
         let cluster = cluster?;
-        if previous_cluster_chrom.as_deref() != Some(&cluster.chrom) {
-            if let Some(previous) = previous_cluster_chrom.replace(cluster.chrom.clone()) {
-                finished_filtered_contigs.insert(previous);
-            }
-        }
-        let mut filtered_truth_keys = BTreeSet::new();
-        loop {
-            let consume = match filtered_truth.peek() {
-                None => false,
-                Some(Err(_)) => true,
-                Some(Ok(variant)) if finished_filtered_contigs.contains(&variant.key.chrom) => true,
-                Some(Ok(variant))
-                    if stream_contig_ranks.get(&variant.key.chrom)
-                        < stream_contig_ranks.get(&cluster.chrom) =>
-                {
-                    true
-                }
-                Some(Ok(variant)) if variant.key.chrom != cluster.chrom => false,
-                Some(Ok(variant)) if variant.key.pos < cluster.start => true,
-                Some(Ok(variant)) if variant.key.pos <= cluster.end => true,
-                Some(Ok(_)) => false,
-            };
-            if !consume {
-                break;
-            }
-            let variant = filtered_truth.next().expect("peeked filtered truth")?;
-            if variant.key.chrom == cluster.chrom
-                && variant.key.pos >= cluster.start
-                && variant.key.pos <= cluster.end
-            {
-                filtered_truth_keys.insert(variant.key);
-            }
-        }
-        let mut decorations = DecorationIndex::default();
-        if let Some(reader) = truth_decorations.as_mut() {
-            collect_cluster_decorations(
-                reader,
-                &cluster,
-                &finished_filtered_contigs,
-                &stream_contig_ranks,
-                &mut decorations,
-                args.preserve_info,
-                &args.roc,
-            )?;
-        }
-        if let Some(reader) = query_decorations.as_mut() {
-            collect_cluster_decorations(
-                reader,
-                &cluster,
-                &finished_filtered_contigs,
-                &stream_contig_ranks,
-                &mut decorations,
-                args.preserve_info,
-                &args.roc,
-            )?;
-        }
         contigs_in_play.insert(cluster.chrom.clone());
         for variant in &cluster.truth {
             add_variant_stats(
@@ -1112,6 +1123,40 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
             &mut subtype_counts,
             &mut cluster_rows,
         )?;
+        let mut emitted_start = cluster.start;
+        let mut emitted_end = cluster.end;
+        for row in &cluster_rows {
+            let record = RawVcfRecord::from_line(&row.line, Path::new("comparison-emitted-span"))
+                .context("failed to determine emitted comparison span")?;
+            emitted_start = emitted_start.min(record.pos);
+            emitted_end = emitted_end.max(record.end_pos());
+        }
+        let mut filtered_truth_keys = BTreeSet::new();
+        let mut decorations = DecorationIndex::default();
+        collect_spooled_comparison_metadata(
+            truth_metadata.get(&cluster.chrom),
+            &cluster.chrom,
+            emitted_start,
+            emitted_end,
+            &mut filtered_truth_keys,
+            &mut decorations,
+            args.preserve_info,
+            &args.roc,
+            true,
+        )?;
+        if needs_decoration {
+            collect_spooled_comparison_metadata(
+                query_metadata.get(&cluster.chrom),
+                &cluster.chrom,
+                emitted_start,
+                emitted_end,
+                &mut filtered_truth_keys,
+                &mut decorations,
+                args.preserve_info,
+                &args.roc,
+                false,
+            )?;
+        }
         for mut row in cluster_rows {
             let sort_line = row.line.clone();
             let filtered_match = row_matches_variant_key(&row, &filtered_truth_keys);
@@ -1932,57 +1977,6 @@ struct DecorationIndex {
     roc_values: BTreeMap<InfoKey, String>,
 }
 
-fn collect_cluster_decorations(
-    reader: &mut std::iter::Peekable<vcf::RawVcfReader>,
-    cluster: &Cluster,
-    finished_contigs: &BTreeSet<String>,
-    contig_ranks: &BTreeMap<String, usize>,
-    decorations: &mut DecorationIndex,
-    preserve_info: bool,
-    roc_field: &str,
-) -> Result<()> {
-    loop {
-        let consume = match reader.peek() {
-            None => false,
-            Some(Err(_)) => true,
-            Some(Ok(record)) if finished_contigs.contains(&record.chrom) => true,
-            Some(Ok(record))
-                if contig_ranks.get(&record.chrom) < contig_ranks.get(&cluster.chrom) =>
-            {
-                true
-            }
-            Some(Ok(record)) if record.chrom != cluster.chrom => false,
-            Some(Ok(record)) if record.pos < cluster.start => true,
-            Some(Ok(record)) if record.pos <= cluster.end => true,
-            Some(Ok(_)) => false,
-        };
-        if !consume {
-            break;
-        }
-        let record = reader.next().expect("peeked comparison decoration")?;
-        if record.chrom == cluster.chrom && record.pos >= cluster.start && record.pos <= cluster.end
-        {
-            decorations.observe(&record, preserve_info, roc_field);
-        }
-    }
-    Ok(())
-}
-
-fn header_contig_ranks(headers: &[String]) -> BTreeMap<String, usize> {
-    let mut ranks = BTreeMap::new();
-    for header in headers {
-        let Some(rest) = header.strip_prefix("##contig=<ID=") else {
-            continue;
-        };
-        let Some(chrom) = rest.split([',', '>']).next() else {
-            continue;
-        };
-        let rank = ranks.len();
-        ranks.entry(chrom.to_string()).or_insert(rank);
-    }
-    ranks
-}
-
 impl DecorationIndex {
     fn observe(&mut self, record: &RawVcfRecord, preserve_info: bool, roc_field: &str) {
         let key = (
@@ -2624,8 +2618,7 @@ fn build_clusters_with_gap(
         match &mut current {
             Some(cluster)
                 if cluster.chrom == entry.variant.key.chrom
-                    && start <= cluster.end.saturating_add(cluster_gap)
-                    && cluster.truth.len() + cluster.query.len() < MAX_CLUSTER_VARIANTS =>
+                    && start <= cluster.end.saturating_add(cluster_gap) =>
             {
                 cluster.end = cluster.end.max(end);
                 match entry.side {
@@ -2758,8 +2751,16 @@ where
             let start = entry.variant.key.pos;
             if cluster.chrom == entry.variant.key.chrom
                 && start <= cluster.end.saturating_add(self.cluster_gap)
-                && cluster.truth.len() + cluster.query.len() < MAX_CLUSTER_VARIANTS
             {
+                if cluster.truth.len() + cluster.query.len() >= MAX_CLUSTER_VARIANTS {
+                    return Some(Err(anyhow::anyhow!(
+                        "connected comparison cluster {}:{}-{} exceeds the {} variant active-window limit",
+                        cluster.chrom,
+                        cluster.start,
+                        cluster.end.max(entry.variant.end_pos()),
+                        MAX_CLUSTER_VARIANTS
+                    )));
+                }
                 cluster.end = cluster.end.max(entry.variant.end_pos());
                 push_cluster_entry(&mut cluster, entry);
             } else {
@@ -9024,10 +9025,11 @@ mod memory_guards {
     }
 
     #[test]
-    fn build_clusters_splits_at_variant_cap() {
+    fn build_clusters_does_not_split_a_connected_cluster_at_variant_cap() {
         // MAX_CLUSTER_VARIANTS + 2 variants packed within 1 bp of each other
-        // must yield at least 2 clusters — no single cluster may exceed the
-        // cap.
+        // remains one connected cluster. The production streaming iterator
+        // reports an explicit resource error at the cap rather than silently
+        // changing comparison semantics by splitting it.
         let mut truth = Vec::new();
         for offset in 0..(MAX_CLUSTER_VARIANTS + 2) {
             truth.push(Variant {
@@ -9043,13 +9045,8 @@ mod memory_guards {
             });
         }
         let clusters = build_clusters(&truth, &[]);
-        assert!(clusters.len() >= 2, "expected split at variant cap");
-        for cluster in &clusters {
-            assert!(
-                cluster.truth.len() + cluster.query.len() <= MAX_CLUSTER_VARIANTS,
-                "cluster exceeded MAX_CLUSTER_VARIANTS"
-            );
-        }
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].truth.len(), MAX_CLUSTER_VARIANTS + 2);
     }
 
     #[test]

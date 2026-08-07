@@ -15,7 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// nothing after). We reproduce the exact literal so stats.csv byte-matches.
 const SOM_VERSION: &str = "som.py-";
 const MAX_AF_BINS: usize = 10_000;
-const MAX_SOMATIC_ROC_OBSERVATIONS: usize = 1_000_000;
+const SOMATIC_ROC_CHUNK: usize = 16_384;
+const SOMATIC_ROC_MERGE_FAN_IN: usize = 32;
 const STATS_TYPE_ROWS: [(usize, &str); 4] =
     [(0, "indels"), (1, "SNVs"), (6, "MNPs"), (7, "others")];
 static SOMATIC_SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
@@ -2127,6 +2128,194 @@ enum SomaticRocTag {
     Fn,
 }
 
+impl SomaticRocTag {
+    fn code(self) -> u8 {
+        match self {
+            Self::Tp => 0,
+            Self::Fp => 1,
+            Self::Fn => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self> {
+        match code {
+            0 => Ok(Self::Tp),
+            1 => Ok(Self::Fp),
+            2 => Ok(Self::Fn),
+            _ => bail!("invalid somatic ROC tag code {code}"),
+        }
+    }
+}
+
+struct SomaticRocSpool {
+    buffer: Vec<(f64, SomaticRocTag, u64)>,
+    chunks: Vec<tempfile::TempPath>,
+    next_serial: u64,
+    totals: [usize; 3],
+}
+
+impl SomaticRocSpool {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            chunks: Vec::new(),
+            next_serial: 0,
+            totals: [0; 3],
+        }
+    }
+
+    fn push(&mut self, score: f64, tag: SomaticRocTag) -> Result<()> {
+        self.totals[tag.code() as usize] += 1;
+        self.buffer.push((score, tag, self.next_serial));
+        self.next_serial += 1;
+        if self.buffer.len() >= SOMATIC_ROC_CHUNK {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.buffer.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then(left.1.cmp(&right.1))
+                .then(left.2.cmp(&right.2))
+        });
+        let mut chunk =
+            tempfile::NamedTempFile::new().context("failed to create somatic ROC chunk")?;
+        {
+            let mut writer = BufWriter::new(chunk.as_file_mut());
+            for (score, tag, serial) in self.buffer.drain(..) {
+                writeln!(writer, "{}\t{}\t{serial}", score.to_bits(), tag.code())?;
+            }
+            writer.flush()?;
+        }
+        self.chunks.push(chunk.into_temp_path());
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(SomaticRocMerge, [usize; 3])> {
+        self.flush()?;
+        let chunks = collapse_somatic_roc_chunks(self.chunks)?;
+        Ok((SomaticRocMerge::open(chunks)?, self.totals))
+    }
+}
+
+struct SomaticRocMerge {
+    _chunks: Vec<tempfile::TempPath>,
+    readers: Vec<std::io::Lines<BufReader<File>>>,
+    current: Vec<Option<(f64, SomaticRocTag, u64)>>,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u8, u64, usize)>>,
+}
+
+impl SomaticRocMerge {
+    fn open(chunks: Vec<tempfile::TempPath>) -> Result<Self> {
+        let mut readers = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            readers.push(BufReader::new(File::open(chunk)?).lines());
+        }
+        let mut merge = Self {
+            current: (0..readers.len()).map(|_| None).collect(),
+            readers,
+            heap: std::collections::BinaryHeap::new(),
+            _chunks: chunks,
+        };
+        for index in 0..merge.readers.len() {
+            merge.advance(index)?;
+        }
+        Ok(merge)
+    }
+
+    fn advance(&mut self, index: usize) -> Result<()> {
+        let Some(line) = self.readers[index].next() else {
+            return Ok(());
+        };
+        let line = line?;
+        let mut fields = line.split('\t');
+        let score = f64::from_bits(
+            fields
+                .next()
+                .context("somatic ROC score missing")?
+                .parse()?,
+        );
+        let tag =
+            SomaticRocTag::from_code(fields.next().context("somatic ROC tag missing")?.parse()?)?;
+        let serial = fields
+            .next()
+            .context("somatic ROC serial missing")?
+            .parse()?;
+        self.heap.push(std::cmp::Reverse((
+            somatic_sortable_f64(score),
+            tag.code(),
+            serial,
+            index,
+        )));
+        self.current[index] = Some((score, tag, serial));
+        Ok(())
+    }
+}
+
+impl Iterator for SomaticRocMerge {
+    type Item = Result<(f64, SomaticRocTag)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let std::cmp::Reverse((_, _, _, index)) = self.heap.pop()?;
+        let (score, tag, _) = self.current[index]
+            .take()
+            .expect("somatic ROC merge entry has a row");
+        if let Err(error) = self.advance(index) {
+            return Some(Err(error));
+        }
+        Some(Ok((score, tag)))
+    }
+}
+
+fn somatic_sortable_f64(value: f64) -> u64 {
+    let bits = value.to_bits();
+    if bits & (1 << 63) == 0 {
+        bits ^ (1 << 63)
+    } else {
+        !bits
+    }
+}
+
+fn collapse_somatic_roc_chunks(
+    mut chunks: Vec<tempfile::TempPath>,
+) -> Result<Vec<tempfile::TempPath>> {
+    while chunks.len() > SOMATIC_ROC_MERGE_FAN_IN {
+        let mut merged = Vec::with_capacity(chunks.len().div_ceil(SOMATIC_ROC_MERGE_FAN_IN));
+        let mut remaining = chunks.into_iter();
+        loop {
+            let batch = remaining
+                .by_ref()
+                .take(SOMATIC_ROC_MERGE_FAN_IN)
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            let mut output = tempfile::NamedTempFile::new()
+                .context("failed to create merged somatic ROC chunk")?;
+            {
+                let mut writer = BufWriter::new(output.as_file_mut());
+                let mut merge = SomaticRocMerge::open(batch)?;
+                let mut serial = 0u64;
+                while let Some(row) = merge.next() {
+                    let (score, tag) = row?;
+                    writeln!(writer, "{}\t{}\t{serial}", score.to_bits(), tag.code())?;
+                    serial += 1;
+                }
+                writer.flush()?;
+            }
+            merged.push(output.into_temp_path());
+        }
+        chunks = merged;
+    }
+    Ok(chunks)
+}
+
 fn write_somatic_roc(
     path: &Path,
     feature_header: &str,
@@ -2140,7 +2329,7 @@ fn write_somatic_roc(
     let tag_index = csv_column_index(&headers, "tag")?;
     let filter_index = headers.iter().position(|field| field == "FILTER");
     let nt_index = headers.iter().position(|field| field == "NT");
-    let mut observations = Vec::new();
+    let mut observations = SomaticRocSpool::new();
 
     for line in BufReader::new(File::open(feature_rows)?).lines() {
         let line = line?;
@@ -2183,35 +2372,20 @@ fn write_somatic_roc(
                 score = f64::MIN_POSITIVE;
             }
         }
-        if observations.len() >= MAX_SOMATIC_ROC_OBSERVATIONS {
-            bail!(
-                "somatic ROC exceeds the {} observation resource limit",
-                MAX_SOMATIC_ROC_OBSERVATIONS
-            );
-        }
-        observations.push((score, tag));
+        observations.push(score, tag)?;
     }
-    observations.sort_by(|left, right| {
-        left.0
-            .total_cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
-    });
-
-    let mut tp = observations
-        .iter()
-        .filter(|(_, tag)| *tag == SomaticRocTag::Tp)
-        .count();
-    let mut fp = observations
-        .iter()
-        .filter(|(_, tag)| *tag == SomaticRocTag::Fp)
-        .count();
-    let mut fn_count = observations
-        .iter()
-        .filter(|(_, tag)| *tag == SomaticRocTag::Fn)
-        .count();
-    let mut roc_rows = Vec::new();
+    let (observations, totals) = observations.finish()?;
+    let mut tp = totals[SomaticRocTag::Tp.code() as usize];
+    let mut fp = totals[SomaticRocTag::Fp.code() as usize];
+    let mut fn_count = totals[SomaticRocTag::Fn.code() as usize];
+    let mut roc_rows =
+        tempfile::NamedTempFile::new().context("failed to create somatic ROC output spool")?;
+    let mut integer_scores = true;
+    let mut integer_precision = true;
+    let mut integer_recall = true;
     let mut previous = None;
-    for (score, tag) in observations {
+    for observation in observations {
+        let (score, tag) = observation?;
         if previous != Some(score) {
             let precision = if tp + fp == 0 {
                 1.0
@@ -2223,15 +2397,17 @@ fn write_somatic_roc(
             } else {
                 tp as f64 / (tp + fn_count) as f64
             };
-            roc_rows.push((
-                cpp_default_six(score),
-                tp,
-                fp,
-                fn_count,
-                cpp_default_six(precision),
-                cpp_default_six(recall),
-            ));
             previous = Some(score);
+            let score = cpp_default_six(score);
+            let precision = cpp_default_six(precision);
+            let recall = cpp_default_six(recall);
+            integer_scores &= score.parse::<i64>().is_ok();
+            integer_precision &= precision.parse::<i64>().is_ok();
+            integer_recall &= recall.parse::<i64>().is_ok();
+            writeln!(
+                roc_rows.as_file_mut(),
+                "{score}\t{tp}\t{fp}\t{fn_count}\t{precision}\t{recall}"
+            )?;
         }
         match tag {
             SomaticRocTag::Tp => {
@@ -2242,19 +2418,32 @@ fn write_somatic_roc(
             SomaticRocTag::Fn => {}
         }
     }
-    let integer_scores = roc_rows
-        .iter()
-        .all(|(score, ..)| score.parse::<i64>().is_ok());
-    let integer_precision = roc_rows
-        .iter()
-        .all(|(_, _, _, _, precision, _)| precision.parse::<i64>().is_ok());
-    let integer_recall = roc_rows
-        .iter()
-        .all(|(_, _, _, _, _, recall)| recall.parse::<i64>().is_ok());
-    let mut lines = vec![format!(",{},tp,fp,fn,precision,recall", config.score)];
-    for (row_index, (score, tp, fp, fn_count, precision, recall)) in
-        roc_rows.into_iter().enumerate()
+    roc_rows.as_file_mut().flush()?;
+    let mut output = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+    );
+    writeln!(output, ",{},tp,fp,fn,precision,recall", config.score)?;
+    for (row_index, row) in BufReader::new(File::open(roc_rows.path())?)
+        .lines()
+        .enumerate()
     {
+        let row = row?;
+        let mut fields = row.split('\t');
+        let score = fields
+            .next()
+            .context("somatic ROC score missing")?
+            .to_string();
+        let tp = fields.next().context("somatic ROC TP missing")?;
+        let fp = fields.next().context("somatic ROC FP missing")?;
+        let fn_count = fields.next().context("somatic ROC FN missing")?;
+        let precision = fields
+            .next()
+            .context("somatic ROC precision missing")?
+            .to_string();
+        let recall = fields
+            .next()
+            .context("somatic ROC recall missing")?
+            .to_string();
         let score = if integer_scores {
             score
         } else {
@@ -2279,11 +2468,13 @@ fn write_somatic_roc(
                 .map(|value| format!("{value:.8}"))
                 .unwrap_or(recall)
         };
-        lines.push(format!(
+        writeln!(
+            output,
             "{row_index},{score},{tp},{fp},{fn_count},{precision},{recall}"
-        ));
+        )?;
     }
-    write_simple_table(path, &format!("{}\n", lines.join("\n")))
+    output.flush()?;
+    Ok(())
 }
 
 fn cpp_default_six(value: f64) -> String {

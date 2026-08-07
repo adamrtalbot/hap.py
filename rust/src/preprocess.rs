@@ -837,7 +837,7 @@ const PREPROCESS_SORT_MERGE_FAN_IN: usize = 32;
 struct PreprocessSpool {
     sorted: bool,
     unsorted: tempfile::NamedTempFile,
-    chunks: Vec<tempfile::NamedTempFile>,
+    chunks: Vec<tempfile::TempPath>,
     buffer: Vec<(usize, usize, usize, vcf::RawVcfRecord)>,
     contig_ranks: HashMap<String, usize>,
     emitted_contigs: Vec<String>,
@@ -900,15 +900,17 @@ impl PreprocessSpool {
                 record.to_line()
             )?;
         }
-        self.chunks.push(chunk);
+        chunk.as_file_mut().flush()?;
+        self.chunks.push(chunk.into_temp_path());
         Ok(())
     }
 
     fn finish(mut self) -> Result<PreprocessRecords> {
         if !self.sorted {
-            let reader = vcf::open_raw_vcf(self.unsorted.path())?;
+            let path = self.unsorted.into_temp_path();
+            let reader = vcf::open_raw_vcf(&path)?;
             return Ok(PreprocessRecords::Unsorted {
-                _file: self.unsorted,
+                _path: path,
                 reader,
             });
         }
@@ -921,7 +923,7 @@ impl PreprocessSpool {
 
 enum PreprocessRecords {
     Unsorted {
-        _file: tempfile::NamedTempFile,
+        _path: tempfile::TempPath,
         reader: vcf::RawVcfReader,
     },
     Sorted(ExternalRecordMerge),
@@ -941,21 +943,21 @@ impl Iterator for PreprocessRecords {
 type SortKey = (usize, usize, usize, usize);
 
 struct ExternalRecordMerge {
-    _chunks: Vec<tempfile::NamedTempFile>,
+    _chunks: Vec<tempfile::TempPath>,
     readers: Vec<BufReader<File>>,
     current: Vec<Option<((usize, usize, usize), vcf::RawVcfRecord)>>,
     heap: BinaryHeap<Reverse<SortKey>>,
 }
 
 impl ExternalRecordMerge {
-    fn new(chunks: Vec<tempfile::NamedTempFile>) -> Result<Self> {
+    fn new(chunks: Vec<tempfile::TempPath>) -> Result<Self> {
         Self::open(collapse_preprocess_chunks(chunks)?)
     }
 
-    fn open(chunks: Vec<tempfile::NamedTempFile>) -> Result<Self> {
+    fn open(chunks: Vec<tempfile::TempPath>) -> Result<Self> {
         let mut readers = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
-            readers.push(BufReader::new(File::open(chunk.path())?));
+            readers.push(BufReader::new(File::open(chunk)?));
         }
         let current = vec![None; readers.len()];
         let mut merge = Self {
@@ -1023,8 +1025,8 @@ impl Iterator for ExternalRecordMerge {
 }
 
 fn collapse_preprocess_chunks(
-    mut chunks: Vec<tempfile::NamedTempFile>,
-) -> Result<Vec<tempfile::NamedTempFile>> {
+    mut chunks: Vec<tempfile::TempPath>,
+) -> Result<Vec<tempfile::TempPath>> {
     while chunks.len() > PREPROCESS_SORT_MERGE_FAN_IN {
         let mut merged = Vec::with_capacity(chunks.len().div_ceil(PREPROCESS_SORT_MERGE_FAN_IN));
         let mut remaining = chunks.into_iter();
@@ -1047,7 +1049,7 @@ fn collapse_preprocess_chunks(
                 }
                 writer.flush()?;
             }
-            merged.push(output);
+            merged.push(output.into_temp_path());
         }
         chunks = merged;
     }

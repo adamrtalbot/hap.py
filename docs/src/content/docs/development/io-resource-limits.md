@@ -6,12 +6,19 @@ description: Streaming behavior, decoder limits, and memory benchmarks.
 VCF and BCF inputs are decoded record by record and compressed inputs are
 decompressed incrementally. Validation retains only the current record.
 Preprocessing uses 65,536-record external-sort chunks and 32-way merge passes.
-Comparison retains at most one 10,000-variant cluster and externally orders
-65,536-row chunks with the same bounded fan-in. Quantify uses a disk-backed
-transformed spool. Somatic comparison closes each per-contig spool before
-opening the next and retains records for only the active contig; feature rows
-are written to five classification spools and renumbered with streaming passes.
-Validation writes `--errors-bed` records directly to a buffered output.
+Comparison retains at most one 10,000-variant cluster and returns a contextual
+resource error instead of splitting a larger connected cluster and changing
+its semantics. It externally orders 65,536-row chunks with the same bounded
+fan-in. Completed preprocess and comparison chunks are closed paths, so only
+the active merge's at most 32 readers are open. Comparison metadata is spooled
+per contig and rescanned over the actual emitted span, including left-shifted
+rows. Quantify uses a disk-backed transformed spool. Germline and somatic ROC
+observations use 16,384-record sorted chunks and bounded 32-way merge passes;
+there is no whole-genome observation or threshold-count cap. Somatic comparison
+closes each per-contig spool before opening the next and retains records for
+only the active contig; feature rows are written to five classification spools
+and renumbered with streaming passes. Validation writes `--errors-bed` records
+directly to a buffered output.
 
 The parser rejects inputs that exceed these hard limits before allocating the
 declared payload:
@@ -24,11 +31,6 @@ declared payload:
 - Quantify records per active superlocus: 1,000,000
 - Somatic records per active contig and side: 10,000,000
 - Comparison variants per active cluster: 10,000
-- ROC observations per group: 1,000,000
-- ROC numeric thresholds per group: 1,000,000
-- ROC groups: 100,000
-- ROC observations across all groups: 4,000,000
-- Somatic ROC observations: 1,000,000
 
 These limits are intentionally far above normal variant records but low enough
 to prevent corrupt length and count fields from causing unbounded allocations.
@@ -41,6 +43,9 @@ feature/happy reports. It compares a chromosome-scale 100,000-record input to
 a whole-genome-scale 2,400,000-record input and uses the median of three runs
 by default. Complete `time` reports and the median table are preserved under
 `target/stream-memory-reports` (or `HAP_MEMORY_REPORT_DIR`) after input cleanup.
-The check proves only that these named scenarios grow by no more than 64 MiB;
-dense clusters, superloci, contigs, and ROC groups are instead protected by the
-hard limits above.
+The generated whole-genome case distributes records across 24 representative
+contigs. The script fails if a workflow or peak-RSS measurement fails, rejects
+missing or non-positive RSS values, and proves only that these named scenarios
+grow by no more than 64 MiB. Dense connected clusters, superloci, and somatic
+contigs are instead protected by the explicit limits above; ROC observation
+counts are handled by external sorting rather than rejected.
