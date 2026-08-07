@@ -110,6 +110,52 @@ pub(crate) fn location_stream_groups(
     }
 }
 
+/// Return the terminal bound used by block splitting for one governed stream.
+///
+/// Independent legacy streams inherit their source filter geometry. A set
+/// union has no single source index: its bound is the union's maximum range
+/// end, or unbounded when any contributing filter selects the whole contig.
+pub(crate) fn location_stream_final_end(
+    policy: LocationStreamPolicy,
+    filters: &[LocationFilter],
+    stream_id: usize,
+    chrom: &str,
+) -> Option<usize> {
+    match policy {
+        LocationStreamPolicy::IndependentLegacyStreams => filters
+            .get(stream_id)
+            .and_then(|filter| location_filter_end(filter, chrom)),
+        LocationStreamPolicy::SetUnion => {
+            let mut maximum = None;
+            for filter in filters {
+                match filter {
+                    LocationFilter::Contig(expected) if expected == chrom => return None,
+                    LocationFilter::Range {
+                        chrom: expected,
+                        end,
+                        ..
+                    } if expected == chrom => {
+                        maximum = Some(maximum.map_or(*end, |current: usize| current.max(*end)));
+                    }
+                    _ => {}
+                }
+            }
+            maximum
+        }
+    }
+}
+
+fn location_filter_end(filter: &LocationFilter, chrom: &str) -> Option<usize> {
+    match filter {
+        LocationFilter::Range {
+            chrom: expected,
+            end,
+            ..
+        } if expected == chrom => Some(*end),
+        _ => None,
+    }
+}
+
 /// Construct an SCMP end coordinate under the selected compatibility policy.
 pub(crate) fn scmp_refvar_end(
     policy: ScmpRefVarSpanPolicy,
@@ -206,6 +252,26 @@ mod tests {
         );
         assert!(
             location_stream_groups(LocationStreamPolicy::SetUnion, &filters, "chr2", 75).is_empty()
+        );
+    }
+
+    #[test]
+    fn normative_set_union_geometry_includes_later_range_end() {
+        let filters = [
+            vcf::LocationFilter::Range {
+                chrom: "chr1".into(),
+                start: 1,
+                end: 100,
+            },
+            vcf::LocationFilter::Range {
+                chrom: "chr1".into(),
+                start: 1_000,
+                end: 2_000,
+            },
+        ];
+        assert_eq!(
+            location_stream_final_end(LocationStreamPolicy::SetUnion, &filters, 0, "chr1"),
+            Some(2_000)
         );
     }
 

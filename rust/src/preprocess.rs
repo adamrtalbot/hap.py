@@ -635,6 +635,22 @@ fn select_blocksplit_resets(
     block_count: usize,
     locations: Option<&[vcf::LocationFilter]>,
 ) -> BlocksplitSelection {
+    select_blocksplit_resets_with_policy(
+        observations,
+        window_size,
+        block_count,
+        locations,
+        LOCATION_STREAM_POLICY,
+    )
+}
+
+fn select_blocksplit_resets_with_policy(
+    observations: &[BlocksplitObservation],
+    window_size: i64,
+    block_count: usize,
+    locations: Option<&[vcf::LocationFilter]>,
+    location_stream_policy: crate::compatibility::LocationStreamPolicy,
+) -> BlocksplitSelection {
     if block_count == 0 {
         return BlocksplitSelection::default();
     }
@@ -682,7 +698,13 @@ fn select_blocksplit_resets(
         }
         partition_resets.insert(partition.clone(), selected);
     }
-    let jobs = build_blocksplit_jobs(observations, &states, &partition_resets, locations);
+    let jobs = build_blocksplit_jobs(
+        observations,
+        &states,
+        &partition_resets,
+        locations,
+        location_stream_policy,
+    );
     BlocksplitSelection { jobs: Some(jobs) }
 }
 
@@ -691,6 +713,7 @@ fn build_blocksplit_jobs(
     states: &std::collections::BTreeMap<(usize, String), BlocksplitContigState>,
     partition_resets: &std::collections::BTreeMap<(usize, String), Vec<usize>>,
     locations: Option<&[vcf::LocationFilter]>,
+    location_stream_policy: crate::compatibility::LocationStreamPolicy,
 ) -> Vec<BlocksplitJob> {
     let mut jobs = Vec::new();
     for ((location_group, chrom), state) in states {
@@ -725,16 +748,14 @@ fn build_blocksplit_jobs(
             continue;
         }
 
-        let final_end = locations
-            .and_then(|filters| filters.get(*location_group))
-            .and_then(|filter| match filter {
-                vcf::LocationFilter::Range {
-                    chrom: expected,
-                    end,
-                    ..
-                } if expected == chrom => Some(*end),
-                _ => None,
-            });
+        let final_end = locations.and_then(|filters| {
+            crate::compatibility::location_stream_final_end(
+                location_stream_policy,
+                filters,
+                *location_group,
+                chrom,
+            )
+        });
         let mut block_start = None;
         let mut block_start_index = None;
         for &boundary_index in boundaries {
@@ -3988,6 +4009,62 @@ mod tests {
         assert_eq!(
             select_blocksplit_resets(&observations, 1, 2, Some(&locations)).reset_indices(),
             HashSet::from([101, 202, 303])
+        );
+    }
+
+    #[test]
+    fn normative_set_union_multiblock_keeps_records_selected_only_by_later_range() {
+        let locations = [
+            vcf::LocationFilter::Range {
+                chrom: "chr1".into(),
+                start: 1,
+                end: 101,
+            },
+            vcf::LocationFilter::Range {
+                chrom: "chr1".into(),
+                start: 10_000,
+                end: 20_101,
+            },
+        ];
+        let observations = (0..303)
+            .map(|index| {
+                let pos = match index {
+                    0..101 => index + 1,
+                    101..202 => 10_000 + index - 101,
+                    _ => 20_000 + index - 202,
+                };
+                BlocksplitObservation {
+                    chrom: "chr1".into(),
+                    pos,
+                    end: pos,
+                    called: true,
+                    location_groups: crate::compatibility::location_stream_groups(
+                        crate::compatibility::LocationStreamPolicy::SetUnion,
+                        &locations,
+                        "chr1",
+                        pos,
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let selection = select_blocksplit_resets_with_policy(
+            &observations,
+            1,
+            40,
+            Some(&locations),
+            crate::compatibility::LocationStreamPolicy::SetUnion,
+        );
+
+        assert_eq!(
+            selection.included_indices(),
+            Some((0..303).collect::<HashSet<_>>())
+        );
+        assert!(
+            selection
+                .included_indices()
+                .is_some_and(|indices| indices.contains(&302)),
+            "the final record exists only in the later range"
         );
     }
 
