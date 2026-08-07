@@ -9,9 +9,10 @@ use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::Write;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -115,6 +116,316 @@ pub struct AnnotatedRow {
     pub xcmp_hap_match: bool,
 }
 
+const COMPARISON_ROW_CHUNK: usize = 65_536;
+const COMPARISON_MERGE_FAN_IN: usize = 32;
+type ComparisonSortKey = (String, usize, u8, usize, usize, String, usize);
+
+struct ComparisonRowSpool {
+    buffer: Vec<(ComparisonSortKey, AnnotatedRow)>,
+    chunks: Vec<tempfile::NamedTempFile>,
+    serial: usize,
+}
+
+impl ComparisonRowSpool {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            chunks: Vec::new(),
+            serial: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        row: AnnotatedRow,
+        filtered_truth_match: bool,
+        sort_line: String,
+    ) -> Result<()> {
+        let key = (
+            row.sort_key.0.clone(),
+            row.sort_key.1,
+            u8::from(!filtered_truth_match),
+            row.sort_key.2,
+            row.sort_key.3,
+            sort_line,
+            self.serial,
+        );
+        self.serial += 1;
+        self.buffer.push((key, row));
+        if self.buffer.len() >= COMPARISON_ROW_CHUNK {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.buffer.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut chunk =
+            tempfile::NamedTempFile::new().context("failed to create comparison sort chunk")?;
+        {
+            let mut writer = BufWriter::new(chunk.as_file_mut());
+            for (key, row) in self.buffer.drain(..) {
+                write_comparison_spool_row(&mut writer, &key, &row)?;
+            }
+            writer.flush()?;
+        }
+        self.chunks.push(chunk);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<ComparisonRowFile> {
+        self.flush()?;
+        let chunks = collapse_comparison_chunks(self.chunks)?;
+        let mut output =
+            tempfile::NamedTempFile::new().context("failed to create ordered comparison spool")?;
+        {
+            let mut writer = BufWriter::new(output.as_file_mut());
+            let mut merge = ComparisonRowMerge::open(chunks)?;
+            while let Some(entry) = merge.next_keyed() {
+                let (key, row) = entry?;
+                write_comparison_spool_row(&mut writer, &key, &row)?;
+            }
+            writer.flush()?;
+        }
+        Ok(ComparisonRowFile {
+            path: output.into_temp_path(),
+        })
+    }
+}
+
+struct ComparisonRowFile {
+    path: tempfile::TempPath,
+}
+
+impl ComparisonRowFile {
+    fn rows(&self) -> Result<ComparisonRowReader> {
+        Ok(ComparisonRowReader {
+            lines: BufReader::new(File::open(&self.path)?).lines(),
+        })
+    }
+}
+
+struct ComparisonRowReader {
+    lines: std::io::Lines<BufReader<File>>,
+}
+
+impl Iterator for ComparisonRowReader {
+    type Item = Result<AnnotatedRow>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.lines.next().map(|line| {
+            let line = line?;
+            parse_comparison_spool_row(&line).map(|(_, row)| row)
+        })
+    }
+}
+
+struct ComparisonRowMerge {
+    _chunks: Vec<tempfile::NamedTempFile>,
+    readers: Vec<std::io::Lines<BufReader<File>>>,
+    current: Vec<Option<(ComparisonSortKey, AnnotatedRow)>>,
+    heap: BinaryHeap<Reverse<(ComparisonSortKey, usize)>>,
+}
+
+impl ComparisonRowMerge {
+    fn open(chunks: Vec<tempfile::NamedTempFile>) -> Result<Self> {
+        let mut readers = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            readers.push(BufReader::new(File::open(chunk.path())?).lines());
+        }
+        let mut merge = Self {
+            current: (0..readers.len()).map(|_| None).collect(),
+            readers,
+            heap: BinaryHeap::new(),
+            _chunks: chunks,
+        };
+        for index in 0..merge.readers.len() {
+            merge.advance(index)?;
+        }
+        Ok(merge)
+    }
+
+    fn advance(&mut self, index: usize) -> Result<()> {
+        let Some(line) = self.readers[index].next() else {
+            return Ok(());
+        };
+        let entry = parse_comparison_spool_row(&line?)?;
+        self.heap.push(Reverse((entry.0.clone(), index)));
+        self.current[index] = Some(entry);
+        Ok(())
+    }
+
+    fn next_keyed(&mut self) -> Option<Result<(ComparisonSortKey, AnnotatedRow)>> {
+        let Reverse((_, index)) = self.heap.pop()?;
+        let entry = self.current[index]
+            .take()
+            .expect("comparison merge heap entry has a current row");
+        if let Err(error) = self.advance(index) {
+            return Some(Err(error));
+        }
+        Some(Ok(entry))
+    }
+}
+
+fn write_comparison_spool_row(
+    writer: &mut dyn Write,
+    key: &ComparisonSortKey,
+    row: &AnnotatedRow,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        key.0,
+        key.1,
+        key.2,
+        key.3,
+        key.4,
+        key.6,
+        hex_encode(key.5.as_bytes()),
+        u8::from(row.query_pass),
+        row.fp_class.unwrap_or("."),
+        row.xcmp_ctype.unwrap_or("."),
+        u8::from(row.xcmp_hap_match),
+        row.line
+    )?;
+    Ok(())
+}
+
+fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, AnnotatedRow)> {
+    let mut fields = line.splitn(12, '\t');
+    let chrom = fields
+        .next()
+        .context("comparison spool lacks chromosome")?
+        .to_string();
+    let pos = fields
+        .next()
+        .context("comparison spool lacks position")?
+        .parse()?;
+    let filtered = fields
+        .next()
+        .context("comparison spool lacks filtered rank")?
+        .parse()?;
+    let third = fields
+        .next()
+        .context("comparison spool lacks tertiary key")?
+        .parse()?;
+    let fourth = fields
+        .next()
+        .context("comparison spool lacks quaternary key")?
+        .parse()?;
+    let serial = fields
+        .next()
+        .context("comparison spool lacks serial")?
+        .parse()?;
+    let sort_line = String::from_utf8(hex_decode(
+        fields
+            .next()
+            .context("comparison spool lacks original sort row")?,
+    )?)
+    .context("comparison spool sort row is not UTF-8")?;
+    let query_pass = fields.next() == Some("1");
+    let fp_class = match fields.next() {
+        Some("gt") => Some("gt"),
+        Some("al") => Some("al"),
+        _ => None,
+    };
+    let xcmp_ctype = match fields.next() {
+        Some(".") | None => None,
+        Some("simple:match") => Some("simple:match"),
+        Some("hap:match") => Some("hap:match"),
+        Some("hap:mismatch") => Some("hap:mismatch"),
+        Some(value) => bail!("comparison spool contains unknown XCMP context {value}"),
+    };
+    let xcmp_hap_match = fields.next() == Some("1");
+    let row_line = fields
+        .next()
+        .context("comparison spool lacks VCF row")?
+        .to_string();
+    let key = (
+        chrom.clone(),
+        pos,
+        filtered,
+        third,
+        fourth,
+        sort_line,
+        serial,
+    );
+    Ok((
+        key,
+        AnnotatedRow {
+            sort_key: (chrom, pos, third, fourth),
+            line: row_line,
+            query_pass,
+            fp_class,
+            xcmp_ctype,
+            xcmp_hap_match,
+        },
+    ))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        bail!("comparison spool sort row has odd hex length");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => Ok(byte - b'0'),
+                b'a'..=b'f' => Ok(byte - b'a' + 10),
+                _ => bail!("comparison spool sort row contains invalid hex"),
+            };
+            Ok((digit(pair[0])? << 4) | digit(pair[1])?)
+        })
+        .collect()
+}
+
+fn collapse_comparison_chunks(
+    mut chunks: Vec<tempfile::NamedTempFile>,
+) -> Result<Vec<tempfile::NamedTempFile>> {
+    while chunks.len() > COMPARISON_MERGE_FAN_IN {
+        let mut merged = Vec::with_capacity(chunks.len().div_ceil(COMPARISON_MERGE_FAN_IN));
+        let mut remaining = chunks.into_iter();
+        loop {
+            let batch = remaining
+                .by_ref()
+                .take(COMPARISON_MERGE_FAN_IN)
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            let mut output = tempfile::NamedTempFile::new()
+                .context("failed to create comparison merge chunk")?;
+            {
+                let mut writer = BufWriter::new(output.as_file_mut());
+                let mut merge = ComparisonRowMerge::open(batch)?;
+                while let Some(entry) = merge.next_keyed() {
+                    let (key, row) = entry?;
+                    write_comparison_spool_row(&mut writer, &key, &row)?;
+                }
+                writer.flush()?;
+            }
+            merged.push(output);
+        }
+        chunks = merged;
+    }
+    Ok(chunks)
+}
+
 /// Append one of the legacy report suffixes without treating a dotted report
 /// prefix as a filename extension.
 pub(crate) fn suffixed_report_path(prefix: &Path, suffix: &str) -> PathBuf {
@@ -125,6 +436,7 @@ pub(crate) fn suffixed_report_path(prefix: &Path, suffix: &str) -> PathBuf {
 }
 
 struct ComparisonOutputs<'a> {
+    // Points at the current cluster-local row window, never the full input.
     counts: &'a mut BTreeMap<String, TypeCounts>,
     subtype_counts: &'a mut BTreeMap<String, BTreeMap<String, TypeCounts>>,
     rows: &'a mut Vec<AnnotatedRow>,
@@ -559,8 +871,13 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     let query_headers = query_reader.headers().to_vec();
     drop(truth_reader);
     drop(query_reader);
+    let mut stream_contig_ranks = header_contig_ranks(&truth_headers);
+    for (chrom, _) in header_contig_ranks(&query_headers) {
+        let rank = stream_contig_ranks.len();
+        stream_contig_ranks.entry(chrom).or_insert(rank);
+    }
 
-    let filtered_truth_keys = vcf::open_variants(
+    let mut filtered_truth = vcf::open_variants(
         &truth_prep,
         &contig_set,
         false,
@@ -569,11 +886,11 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         locations.as_deref(),
     )?
     .filter_map(|variant| match variant {
-        Ok(variant) if !variant.is_pass() => Some(Ok(variant.key)),
+        Ok(variant) if !variant.is_pass() => Some(Ok(variant)),
         Ok(_) => None,
         Err(error) => Some(Err(error)),
     })
-    .collect::<Result<BTreeSet<_>>>()?;
+    .peekable();
     // CONF insertion padding is derived from the preprocessed truth stream,
     // including filtered records retained by `--usefiltered-truth`. xcmp
     // excludes those records as calls below, but gvcf2bed sees them first;
@@ -679,9 +996,77 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         .unwrap_or_default();
     let mut counts: BTreeMap<String, TypeCounts> = BTreeMap::new();
     let mut subtype_counts: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
-    let mut rows = Vec::new();
+    let mut row_spool = ComparisonRowSpool::new();
+    let mut finished_filtered_contigs = BTreeSet::new();
+    let mut previous_cluster_chrom: Option<String> = None;
+    let needs_decoration =
+        args.preserve_info || args.output_vtc || !matches!(args.roc.as_str(), "QUAL" | "QQ");
+    let mut truth_decorations = needs_decoration
+        .then(|| vcf::open_raw_vcf(&truth_prep))
+        .transpose()?
+        .map(Iterator::peekable);
+    let mut query_decorations = needs_decoration
+        .then(|| vcf::open_raw_vcf(&query_prep))
+        .transpose()?
+        .map(Iterator::peekable);
     for cluster in clusters {
         let cluster = cluster?;
+        if previous_cluster_chrom.as_deref() != Some(&cluster.chrom) {
+            if let Some(previous) = previous_cluster_chrom.replace(cluster.chrom.clone()) {
+                finished_filtered_contigs.insert(previous);
+            }
+        }
+        let mut filtered_truth_keys = BTreeSet::new();
+        loop {
+            let consume = match filtered_truth.peek() {
+                None => false,
+                Some(Err(_)) => true,
+                Some(Ok(variant)) if finished_filtered_contigs.contains(&variant.key.chrom) => true,
+                Some(Ok(variant))
+                    if stream_contig_ranks.get(&variant.key.chrom)
+                        < stream_contig_ranks.get(&cluster.chrom) =>
+                {
+                    true
+                }
+                Some(Ok(variant)) if variant.key.chrom != cluster.chrom => false,
+                Some(Ok(variant)) if variant.key.pos < cluster.start => true,
+                Some(Ok(variant)) if variant.key.pos <= cluster.end => true,
+                Some(Ok(_)) => false,
+            };
+            if !consume {
+                break;
+            }
+            let variant = filtered_truth.next().expect("peeked filtered truth")?;
+            if variant.key.chrom == cluster.chrom
+                && variant.key.pos >= cluster.start
+                && variant.key.pos <= cluster.end
+            {
+                filtered_truth_keys.insert(variant.key);
+            }
+        }
+        let mut decorations = DecorationIndex::default();
+        if let Some(reader) = truth_decorations.as_mut() {
+            collect_cluster_decorations(
+                reader,
+                &cluster,
+                &finished_filtered_contigs,
+                &stream_contig_ranks,
+                &mut decorations,
+                args.preserve_info,
+                &args.roc,
+            )?;
+        }
+        if let Some(reader) = query_decorations.as_mut() {
+            collect_cluster_decorations(
+                reader,
+                &cluster,
+                &finished_filtered_contigs,
+                &stream_contig_ranks,
+                &mut decorations,
+                args.preserve_info,
+                &args.roc,
+            )?;
+        }
         contigs_in_play.insert(cluster.chrom.clone());
         for variant in &cluster.truth {
             add_variant_stats(
@@ -713,6 +1098,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
                 |stats| &mut stats.query_total,
             );
         }
+        let mut cluster_rows = Vec::new();
         process_cluster(
             &cluster,
             &reference_sequences,
@@ -724,9 +1110,24 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
             },
             &mut counts,
             &mut subtype_counts,
-            &mut rows,
+            &mut cluster_rows,
         )?;
+        for mut row in cluster_rows {
+            let sort_line = row.line.clone();
+            let filtered_match = row_matches_variant_key(&row, &filtered_truth_keys);
+            if needs_decoration {
+                decorate_output_rows_with_index(
+                    std::slice::from_mut(&mut row),
+                    &decorations,
+                    args.preserve_info,
+                    args.output_vtc,
+                    &args.roc,
+                )?;
+            }
+            row_spool.push(row, filtered_match, sort_line)?;
+        }
     }
+    let row_file = row_spool.finish()?;
 
     let subset_size = report_subset_size(
         &contig_non_n_lengths,
@@ -738,61 +1139,40 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         bail!("no reference contigs selected for analysis");
     }
 
-    sort_comparison_rows(&mut rows, &filtered_truth_keys);
-    decorate_output_rows_from_paths(
-        &mut rows,
-        [&truth_prep, &query_prep],
-        args.preserve_info,
-        args.output_vtc,
-        &args.roc,
-    )?;
-
-    let all_counts = derive_total_counts(&rows, false);
-    let pass_counts = derive_total_counts(&rows, true);
-    let all_subtype = derive_subtype_counts(&rows, false);
-    let pass_subtype = derive_subtype_counts(&rows, true);
-    let all_subset = derive_subset_counts(&rows, false);
-    let pass_subset = derive_subset_counts(&rows, true);
-    let all_subset_subtype = derive_subset_subtype_counts(&rows, false);
-    let pass_subset_subtype = derive_subset_subtype_counts(&rows, true);
-    let all_fp = derive_fp_classes(&rows, false);
-    let pass_fp = derive_fp_classes(&rows, true);
-    let all_subset_fp = derive_subset_fp_classes(&rows, false);
-    let pass_subset_fp = derive_subset_fp_classes(&rows, true);
-    let all_subtype_fp = derive_subtype_fp_classes(&rows, false);
-    let pass_subtype_fp = derive_subtype_fp_classes(&rows, true);
-    let all_subset_subtype_fp = derive_subset_subtype_fp_classes(&rows, false);
-    let pass_subset_subtype_fp = derive_subset_subtype_fp_classes(&rows, true);
+    let mut tallies = FoldedComparisonReports::default();
+    for row in row_file.rows()? {
+        tallies.observe(&row?);
+    }
     report::write_summary(
         &suffixed_report_path(prefix, "summary.csv"),
-        &all_counts,
-        &pass_counts,
-        &all_fp,
-        &pass_fp,
+        &tallies.all_counts,
+        &tallies.pass_counts,
+        &tallies.all_fp,
+        &tallies.pass_fp,
     )?;
     let write_counts = args.write_counts && !args.no_write_counts;
     if write_counts {
         report::write_extended(
             &suffixed_report_path(prefix, "extended.csv"),
-            &all_counts,
-            &pass_counts,
-            &all_subtype,
-            &pass_subtype,
+            &tallies.all_counts,
+            &tallies.pass_counts,
+            &tallies.all_subtype,
+            &tallies.pass_subtype,
             subset_size,
             conf_size,
             conf_bed.is_some(),
-            &all_subset,
-            &pass_subset,
-            &all_subset_subtype,
-            &pass_subset_subtype,
-            &all_fp,
-            &pass_fp,
-            &all_subset_fp,
-            &pass_subset_fp,
-            &all_subtype_fp,
-            &pass_subtype_fp,
-            &all_subset_subtype_fp,
-            &pass_subset_subtype_fp,
+            &tallies.all_subset,
+            &tallies.pass_subset,
+            &tallies.all_subset_subtype,
+            &tallies.pass_subset_subtype,
+            &tallies.all_fp,
+            &tallies.pass_fp,
+            &tallies.all_subset_fp,
+            &tallies.pass_subset_fp,
+            &tallies.all_subtype_fp,
+            &tallies.pass_subtype_fp,
+            &tallies.all_subset_subtype_fp,
+            &tallies.pass_subset_subtype_fp,
         )?;
     }
     let vcf_headers = build_vcf_headers(
@@ -816,11 +1196,18 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     } else {
         suffixed_report_path(prefix, "vcf.gz")
     };
-    let requantify_rows = requantify.then(|| sanitize_requantify_handoff_rows(&rows));
-    report::write_vcf(
+    vcf::write_raw_vcf_iter(
         &comparison_vcf,
         &vcf_headers,
-        requantify_rows.as_deref().unwrap_or(&rows),
+        row_file.rows()?.map(|row| {
+            let row = row?;
+            let row = if requantify {
+                sanitize_requantify_handoff_row(row)
+            } else {
+                row
+            };
+            RawVcfRecord::from_line(&row.line, Path::new("comparison-row-spool"))
+        }),
     )?;
     let roc_indices = if requantify {
         crate::quantify::run_from_compare(
@@ -867,7 +1254,15 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
             },
         )?
     } else {
-        let indices = crate::roc::write_roc_files(prefix, &rows, subset_size, conf_size)?;
+        let mut roc_options = crate::roc::RocOptions::default();
+        roc_options.output_rocs = !args.no_roc;
+        let indices = crate::roc::write_roc_files_with_options_iter(
+            prefix,
+            row_file.rows()?,
+            subset_size,
+            conf_size,
+            &roc_options,
+        )?;
         if args.no_roc {
             compact_no_roc_outputs(prefix)?;
         }
@@ -1537,6 +1932,57 @@ struct DecorationIndex {
     roc_values: BTreeMap<InfoKey, String>,
 }
 
+fn collect_cluster_decorations(
+    reader: &mut std::iter::Peekable<vcf::RawVcfReader>,
+    cluster: &Cluster,
+    finished_contigs: &BTreeSet<String>,
+    contig_ranks: &BTreeMap<String, usize>,
+    decorations: &mut DecorationIndex,
+    preserve_info: bool,
+    roc_field: &str,
+) -> Result<()> {
+    loop {
+        let consume = match reader.peek() {
+            None => false,
+            Some(Err(_)) => true,
+            Some(Ok(record)) if finished_contigs.contains(&record.chrom) => true,
+            Some(Ok(record))
+                if contig_ranks.get(&record.chrom) < contig_ranks.get(&cluster.chrom) =>
+            {
+                true
+            }
+            Some(Ok(record)) if record.chrom != cluster.chrom => false,
+            Some(Ok(record)) if record.pos < cluster.start => true,
+            Some(Ok(record)) if record.pos <= cluster.end => true,
+            Some(Ok(_)) => false,
+        };
+        if !consume {
+            break;
+        }
+        let record = reader.next().expect("peeked comparison decoration")?;
+        if record.chrom == cluster.chrom && record.pos >= cluster.start && record.pos <= cluster.end
+        {
+            decorations.observe(&record, preserve_info, roc_field);
+        }
+    }
+    Ok(())
+}
+
+fn header_contig_ranks(headers: &[String]) -> BTreeMap<String, usize> {
+    let mut ranks = BTreeMap::new();
+    for header in headers {
+        let Some(rest) = header.strip_prefix("##contig=<ID=") else {
+            continue;
+        };
+        let Some(chrom) = rest.split([',', '>']).next() else {
+            continue;
+        };
+        let rank = ranks.len();
+        ranks.entry(chrom.to_string()).or_insert(rank);
+    }
+    ranks
+}
+
 impl DecorationIndex {
     fn observe(&mut self, record: &RawVcfRecord, preserve_info: bool, roc_field: &str) {
         let key = (
@@ -1708,35 +2154,38 @@ fn info_fields_by_key(info: &str) -> BTreeMap<String, String> {
 /// tags. Legacy hands qfy the pre-quantification stream instead, so remove
 /// those provisional tags from the private re-quantification handoff and let
 /// qfy derive them from the final confidence and stratification inputs.
+#[cfg(test)]
 fn sanitize_requantify_handoff_rows(rows: &[AnnotatedRow]) -> Vec<AnnotatedRow> {
     rows.iter()
         .cloned()
-        .map(|mut row| {
-            let mut fields = row.line.split('\t').map(str::to_string).collect::<Vec<_>>();
-            if let Some(info) = fields.get_mut(7) {
-                let entries = info
-                    .split(';')
-                    .filter_map(|entry| {
-                        let Some(regions) = entry.strip_prefix("Regions=") else {
-                            return Some(entry.to_string());
-                        };
-                        let retained = regions
-                            .split(',')
-                            .filter(|tag| !matches!(*tag, "TS_boundary" | "TS_contained"))
-                            .collect::<Vec<_>>();
-                        (!retained.is_empty()).then(|| format!("Regions={}", retained.join(",")))
-                    })
-                    .collect::<Vec<_>>();
-                *info = if entries.is_empty() {
-                    ".".to_string()
-                } else {
-                    entries.join(";")
-                };
-                row.line = fields.join("\t");
-            }
-            row
-        })
+        .map(sanitize_requantify_handoff_row)
         .collect()
+}
+
+fn sanitize_requantify_handoff_row(mut row: AnnotatedRow) -> AnnotatedRow {
+    let mut fields = row.line.split('\t').map(str::to_string).collect::<Vec<_>>();
+    if let Some(info) = fields.get_mut(7) {
+        let entries = info
+            .split(';')
+            .filter_map(|entry| {
+                let Some(regions) = entry.strip_prefix("Regions=") else {
+                    return Some(entry.to_string());
+                };
+                let retained = regions
+                    .split(',')
+                    .filter(|tag| !matches!(*tag, "TS_boundary" | "TS_contained"))
+                    .collect::<Vec<_>>();
+                (!retained.is_empty()).then(|| format!("Regions={}", retained.join(",")))
+            })
+            .collect::<Vec<_>>();
+        *info = if entries.is_empty() {
+            ".".to_string()
+        } else {
+            entries.join(";")
+        };
+        row.line = fields.join("\t");
+    }
+    row
 }
 
 fn set_comparison_format_value(
@@ -6145,6 +6594,143 @@ fn derive_subtype_counts(
         }
     }
     subtypes
+}
+
+#[derive(Default)]
+struct FoldedComparisonReports {
+    all_counts: BTreeMap<String, TypeCounts>,
+    pass_counts: BTreeMap<String, TypeCounts>,
+    all_subtype: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pass_subtype: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    all_subset: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pass_subset: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    all_subset_subtype: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+    pass_subset_subtype: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+    all_fp: BTreeMap<String, (usize, usize)>,
+    pass_fp: BTreeMap<String, (usize, usize)>,
+    all_subset_fp: BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    pass_subset_fp: BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    all_subtype_fp: SubtypeFpClasses,
+    pass_subtype_fp: SubtypeFpClasses,
+    all_subset_subtype_fp: SubsetSubtypeFpClasses,
+    pass_subset_subtype_fp: SubsetSubtypeFpClasses,
+}
+
+impl FoldedComparisonReports {
+    fn observe(&mut self, row: &AnnotatedRow) {
+        let rows = std::slice::from_ref(row);
+        merge_type_map(&mut self.all_counts, derive_total_counts(rows, false));
+        merge_type_map(&mut self.pass_counts, derive_total_counts(rows, true));
+        merge_nested_type_map(&mut self.all_subtype, derive_subtype_counts(rows, false));
+        merge_nested_type_map(&mut self.pass_subtype, derive_subtype_counts(rows, true));
+        merge_nested_type_map(&mut self.all_subset, derive_subset_counts(rows, false));
+        merge_nested_type_map(&mut self.pass_subset, derive_subset_counts(rows, true));
+        merge_triple_type_map(
+            &mut self.all_subset_subtype,
+            derive_subset_subtype_counts(rows, false),
+        );
+        merge_triple_type_map(
+            &mut self.pass_subset_subtype,
+            derive_subset_subtype_counts(rows, true),
+        );
+        merge_pair_map(&mut self.all_fp, derive_fp_classes(rows, false));
+        merge_pair_map(&mut self.pass_fp, derive_fp_classes(rows, true));
+        merge_nested_pair_map(
+            &mut self.all_subset_fp,
+            derive_subset_fp_classes(rows, false),
+        );
+        merge_nested_pair_map(
+            &mut self.pass_subset_fp,
+            derive_subset_fp_classes(rows, true),
+        );
+        merge_nested_pair_map(
+            &mut self.all_subtype_fp,
+            derive_subtype_fp_classes(rows, false),
+        );
+        merge_nested_pair_map(
+            &mut self.pass_subtype_fp,
+            derive_subtype_fp_classes(rows, true),
+        );
+        merge_triple_pair_map(
+            &mut self.all_subset_subtype_fp,
+            derive_subset_subtype_fp_classes(rows, false),
+        );
+        merge_triple_pair_map(
+            &mut self.pass_subset_subtype_fp,
+            derive_subset_subtype_fp_classes(rows, true),
+        );
+    }
+}
+
+fn add_bucket(target: &mut CountsBucket, source: CountsBucket) {
+    target.total += source.total;
+    target.ti += source.ti;
+    target.tv += source.tv;
+    target.het += source.het;
+    target.homalt += source.homalt;
+}
+
+fn add_type_counts(target: &mut TypeCounts, source: TypeCounts) {
+    add_bucket(&mut target.truth_total, source.truth_total);
+    add_bucket(&mut target.truth_tp, source.truth_tp);
+    add_bucket(&mut target.truth_fn, source.truth_fn);
+    add_bucket(&mut target.query_total, source.query_total);
+    add_bucket(&mut target.query_tp, source.query_tp);
+    add_bucket(&mut target.query_fp, source.query_fp);
+    add_bucket(&mut target.query_unk, source.query_unk);
+}
+
+fn merge_type_map(target: &mut BTreeMap<String, TypeCounts>, source: BTreeMap<String, TypeCounts>) {
+    for (key, value) in source {
+        add_type_counts(target.entry(key).or_default(), value);
+    }
+}
+
+fn merge_nested_type_map(
+    target: &mut BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    source: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+) {
+    for (key, values) in source {
+        merge_type_map(target.entry(key).or_default(), values);
+    }
+}
+
+fn merge_triple_type_map(
+    target: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+    source: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+) {
+    for (key, values) in source {
+        merge_nested_type_map(target.entry(key).or_default(), values);
+    }
+}
+
+fn merge_pair_map(
+    target: &mut BTreeMap<String, (usize, usize)>,
+    source: BTreeMap<String, (usize, usize)>,
+) {
+    for (key, (left, right)) in source {
+        let value = target.entry(key).or_default();
+        value.0 += left;
+        value.1 += right;
+    }
+}
+
+fn merge_nested_pair_map(
+    target: &mut BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    source: BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+) {
+    for (key, values) in source {
+        merge_pair_map(target.entry(key).or_default(), values);
+    }
+}
+
+fn merge_triple_pair_map(
+    target: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, (usize, usize)>>>,
+    source: BTreeMap<String, BTreeMap<String, BTreeMap<String, (usize, usize)>>>,
+) {
+    for (key, values) in source {
+        merge_nested_pair_map(target.entry(key).or_default(), values);
+    }
 }
 
 struct SampleView<'a> {

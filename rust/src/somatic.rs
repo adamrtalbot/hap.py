@@ -3,8 +3,8 @@ use crate::compare::suffixed_report_path;
 use crate::{fasta, ftx, strelka, vcf};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
-use std::io::{BufWriter, Write};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// nothing after). We reproduce the exact literal so stats.csv byte-matches.
 const SOM_VERSION: &str = "som.py-";
 const MAX_AF_BINS: usize = 10_000;
+const MAX_SOMATIC_ROC_OBSERVATIONS: usize = 1_000_000;
 const STATS_TYPE_ROWS: [(usize, &str); 4] =
     [(0, "indels"), (1, "SNVs"), (6, "MNPs"), (7, "others")];
 static SOMATIC_SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
@@ -446,11 +447,7 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     } else {
         None
     };
-    let mut tp_rows: Vec<String> = Vec::new();
-    let mut fp_rows: Vec<String> = Vec::new();
-    let mut fn_rows: Vec<String> = Vec::new();
-    let mut ambi_rows: Vec<String> = Vec::new();
-    let mut unk_rows: Vec<String> = Vec::new();
+    let mut feature_rows = FeatureRowSpools::new()?;
     let mut ambiguous_classes = BTreeMap::new();
     let mut ambiguous_reasons = BTreeMap::new();
     let truth_spool_index = truth_spools
@@ -513,18 +510,20 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
                     filtered_by_type.entry(label).or_default().tp += 1;
                 }
                 if use_strelka_hcc_indel {
-                    tp_rows.push(render_strelka_hcc_indel_tp_row(
+                    feature_rows.push(
                         0,
-                        &truth_record.record,
-                        &query_record.record,
-                        &query_depths,
-                    ));
+                        render_strelka_hcc_indel_tp_row(
+                            0,
+                            &truth_record.record,
+                            &query_record.record,
+                            &query_depths,
+                        ),
+                    )?;
                 } else if use_generic_feature_table {
-                    tp_rows.push(render_generic_tp_row(
+                    feature_rows.push(
                         0,
-                        &truth_record.record,
-                        &query_record.record,
-                    ));
+                        render_generic_tp_row(0, &truth_record.record, &query_record.record),
+                    )?;
                 } else if use_caller_feature_table {
                     caller_tp_truth.push(truth_record.record.clone());
                     caller_tp_query.push(query_record.record.clone());
@@ -532,9 +531,10 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
             } else {
                 by_type.entry(label).or_default().fn_count += 1;
                 if use_strelka_hcc_indel {
-                    fn_rows.push(render_strelka_hcc_indel_fn_row(0, &truth_record.record));
+                    feature_rows
+                        .push(2, render_strelka_hcc_indel_fn_row(0, &truth_record.record))?;
                 } else if use_generic_feature_table {
-                    fn_rows.push(render_generic_fn_row(0, &truth_record.record));
+                    feature_rows.push(2, render_generic_fn_row(0, &truth_record.record))?;
                 } else if use_caller_feature_table {
                     caller_fn_truth.push(truth_record.record.clone());
                 }
@@ -618,16 +618,16 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
                         &query_depths,
                     );
                     match class {
-                        QueryClass::Fp => fp_rows.push(row),
-                        QueryClass::Unk => unk_rows.push(row),
-                        QueryClass::Ambi => ambi_rows.push(row),
+                        QueryClass::Fp => feature_rows.push(1, row)?,
+                        QueryClass::Unk => feature_rows.push(4, row)?,
+                        QueryClass::Ambi => feature_rows.push(3, row)?,
                     }
                 } else if use_generic_feature_table {
                     let row = render_generic_query_row(0, &query_record.record, tag);
                     match class {
-                        QueryClass::Fp => fp_rows.push(row),
-                        QueryClass::Unk => unk_rows.push(row),
-                        QueryClass::Ambi => ambi_rows.push(row),
+                        QueryClass::Fp => feature_rows.push(1, row)?,
+                        QueryClass::Unk => feature_rows.push(4, row)?,
+                        QueryClass::Ambi => feature_rows.push(3, row)?,
                     }
                 } else if use_caller_feature_table {
                     match class {
@@ -660,16 +660,17 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
                 bail!("caller feature header changed between somatic contigs");
             }
             feature_header = Some(caller_table.header);
-            tp_rows.extend(caller_table.tp);
-            fp_rows.extend(caller_table.fp);
-            fn_rows.extend(caller_table.fn_rows);
-            ambi_rows.extend(caller_table.ambi);
-            unk_rows.extend(caller_table.unk);
+            feature_rows.extend(0, caller_table.tp)?;
+            feature_rows.extend(1, caller_table.fp)?;
+            feature_rows.extend(2, caller_table.fn_rows)?;
+            feature_rows.extend(3, caller_table.ambi)?;
+            feature_rows.extend(4, caller_table.unk)?;
         }
     }
     let ordered_feature_rows = feature_header
         .as_ref()
-        .map(|_| renumber_feature_rows(&[tp_rows, fp_rows, fn_rows, ambi_rows, unk_rows]));
+        .map(|_| feature_rows.renumber())
+        .transpose()?;
 
     // som.py writes feature and ambiguity detail artifacts before it derives
     // the FP denominator. Preserve that order because the legacy range/FP
@@ -689,45 +690,50 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         )?;
     }
     if let Some(header) = feature_header.as_deref() {
-        let ordered_rows = ordered_feature_rows.as_deref().unwrap_or_default();
-        fs::write(
-            suffixed_report_path(Path::new(&args.output), "features.csv"),
-            format!("{header}\n{}\n", ordered_rows.join("\n")),
-        )
-        .with_context(|| format!("failed to write {}.features.csv", args.output))?;
+        let ordered_rows = ordered_feature_rows
+            .as_ref()
+            .context("missing ordered somatic feature spool")?;
+        let features_path = suffixed_report_path(Path::new(&args.output), "features.csv");
+        let mut features = BufWriter::new(File::create(&features_path)?);
+        writeln!(features, "{header}")?;
+        std::io::copy(&mut File::open(ordered_rows.path())?, &mut features)?;
+        features
+            .flush()
+            .with_context(|| format!("failed to write {}", features_path.display()))?;
         if let Some(roc_name) = args.roc.as_deref() {
             write_somatic_roc(
                 &suffixed_report_path(Path::new(&args.output), "roc.csv"),
                 header,
-                ordered_rows,
+                ordered_rows.path(),
                 roc_name,
             )?;
             if args.af_strat {
                 for &(start, end) in &af_bins {
-                    let rows = feature_rows_for_af_roc(
+                    let Some(rows) = feature_rows_for_af_roc(
                         header,
-                        ordered_rows,
+                        ordered_rows.path(),
                         start,
                         end,
                         &args.af_strat_truth,
                         &args.af_strat_query,
-                    )?;
-                    if rows.is_empty() {
+                    )?
+                    else {
                         continue;
-                    }
+                    };
                     for prefix in ["records", "SNVs", "indels"] {
                         let type_label = (prefix != "records").then_some(prefix);
-                        let rows = feature_rows_for_type(&rows, header, type_label)?;
-                        if rows.is_empty() {
+                        let Some(typed_rows) =
+                            feature_rows_for_type(rows.path(), header, type_label)?
+                        else {
                             continue;
-                        }
+                        };
                         let path = PathBuf::from(format!(
                             "{}.{}.{}.roc.csv",
                             args.output,
                             prefix,
                             format_af_interval(start, end)
                         ));
-                        write_somatic_roc(&path, header, &rows, roc_name)?;
+                        write_somatic_roc(&path, header, typed_rows.path(), roc_name)?;
                     }
                 }
             }
@@ -856,7 +862,10 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
             let type_label = (prefix != "records").then_some(prefix);
             let af_counts = calculate_af_stats(
                 header,
-                ordered_feature_rows.as_deref().unwrap_or_default(),
+                ordered_feature_rows
+                    .as_ref()
+                    .context("missing ordered somatic feature spool")?
+                    .path(),
                 &args.af_strat_binsize,
                 &args.af_strat_truth,
                 &args.af_strat_query,
@@ -909,19 +918,21 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     )?;
 
     if let Some(header) = feature_header.as_deref() {
-        let ordered_rows = ordered_feature_rows.as_deref().unwrap_or_default();
+        let ordered_rows = ordered_feature_rows
+            .as_ref()
+            .context("missing ordered somatic feature spool")?;
         if args.happy_stats {
             write_happy_style_summary(
                 &suffixed_report_path(Path::new(&args.output), "summary.csv"),
                 header,
-                ordered_rows,
+                ordered_rows.path(),
                 feature_table_name,
             )?;
             if args.af_strat {
                 write_happy_style_extended(
                     &suffixed_report_path(Path::new(&args.output), "extended.csv"),
                     header,
-                    ordered_rows,
+                    ordered_rows.path(),
                     feature_table_name,
                     &args.af_strat_binsize,
                     &args.af_strat_truth,
@@ -934,15 +945,59 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     controls.scratch.cleanup()
 }
 
-fn renumber_feature_rows(groups: &[Vec<String>]) -> Vec<String> {
-    let mut out = Vec::new();
-    for group in groups {
-        for (idx, row) in group.iter().enumerate() {
-            let tail = row.split_once(',').map(|(_, tail)| tail).unwrap_or(row);
-            out.push(format!("{idx},{tail}"));
-        }
+struct FeatureRowSpools {
+    groups: [tempfile::NamedTempFile; 5],
+}
+
+impl FeatureRowSpools {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            groups: [
+                tempfile::NamedTempFile::new(),
+                tempfile::NamedTempFile::new(),
+                tempfile::NamedTempFile::new(),
+                tempfile::NamedTempFile::new(),
+                tempfile::NamedTempFile::new(),
+            ]
+            .into_iter()
+            .collect::<std::io::Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("failed to initialize somatic feature spools"))?,
+        })
     }
-    out
+
+    fn push(&mut self, group: usize, row: impl AsRef<str>) -> Result<()> {
+        writeln!(self.groups[group].as_file_mut(), "{}", row.as_ref())?;
+        Ok(())
+    }
+
+    fn extend(&mut self, group: usize, rows: impl IntoIterator<Item = String>) -> Result<()> {
+        for row in rows {
+            self.push(group, row)?;
+        }
+        Ok(())
+    }
+
+    fn renumber(mut self) -> Result<tempfile::NamedTempFile> {
+        let mut ordered = tempfile::NamedTempFile::new()
+            .context("failed to create ordered somatic feature spool")?;
+        {
+            let mut writer = BufWriter::new(ordered.as_file_mut());
+            for group in &mut self.groups {
+                group.as_file_mut().flush()?;
+                for (index, row) in BufReader::new(File::open(group.path())?)
+                    .lines()
+                    .enumerate()
+                {
+                    let row = row?;
+                    let tail = row.split_once(',').map(|(_, tail)| tail).unwrap_or(&row);
+                    writeln!(writer, "{index},{tail}")?;
+                }
+            }
+            writer.flush()?;
+        }
+        Ok(ordered)
+    }
 }
 
 struct CallerFeatureTable {
@@ -1629,7 +1684,7 @@ fn write_simple_table(path: &Path, body: &str) -> Result<()> {
 fn write_happy_style_summary(
     path: &Path,
     feature_header: &str,
-    feature_rows: &[String],
+    feature_rows: &Path,
     feature_table: &str,
 ) -> Result<()> {
     let mut lines = vec![
@@ -1641,42 +1696,43 @@ fn write_happy_style_summary(
     let ref_index = csv_column_index(&headers, "REF")?;
     let alt_index = csv_column_index(&headers, "ALT")?;
     let truth_ref_index = csv_column_index(&headers, "REF.truth")?;
-    let rows = feature_rows
-        .iter()
-        .map(|row| parse_csv_line(row))
-        .collect::<Vec<_>>();
     let happy_type = match feature_table.rsplit('.').next() {
         Some("snv") => "SNP",
         Some("indel") => "INDEL",
         _ => "NA",
     };
-    let truth_tags = rows
-        .iter()
-        .filter(|row| nonempty_csv_field(row, truth_ref_index))
-        .filter_map(|row| row.get(tag_index).map(String::as_str))
-        .collect::<Vec<_>>();
-    let truth_total = truth_tags.len();
-    let truth_tp = truth_tags.iter().filter(|tag| **tag == "TP").count();
-    let truth_fn = truth_tags.iter().filter(|tag| **tag == "FN").count();
+    let mut truth_total = 0usize;
+    let mut truth_tp = 0usize;
+    let mut truth_fn = 0usize;
+    let mut query = [(0usize, 0usize); 2];
+    for row in BufReader::new(File::open(feature_rows)?).lines() {
+        let row = parse_csv_line(&row?);
+        if nonempty_csv_field(&row, truth_ref_index) {
+            truth_total += 1;
+            match row.get(tag_index).map(String::as_str) {
+                Some("TP") => truth_tp += 1,
+                Some("FN") => truth_fn += 1,
+                _ => {}
+            }
+        }
+        if nonempty_csv_field(&row, ref_index) && nonempty_csv_field(&row, alt_index) {
+            let pass = row
+                .get(filter_index)
+                .is_none_or(|value| value.is_empty() || value == "." || value == "PASS");
+            for (index, include) in [pass, true].into_iter().enumerate() {
+                if include {
+                    match row.get(tag_index).map(String::as_str) {
+                        Some("FP") => query[index].0 += 1,
+                        Some("UNK" | "AMBI") => query[index].1 += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 
-    for filter in ["PASS", "ALL"] {
-        let query_tags = rows
-            .iter()
-            .filter(|row| {
-                nonempty_csv_field(row, ref_index)
-                    && nonempty_csv_field(row, alt_index)
-                    && (filter == "ALL"
-                        || row.get(filter_index).is_none_or(|value| {
-                            value.is_empty() || value == "." || value == "PASS"
-                        }))
-            })
-            .filter_map(|row| row.get(tag_index).map(String::as_str))
-            .collect::<Vec<_>>();
-        let query_fp = query_tags.iter().filter(|tag| **tag == "FP").count();
-        let query_unk = query_tags
-            .iter()
-            .filter(|tag| **tag == "UNK" || **tag == "AMBI")
-            .count();
+    for (filter_index, filter) in ["PASS", "ALL"].into_iter().enumerate() {
+        let (query_fp, query_unk) = query[filter_index];
         let query_total = truth_tp + query_fp + query_unk;
         let recall = rounded_metric(truth_tp, truth_total);
         let precision = rounded_metric(truth_tp, truth_tp + query_fp);
@@ -1718,7 +1774,7 @@ fn render_summary_metric(value: Option<f64>) -> String {
 fn write_happy_style_extended(
     path: &Path,
     feature_header: &str,
-    feature_rows: &[String],
+    feature_rows: &Path,
     feature_table: &str,
     bin_sizes: &str,
     truth_af_field: &str,
@@ -1745,10 +1801,6 @@ fn write_happy_style_extended(
     let ref_index = csv_column_index(&headers, "REF")?;
     let alt_index = csv_column_index(&headers, "ALT")?;
     let truth_ref_index = csv_column_index(&headers, "REF.truth")?;
-    let rows = feature_rows
-        .iter()
-        .map(|row| parse_csv_line(row))
-        .collect::<Vec<_>>();
     let happy_type = match feature_table.rsplit('.').next() {
         Some("snv") => "SNP",
         Some("indel") => "INDEL",
@@ -1772,36 +1824,44 @@ fn write_happy_style_extended(
                 value >= start && (value < end || (inclusive_last && value <= 1.0))
             })
         };
-        let truth_rows = rows.iter().filter(|row| {
-            nonempty_csv_field(row, truth_ref_index)
+        let mut truth_total = 0usize;
+        let mut truth_tp = 0usize;
+        let mut truth_fn = 0usize;
+        let mut query = [(0usize, 0usize); 2];
+        for row in BufReader::new(File::open(feature_rows)?).lines() {
+            let row = parse_csv_line(&row?);
+            if nonempty_csv_field(&row, truth_ref_index)
                 && row.get(truth_af_index).is_some_and(|value| in_bin(value))
-        });
-        let truth_tags = truth_rows
-            .filter_map(|row| row.get(tag_index).map(String::as_str))
-            .collect::<Vec<_>>();
-        let truth_total = truth_tags.len();
-        let truth_tp = truth_tags.iter().filter(|tag| **tag == "TP").count();
-        let truth_fn = truth_tags.iter().filter(|tag| **tag == "FN").count();
+            {
+                truth_total += 1;
+                match row.get(tag_index).map(String::as_str) {
+                    Some("TP") => truth_tp += 1,
+                    Some("FN") => truth_fn += 1,
+                    _ => {}
+                }
+            }
+            if nonempty_csv_field(&row, ref_index)
+                && nonempty_csv_field(&row, alt_index)
+                && row.get(query_af_index).is_some_and(|value| in_bin(value))
+            {
+                let pass = row
+                    .get(filter_index)
+                    .is_none_or(|value| value.is_empty() || value == "." || value == "PASS");
+                for (index, include) in [pass, true].into_iter().enumerate() {
+                    if include {
+                        match row.get(tag_index).map(String::as_str) {
+                            Some("FP") => query[index].0 += 1,
+                            Some("UNK" | "AMBI") => query[index].1 += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
 
         // Preserve the legacy bin-major PASS, ALL append order.
-        for filter in ["PASS", "ALL"] {
-            let query_rows = rows.iter().filter(|row| {
-                nonempty_csv_field(row, ref_index)
-                    && nonempty_csv_field(row, alt_index)
-                    && row.get(query_af_index).is_some_and(|value| in_bin(value))
-                    && (filter == "ALL"
-                        || row.get(filter_index).is_none_or(|value| {
-                            value.is_empty() || value == "." || value == "PASS"
-                        }))
-            });
-            let query_tags = query_rows
-                .filter_map(|row| row.get(tag_index).map(String::as_str))
-                .collect::<Vec<_>>();
-            let query_fp = query_tags.iter().filter(|tag| **tag == "FP").count();
-            let query_unk = query_tags
-                .iter()
-                .filter(|tag| **tag == "UNK" || **tag == "AMBI")
-                .count();
+        for (filter_index, filter) in ["PASS", "ALL"].into_iter().enumerate() {
+            let (query_fp, query_unk) = query[filter_index];
             let query_total = truth_tp + query_fp + query_unk;
             let recall = rounded_metric(truth_tp, truth_total);
             let precision = rounded_metric(truth_tp, truth_tp + query_fp);
@@ -1933,7 +1993,7 @@ fn format_af_interval(start: f64, end: f64) -> String {
 
 fn calculate_af_stats(
     feature_header: &str,
-    feature_rows: &[String],
+    feature_rows: &Path,
     bin_sizes: &str,
     truth_af_field: &str,
     query_af_field: &str,
@@ -1944,11 +2004,6 @@ fn calculate_af_stats(
     let filter_index = csv_column_index(&headers, "FILTER")?;
     let truth_af_index = csv_column_index(&headers, truth_af_field)?;
     let query_af_index = csv_column_index(&headers, query_af_field)?;
-    let rows = feature_rows
-        .iter()
-        .map(|row| parse_csv_line(row))
-        .collect::<Vec<_>>();
-
     let mut output = Vec::new();
     for (start, end) in parse_af_bins(bin_sizes) {
         let in_bin = |row: &[String], index: usize| {
@@ -1964,34 +2019,35 @@ fn calculate_af_stats(
 
         let mut counts = SomaticCounts::default();
         let mut filtered = FilteredCounts::default();
-        for row in &rows {
-            if type_label.is_some_and(|expected| feature_row_type(&headers, row) != Some(expected))
+        for row in BufReader::new(File::open(feature_rows)?).lines() {
+            let row = parse_csv_line(&row?);
+            if type_label.is_some_and(|expected| feature_row_type(&headers, &row) != Some(expected))
             {
                 continue;
             }
             let tag = row.get(tag_index).map(String::as_str).unwrap_or_default();
             let filtered_call = row.get(filter_index).is_some_and(|value| !value.is_empty());
             match tag {
-                "TP" if in_bin(row, truth_af_index) => {
+                "TP" if in_bin(&row, truth_af_index) => {
                     counts.tp += 1;
                     if filtered_call {
                         filtered.tp += 1;
                     }
                 }
-                "FN" if in_bin(row, truth_af_index) => counts.fn_count += 1,
-                "FP" if in_bin(row, query_af_index) => {
+                "FN" if in_bin(&row, truth_af_index) => counts.fn_count += 1,
+                "FP" if in_bin(&row, query_af_index) => {
                     counts.fp += 1;
                     if filtered_call {
                         filtered.fp += 1;
                     }
                 }
-                "UNK" if in_bin(row, query_af_index) => {
+                "UNK" if in_bin(&row, query_af_index) => {
                     counts.unk += 1;
                     if filtered_call {
                         filtered.unk += 1;
                     }
                 }
-                "AMBI" if in_bin(row, query_af_index) => {
+                "AMBI" if in_bin(&row, query_af_index) => {
                     counts.ambi += 1;
                     if filtered_call {
                         filtered.ambi += 1;
@@ -2008,19 +2064,23 @@ fn calculate_af_stats(
 }
 
 fn feature_rows_for_type(
-    feature_rows: &[String],
+    feature_rows: &Path,
     feature_header: &str,
     type_label: Option<&str>,
-) -> Result<Vec<String>> {
-    let Some(type_label) = type_label else {
-        return Ok(feature_rows.to_vec());
-    };
+) -> Result<Option<tempfile::NamedTempFile>> {
     let headers = parse_csv_line(feature_header);
-    Ok(feature_rows
-        .iter()
-        .filter(|row| feature_row_type(&headers, &parse_csv_line(row)) == Some(type_label))
-        .cloned()
-        .collect())
+    let mut output =
+        tempfile::NamedTempFile::new().context("failed to create feature type spool")?;
+    let mut count = 0usize;
+    for row in BufReader::new(File::open(feature_rows)?).lines() {
+        let row = row?;
+        if type_label.is_none() || feature_row_type(&headers, &parse_csv_line(&row)) == type_label {
+            writeln!(output.as_file_mut(), "{row}")?;
+            count += 1;
+        }
+    }
+    output.as_file_mut().flush()?;
+    Ok((count > 0).then_some(output))
 }
 
 fn feature_row_type(headers: &[String], row: &[String]) -> Option<&'static str> {
@@ -2070,7 +2130,7 @@ enum SomaticRocTag {
 fn write_somatic_roc(
     path: &Path,
     feature_header: &str,
-    feature_rows: &[String],
+    feature_rows: &Path,
     roc_name: &str,
 ) -> Result<()> {
     let config = somatic_roc_config(roc_name)
@@ -2082,8 +2142,9 @@ fn write_somatic_roc(
     let nt_index = headers.iter().position(|field| field == "NT");
     let mut observations = Vec::new();
 
-    for line in feature_rows {
-        let fields = parse_csv_line(line);
+    for line in BufReader::new(File::open(feature_rows)?).lines() {
+        let line = line?;
+        let fields = parse_csv_line(&line);
         let Some(tag) = fields.get(tag_index).and_then(|value| {
             let lower = value.to_ascii_lowercase();
             if lower.starts_with("tp") {
@@ -2121,6 +2182,12 @@ fn write_somatic_roc(
             if !filters.is_empty() {
                 score = f64::MIN_POSITIVE;
             }
+        }
+        if observations.len() >= MAX_SOMATIC_ROC_OBSERVATIONS {
+            bail!(
+                "somatic ROC exceeds the {} observation resource limit",
+                MAX_SOMATIC_ROC_OBSERVATIONS
+            );
         }
         observations.push((score, tag));
     }
@@ -2246,12 +2313,12 @@ fn cpp_default_six(value: f64) -> String {
 
 fn feature_rows_for_af_roc(
     feature_header: &str,
-    feature_rows: &[String],
+    feature_rows: &Path,
     start: f64,
     end: f64,
     truth_af_field: &str,
     query_af_field: &str,
-) -> Result<Vec<String>> {
+) -> Result<Option<tempfile::NamedTempFile>> {
     let headers = parse_csv_line(feature_header);
     let tag_index = csv_column_index(&headers, "tag")?;
     let truth_index = csv_column_index(&headers, truth_af_field)?;
@@ -2262,18 +2329,23 @@ fn feature_rows_for_af_roc(
             .and_then(|value| value.parse::<f64>().ok())
             .is_some_and(|value| value >= start && (value < end || (end >= 1.0 && value == 1.0)))
     };
-    Ok(feature_rows
-        .iter()
-        .filter(|line| {
-            let fields = parse_csv_line(line);
-            match fields.get(tag_index).map(String::as_str) {
-                Some("TP" | "FN") => in_bin(&fields, truth_index),
-                Some("FP") => in_bin(&fields, query_index),
-                _ => false,
-            }
-        })
-        .cloned()
-        .collect())
+    let mut output = tempfile::NamedTempFile::new().context("failed to create feature AF spool")?;
+    let mut count = 0usize;
+    for line in BufReader::new(File::open(feature_rows)?).lines() {
+        let line = line?;
+        let fields = parse_csv_line(&line);
+        let keep = match fields.get(tag_index).map(String::as_str) {
+            Some("TP" | "FN") => in_bin(&fields, truth_index),
+            Some("FP") => in_bin(&fields, query_index),
+            _ => false,
+        };
+        if keep {
+            writeln!(output.as_file_mut(), "{line}")?;
+            count += 1;
+        }
+    }
+    output.as_file_mut().flush()?;
+    Ok((count > 0).then_some(output))
 }
 
 fn raw_type_label(record: &vcf::RawVcfRecord) -> Option<&'static str> {
@@ -3220,13 +3292,13 @@ fn write_normalized_somatic_contig(
 
 struct ContigSpool {
     chrom: String,
-    file: tempfile::NamedTempFile,
+    path: tempfile::TempPath,
     count: usize,
 }
 
 impl ContigSpool {
     fn load(&self) -> Result<Vec<FilteredRawRecord>> {
-        vcf::open_raw_vcf(self.file.path())?
+        vcf::open_raw_vcf(&self.path)?
             .map(|record| {
                 let record = record?;
                 Ok(FilteredRawRecord {
@@ -3250,16 +3322,23 @@ fn spool_filtered_contigs(
 ) -> Result<Vec<ContigSpool>> {
     let mut spools: Vec<ContigSpool> = Vec::new();
     let mut closed = BTreeSet::new();
+    let mut active: Option<(String, tempfile::NamedTempFile, usize)> = None;
     for record in vcf::open_raw_vcf(path)? {
         let Some(record) = filter_raw_record(record?, source_path, options)? else {
             continue;
         };
-        if spools
-            .last()
-            .is_none_or(|spool| spool.chrom != record.key.chrom)
+        if active
+            .as_ref()
+            .is_none_or(|(chrom, _, _)| chrom != &record.key.chrom)
         {
-            if let Some(previous) = spools.last() {
-                closed.insert(previous.chrom.clone());
+            if let Some((chrom, mut file, count)) = active.take() {
+                file.as_file_mut().flush()?;
+                closed.insert(chrom.clone());
+                spools.push(ContigSpool {
+                    chrom,
+                    path: file.into_temp_path(),
+                    count,
+                });
             }
             if closed.contains(&record.key.chrom) {
                 bail!(
@@ -3268,23 +3347,30 @@ fn spool_filtered_contigs(
                     path.display()
                 );
             }
-            spools.push(ContigSpool {
-                chrom: record.key.chrom.clone(),
-                file: tempfile::NamedTempFile::new()
-                    .context("failed to create somatic contig spool")?,
-                count: 0,
-            });
+            active = Some((
+                record.key.chrom.clone(),
+                tempfile::NamedTempFile::new().context("failed to create somatic contig spool")?,
+                0,
+            ));
         }
-        let spool = spools.last_mut().expect("somatic spool was just created");
-        writeln!(spool.file.as_file_mut(), "{}", record.record.to_line())?;
-        spool.count += 1;
-        if spool.count > MAX_SOMATIC_CONTIG_RECORDS {
+        let (chrom, file, count) = active.as_mut().expect("somatic spool was just created");
+        writeln!(file.as_file_mut(), "{}", record.record.to_line())?;
+        *count += 1;
+        if *count > MAX_SOMATIC_CONTIG_RECORDS {
             bail!(
                 "somatic contig {} exceeds the {} record active-window limit",
-                spool.chrom,
+                chrom,
                 MAX_SOMATIC_CONTIG_RECORDS
             );
         }
+    }
+    if let Some((chrom, mut file, count)) = active {
+        file.as_file_mut().flush()?;
+        spools.push(ContigSpool {
+            chrom,
+            path: file.into_temp_path(),
+            count,
+        });
     }
     Ok(spools)
 }

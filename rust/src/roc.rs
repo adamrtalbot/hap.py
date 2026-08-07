@@ -31,6 +31,10 @@ use std::path::Path;
 const INDEL_SUBTYPES: [&str; 9] = [
     "C16_PLUS", "C1_5", "C6_15", "D16_PLUS", "D1_5", "D6_15", "I16_PLUS", "I1_5", "I6_15",
 ];
+const MAX_ROC_OBSERVATIONS_PER_GROUP: usize = 1_000_000;
+const MAX_ROC_THRESHOLDS_PER_GROUP: usize = 1_000_000;
+const MAX_ROC_GROUPS: usize = 100_000;
+const MAX_ROC_TOTAL_OBSERVATIONS: usize = 4_000_000;
 
 /// Write `roc.all` and each non-empty Locations ROC file alongside `prefix`.
 #[derive(Clone, Debug, Default)]
@@ -140,7 +144,7 @@ where
     }
     let groups = accumulate_impl(rows, options)?;
 
-    if !groups.values().any(|group| !group.obs.is_empty()) {
+    if !groups.values().any(|group| group.records > 0) {
         let all = empty_comparison_extended_lines(subset_size);
         write_gzip_csv(
             &suffixed_report_path(prefix, "roc.all.csv.gz"),
@@ -291,15 +295,15 @@ struct MetricRows<'a> {
 }
 
 fn build_metric_indices(
-    groups: &BTreeMap<RowKey, GroupAccum>,
+    groups: &BTreeMap<RowKey, BoundedGroupAccum>,
     rows: MetricRows<'_>,
     delta: f64,
     output_rocs: bool,
 ) -> MetricIndices {
-    let mut rocs = BTreeMap::<String, (&RowKey, &GroupAccum)>::new();
+    let mut rocs = BTreeMap::<String, (&RowKey, &BoundedGroupAccum)>::new();
     let active_types = groups
         .iter()
-        .filter(|(_, accum)| !accum.obs.is_empty())
+        .filter(|(_, accum)| accum.records > 0)
         .map(|(key, _)| key.ty.as_str())
         .collect::<HashSet<_>>();
     for (key, accum) in groups {
@@ -354,7 +358,12 @@ fn build_metric_indices(
                 if counts_only {
                     continue;
                 }
-                for level in legacy_masked_levels(&accum.obs, *subtype_flag, genotype_flag, delta) {
+                for level in legacy_masked_levels(
+                    &accum.observation_window,
+                    *subtype_flag,
+                    genotype_flag,
+                    delta,
+                ) {
                     let qq = format!("{level:.6}");
                     if !matches!(*subtype, "ti" | "tv") && genotype == "*" {
                         table.set(
@@ -824,7 +833,7 @@ impl LegacyRawTable {
 
 fn write_legacy_roc_table(
     prefix: &Path,
-    groups: &BTreeMap<RowKey, GroupAccum>,
+    groups: &BTreeMap<RowKey, BoundedGroupAccum>,
     subset_size: usize,
     conf_size: usize,
     options: &RocOptions,
@@ -832,7 +841,7 @@ fn write_legacy_roc_table(
     // ROCOutput iterates a std::map keyed by its internal ROC name, not by
     // the final report axes. Recreate those names so insertion/rehash order
     // in LegacyUnorderedRows is byte-identical to libstdc++.
-    let mut rocs = BTreeMap::<String, (&RowKey, &GroupAccum)>::new();
+    let mut rocs = BTreeMap::<String, (&RowKey, &BoundedGroupAccum)>::new();
     for (key, accum) in groups {
         if key.subtype != "*" {
             continue;
@@ -861,10 +870,10 @@ fn write_legacy_roc_table(
             !is_aggregate_filter(&key.filter) && options.roc_regions.contains(key.subset.as_str());
         // getLevels sorts the shared observation vector in-place on every
         // subtype/genotype call. Preserve that progressive tied-level order.
-        let mut sorted_obs = accum.obs.clone();
+        let mut sorted_obs = accum.observation_window.clone();
         for subtype in subtypes {
             for genotype in ["het", "hetalt", "homalt", "*"] {
-                let totals = legacy_totals(&accum.obs, subtype, genotype);
+                let totals = legacy_totals(&accum.observation_window, subtype, genotype);
                 add_legacy_level(
                     &mut table,
                     key,
@@ -1270,14 +1279,19 @@ fn sum_buckets(a: &CountsBucket, b: &CountsBucket) -> CountsBucket {
 ///     ROC rows. This is the only path that can reproduce legacy's
 ///     std::sort instability on equal-level (truth, query) pairs at
 ///     bit-exact parity.
-///   • `numeric_buckets`: per-`{:.6}` bucket aggregate, retained for
+/// Both structures below are hard-capped before insertion. Consequently a
+/// malformed or adversarial cardinality cannot turn either into a full-input
+/// accumulator; callers receive a contextual resource-limit error instead.
+///   • `threshold_window`: per-`{:.6}` bucket aggregate, retained for
 ///     the per-substat (ti/tv/het/homalt) roc-delta sweeps and for
 ///     bookkeeping helpers like `bucket_has_ti`.
 #[derive(Default)]
-struct GroupAccum {
+struct BoundedGroupAccum {
     baseline: Cumul,
-    obs: Vec<ObsRecord>,
-    numeric_buckets: BTreeMap<String, NumericBucket>,
+    observation_window: Vec<ObsRecord>,
+    threshold_window: BTreeMap<String, NumericBucket>,
+    records: usize,
+    limit_error: Option<String>,
 }
 
 struct NumericBucket {
@@ -1308,7 +1322,7 @@ struct SubstatAvail {
     homalt: bool,
 }
 
-/// One row emitted by a `GroupAccum`. For the baseline row (qq_str = "*"),
+/// One row emitted by a `BoundedGroupAccum`. For the baseline row (qq_str = "*"),
 /// `substats` is `None` and every substat cell is taken from `cum`. For
 /// numeric QQ rows, `substats` marks which substat cells the independent
 /// sweeps kept at this level; cells where the substat sweep didn't keep
@@ -1320,7 +1334,7 @@ struct EmittedRow {
     substats: Option<SubstatAvail>,
 }
 
-impl GroupAccum {
+impl BoundedGroupAccum {
     fn add(
         &mut self,
         qq: Option<f64>,
@@ -1328,8 +1342,21 @@ impl GroupAccum {
         subtypes: &[String],
         bi: Option<&str>,
         blt: Option<&str>,
+        track_thresholds: bool,
     ) {
         self.baseline.add(counts);
+        self.records += 1;
+        if !track_thresholds {
+            return;
+        }
+        if self.observation_window.len() >= MAX_ROC_OBSERVATIONS_PER_GROUP {
+            self.limit_error.get_or_insert_with(|| {
+                format!(
+                    "ROC group exceeds the {MAX_ROC_OBSERVATIONS_PER_GROUP} observation resource limit"
+                )
+            });
+            return;
+        }
         // Legacy `BlockQuantify::observe` maps NaN-level obs to level=0
         // (`if(std::isnan(qq)) qq = 0`) before any further processing.
         // Mirror that by treating None / non-finite QQ as 0 for sorting
@@ -1344,8 +1371,18 @@ impl GroupAccum {
         // rather than `1001.340000`).
         let q32 = q as f32 as f64;
         let key = format!("{q32:.6}");
+        if !self.threshold_window.contains_key(&key)
+            && self.threshold_window.len() >= MAX_ROC_THRESHOLDS_PER_GROUP
+        {
+            self.limit_error.get_or_insert_with(|| {
+                format!(
+                    "ROC group exceeds the {MAX_ROC_THRESHOLDS_PER_GROUP} threshold resource limit"
+                )
+            });
+            return;
+        }
         let entry = self
-            .numeric_buckets
+            .threshold_window
             .entry(key)
             .or_insert_with(|| NumericBucket {
                 qq: q32,
@@ -1439,7 +1476,7 @@ impl GroupAccum {
         {
             tv_flag = true;
         }
-        self.obs.push(ObsRecord {
+        self.observation_window.push(ObsRecord {
             level: obs_level,
             counts: counts.clone(),
             subtypes: subtypes.to_vec(),
@@ -1474,7 +1511,7 @@ impl GroupAccum {
     /// `getLevels(flag_mask)` × `dropRowsWithMissing("Type")` pipeline
     /// where substat-only levels get filtered out and substat values are
     /// written only into prefixes the main sweep already visited.
-    /// Standard emit — sorts self.obs with libstdc++ introsort.
+    /// Standard emit — sorts self.observation_window with libstdc++ introsort.
     /// Used for the `Subtype="*"` group and as a fallback for callers
     /// that don't have a pre-sorted obs vector to share.
     #[cfg(test)]
@@ -1510,7 +1547,7 @@ impl GroupAccum {
     ) -> Vec<EmittedRow> {
         let truth_total_const = sum_buckets(&self.baseline.truth_tp, &self.baseline.truth_fn);
 
-        let mut out = Vec::with_capacity(1 + self.numeric_buckets.len());
+        let mut out = Vec::with_capacity(1 + self.threshold_window.len());
         out.push(EmittedRow {
             qq_str: "*".to_string(),
             cum: self.baseline.clone(),
@@ -1536,7 +1573,7 @@ impl GroupAccum {
         // behavior. Reproducing that order bit-exactly requires the
         // `introsort_libstdcpp` port below.
         // The level==0 → MIN_POSITIVE remap for FN/N obs is now done
-        // at insertion time (`GroupAccum::add`), matching legacy's
+        // at insertion time (`BoundedGroupAccum::add`), matching legacy's
         // `BlockQuantify::observe`. No synthetic injection needed —
         // the FN obs whose `final_dt` is FN/N at level==0 already
         // sit at MIN_POSITIVE, so they form the "0.000000"-formatted
@@ -1558,7 +1595,7 @@ impl GroupAccum {
                     .collect();
                 (filtered, true)
             }
-            _ => (self.obs.clone(), false),
+            _ => (self.observation_window.clone(), false),
         };
 
         // Match legacy's `OBS_FLAG_TI` / `OBS_FLAG_TV` masks: the flag is
@@ -1722,9 +1759,9 @@ impl GroupAccum {
             has_ti: false,
             has_tv: false,
         };
-        let zero_already_bucket = self.numeric_buckets.contains_key(&zero_key);
+        let zero_already_bucket = self.threshold_window.contains_key(&zero_key);
         let need_synthetic_zero_bucket = truth_total_const.total > 0 && !zero_already_bucket;
-        let mut ordered: Vec<(&String, &NumericBucket)> = self.numeric_buckets.iter().collect();
+        let mut ordered: Vec<(&String, &NumericBucket)> = self.threshold_window.iter().collect();
         if need_synthetic_zero_bucket {
             ordered.push((&zero_key, &synthetic_zero));
         }
@@ -1978,7 +2015,7 @@ fn sift_down(arr: &mut [ObsRecord], start: usize, first: usize, last: usize) {
 }
 
 #[cfg(test)]
-fn accumulate(rows: &[AnnotatedRow]) -> BTreeMap<RowKey, GroupAccum> {
+fn accumulate(rows: &[AnnotatedRow]) -> BTreeMap<RowKey, BoundedGroupAccum> {
     accumulate_impl(
         rows.iter().map(Ok::<_, anyhow::Error>),
         &RocOptions::default(),
@@ -1986,12 +2023,18 @@ fn accumulate(rows: &[AnnotatedRow]) -> BTreeMap<RowKey, GroupAccum> {
     .expect("in-memory ROC rows are infallible")
 }
 
-fn accumulate_impl<I, R>(rows: I, options: &RocOptions) -> Result<BTreeMap<RowKey, GroupAccum>>
+fn accumulate_impl<I, R>(
+    rows: I,
+    options: &RocOptions,
+) -> Result<BTreeMap<RowKey, BoundedGroupAccum>>
 where
     I: IntoIterator<Item = Result<R>>,
     R: Borrow<AnnotatedRow>,
 {
-    let mut groups: BTreeMap<RowKey, GroupAccum> = BTreeMap::new();
+    let mut groups: BTreeMap<RowKey, BoundedGroupAccum> = BTreeMap::new();
+    let track_thresholds = options.output_rocs || options.preserve_raw_table;
+    let mut total_observations = 0usize;
+    let mut accumulation_error: Option<String> = None;
 
     // Named stratifications are configured lanes, not merely observed axes.
     // QuantifyRegions registers each one when it loads the BED, so an empty
@@ -2018,6 +2061,22 @@ where
             row,
             options,
             |key, qq, counts, subtypes: &[String], bi: Option<&str>, blt: Option<&str>| {
+                if !groups.contains_key(&key) && groups.len() >= MAX_ROC_GROUPS {
+                    accumulation_error.get_or_insert_with(|| {
+                        format!(
+                            "ROC accumulation exceeds the {MAX_ROC_GROUPS} group resource limit"
+                        )
+                    });
+                    return;
+                }
+                if track_thresholds && total_observations >= MAX_ROC_TOTAL_OBSERVATIONS {
+                    accumulation_error.get_or_insert_with(|| {
+                        format!(
+                            "ROC accumulation exceeds the {MAX_ROC_TOTAL_OBSERVATIONS} total-observation resource limit"
+                        )
+                    });
+                    return;
+                }
                 observed_subsets.insert(key.subset.clone());
                 if key.filter != "ALL" && key.filter != "PASS" {
                     observed_filters_per_ty
@@ -2028,9 +2087,21 @@ where
                 groups
                     .entry(key)
                     .or_default()
-                    .add(qq, counts, subtypes, bi, blt);
+                    .add(qq, counts, subtypes, bi, blt, track_thresholds);
+                if track_thresholds {
+                    total_observations += 1;
+                }
             },
         );
+    }
+    if let Some(error) = accumulation_error {
+        bail!("{error}");
+    }
+    if let Some(error) = groups
+        .values()
+        .find_map(|group| group.limit_error.as_deref())
+    {
+        bail!("{error}");
     }
 
     // Pre-seed baseline rows for every (type, subtype, subset, filter)
@@ -2096,7 +2167,7 @@ where
 fn accumulate_with_options(
     rows: &[AnnotatedRow],
     options: &RocOptions,
-) -> BTreeMap<RowKey, GroupAccum> {
+) -> BTreeMap<RowKey, BoundedGroupAccum> {
     accumulate_impl(rows.iter().map(Ok::<_, anyhow::Error>), options)
         .expect("in-memory ROC rows are infallible")
 }
@@ -2588,7 +2659,7 @@ struct RenderConfig<'a> {
 /// sort boundary. Each snapshot reproduces the obs state that legacy's
 /// `Roc::getLevels` walks for that subtype.
 fn build_star_sorted(
-    groups: &BTreeMap<RowKey, GroupAccum>,
+    groups: &BTreeMap<RowKey, BoundedGroupAccum>,
 ) -> BTreeMap<(String, String, String, String), Vec<ObsRecord>> {
     let mut star_sorted: BTreeMap<(String, String, String, String), Vec<ObsRecord>> =
         BTreeMap::new();
@@ -2599,7 +2670,7 @@ fn build_star_sorted(
                 "INDEL" => 40,
                 _ => 4,
             };
-            let mut obs = accum.obs.clone();
+            let mut obs = accum.observation_window.clone();
             let mut current_count: usize = 0;
             // Insert per-subtype snapshots at every 4-sort boundary.
             let snapshots: &[(usize, &str)] = match key.ty.as_str() {
@@ -2640,7 +2711,7 @@ fn build_star_sorted(
 }
 
 fn render_rows(
-    groups: &BTreeMap<RowKey, GroupAccum>,
+    groups: &BTreeMap<RowKey, BoundedGroupAccum>,
     star_sorted: &BTreeMap<(String, String, String, String), Vec<ObsRecord>>,
     row_filter: RowFilter<'_>,
     config: RenderConfig<'_>,
@@ -2653,7 +2724,7 @@ fn render_rows(
     // the pre-seeded map.
     let active_types: HashSet<&str> = groups
         .iter()
-        .filter(|(_, accum)| !accum.obs.is_empty())
+        .filter(|(_, accum)| accum.records > 0)
         .map(|(key, _)| key.ty.as_str())
         .collect();
     for (key, accum) in groups {
@@ -3191,7 +3262,7 @@ mod tests {
         // Truth-side bucket at qq=500.0 must hold the TP. (Reading
         // record QUAL=0 would put it in the 0.000000 bucket instead.)
         let bucket_500 = accum
-            .numeric_buckets
+            .threshold_window
             .get("500.000000")
             .expect("missing 500.000000 bucket");
         assert_eq!(bucket_500.counts.truth_tp.total, 1);
@@ -3199,7 +3270,7 @@ mod tests {
 
         // Query-side bucket at qq=0.0 must hold the matching query TP.
         let bucket_0 = accum
-            .numeric_buckets
+            .threshold_window
             .get("0.000000")
             .expect("missing 0.000000 bucket");
         assert_eq!(bucket_0.counts.truth_tp.total, 0);
@@ -3580,7 +3651,7 @@ mod tests {
         // Legacy rocEvaluate calls addROCValue only for TP/FP/UNK query
         // decisions. A filtered record with BD=. must not create an N
         // observation or shift the roc-delta threshold sequence.
-        assert_eq!(pass.obs.len(), 1);
+        assert_eq!(pass.observation_window.len(), 1);
         let qq: Vec<_> = pass.emit().into_iter().map(|row| row.qq_str).collect();
         assert_eq!(qq, vec!["*", "10.000000"]);
     }
@@ -3828,7 +3899,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["*", "10.000000", "10.400000"]
         );
-        assert!(!groups[&key].numeric_buckets.contains_key("90.000000"));
+        assert!(!groups[&key].threshold_window.contains_key("90.000000"));
         let sorted = build_star_sorted(&groups);
         for subtype in ["*", "ti", "tv"] {
             assert!(

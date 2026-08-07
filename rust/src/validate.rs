@@ -3,7 +3,7 @@ use crate::{fasta, vcf};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const WARNING_REFPADDING: usize = 0;
@@ -111,7 +111,19 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
 
     let mut counts = ValidationCounts::default();
     let mut previous = PreviousRecord::default();
-    let mut errors = Vec::new();
+    let mut errors = args
+        .errors_bed
+        .as_deref()
+        .map(|path| {
+            let parent = Path::new(path)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            tempfile::NamedTempFile::new_in(parent)
+                .map(|file| (path.to_string(), BufWriter::new(file)))
+                .with_context(|| format!("failed to stage {path}"))
+        })
+        .transpose()?;
     let mut parsed_any_record = false;
     let mut previous_record_failed_to_parse = false;
     let mut reported_extreme_format_value = false;
@@ -235,13 +247,16 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
         if let Some(reference_sequences) = &reference_sequences
             && let Some(reason) = validate_record(&record, reference_sequences)
         {
-            errors.push(format!(
-                "{}\t{}\t{}\t{}",
-                record.chrom,
-                record.pos.saturating_sub(1),
-                record.end_pos(),
-                reason
-            ));
+            if let Some((_, errors)) = errors.as_mut() {
+                writeln!(
+                    errors,
+                    "{}\t{}\t{}\t{}",
+                    record.chrom,
+                    record.pos.saturating_sub(1),
+                    record.end_pos(),
+                    reason
+                )?;
+            }
         }
 
         if args
@@ -273,16 +288,15 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
         fs::write(path, json).with_context(|| format!("failed to write {path}"))?;
     }
 
-    if let Some(path) = &args.errors_bed {
-        fs::write(
-            path,
-            if errors.is_empty() {
-                String::new()
-            } else {
-                format!("{}\n", errors.join("\n"))
-            },
-        )
-        .with_context(|| format!("failed to write {path}"))?;
+    if let Some((path, mut errors)) = errors {
+        errors
+            .flush()
+            .context("failed to flush validation errors BED")?;
+        let staged = errors.into_inner().map_err(|error| error.into_error())?;
+        staged
+            .persist(&path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("failed to publish {path}"))?;
     }
 
     Ok(())

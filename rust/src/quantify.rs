@@ -6,11 +6,12 @@ use crate::roc;
 use crate::vcf::{self, RawVcfRecord};
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
@@ -2171,18 +2172,29 @@ fn region_intersection_size(left: &[vcf::BedInterval], right: &[vcf::BedInterval
 
 fn compact_no_roc_outputs(prefix: &Path) -> Result<()> {
     let all_path = suffixed_report_path(prefix, "roc.all.csv.gz");
-    let text = vcf::read_text(&all_path)?;
-    let rows = text
-        .lines()
-        .enumerate()
-        .filter(|(index, line)| *index == 0 || line.split(',').nth(6).is_some_and(|qq| qq == "*"))
-        .map(|(_, line)| line)
-        .collect::<Vec<_>>();
-    let file = fs::File::create(&all_path)
-        .with_context(|| format!("failed to create {}", all_path.display()))?;
-    let mut encoder = GzEncoder::new(file, Compression::default());
-    writeln!(encoder, "{}", rows.join("\n"))?;
-    encoder.finish()?;
+    let parent = all_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to stage {}", all_path.display()))?;
+    {
+        let input = fs::File::open(&all_path)
+            .with_context(|| format!("failed to open {}", all_path.display()))?;
+        let reader = BufReader::new(MultiGzDecoder::new(input));
+        let mut encoder = GzEncoder::new(staged.as_file_mut(), Compression::default());
+        for (index, line) in reader.lines().enumerate() {
+            let line = line?;
+            if index == 0 || line.split(',').nth(6).is_some_and(|qq| qq == "*") {
+                writeln!(encoder, "{line}")?;
+            }
+        }
+        encoder.finish()?;
+    }
+    staged
+        .persist(&all_path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to publish {}", all_path.display()))?;
 
     for suffix in [
         "roc.Locations.SNP.csv.gz",

@@ -832,6 +832,7 @@ fn sort_normalized_records(records: &mut [vcf::RawVcfRecord]) {
 }
 
 const PREPROCESS_SORT_CHUNK_RECORDS: usize = 65_536;
+const PREPROCESS_SORT_MERGE_FAN_IN: usize = 32;
 
 struct PreprocessSpool {
     sorted: bool,
@@ -942,12 +943,16 @@ type SortKey = (usize, usize, usize, usize);
 struct ExternalRecordMerge {
     _chunks: Vec<tempfile::NamedTempFile>,
     readers: Vec<BufReader<File>>,
-    current: Vec<Option<vcf::RawVcfRecord>>,
+    current: Vec<Option<((usize, usize, usize), vcf::RawVcfRecord)>>,
     heap: BinaryHeap<Reverse<SortKey>>,
 }
 
 impl ExternalRecordMerge {
     fn new(chunks: Vec<tempfile::NamedTempFile>) -> Result<Self> {
+        Self::open(collapse_preprocess_chunks(chunks)?)
+    }
+
+    fn open(chunks: Vec<tempfile::NamedTempFile>) -> Result<Self> {
         let mut readers = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
             readers.push(BufReader::new(File::open(chunk.path())?));
@@ -988,12 +993,23 @@ impl ExternalRecordMerge {
         let record = fields
             .next()
             .context("preprocess sort chunk lacks record")?;
-        self.current[index] = Some(vcf::RawVcfRecord::from_line(
-            record,
-            Path::new("preprocess-sort-chunk"),
-        )?);
+        self.current[index] = Some((
+            (rank, pos, serial),
+            vcf::RawVcfRecord::from_line(record, Path::new("preprocess-sort-chunk"))?,
+        ));
         self.heap.push(Reverse((rank, pos, serial, index)));
         Ok(())
+    }
+
+    fn next_keyed(&mut self) -> Option<Result<((usize, usize, usize), vcf::RawVcfRecord)>> {
+        let Reverse((_, _, _, index)) = self.heap.pop()?;
+        let entry = self.current[index]
+            .take()
+            .expect("heap entry has a current preprocess record");
+        if let Err(error) = self.read_next(index) {
+            return Some(Err(error));
+        }
+        Some(Ok(entry))
     }
 }
 
@@ -1001,15 +1017,41 @@ impl Iterator for ExternalRecordMerge {
     type Item = Result<vcf::RawVcfRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Reverse((_, _, _, index)) = self.heap.pop()?;
-        let record = self.current[index]
-            .take()
-            .expect("heap entry has a current preprocess record");
-        if let Err(error) = self.read_next(index) {
-            return Some(Err(error));
-        }
-        Some(Ok(record))
+        self.next_keyed()
+            .map(|entry| entry.map(|(_, record)| record))
     }
+}
+
+fn collapse_preprocess_chunks(
+    mut chunks: Vec<tempfile::NamedTempFile>,
+) -> Result<Vec<tempfile::NamedTempFile>> {
+    while chunks.len() > PREPROCESS_SORT_MERGE_FAN_IN {
+        let mut merged = Vec::with_capacity(chunks.len().div_ceil(PREPROCESS_SORT_MERGE_FAN_IN));
+        let mut remaining = chunks.into_iter();
+        loop {
+            let batch = remaining
+                .by_ref()
+                .take(PREPROCESS_SORT_MERGE_FAN_IN)
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            let mut output = tempfile::NamedTempFile::new()
+                .context("failed to create preprocess merge chunk")?;
+            {
+                let mut writer = std::io::BufWriter::new(output.as_file_mut());
+                let mut merge = ExternalRecordMerge::open(batch)?;
+                while let Some(entry) = merge.next_keyed() {
+                    let ((rank, pos, serial), record) = entry?;
+                    writeln!(writer, "{rank}\t{pos}\t{serial}\t{}", record.to_line())?;
+                }
+                writer.flush()?;
+            }
+            merged.push(output);
+        }
+        chunks = merged;
+    }
+    Ok(chunks)
 }
 
 fn effective_thread_count(threads: Option<usize>) -> usize {
