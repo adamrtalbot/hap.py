@@ -5,7 +5,7 @@ use super::{
     query_type_rank,
 };
 use crate::adapters::vcf::VariantKey;
-use crate::domain::RawVcfRecord;
+use crate::domain::{ComparisonRecord, RawVcfRecord};
 use crate::engines::partial_credit;
 use std::collections::BTreeSet;
 
@@ -18,7 +18,7 @@ fn comparison_record(
     info: String,
     truth_sample: String,
     query_sample: String,
-) -> RawVcfRecord {
+) -> ComparisonRecord {
     RawVcfRecord {
         chrom: variant.key.chrom.clone(),
         pos: variant.key.pos,
@@ -31,6 +31,7 @@ fn comparison_record(
         format: Some("GT:BD:BK:BI:BVT:BLT:QQ".to_string()),
         samples: vec![truth_sample, query_sample],
     }
+    .into()
 }
 
 pub(super) fn combined_record_qual<'a>(truth: &'a Variant, query: &'a Variant) -> &'a str {

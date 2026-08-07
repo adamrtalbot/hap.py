@@ -9,8 +9,8 @@ use crate::adapters::{
     report::suffixed_report_path,
     vcf::{self},
 };
+use crate::application::CompareArgs;
 use crate::application::preprocess;
-use crate::cli_compat::cli::CompareArgs;
 use crate::domain::RawVcfRecord;
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
@@ -144,7 +144,7 @@ pub(super) fn decorate_output_rows(
         }
     }
     for row in rows {
-        let record = &mut row.record;
+        let mut record = row.record.raw().clone();
         let key = (
             record.chrom.clone(),
             record.pos,
@@ -245,6 +245,7 @@ pub(super) fn decorate_output_rows(
         } else {
             info.join(";")
         };
+        row.record = record.into();
     }
     Ok(())
 }
@@ -267,28 +268,31 @@ pub(super) fn sanitize_requantify_handoff_rows(rows: &[AnnotatedRow]) -> Vec<Ann
     rows.iter()
         .cloned()
         .map(|mut row| {
-            {
-                let entries = row
-                    .record
-                    .info
-                    .split(';')
-                    .filter_map(|entry| {
-                        let Some(regions) = entry.strip_prefix("Regions=") else {
-                            return Some(entry.to_string());
-                        };
-                        let retained = regions
-                            .split(',')
-                            .filter(|tag| !matches!(*tag, "TS_boundary" | "TS_contained"))
-                            .collect::<Vec<_>>();
-                        (!retained.is_empty()).then(|| format!("Regions={}", retained.join(",")))
-                    })
-                    .collect::<Vec<_>>();
-                row.record.info = if entries.is_empty() {
-                    ".".to_string()
-                } else {
-                    entries.join(";")
-                };
-            }
+            row.record
+                .try_update(|record| {
+                    let entries = record
+                        .info
+                        .split(';')
+                        .filter_map(|entry| {
+                            let Some(regions) = entry.strip_prefix("Regions=") else {
+                                return Some(entry.to_string());
+                            };
+                            let retained = regions
+                                .split(',')
+                                .filter(|tag| !matches!(*tag, "TS_boundary" | "TS_contained"))
+                                .collect::<Vec<_>>();
+                            (!retained.is_empty())
+                                .then(|| format!("Regions={}", retained.join(",")))
+                        })
+                        .collect::<Vec<_>>();
+                    record.info = if entries.is_empty() {
+                        ".".to_string()
+                    } else {
+                        entries.join(";")
+                    };
+                    Ok(())
+                })
+                .expect("sanitizing INFO preserves checked record invariants");
             row
         })
         .collect()
@@ -587,8 +591,12 @@ pub(super) fn decorate_existing_comparison_vcf(
             }
         }
     }
-    let decorated = rows.into_iter().map(|row| row.record).collect::<Vec<_>>();
-    vcf::write_raw_vcf(output_path, &headers, &decorated)
+    let decorated = rows
+        .into_iter()
+        .map(|row| row.record.into_validated())
+        .collect::<Vec<_>>();
+    let validated = vcf::ValidatedVcf::from_parts(headers, decorated);
+    vcf::write_validated_vcf(output_path, &validated)
 }
 
 pub(super) fn resolve_default_reference() -> Result<String> {

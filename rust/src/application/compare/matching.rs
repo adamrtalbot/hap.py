@@ -306,8 +306,10 @@ pub(super) fn process_cluster(
     // their BK=lm hardcode is what legacy emits in those shapes.
     if allow_haplotype_match && !hap_mismatch {
         for row in &mut rows[exact_match_pre_count..exact_match_post_count] {
-            if row.record.sample_values_contain(":UNK:lm:") {
-                row.record.replace_sample_values(":UNK:lm:", ":UNK:.:");
+            if row.record.samples_contain(":UNK:lm:") {
+                row.record
+                    .replace_sample_fragment(":UNK:lm:", ":UNK:.:")
+                    .expect("comparison decision edits preserve valid records");
             }
         }
     }
@@ -373,8 +375,8 @@ pub(super) fn process_cluster(
     if !legacy_hap_promotions.is_empty() {
         for row in &mut rows[exact_match_post_count..] {
             if row_matches_variant_key(row, &legacy_hap_promotions)
-                && row.record.sample_values_contain(":FN:am:")
-                && row.record.sample_values_contain(":FP:am:")
+                && row.record.samples_contain(":FN:am:")
+                && row.record.samples_contain(":FP:am:")
             {
                 let key = legacy_hap_promotions
                     .iter()
@@ -459,8 +461,10 @@ pub(super) fn degrade_identical_exact_unk_rows(
     keys: &BTreeSet<VariantKey>,
 ) {
     for row in rows {
-        if row_matches_variant_key(row, keys) && row.record.sample_values_contain(":UNK:lm:") {
-            row.record.replace_sample_values(":UNK:lm:", ":UNK:.:");
+        if row_matches_variant_key(row, keys) && row.record.samples_contain(":UNK:lm:") {
+            row.record
+                .replace_sample_fragment(":UNK:lm:", ":UNK:.:")
+                .expect("comparison decision edits preserve valid records");
         }
     }
 }

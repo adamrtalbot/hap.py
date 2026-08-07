@@ -151,19 +151,19 @@ pub fn run() -> Result<()> {
     };
     compatibility::emit_deprecation_warnings(&cli.command);
     match cli.command {
-        Command::Germline(args) => application::compare::run(args),
-        Command::Somatic(args) => application::somatic::run(args),
+        Command::Germline(args) => application::compare::run(args.try_into()?),
+        Command::Somatic(args) => application::somatic::run(args.try_into()?),
         Command::Preprocess(args) if args.version => {
             println!("pre.py ");
             Ok(())
         }
-        Command::Preprocess(args) => application::preprocess::run(args),
-        Command::Ftx(args) => application::ftx::run(args),
+        Command::Preprocess(args) => application::preprocess::run(args.try_into()?),
+        Command::Ftx(args) => application::ftx::run(args.try_into()?),
         Command::Quantify(_) if quantify_version => {
             println!("qfy.py ");
             Ok(())
         }
-        Command::Quantify(args) => application::quantify::run(args),
-        Command::Validate(args) => application::validate::run(args),
+        Command::Quantify(args) => application::quantify::run(args.try_into()?),
+        Command::Validate(args) => application::validate::run(args.try_into()?),
     }
 }

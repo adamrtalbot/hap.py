@@ -1,5 +1,5 @@
 use crate::adapters::{fasta, vcf};
-use crate::cli_compat::cli::ValidateArgs;
+use crate::application::{ValidateArgs as RawValidateArgs, ValidatedValidateArgs as ValidateArgs};
 use crate::domain::RawVcfRecord;
 use crate::output::OutputTransaction;
 use anyhow::{Context, Result, bail};
@@ -71,10 +71,10 @@ struct FormatParseError {
 
 pub(crate) fn run(args: ValidateArgs) -> Result<()> {
     let stderr = std::io::stderr();
-    run_with_diagnostics(args, &mut stderr.lock())
+    run_with_diagnostics(args.into_inner(), &mut stderr.lock())
 }
 
-fn run_with_diagnostics<W: Write>(mut args: ValidateArgs, diagnostics: &mut W) -> Result<()> {
+fn run_with_diagnostics<W: Write>(mut args: RawValidateArgs, diagnostics: &mut W) -> Result<()> {
     let outputs = [args.output_json.as_deref(), args.errors_bed.as_deref()]
         .into_iter()
         .flatten()
@@ -115,7 +115,7 @@ fn run_with_diagnostics<W: Write>(mut args: ValidateArgs, diagnostics: &mut W) -
     transaction.commit()
 }
 
-fn run_with_diagnostics_inner<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Result<()> {
+fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut W) -> Result<()> {
     let reference_contigs = if let Some(reference) = &args.reference {
         fasta::contig_lengths(Path::new(reference))?
             .into_keys()
@@ -861,8 +861,8 @@ mod tests {
         Ok(())
     }
 
-    fn args(input: &Path, output: &Path) -> ValidateArgs {
-        ValidateArgs {
+    fn args(input: &Path, output: &Path) -> crate::application::ValidateArgs {
+        crate::application::ValidateArgs {
             input: input.display().to_string(),
             reference: None,
             output_json: Some(output.display().to_string()),
@@ -877,6 +877,13 @@ mod tests {
             check_bcf_errors: false,
             all_warnings: false,
         }
+    }
+
+    fn run_with_diagnostics(
+        args: crate::application::ValidateArgs,
+        diagnostics: &mut dyn Write,
+    ) -> Result<()> {
+        super::run_with_diagnostics(args.validated()?, diagnostics)
     }
 
     #[test]

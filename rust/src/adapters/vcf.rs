@@ -1,4 +1,6 @@
-use crate::domain::{Interval, RawVcfRecord};
+use crate::domain::{
+    Allele, GenomicCoordinate, GenomicPosition, Genotype, Interval, QueryProvenance, RawVcfRecord,
+};
 use crate::output::{FailureOperation, OutputTransaction, fail_operation};
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
@@ -19,18 +21,18 @@ static PUBLICATION_MUTEX: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct VariantKey {
-    pub chrom: String,
-    pub pos: usize,
-    pub ref_allele: String,
-    pub alt_allele: String,
+    pub(crate) chrom: String,
+    pub(crate) pos: usize,
+    pub(crate) ref_allele: String,
+    pub(crate) alt_allele: String,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Variant {
-    pub key: VariantKey,
-    pub qual: String,
-    pub filter: String,
-    pub gt: String,
+    pub(crate) key: VariantKey,
+    pub(crate) qual: String,
+    pub(crate) filter: String,
+    pub(crate) gt: String,
 }
 
 impl Variant {
@@ -156,6 +158,273 @@ fn alt_type_matches_ref(ref_allele: &str, alt_alleles: &str) -> bool {
     alt_alleles
         .split(',')
         .all(|alt| alt != "." && !alt.starts_with('<') && alt.len() == ref_len)
+}
+
+/// A VCF/BCF record translated into checked domain values at the file adapter.
+///
+/// The original representation remains private so it can be rendered without
+/// losing header-dependent fields, while comparison code consumes coordinates,
+/// alleles, genotypes, and provenance through validated accessors.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedVcfRecord {
+    raw: RawVcfRecord,
+    coordinate: GenomicCoordinate,
+    reference: Allele,
+    alternates: Vec<Allele>,
+    genotypes: Vec<Option<Genotype>>,
+    provenance: QueryProvenance,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedRecordFacts {
+    coordinate: GenomicCoordinate,
+    reference: Allele,
+    alternates: Vec<Allele>,
+    genotypes: Vec<Option<Genotype>>,
+    provenance: QueryProvenance,
+}
+
+/// A complete VCF/BCF payload whose records crossed the checked file boundary.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedVcf {
+    headers: Vec<String>,
+    records: Vec<RawVcfRecord>,
+    facts: Vec<ValidatedRecordFacts>,
+}
+
+impl ValidatedVcf {
+    /// Reassembles a payload from records that are already checked.
+    pub(crate) fn from_parts(headers: Vec<String>, records: Vec<ValidatedVcfRecord>) -> Self {
+        let (records, facts) = records
+            .into_iter()
+            .map(ValidatedVcfRecord::into_raw_and_facts)
+            .unzip();
+        Self {
+            headers,
+            records,
+            facts,
+        }
+    }
+
+    /// Checks raw records with unavailable query provenance.
+    pub(crate) fn try_from_raw(headers: Vec<String>, records: Vec<RawVcfRecord>) -> Result<Self> {
+        let provenance = std::iter::repeat_n(QueryProvenance::Unavailable, records.len());
+        Self::try_from_raw_with_provenance(headers, records, provenance)
+    }
+
+    /// Checks raw records and binds each record to its already-checked provenance.
+    pub(crate) fn try_from_raw_with_provenance(
+        headers: Vec<String>,
+        records: Vec<RawVcfRecord>,
+        provenance: impl IntoIterator<Item = QueryProvenance>,
+    ) -> Result<Self> {
+        let provenance = provenance.into_iter().collect::<Vec<_>>();
+        if provenance.len() != records.len() {
+            bail!(
+                "query provenance count {} does not match record count {}",
+                provenance.len(),
+                records.len()
+            );
+        }
+        let checked = records
+            .into_iter()
+            .zip(provenance)
+            .map(|(record, provenance)| ValidatedVcfRecord::try_from_raw(record, provenance))
+            .collect::<Result<Vec<_>>>()?;
+        let (records, facts) = checked
+            .into_iter()
+            .map(ValidatedVcfRecord::into_raw_and_facts)
+            .unzip();
+        Ok(Self {
+            headers,
+            records,
+            facts,
+        })
+    }
+
+    /// Returns the VCF header lines.
+    pub(crate) fn headers(&self) -> &[String] {
+        &self.headers
+    }
+
+    /// Returns the checked records.
+    pub(crate) fn records(&self) -> &[RawVcfRecord] {
+        &self.records
+    }
+
+    /// Splits the payload into headers and checked records without weakening them.
+    pub(crate) fn into_parts(self) -> (Vec<String>, Vec<ValidatedVcfRecord>) {
+        let records = self
+            .records
+            .into_iter()
+            .zip(self.facts)
+            .map(|(raw, facts)| ValidatedVcfRecord::from_raw_and_facts(raw, facts))
+            .collect();
+        (self.headers, records)
+    }
+
+    /// Edits headers without touching already-checked records.
+    pub(crate) fn edit_headers<R>(&mut self, edit: impl FnOnce(&mut Vec<String>) -> R) -> R {
+        edit(&mut self.headers)
+    }
+
+    /// Applies one record edit transactionally and refreshes only its checked facts.
+    pub(crate) fn try_edit_record<R>(
+        &mut self,
+        index: usize,
+        edit: impl FnOnce(&mut RawVcfRecord) -> Result<R>,
+    ) -> Result<R> {
+        let provenance = self
+            .facts
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("VCF record index {index} is out of bounds"))?
+            .provenance;
+        let mut raw = self.records[index].clone();
+        let result = edit(&mut raw)?;
+        let checked = ValidatedVcfRecord::try_from_raw(raw, provenance)?;
+        let (raw, facts) = checked.into_raw_and_facts();
+        self.records[index] = raw;
+        self.facts[index] = facts;
+        Ok(result)
+    }
+}
+
+impl ValidatedVcfRecord {
+    /// Converts a raw file-adapter record into checked domain values.
+    pub(crate) fn try_from_raw(raw: RawVcfRecord, provenance: QueryProvenance) -> Result<Self> {
+        let position = GenomicPosition::new(raw.pos).map_err(|error| {
+            anyhow::anyhow!(
+                "invalid VCF position {} on contig {}: {error}",
+                raw.pos,
+                raw.chrom
+            )
+        })?;
+        let coordinate = GenomicCoordinate::new(raw.chrom.clone(), position)
+            .with_context(|| format!("invalid VCF coordinate {}:{}", raw.chrom, raw.pos))?;
+        let reference = Allele::new(raw.ref_allele.clone())
+            .with_context(|| format!("invalid REF allele at {coordinate}"))?;
+        let alternates = if raw.alt_allele == "." {
+            Vec::new()
+        } else {
+            raw.alt_allele
+                .split(',')
+                .map(|allele| {
+                    Allele::new(allele)
+                        .with_context(|| format!("invalid ALT allele {allele:?} at {coordinate}"))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let format_keys = raw.format_keys();
+        let gt_index = format_keys.iter().position(|key| *key == "GT");
+        let genotypes = raw
+            .samples
+            .iter()
+            .map(|sample| {
+                let Some(gt_index) = gt_index else {
+                    return Ok(None);
+                };
+                let Some(gt) = sample.split(':').nth(gt_index) else {
+                    return Ok(None);
+                };
+                Genotype::parse(gt, alternates.len())
+                    .map(Some)
+                    .map_err(|error| anyhow::anyhow!("invalid GT {gt:?} at {coordinate}: {error}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            raw,
+            coordinate,
+            reference,
+            alternates,
+            genotypes,
+            provenance,
+        })
+    }
+
+    fn into_raw_and_facts(self) -> (RawVcfRecord, ValidatedRecordFacts) {
+        let Self {
+            raw,
+            coordinate,
+            reference,
+            alternates,
+            genotypes,
+            provenance,
+        } = self;
+        (
+            raw,
+            ValidatedRecordFacts {
+                coordinate,
+                reference,
+                alternates,
+                genotypes,
+                provenance,
+            },
+        )
+    }
+
+    fn from_raw_and_facts(raw: RawVcfRecord, facts: ValidatedRecordFacts) -> Self {
+        Self {
+            raw,
+            coordinate: facts.coordinate,
+            reference: facts.reference,
+            alternates: facts.alternates,
+            genotypes: facts.genotypes,
+            provenance: facts.provenance,
+        }
+    }
+
+    /// Returns the checked genomic coordinate.
+    #[cfg_attr(not(test), allow(dead_code, reason = "checked record accessor"))]
+    pub(crate) fn coordinate(&self) -> &GenomicCoordinate {
+        &self.coordinate
+    }
+
+    /// Returns the checked reference allele.
+    #[cfg_attr(not(test), allow(dead_code, reason = "checked record accessor"))]
+    pub(crate) fn reference(&self) -> &Allele {
+        &self.reference
+    }
+
+    /// Returns the individually checked alternate alleles.
+    #[cfg_attr(not(test), allow(dead_code, reason = "checked record accessor"))]
+    pub(crate) fn alternates(&self) -> &[Allele] {
+        &self.alternates
+    }
+
+    /// Returns each sample's explicit genotype, or `None` when GT is absent.
+    #[cfg_attr(not(test), allow(dead_code, reason = "checked record accessor"))]
+    pub(crate) fn genotypes(&self) -> &[Option<Genotype>] {
+        &self.genotypes
+    }
+
+    /// Returns the record's query-source provenance.
+    pub(crate) const fn provenance(&self) -> QueryProvenance {
+        self.provenance
+    }
+
+    /// Borrows the lossless file-adapter representation.
+    pub(crate) fn raw(&self) -> &RawVcfRecord {
+        &self.raw
+    }
+
+    /// Applies a structured edit transactionally and rechecks the record.
+    pub(crate) fn try_update<R>(
+        &mut self,
+        edit: impl FnOnce(&mut RawVcfRecord) -> Result<R>,
+    ) -> Result<R> {
+        let mut raw = self.raw.clone();
+        let result = edit(&mut raw)?;
+        *self = Self::try_from_raw(raw, self.provenance)?;
+        Ok(result)
+    }
+}
+
+impl std::ops::Deref for ValidatedVcfRecord {
+    type Target = RawVcfRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
 }
 
 impl RawVcfRecord {
@@ -305,6 +574,12 @@ pub(crate) fn load_raw_vcf(path: &Path) -> Result<(Vec<String>, Vec<RawVcfRecord
     Ok((headers, records))
 }
 
+/// Loads VCF/BCF and retains checked coordinates, alleles, genotypes, and provenance.
+pub(crate) fn load_validated_vcf(path: &Path) -> Result<ValidatedVcf> {
+    let (headers, records) = load_raw_vcf(path)?;
+    ValidatedVcf::try_from_raw(headers, records)
+}
+
 pub(crate) fn write_raw_vcf(
     path: &Path,
     headers: &[String],
@@ -344,6 +619,11 @@ pub(crate) fn write_raw_vcf(
         transaction.commit()?;
     }
     Ok(())
+}
+
+/// Serializes an already-checked VCF payload at the file output boundary.
+pub(crate) fn write_validated_vcf(path: &Path, vcf: &ValidatedVcf) -> Result<()> {
+    write_raw_vcf(path, vcf.headers(), vcf.records())
 }
 
 /// Writes a BGZF-compressed VCF and its Tabix v1 index without invoking
@@ -1070,7 +1350,10 @@ pub(crate) fn load_variants(
         if line.starts_with('#') || line.trim().is_empty() {
             continue;
         }
-        let record = RawVcfRecord::from_line(line, path)?;
+        let record = ValidatedVcfRecord::try_from_raw(
+            RawVcfRecord::from_line(line, path)?,
+            QueryProvenance::Unavailable,
+        )?;
         if record.format.is_none() || record.samples.is_empty() {
             bail!("VCF record has fewer than 10 fields in {}", path.display());
         }
@@ -1093,7 +1376,7 @@ pub(crate) fn load_variants(
                 alt_allele: record.alt_allele.clone(),
             },
             qual: canonical_qual(&record.qual).to_string(),
-            filter: record.filter,
+            filter: record.filter.clone(),
             gt: canonical_gt(&gt),
         };
 
@@ -1334,6 +1617,104 @@ mod tests {
         assert!(!locations[0].matches("1", 6));
         assert!(!locations[0].matches("1", 8));
         assert!(!locations[0].matches("chr1", 7));
+        Ok(())
+    }
+
+    #[test]
+    fn validated_vcf_adapter_preserves_phase_ploidy_and_provenance() -> Result<()> {
+        let line = "chr1\t7\tcall\tA\tC,G\t60\tPASS\t.\tGT:DP\t1|2:9\t0:5";
+        let validated = ValidatedVcfRecord::try_from_raw(
+            RawVcfRecord::from_line(line, Path::new("source.vcf"))?,
+            QueryProvenance::source(3, 4)?,
+        )?;
+
+        assert_eq!(validated.coordinate().to_string(), "chr1:7");
+        assert_eq!(validated.reference().as_str(), "A");
+        assert_eq!(validated.alternates().len(), 2);
+        assert_eq!(
+            validated.genotypes()[0].as_ref().unwrap().to_string(),
+            "1|2"
+        );
+        assert_eq!(validated.genotypes()[0].as_ref().unwrap().ploidy().get(), 2);
+        assert_eq!(validated.genotypes()[1].as_ref().unwrap().ploidy().get(), 1);
+        assert_eq!(validated.provenance().source_index(), Some(3));
+        assert_eq!(validated.raw().to_line(), line);
+        Ok(())
+    }
+
+    #[test]
+    fn validated_vcf_adapter_rejects_invalid_coordinate_and_allele_index() -> Result<()> {
+        let zero = RawVcfRecord::from_line(
+            "chr1\t0\t.\tA\tC\t.\tPASS\t.\tGT\t0/1",
+            Path::new("zero.vcf"),
+        )?;
+        assert!(
+            ValidatedVcfRecord::try_from_raw(zero, QueryProvenance::Unavailable)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid VCF position 0")
+        );
+
+        let out_of_range = RawVcfRecord::from_line(
+            "chr1\t1\t.\tA\tC\t.\tPASS\t.\tGT\t0/2",
+            Path::new("index.vcf"),
+        )?;
+        assert!(
+            ValidatedVcfRecord::try_from_raw(out_of_range, QueryProvenance::Unavailable)
+                .unwrap_err()
+                .to_string()
+                .contains("allele index 2 is out of bounds")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validated_vcf_adapter_allows_an_omitted_trailing_gt_value() -> Result<()> {
+        let record = RawVcfRecord::from_line(
+            "chr1\t1\t.\tA\tC\t.\tPASS\t.\tDP:GT\t5",
+            Path::new("omitted-gt.vcf"),
+        )?;
+        let validated = ValidatedVcfRecord::try_from_raw(record, QueryProvenance::Unavailable)?;
+        assert_eq!(validated.genotypes(), &[None]);
+
+        let malformed = RawVcfRecord::from_line(
+            "chr1\t1\t.\tA\tC\t.\tPASS\t.\tDP:GT\t5:",
+            Path::new("malformed-gt.vcf"),
+        )?;
+        assert!(
+            ValidatedVcfRecord::try_from_raw(malformed, QueryProvenance::Unavailable)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid GT")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bcf_adapter_round_trip_reenters_the_validated_boundary() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("round-trip.bcf");
+        let headers = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##contig=<ID=chr1,length=100>".to_string(),
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tQUERY".to_string(),
+        ];
+        let raw = RawVcfRecord::from_line(
+            "chr1\t11\t.\tA\tC,G\t.\tPASS\t.\tGT\t1|2",
+            Path::new("source.vcf"),
+        )?;
+        write_raw_vcf(&path, &headers, &[raw])?;
+        let (_, records) = load_raw_vcf(&path)?;
+        let validated = ValidatedVcfRecord::try_from_raw(
+            records.into_iter().next().unwrap(),
+            QueryProvenance::source(0, 1)?,
+        )?;
+        assert_eq!(
+            validated.genotypes()[0].as_ref().unwrap().to_string(),
+            "1|2"
+        );
+        assert_eq!(validated.provenance().source_index(), Some(0));
         Ok(())
     }
 

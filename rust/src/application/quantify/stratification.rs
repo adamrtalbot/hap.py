@@ -5,8 +5,8 @@ use super::annotations::{
     propagate_ga4gh_superlocus_for_samples, remove_region_tag, set_format_value,
 };
 use super::{BenchmarkSamples, LoadedRegions, RegionLevels, RegionMap};
-use crate::adapters::vcf;
-use crate::cli_compat::cli::QuantifyArgs;
+use crate::adapters::vcf::{self, ValidatedVcf};
+use crate::application::QuantifyArgs;
 use crate::domain::{Interval, RawVcfRecord};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
@@ -443,6 +443,30 @@ pub(super) fn propagate_superlocus_annotations_for_samples(
         }
         start = end;
     }
+}
+
+pub(super) fn propagate_checked_superlocus_annotations_for_samples(
+    input: &mut ValidatedVcf,
+    annotation_type: &str,
+    samples: BenchmarkSamples,
+    preserve_missing_query_qq: bool,
+    inherit_same_position_tp_qq: bool,
+) -> Result<()> {
+    let mut edited = input.records().to_vec();
+    propagate_superlocus_annotations_for_samples(
+        &mut edited,
+        annotation_type,
+        samples,
+        preserve_missing_query_qq,
+        inherit_same_position_tp_qq,
+    );
+    for (index, replacement) in edited.into_iter().enumerate() {
+        input.try_edit_record(index, |record| {
+            *record = replacement;
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 pub(super) fn benchmark_superlocus(info: &str) -> Option<i64> {

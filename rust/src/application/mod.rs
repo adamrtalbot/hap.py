@@ -5,6 +5,14 @@ pub(crate) mod comparison_io;
 pub(crate) mod ftx;
 pub(crate) mod preprocess;
 pub(crate) mod quantify;
+mod requests;
 pub(crate) mod roc_publication;
 pub(crate) mod somatic;
 pub(crate) mod validate;
+
+pub(crate) use requests::{
+    CompareArgs, CompareEngine, FtxArgs, PreprocessArgs, PreprocessGender, QuantifyArgs,
+    RequestValidationError, SomaticArgs, SomaticGtMode, ValidateArgs, ValidatedCompareArgs,
+    ValidatedFtxArgs, ValidatedPreprocessArgs, ValidatedQuantifyArgs, ValidatedSomaticArgs,
+    ValidatedValidateArgs,
+};

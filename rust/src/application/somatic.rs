@@ -1,5 +1,5 @@
 use crate::adapters::report::suffixed_report_path;
-use crate::cli_compat::cli::SomaticArgs;
+use crate::application::{SomaticArgs, ValidatedSomaticArgs};
 use crate::domain::{Interval, RawVcfRecord};
 use crate::{
     adapters::{fasta, vcf},
@@ -297,7 +297,8 @@ enum QueryClass {
     Ambi,
 }
 
-pub(crate) fn run(mut args: SomaticArgs) -> Result<()> {
+pub(crate) fn run(args: ValidatedSomaticArgs) -> Result<()> {
+    let mut args = args.into_inner();
     let destination_prefix = PathBuf::from(&args.output);
     let inputs = somatic_inputs(&args);
     let logfile = args.logfile.as_ref().map(PathBuf::from);

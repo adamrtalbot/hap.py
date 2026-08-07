@@ -6,7 +6,8 @@
 //! `preprocessVCF` helper did not run hap.py's primitive decomposition or
 //! genotype rewriting stages.
 
-use crate::cli_compat::cli::{FtxArgs, resolve_legacy_reference};
+use crate::application::{FtxArgs, ValidatedFtxArgs};
+use crate::cli_compat::cli::resolve_legacy_reference;
 use crate::domain::RawVcfRecord;
 use crate::engines::partial_credit::RefVar;
 use crate::{
@@ -82,7 +83,8 @@ impl Drop for ScratchRun {
     }
 }
 
-pub(crate) fn run(mut args: FtxArgs) -> Result<()> {
+pub(crate) fn run(args: ValidatedFtxArgs) -> Result<()> {
+    let mut args = args.into_inner();
     if args.normalize {
         args.reference = Some(resolve_legacy_reference(args.reference.as_deref()).context(
             "no reference file found for --normalize; pass --reference or set HG19/HGREF",
@@ -523,7 +525,7 @@ mod tests {
     use std::thread;
 
     fn args(input: &Path, reference: &Path) -> FtxArgs {
-        FtxArgs {
+        crate::application::FtxArgs {
             input: input.display().to_string(),
             output: "unused".to_string(),
             location: None,
@@ -537,6 +539,8 @@ mod tests {
             normalize: false,
             fixchr: false,
         }
+        .validated()
+        .unwrap()
     }
 
     fn fixture(contents: &str, reference: &str) -> (ScratchRun, PathBuf, PathBuf) {

@@ -7,7 +7,7 @@ use super::metrics::python2_counter_indices;
 use super::{AmbiguousInterval, FilteredRawRecord, QueryClass};
 use crate::adapters::report;
 use crate::adapters::vcf;
-use crate::cli_compat::cli::SomaticArgs;
+use crate::application::SomaticArgs;
 use crate::domain::{Interval, RawVcfRecord};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};

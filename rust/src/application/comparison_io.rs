@@ -11,8 +11,7 @@ pub(crate) fn run_scmp(
     reference: &Path,
     mode: scmp::ScmpMode,
     qq_field: &str,
-    output: &Path,
-) -> Result<()> {
+) -> Result<vcf::ValidatedVcf> {
     let (truth_headers, truth_records) = vcf::load_raw_vcf(truth)?;
     let (query_headers, query_records) = vcf::load_raw_vcf(query)?;
     let mut merged = scmp::merge_two_sample_records(
@@ -29,7 +28,7 @@ pub(crate) fn run_scmp(
         mode,
         qq_field,
     )?;
-    vcf::write_raw_vcf(output, &merged.headers, &merged.records)
+    vcf::ValidatedVcf::try_from_raw(merged.headers, merged.records)
 }
 
 pub(crate) fn run_vcfeval(
@@ -37,18 +36,16 @@ pub(crate) fn run_vcfeval(
     query: &Path,
     reference: &Path,
     options: vcfeval::Options<'_>,
-    output: &Path,
-) -> Result<()> {
+) -> Result<vcf::ValidatedVcf> {
     let (truth_headers, truth_records) = vcf::load_raw_vcf(truth)?;
     let (query_headers, query_records) = vcf::load_raw_vcf(query)?;
     let references = fasta::read_sequences(reference)?;
-    let (headers, records) = vcfeval::compare_records(
+    vcfeval::compare_records(
         &truth_headers,
         &truth_records,
         &query_headers,
         &query_records,
         &references,
         options,
-    )?;
-    vcf::write_raw_vcf(output, &headers, &records)
+    )
 }

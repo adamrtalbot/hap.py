@@ -4,8 +4,10 @@
 mod tests {
     use super::super::*;
 
-    fn comparison_record(line: &str) -> crate::domain::RawVcfRecord {
-        crate::domain::RawVcfRecord::from_line(line, std::path::Path::new("roc-test.vcf")).unwrap()
+    fn comparison_record(line: &str) -> crate::domain::ComparisonRecord {
+        crate::domain::RawVcfRecord::from_line(line, std::path::Path::new("roc-test.vcf"))
+            .unwrap()
+            .into()
     }
 
     #[test]
@@ -895,7 +897,13 @@ mod tests {
             true,
             None,
         );
-        first.record.info = first.record.info.replace("BS=1", "BS=1;SCORE=10.0");
+        first
+            .record
+            .try_update(|record| {
+                record.info = record.info.replace("BS=1", "BS=1;SCORE=10.0");
+                Ok(())
+            })
+            .unwrap();
         let mut second = annotated(
             "chr1",
             200,
@@ -906,7 +914,13 @@ mod tests {
             true,
             None,
         );
-        second.record.info = second.record.info.replace("BS=1", "BS=1;SCORE=10.4");
+        second
+            .record
+            .try_update(|record| {
+                record.info = record.info.replace("BS=1", "BS=1;SCORE=10.4");
+                Ok(())
+            })
+            .unwrap();
         let options = RocOptions {
             qq_field: "SCORE".to_string(),
             delta: 0.0,
@@ -979,7 +993,12 @@ mod tests {
             false,
             None,
         );
-        row.record.filter = "LowQual".to_string();
+        row.record
+            .try_update(|record| {
+                record.filter = "LowQual".to_string();
+                Ok(())
+            })
+            .unwrap();
         let options = RocOptions {
             ignored_filters: HashSet::from(["LowQual".to_string()]),
             ..RocOptions::default()
@@ -1008,7 +1027,12 @@ mod tests {
             false,
             None,
         );
-        row.record.filter = "LowQual".to_string();
+        row.record
+            .try_update(|record| {
+                record.filter = "LowQual".to_string();
+                Ok(())
+            })
+            .unwrap();
         let options = RocOptions {
             roc_regions: HashSet::from(["TS_contained".to_string()]),
             ..RocOptions::default()

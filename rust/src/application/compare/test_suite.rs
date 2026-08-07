@@ -5,8 +5,10 @@ mod scratch_tests {
     use super::super::*;
     use std::thread;
 
-    fn comparison_record(line: &str) -> RawVcfRecord {
-        RawVcfRecord::from_line(line, Path::new("comparison-test.vcf")).unwrap()
+    fn comparison_record(line: &str) -> crate::domain::ComparisonRecord {
+        RawVcfRecord::from_line(line, Path::new("comparison-test.vcf"))
+            .unwrap()
+            .into()
     }
 
     #[test]
@@ -132,7 +134,7 @@ mod scratch_tests {
         normalize_engine_preprocessing(&mut distance);
         assert_eq!(
             distance.set_gt,
-            Some(crate::cli_compat::cli::SomaticGtMode::First)
+            Some(crate::application::SomaticGtMode::First)
         );
         assert!(!effective_decomposition(&distance));
         fs::remove_dir_all(root).unwrap();
@@ -209,7 +211,7 @@ mod scratch_tests {
         options.preprocess_truth = true;
         options.bcftools_norm = true;
         options.fixchr = Some(true);
-        options.gender = crate::cli_compat::cli::PreprocessGender::Male;
+        options.gender = crate::application::PreprocessGender::Male;
         options.preprocess_window = 4096;
 
         let truth = build_preprocess_args(
@@ -236,7 +238,7 @@ mod scratch_tests {
         for side in [&truth, &query] {
             assert!(side.bcftools_norm);
             assert_eq!(side.fixchr, Some(true));
-            assert_eq!(side.gender, crate::cli_compat::cli::PreprocessGender::Male);
+            assert_eq!(side.gender, crate::application::PreprocessGender::Male);
             assert_eq!(side.window_size, 4096);
         }
         fs::remove_dir_all(root).unwrap();

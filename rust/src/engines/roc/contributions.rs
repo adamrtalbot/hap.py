@@ -11,16 +11,16 @@ pub(super) fn emit_contributions_with_options<
     options: &RocOptions,
     mut emit: F,
 ) {
-    let Some(format) = row.record.format.as_deref() else {
+    let record = row.record.raw();
+    let Some(format) = record.format.as_deref() else {
         return;
     };
-    let (Some(truth_sample), Some(query_sample)) =
-        (row.record.samples.first(), row.record.samples.get(1))
+    let (Some(truth_sample), Some(query_sample)) = (record.samples.first(), record.samples.get(1))
     else {
         return;
     };
 
-    let info = row.record.info.as_str();
+    let info = record.info.as_str();
     let subsets = extract_subsets(info);
 
     let format_keys: Vec<&str> = format.split(':').collect();
@@ -34,11 +34,10 @@ pub(super) fn emit_contributions_with_options<
     // xcmp output sets QUAL=0 while still writing the matched per-side
     // quality into FORMAT.QQ.
     let score_field = options.score_field.as_deref().unwrap_or(&options.qq_field);
-    let truth_qq = truth.roc_value(score_field, &row.record.qual, info);
-    let query_qq = query.roc_value(score_field, &row.record.qual, info);
+    let truth_qq = truth.roc_value(score_field, &record.qual, info);
+    let query_qq = query.roc_value(score_field, &record.qual, info);
 
-    let filter_tags = row
-        .record
+    let filter_tags = record
         .filter
         .split(';')
         .filter(|tag| !tag.is_empty() && *tag != "." && *tag != "PASS")

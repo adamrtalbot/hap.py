@@ -1,8 +1,8 @@
 use crate::adapters::metrics_json;
 use crate::adapters::report::{self, suffixed_report_path};
-use crate::adapters::vcf::{self};
+use crate::adapters::vcf::{self, ValidatedVcf, ValidatedVcfRecord};
 use crate::application::roc_publication;
-use crate::cli_compat::cli::QuantifyArgs;
+use crate::application::{QuantifyArgs, ValidatedQuantifyArgs};
 use crate::domain::{AnnotatedRow, CountsBucket, Interval, RawVcfRecord, TypeCounts};
 use crate::engines::roc;
 use crate::output::{OutputTransaction, benchmark_artifacts, stratification_inputs};
@@ -108,8 +108,8 @@ struct ExtendedTableOptions<'a> {
     ci_alpha: f64,
 }
 
-pub(crate) fn run(args: QuantifyArgs) -> Result<()> {
-    run_with_metric_indices(args).map(|_| ())
+pub(crate) fn run(args: ValidatedQuantifyArgs) -> Result<()> {
+    run_with_metric_indices(args.into_inner()).map(|_| ())
 }
 
 /// Run qfy and return the legacy table row indices used by metrics JSON.
@@ -118,7 +118,12 @@ pub(crate) fn run(args: QuantifyArgs) -> Result<()> {
 /// hap.py metadata. Returning the indices keeps that rewrite from replacing
 /// qfy's unordered-table row identifiers with synthetic `0..N` values.
 pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricIndices> {
-    run_with_metric_indices_mode(args, CompareQuantifyMode::default())
+    let input = PathBuf::from(&args.input_vcf);
+    run_with_metric_indices_mode(
+        args,
+        CompareQuantifyMode::default(),
+        QuantifySource::File(input),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,26 +136,41 @@ pub(crate) struct CompareQuantifyMode {
 
 pub(crate) fn run_from_compare(
     args: QuantifyArgs,
+    headers: Vec<String>,
+    records: Vec<ValidatedVcfRecord>,
     mode: CompareQuantifyMode,
 ) -> Result<roc::MetricIndices> {
-    run_with_metric_indices_mode(args, mode)
+    run_with_metric_indices_mode(
+        args,
+        mode,
+        QuantifySource::Records(ValidatedVcf::from_parts(headers, records)),
+    )
+}
+
+enum QuantifySource {
+    File(PathBuf),
+    Records(ValidatedVcf),
 }
 
 fn run_with_metric_indices_mode(
     mut args: QuantifyArgs,
     mode: CompareQuantifyMode,
+    source: QuantifySource,
 ) -> Result<roc::MetricIndices> {
     let destination_prefix = PathBuf::from(&args.report_prefix);
     let destination_vcf =
         suffixed_report_path(&destination_prefix, if args.bcf { "bcf" } else { "vcf.gz" });
-    if args.write_vcf && paths_refer_to_same_file(Path::new(&args.input_vcf), &destination_vcf) {
+    if matches!(&source, QuantifySource::File(_))
+        && args.write_vcf
+        && paths_refer_to_same_file(Path::new(&args.input_vcf), &destination_vcf)
+    {
         bail!(
             "cannot overwrite input VCF: {} would be overwritten by output {}",
             args.input_vcf,
             destination_vcf.display()
         );
     }
-    let (inputs, mut labels) = quantify_inputs(&args)?;
+    let (inputs, mut labels) = quantify_inputs(&args, matches!(&source, QuantifySource::File(_)))?;
     labels.extend(
         args.roc_regions
             .iter()
@@ -170,7 +190,7 @@ fn run_with_metric_indices_mode(
         );
     }
     args.report_prefix = transaction.staged_prefix()?.to_string_lossy().into_owned();
-    let indices = run_with_metric_indices_inner(args, mode).map_err(|error| {
+    let indices = run_with_metric_indices_inner(args, mode, source).map_err(|error| {
         anyhow::anyhow!(
             "failed to produce quantified report generation {}: {error:#}",
             destination_prefix.display()
@@ -180,9 +200,14 @@ fn run_with_metric_indices_mode(
     Ok(indices)
 }
 
-fn quantify_inputs(args: &QuantifyArgs) -> Result<(Vec<PathBuf>, Vec<String>)> {
+fn quantify_inputs(
+    args: &QuantifyArgs,
+    include_primary_input: bool,
+) -> Result<(Vec<PathBuf>, Vec<String>)> {
     let (indirect, labels) = stratification_inputs(args.strat_tsv.as_deref(), &args.strat_regions)?;
-    let mut inputs = std::iter::once(args.input_vcf.as_str())
+    let mut inputs = include_primary_input
+        .then_some(args.input_vcf.as_str())
+        .into_iter()
         .chain(std::iter::once(args.reference.as_str()))
         .chain(args.fp_bedfile.as_deref())
         .chain(args.adjust_conf_regions.as_deref())
@@ -195,6 +220,7 @@ fn quantify_inputs(args: &QuantifyArgs) -> Result<(Vec<PathBuf>, Vec<String>)> {
 fn run_with_metric_indices_inner(
     args: QuantifyArgs,
     mode: CompareQuantifyMode,
+    source: QuantifySource,
 ) -> Result<roc::MetricIndices> {
     validate_options(&args)?;
     if let Some(logfile) = args.logfile.as_deref() {
@@ -207,68 +233,80 @@ fn run_with_metric_indices_inner(
     let annotation_type = args.annotation_type.as_deref().unwrap_or("xcmp");
     let prefix = Path::new(&args.report_prefix);
     let output_vcf = suffixed_report_path(prefix, if args.bcf { "bcf" } else { "vcf.gz" });
-    if args.write_vcf && paths_refer_to_same_file(Path::new(&args.input_vcf), &output_vcf) {
-        bail!(
-            "cannot overwrite input VCF: {} would be overwritten by output {}",
-            args.input_vcf,
-            output_vcf.display()
-        );
-    }
-    require_quantifier_index(Path::new(&args.input_vcf))?;
-    let (mut headers, mut records) = vcf::load_raw_vcf(Path::new(&args.input_vcf))?;
+    let mut input = match source {
+        QuantifySource::File(path) => {
+            if args.write_vcf && paths_refer_to_same_file(&path, &output_vcf) {
+                bail!(
+                    "cannot overwrite input VCF: {} would be overwritten by output {}",
+                    path.display(),
+                    output_vcf.display()
+                );
+            }
+            require_quantifier_index(&path)?;
+            vcf::load_validated_vcf(&path)?
+        }
+        QuantifySource::Records(records) => records,
+    };
     if annotation_type == "ga4gh" {
-        validate_ga4gh_qq_fields(&headers, &records)?;
+        validate_ga4gh_qq_fields(input.headers(), input.records())?;
     }
-    let benchmark_samples = benchmark_sample_indices(&headers);
+    let benchmark_samples = benchmark_sample_indices(input.headers());
     let do_roc = args.do_roc && benchmark_samples.has_both();
     let reference = crate::adapters::fasta::read_sequences(Path::new(&args.reference))?;
     let reference_contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
     let (confidence, stratifications, stratification_levels) =
         load_regions(&args, &reference_contigs)?;
-    for record in &mut records {
-        if args.preserve_info {
-            let extent = legacy_regions_extent(record);
-            set_info_value(&mut record.info, "RegionsExtent", &extent);
-        }
-        annotate_regions_for_samples(
-            record,
-            confidence.as_deref(),
-            &stratifications,
-            annotation_type == "ga4gh",
-            benchmark_samples,
-            mode.preserve_missing_nocall_bd,
-        );
-        if annotation_type == "xcmp" {
-            reannotate_xcmp_record_for_samples(
+    for index in 0..input.records().len() {
+        input.try_edit_record(index, |record| {
+            if args.preserve_info {
+                let extent = legacy_regions_extent(record);
+                set_info_value(&mut record.info, "RegionsExtent", &extent);
+            }
+            annotate_regions_for_samples(
                 record,
-                confidence.is_some(),
-                &args.roc,
+                confidence.as_deref(),
+                &stratifications,
+                annotation_type == "ga4gh",
                 benchmark_samples,
+                mode.preserve_missing_nocall_bd,
             );
-        } else {
-            reannotate_ga4gh_record(record);
-        }
+            if annotation_type == "xcmp" {
+                reannotate_xcmp_record_for_samples(
+                    record,
+                    confidence.is_some(),
+                    &args.roc,
+                    benchmark_samples,
+                );
+            } else {
+                reannotate_ga4gh_record(record);
+            }
+            Ok(())
+        })?;
     }
-    propagate_superlocus_annotations_for_samples(
-        &mut records,
+    propagate_checked_superlocus_annotations_for_samples(
+        &mut input,
         annotation_type,
         benchmark_samples,
         mode.preserve_missing_query_qq,
         mode.inherit_same_position_tp_qq,
-    );
-    for record in &mut records {
-        decorate_quantified_record_for_samples(
-            record,
-            annotation_type,
-            args.preserve_info,
-            args.output_vtc,
-            confidence.is_some(),
-            benchmark_samples,
-        );
-        if annotation_type == "ga4gh" {
-            normalize_integer_like_format_values(record, "QQ");
-        }
+    )?;
+    for index in 0..input.records().len() {
+        input.try_edit_record(index, |record| {
+            decorate_quantified_record_for_samples(
+                record,
+                annotation_type,
+                args.preserve_info,
+                args.output_vtc,
+                confidence.is_some(),
+                benchmark_samples,
+            );
+            if annotation_type == "ga4gh" {
+                normalize_integer_like_format_values(record, "QQ");
+            }
+            Ok(())
+        })?;
     }
+    let records = input.records();
     let subset_size = contigs_in_input(&records)
         .into_iter()
         .filter_map(|contig| {
@@ -381,6 +419,7 @@ fn run_with_metric_indices_inner(
         )?;
     }
     if args.write_vcf {
+        let mut headers = input.headers().to_vec();
         ensure_info_header(
             &mut headers,
             "Regions",
@@ -411,7 +450,8 @@ fn run_with_metric_indices_inner(
                 );
             }
         }
-        vcf::write_raw_vcf(&output_vcf, &headers, &records)?;
+        let output = ValidatedVcf::try_from_raw(headers, records.to_vec())?;
+        vcf::write_validated_vcf(&output_vcf, &output)?;
     }
     let mut rows = records
         .iter()
@@ -419,7 +459,7 @@ fn run_with_metric_indices_inner(
         .filter_map(|(index, record)| {
             Some(AnnotatedRow {
                 sort_key: (record.chrom.clone(), record.pos, index, 0),
-                record: roc_record(record, benchmark_samples)?,
+                record: roc_record(record, benchmark_samples)?.into(),
                 query_pass: record.is_pass(),
                 fp_class: benchmark_samples
                     .query

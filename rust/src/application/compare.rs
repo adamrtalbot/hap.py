@@ -1,7 +1,9 @@
 use crate::adapters::vcf::{self, Variant, VariantKey};
 use crate::adapters::{fasta, metrics_json, report};
-use crate::application::{comparison_io, preprocess, roc_publication};
-use crate::cli_compat::cli::{CompareArgs, CompareEngine, PreprocessArgs};
+use crate::application::{
+    CompareArgs, CompareEngine, PreprocessArgs, PreprocessGender, QuantifyArgs, SomaticGtMode,
+    ValidatedCompareArgs, comparison_io, preprocess, roc_publication,
+};
 use crate::domain::{AnnotatedRow, CountsBucket, Interval, RawVcfRecord, TypeCounts};
 use crate::engines::partial_credit;
 use crate::output::{OutputTransaction, benchmark_artifacts, stratification_inputs};
@@ -359,7 +361,8 @@ fn validate_regions_bed(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run(mut args: CompareArgs) -> Result<()> {
+pub(crate) fn run(args: ValidatedCompareArgs) -> Result<()> {
+    let mut args = args.into_inner();
     if args.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -506,7 +509,7 @@ fn run_inner(
     // intermediates directly.
     let bcf_intermediates = args.bcf && args.engine != CompareEngine::Vcfeval;
     preprocessing_args.bcf = bcf_intermediates;
-    if preprocessing_args.gender == crate::cli_compat::cli::PreprocessGender::Auto {
+    if preprocessing_args.gender == PreprocessGender::Auto {
         preprocessing_args.gender = preprocess::infer_gender(Path::new(&args.truth))?;
     }
     let truth_prep = scratch.path().join(if bcf_intermediates {
@@ -520,13 +523,16 @@ fn run_inner(
         "query.prep.vcf.gz"
     });
     log_compare_info(&args, "Preprocessing truth")?;
-    preprocess::run(build_preprocess_args(
-        &preprocessing_args,
-        &args.truth,
-        &truth_prep,
-        !args.usefiltered_truth,
-        args.preprocess_truth,
-    ))?;
+    preprocess::run(
+        build_preprocess_args(
+            &preprocessing_args,
+            &args.truth,
+            &truth_prep,
+            !args.usefiltered_truth,
+            args.preprocess_truth,
+        )
+        .validated()?,
+    )?;
     if args.locations.is_none() {
         let (_, preprocessed_truth) = vcf::load_raw_vcf(&truth_prep)?;
         if !preprocessed_truth
@@ -537,13 +543,16 @@ fn run_inner(
         }
     }
     log_compare_info(&args, "Preprocessing query")?;
-    preprocess::run(build_preprocess_args(
-        &preprocessing_args,
-        &args.query,
-        &query_prep,
-        args.pass_only,
-        true,
-    ))?;
+    preprocess::run(
+        build_preprocess_args(
+            &preprocessing_args,
+            &args.query,
+            &query_prep,
+            args.pass_only,
+            true,
+        )
+        .validated()?,
+    )?;
 
     if args.engine == CompareEngine::Vcfeval {
         log_compare_info(&args, "Running vcfeval comparison")?;
@@ -809,21 +818,14 @@ fn run_inner(
         || args.roc_regions.iter().any(|region| region != "*")
         || (args.roc_delta - 0.5).abs() > f64::EPSILON
         || args.ci_alpha != 0.0;
-    let comparison_vcf = if requantify {
-        scratch.path().join("comparison.vcf.gz")
-    } else {
-        suffixed_report_path(prefix, "vcf.gz")
-    };
     let requantify_rows = requantify.then(|| sanitize_requantify_handoff_rows(&rows));
-    report::write_vcf(
-        &comparison_vcf,
-        &vcf_headers,
-        requantify_rows.as_deref().unwrap_or(&rows),
-    )?;
+    if !requantify {
+        report::write_vcf(&suffixed_report_path(prefix, "vcf.gz"), &vcf_headers, &rows)?;
+    }
     let roc_indices = if requantify {
         crate::application::quantify::run_from_compare(
-            crate::cli_compat::cli::QuantifyArgs {
-                input_vcf: comparison_vcf.display().to_string(),
+            QuantifyArgs {
+                input_vcf: String::new(),
                 report_prefix: args.report_prefix.clone(),
                 reference: args.reference.clone(),
                 // Rust comparison rows already carry finalized GA4GH BD/BK/BVT
@@ -859,6 +861,14 @@ fn run_inner(
                 ci_alpha: args.ci_alpha,
                 no_json: args.no_json,
             },
+            vcf_headers.clone(),
+            requantify_rows
+                .as_ref()
+                .expect("requantification rows exist")
+                .iter()
+                .cloned()
+                .map(|row| row.record.into_validated())
+                .collect(),
             crate::application::quantify::CompareQuantifyMode {
                 preserve_missing_nocall_bd: args.usefiltered_truth,
                 ..Default::default()
@@ -913,10 +923,10 @@ fn run_inner(
         },
         fp_adjust_conf: args.adjust_conf_regions && !args.no_adjust_conf_regions,
         gender: match args.gender {
-            crate::cli_compat::cli::PreprocessGender::Male => "male",
-            crate::cli_compat::cli::PreprocessGender::Female => "female",
-            crate::cli_compat::cli::PreprocessGender::Auto => "auto",
-            crate::cli_compat::cli::PreprocessGender::None => "none",
+            PreprocessGender::Male => "male",
+            PreprocessGender::Female => "female",
+            PreprocessGender::Auto => "auto",
+            PreprocessGender::None => "none",
         },
         hb_expand: args.hb_expand,
         logfile: args.logfile.as_deref(),
@@ -1126,8 +1136,7 @@ fn run_vcfeval(
         }
         strat_regions.push(format!("CONF_VARS:{}", padding_path.display()));
     }
-    let vcfeval_vcf = scratch.path().join("vcfeval.comparison.vcf.gz");
-    comparison_io::run_vcfeval(
+    let validated = comparison_io::run_vcfeval(
         truth_prep,
         query_prep,
         Path::new(&args.reference),
@@ -1135,11 +1144,11 @@ fn run_vcfeval(
             roc_field: &args.roc,
             loose_match_distance: args.engine_scmp_distance,
         },
-        &vcfeval_vcf,
     )?;
+    let (vcfeval_headers, vcfeval_records) = validated.into_parts();
     let roc_indices = crate::application::quantify::run_from_compare(
-        crate::cli_compat::cli::QuantifyArgs {
-            input_vcf: vcfeval_vcf.display().to_string(),
+        QuantifyArgs {
+            input_vcf: String::new(),
             report_prefix: args.report_prefix.clone(),
             reference: args.reference.clone(),
             annotation_type: Some("ga4gh".to_string()),
@@ -1166,6 +1175,8 @@ fn run_vcfeval(
             ci_alpha: args.ci_alpha,
             no_json: args.no_json,
         },
+        vcfeval_headers,
+        vcfeval_records,
         crate::application::quantify::CompareQuantifyMode {
             inherit_same_position_tp_qq: true,
             roc_value_from_qq: true,
@@ -1199,7 +1210,6 @@ fn run_scmp(
     scratch: ScratchRun,
     published_logfile: Option<&str>,
 ) -> Result<()> {
-    let comparison_vcf = scratch.path().join("scmp.comparison.vcf.gz");
     let mut strat_regions = args.strat_regions.clone();
     if args.adjust_conf_regions
         && !args.no_adjust_conf_regions
@@ -1235,18 +1245,18 @@ fn run_scmp(
             bail!("internal error: run_scmp called for a non-SCMP engine")
         }
     };
-    comparison_io::run_scmp(
+    let validated = comparison_io::run_scmp(
         truth_prep,
         query_prep,
         Path::new(&args.reference),
         mode,
         &args.roc,
-        &comparison_vcf,
     )?;
+    let (scmp_headers, scmp_records) = validated.into_parts();
     let write_counts = args.write_counts && !args.no_write_counts;
     let roc_indices = crate::application::quantify::run_from_compare(
-        crate::cli_compat::cli::QuantifyArgs {
-            input_vcf: comparison_vcf.display().to_string(),
+        QuantifyArgs {
+            input_vcf: String::new(),
             report_prefix: args.report_prefix.clone(),
             reference: args.reference.clone(),
             annotation_type: Some("ga4gh".to_string()),
@@ -1273,6 +1283,8 @@ fn run_scmp(
             ci_alpha: args.ci_alpha,
             no_json: args.no_json,
         },
+        scmp_headers,
+        scmp_records,
         crate::application::quantify::CompareQuantifyMode {
             preserve_missing_query_qq: args.engine == CompareEngine::ScmpSomatic,
             ..Default::default()
@@ -1309,7 +1321,7 @@ fn normalize_engine_preprocessing(args: &mut CompareArgs) {
         }
         CompareEngine::ScmpDistance => {
             if !args.somatic && args.set_gt.is_none() {
-                args.set_gt = Some(crate::cli_compat::cli::SomaticGtMode::First);
+                args.set_gt = Some(SomaticGtMode::First);
             }
             args.decompose = false;
         }
@@ -1317,13 +1329,13 @@ fn normalize_engine_preprocessing(args: &mut CompareArgs) {
     }
 }
 
-fn somatic_mode_name(mode: Option<crate::cli_compat::cli::SomaticGtMode>) -> Option<&'static str> {
+fn somatic_mode_name(mode: Option<SomaticGtMode>) -> Option<&'static str> {
     mode.map(|mode| match mode {
-        crate::cli_compat::cli::SomaticGtMode::Half => "half",
-        crate::cli_compat::cli::SomaticGtMode::Hemi => "hemi",
-        crate::cli_compat::cli::SomaticGtMode::Het => "het",
-        crate::cli_compat::cli::SomaticGtMode::Hom => "hom",
-        crate::cli_compat::cli::SomaticGtMode::First => "first",
+        SomaticGtMode::Half => "half",
+        SomaticGtMode::Hemi => "hemi",
+        SomaticGtMode::Het => "het",
+        SomaticGtMode::Hom => "hom",
+        SomaticGtMode::First => "first",
     })
 }
 
@@ -1408,10 +1420,10 @@ fn write_runinfo_for_args(
         },
         fp_adjust_conf: args.adjust_conf_regions && !args.no_adjust_conf_regions,
         gender: match args.gender {
-            crate::cli_compat::cli::PreprocessGender::Male => "male",
-            crate::cli_compat::cli::PreprocessGender::Female => "female",
-            crate::cli_compat::cli::PreprocessGender::Auto => "auto",
-            crate::cli_compat::cli::PreprocessGender::None => "none",
+            PreprocessGender::Male => "male",
+            PreprocessGender::Female => "female",
+            PreprocessGender::Auto => "auto",
+            PreprocessGender::None => "none",
         },
         hb_expand: args.hb_expand,
         logfile: args.logfile.as_deref(),

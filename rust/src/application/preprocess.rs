@@ -1,4 +1,6 @@
-use crate::cli_compat::cli::{PreprocessArgs, PreprocessGender, SomaticGtMode};
+use crate::application::{
+    PreprocessArgs, PreprocessGender, SomaticGtMode, ValidatedPreprocessArgs,
+};
 use crate::domain::{Interval, RawVcfRecord};
 use crate::{
     adapters::{fasta, vcf},
@@ -93,7 +95,8 @@ impl BlocksplitSelection {
     }
 }
 
-pub(crate) fn run(mut args: PreprocessArgs) -> Result<()> {
+pub(crate) fn run(args: ValidatedPreprocessArgs) -> Result<()> {
+    let mut args = args.into_inner();
     if args.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());

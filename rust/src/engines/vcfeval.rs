@@ -7,7 +7,8 @@
 //! variants wins. A second haploid pass identifies allele-only matches and a
 //! final proximity pass applies GA4GH loose-match annotations.
 
-use crate::domain::RawVcfRecord;
+use crate::adapters::vcf::{ValidatedVcf, ValidatedVcfRecord};
+use crate::domain::{QueryProvenance, RawVcfRecord};
 use crate::engines::scmp;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +21,54 @@ const PATH_PADDING: usize = 32;
 pub(crate) struct Options<'a> {
     pub roc_field: &'a str,
     pub loose_match_distance: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ProvenancedMerge {
+    records: Vec<ValidatedVcfRecord>,
+    query_records: Vec<ValidatedVcfRecord>,
+}
+
+impl ProvenancedMerge {
+    fn new(
+        vcf: scmp::MergedVcf,
+        provenance: Vec<QueryProvenance>,
+        query_records: Vec<RawVcfRecord>,
+    ) -> Result<Self> {
+        if vcf.records.len() != provenance.len() {
+            bail!(
+                "query provenance count {} does not match merged record count {}",
+                provenance.len(),
+                vcf.records.len()
+            );
+        }
+        let records = vcf
+            .records
+            .into_iter()
+            .zip(provenance)
+            .map(|(record, provenance)| ValidatedVcfRecord::try_from_raw(record, provenance))
+            .collect::<Result<Vec<_>>>()?;
+        let query_len = query_records.len();
+        let query_records = query_records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| {
+                ValidatedVcfRecord::try_from_raw(
+                    record,
+                    QueryProvenance::source(index, query_len)
+                        .expect("enumerated index belongs to the query collection"),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            records,
+            query_records,
+        })
+    }
+
+    fn into_validated(self, headers: Vec<String>) -> ValidatedVcf {
+        ValidatedVcf::from_parts(headers, self.records)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,9 +147,13 @@ pub(crate) fn compare_records(
     query_records: &[RawVcfRecord],
     references: &BTreeMap<String, String>,
     options: Options<'_>,
-) -> Result<(Vec<String>, Vec<RawVcfRecord>)> {
-    let (mut merged, query_sources) =
-        merge_records_rtg(truth_headers, truth_records, query_headers, query_records)?;
+) -> Result<ValidatedVcf> {
+    let mut merged = merge_records_rtg(
+        truth_headers,
+        truth_records,
+        query_headers,
+        query_records.to_vec(),
+    )?;
     let calls = extract_calls(&merged.records)?;
     let clusters = build_clusters(&calls);
     let mut verdicts = vec![Verdict::default(); calls.len()];
@@ -114,15 +167,10 @@ pub(crate) fn compare_records(
     apply_allele_matches(&calls, &references, &mut verdicts)?;
     apply_loose_matches(&calls, options.loose_match_distance, &mut verdicts);
 
-    let qq = query_scores(
-        &merged.records,
-        &query_records,
-        &query_sources,
-        options.roc_field,
-    )?;
+    let qq = query_scores(&merged, options.roc_field)?;
     annotate_records(&mut merged.records, &calls, &verdicts, &qq);
     let headers = output_headers(query_headers, references, options.loose_match_distance);
-    Ok((headers, merged.records))
+    Ok(merged.into_validated(headers))
 }
 
 /// RTG combines truth and query records only when their start and REF agree.
@@ -132,8 +180,8 @@ fn merge_records_rtg(
     truth_headers: &[String],
     truth: &[RawVcfRecord],
     query_headers: &[String],
-    query: &[RawVcfRecord],
-) -> Result<(scmp::MergedVcf, Vec<Option<usize>>)> {
+    query: Vec<RawVcfRecord>,
+) -> Result<ProvenancedMerge> {
     let mut used_query = vec![false; query.len()];
     let mut tagged = Vec::with_capacity(truth.len() + query.len());
     for truth_record in truth {
@@ -151,14 +199,20 @@ fn merge_records_rtg(
                 query_headers,
                 std::slice::from_ref(&query[index]),
             )?;
-            tagged.extend(
-                merged
-                    .records
-                    .into_iter()
-                    .map(|record| (record, 0usize, Some(index))),
-            );
+            tagged.extend(merged.records.into_iter().map(|record| {
+                (
+                    record,
+                    0usize,
+                    QueryProvenance::source(index, query.len())
+                        .expect("index came from the query collection"),
+                )
+            }));
         } else {
-            tagged.push((simple_two_sample_record(truth_record, Side::Truth), 1, None));
+            tagged.push((
+                simple_two_sample_record(truth_record, Side::Truth),
+                1,
+                QueryProvenance::Unavailable,
+            ));
         }
     }
     for (index, query_record) in query.iter().enumerate() {
@@ -166,7 +220,8 @@ fn merge_records_rtg(
             tagged.push((
                 simple_two_sample_record(query_record, Side::Query),
                 0,
-                Some(index),
+                QueryProvenance::source(index, query.len())
+                    .expect("index came from the query collection"),
             ));
         }
     }
@@ -181,13 +236,14 @@ fn merge_records_rtg(
         .into_iter()
         .map(|(record, _, query_source)| (record, query_source))
         .unzip();
-    Ok((
+    ProvenancedMerge::new(
         scmp::MergedVcf {
             headers: Vec::new(),
             records,
         },
         query_sources,
-    ))
+        query,
+    )
 }
 
 fn simple_two_sample_record(record: &RawVcfRecord, side: Side) -> RawVcfRecord {
@@ -217,7 +273,7 @@ fn simple_two_sample_record(record: &RawVcfRecord, side: Side) -> RawVcfRecord {
     }
 }
 
-fn extract_calls(records: &[RawVcfRecord]) -> Result<Vec<Call>> {
+fn extract_calls(records: &[ValidatedVcfRecord]) -> Result<Vec<Call>> {
     let mut calls = Vec::new();
     for (record_index, record) in records.iter().enumerate() {
         let alts = record
@@ -617,17 +673,9 @@ fn apply_loose_matches(calls: &[Call], distance: usize, verdicts: &mut [Verdict]
     }
 }
 
-fn query_scores(
-    merged: &[RawVcfRecord],
-    query: &[RawVcfRecord],
-    query_sources: &[Option<usize>],
-    field: &str,
-) -> Result<BTreeMap<usize, String>> {
-    if merged.len() != query_sources.len() {
-        bail!("vcfeval query provenance does not match merged records");
-    }
+fn query_scores(merged: &ProvenancedMerge, field: &str) -> Result<BTreeMap<usize, String>> {
     let mut scores = BTreeMap::new();
-    for (record_index, record) in merged.iter().enumerate() {
+    for (record_index, record) in merged.records.iter().enumerate() {
         if !record.sample_map(1).get("GT").is_some_and(|gt| {
             gt.split(['/', '|'])
                 .filter_map(|value| value.parse::<usize>().ok())
@@ -635,10 +683,10 @@ fn query_scores(
         }) {
             continue;
         }
-        let Some(source_index) = query_sources[record_index] else {
+        let Some(source_index) = record.provenance().source_index() else {
             continue;
         };
-        let source = query.get(source_index).with_context(|| {
+        let source = merged.query_records.get(source_index).with_context(|| {
             format!("vcfeval query provenance index {source_index} is out of bounds")
         })?;
         let value = if field == "QUAL" {
@@ -673,7 +721,7 @@ fn info_value<'a>(info: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn annotate_records(
-    records: &mut Vec<RawVcfRecord>,
+    records: &mut Vec<ValidatedVcfRecord>,
     calls: &[Call],
     verdicts: &[Verdict],
     qq: &BTreeMap<usize, String>,
@@ -686,10 +734,11 @@ fn annotate_records(
         }] = Some(call_id);
     }
     let mut output = Vec::with_capacity(records.len());
-    for (record_index, mut record) in records.drain(..).enumerate() {
+    for (record_index, mut checked) in records.drain(..).enumerate() {
         let Some(call_ids) = by_record.get(&record_index) else {
             continue;
         };
+        let record = checked.raw();
         let mut sync = BTreeSet::new();
         let mut samples = Vec::with_capacity(2);
         let include_qq = qq.contains_key(&record_index) && call_ids[1].is_some();
@@ -749,12 +798,7 @@ fn annotate_records(
             };
             samples.push(trim_trailing_missing(&sample));
         }
-        record.id = ".".to_string();
-        record.qual = ".".to_string();
-        if call_ids[1].is_none() {
-            record.filter = ".".to_string();
-        }
-        record.info = if sync.is_empty() {
+        let info = if sync.is_empty() {
             ".".to_string()
         } else {
             format!(
@@ -765,7 +809,7 @@ fn annotate_records(
                     .join(",")
             )
         };
-        record.format = Some(if skipped {
+        let format = Some(if skipped {
             "GT:BD".to_string()
         } else if query_only {
             "GT:QQ:BD:BK".to_string()
@@ -774,8 +818,20 @@ fn annotate_records(
         } else {
             "GT:BD:BK".to_string()
         });
-        record.samples = samples;
-        output.push(record);
+        checked
+            .try_update(|record| {
+                record.id = ".".to_string();
+                record.qual = ".".to_string();
+                if call_ids[1].is_none() {
+                    record.filter = ".".to_string();
+                }
+                record.info = info;
+                record.format = format;
+                record.samples = samples;
+                Ok(())
+            })
+            .expect("vcfeval annotations preserve checked VCF invariants");
+        output.push(checked);
     }
     *records = output;
 }
@@ -916,12 +972,22 @@ mod tests {
         let low = RawVcfRecord::from_line("chr1\t2\t.\tA\tC\t10\tPASS\t.\tGT\t1/1", path)?;
         let high = RawVcfRecord::from_line("chr1\t2\t.\tA\tG\t99\tPASS\t.\tGT\t1/1", path)?;
         let query = vec![low.clone(), high.clone()];
-        let merged = vec![
-            simple_two_sample_record(&high, Side::Query),
-            simple_two_sample_record(&low, Side::Query),
-        ];
+        let merged = ProvenancedMerge::new(
+            scmp::MergedVcf {
+                headers: Vec::new(),
+                records: vec![
+                    simple_two_sample_record(&high, Side::Query),
+                    simple_two_sample_record(&low, Side::Query),
+                ],
+            },
+            vec![
+                QueryProvenance::source(1, 2)?,
+                QueryProvenance::source(0, 2)?,
+            ],
+            query,
+        )?;
 
-        let scores = query_scores(&merged, &query, &[Some(1), Some(0)], "QUAL")?;
+        let scores = query_scores(&merged, "QUAL")?;
 
         assert_eq!(scores.get(&0).map(String::as_str), Some("99.0"));
         assert_eq!(scores.get(&1).map(String::as_str), Some("10.0"));
