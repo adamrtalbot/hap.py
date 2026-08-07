@@ -2771,6 +2771,7 @@ fn ref_bytes_equal(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::fs;
     use tempfile::tempdir;
 
@@ -3804,6 +3805,46 @@ mod tests {
             info: info.into(),
             format: None,
             samples: vec![],
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn bcftools_normalization_is_idempotent(
+            reference in proptest::collection::vec(prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')], 8..40),
+            alternate in proptest::collection::vec(prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')], 1..8),
+            position_seed in 0usize..64,
+            ref_len_seed in 1usize..8,
+        ) {
+            let position = position_seed % reference.len() + 1;
+            let ref_len = ref_len_seed.min(reference.len() - position + 1);
+            let mut record = make_record(".");
+            record.pos = position;
+            record.ref_allele = String::from_utf8(reference[position - 1..position - 1 + ref_len].to_vec()).unwrap();
+            record.alt_allele = String::from_utf8(alternate).unwrap();
+            normalize_bcftools_record(&mut record, &reference);
+            let once = record.to_line();
+            normalize_bcftools_record(&mut record, &reference);
+            prop_assert_eq!(record.to_line(), once);
+        }
+
+        #[test]
+        fn legacy_genotype_canonicalization_is_idempotent_across_ploidies_and_missing_calls(
+            alleles in proptest::collection::vec(proptest::option::of(0usize..4), 1..=6),
+            depth in 0usize..1000,
+        ) {
+            let mut record = make_record(".");
+            record.format = Some("GT:DP".into());
+            let genotype = alleles
+                .iter()
+                .map(|allele| allele.map_or_else(|| ".".to_string(), |value| value.to_string()))
+                .collect::<Vec<_>>()
+                .join("|");
+            record.samples = vec![format!("{genotype}:{depth}")];
+            canonicalize_legacy_genotypes(&mut record);
+            let once = record.samples.clone();
+            canonicalize_legacy_genotypes(&mut record);
+            prop_assert_eq!(record.samples, once);
         }
     }
 

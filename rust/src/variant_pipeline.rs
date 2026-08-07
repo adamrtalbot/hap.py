@@ -456,27 +456,16 @@ fn canonical_split_gt(gt: &str, target: u32) -> String {
             .collect::<Vec<_>>()
             .join("|");
     }
-    let count_target = tokens.iter().filter(|t| **t == target_i).count();
-    let count_ref = tokens.iter().filter(|t| **t == 0).count();
-    let total = tokens.len();
-    if count_target == 0 {
-        // Allele not called for this sample — emit homref so the record is
-        // still valid VCF; legacy emits a no-call here but the record gets
-        // dropped at write-time anyway.
-        return vec!["0"; total].join(&separator.to_string());
-    }
-    if count_target == total {
-        return vec!["1"; total].join(&separator.to_string());
-    }
-    if count_ref + count_target == total || count_target < total {
-        // Het call (target + ref OR target + sibling alt that we fold to
-        // ref): emit `0/1` in canonical low-allele-first order to match
-        // legacy. The original separator (`/` vs `|`) is preserved.
-        return ["0", "1"].join(&separator.to_string());
-    }
-    // Fall-through (shouldn't trigger given the prior branches) — pass GT
-    // back unchanged.
-    gt.to_string()
+    let mut projected = tokens
+        .iter()
+        .map(|allele| if *allele == target_i { 1 } else { 0 })
+        .collect::<Vec<_>>();
+    projected.sort_unstable();
+    projected
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(&separator.to_string())
 }
 
 /// Stage 7 — aggregate primitives that landed at the same anchor position
@@ -670,6 +659,7 @@ fn merge_unphased_genotypes(genotypes: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn make_record(
         chrom: &str,
@@ -961,5 +951,56 @@ mod tests {
         assert_eq!(canonical_split_gt("1|2", 1), "1|0");
         // No-call passes through.
         assert_eq!(canonical_split_gt("./.", 1), "./.");
+    }
+
+    proptest! {
+        #[test]
+        fn split_genotype_canonicalization_is_idempotent_across_ploidies_and_missing_calls(
+            alleles in proptest::collection::vec(proptest::option::of(0u32..4), 1..=6),
+            phased in any::<bool>(),
+        ) {
+            let separator = if phased { "|" } else { "/" };
+            let gt = alleles
+                .iter()
+                .map(|allele| allele.map_or_else(|| ".".to_string(), |value| value.to_string()))
+                .collect::<Vec<_>>()
+                .join(separator);
+            let once = canonical_split_gt(&gt, 1);
+            prop_assert_eq!(canonical_split_gt(&once, 1), once);
+        }
+
+        #[test]
+        fn unphased_projection_preserves_ploidy_and_sorts_binary_alleles(
+            alleles in proptest::collection::vec(0u32..4, 1..=6),
+            target in 1u32..4,
+        ) {
+            let gt = alleles.iter().map(u32::to_string).collect::<Vec<_>>().join("/");
+            let projected = canonical_split_gt(&gt, target);
+            let observed = projected
+                .split('/')
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("projected genotype is numeric");
+            let mut expected = alleles
+                .iter()
+                .map(|allele| u32::from(*allele == target))
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            prop_assert_eq!(observed, expected);
+        }
+
+        #[test]
+        fn phased_projection_preserves_ploidy_and_haplotype_positions(
+            alleles in proptest::collection::vec(0u32..4, 1..=6),
+            target in 1u32..4,
+        ) {
+            let gt = alleles.iter().map(u32::to_string).collect::<Vec<_>>().join("|");
+            let projected = canonical_split_gt(&gt, target);
+            let observed = projected.split('|').collect::<Vec<_>>();
+            prop_assert_eq!(observed.len(), alleles.len());
+            for (source, binary) in alleles.iter().zip(observed) {
+                prop_assert_eq!(binary, if *source == target { "1" } else { "0" });
+            }
+        }
     }
 }

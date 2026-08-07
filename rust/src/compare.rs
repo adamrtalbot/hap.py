@@ -8401,43 +8401,6 @@ mod memory_guards {
         );
     }
 
-    /// Debug helper retained (and pinned via the test above).
-    /// Reference at chr21:30374425-30374445 = "ggccTAATTTGTTTTTTTTTT".
-    #[test]
-    #[ignore]
-    fn debug_class_c_cluster_signatures() {
-        // Build a synthetic reference exposing the chr21:30374431-435 window.
-        // We need positions 30374431-435 to be "ATTTG" and 30374436-445 = "TTTTTTTTTT".
-        let mut reference = vec![b'N'; 30374450];
-        let window = b"ggccTAATTTGTTTTTTTTTT"; // 30374425-30374445
-        for (i, b) in window.iter().enumerate() {
-            reference[30374425 - 1 + i] = *b;
-        }
-        let reference = String::from_utf8(reference).unwrap();
-        let truth = vec![
-            variant(30374431, "A", "AT", "1|0"),
-            variant(30374435, "G", "GT,T", "2|1"),
-        ];
-        let query = vec![
-            variant(30374435, "G", "GT", "1/1"),
-            variant(30374435, "G", "T", "0/1"),
-        ];
-        let cluster = Cluster {
-            chrom: "chr21".to_string(),
-            start: 30374431,
-            end: 30374435,
-            truth: truth.clone(),
-            query: query.clone(),
-        };
-        let relax = compute_class_c_relaxation_positions(&query, &truth);
-        let truth_sig =
-            cluster_signature(&cluster, &truth, &reference, None, &BTreeSet::new()).unwrap();
-        let query_sig = cluster_signature(&cluster, &query, &reference, None, &relax).unwrap();
-        eprintln!("relax_positions = {:?}", relax);
-        eprintln!("truth_sig = {:?}", truth_sig);
-        eprintln!("query_sig = {:?}", query_sig);
-    }
-
     fn variant(pos: usize, r: &str, alt: &str, gt: &str) -> Variant {
         Variant {
             key: VariantKey {

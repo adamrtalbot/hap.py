@@ -38,13 +38,32 @@ jobs:
         run: cargo build --locked --release --bin hap
 
       - name: Verify single-binary package installation
-        run: |
-          cargo package --locked
-          package_dir="$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'hap-rs-*' -print -quit)"
-          test -n "$package_dir"
-          cargo test --locked --all-targets --manifest-path "$package_dir/Cargo.toml"
-          cargo install --locked --path "$package_dir" --root "$RUNNER_TEMP/hap-install" --bin hap
-          "$RUNNER_TEMP/hap-install/bin/hap" --version
+        run: tests/package_smoke.sh
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Run bounded parser fuzz smoke
+        run: tests/fuzz_smoke.sh 1000
+
+      - name: Upload fuzz reproducers on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-fuzz-reproducers
+          path: fuzz/artifacts
+          if-no-files-found: ignore
 
   msrv:
     runs-on: ubuntu-latest

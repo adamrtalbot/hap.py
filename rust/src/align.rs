@@ -286,6 +286,33 @@ fn cigar_to_primitives(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn apply_primitives(reference: &[u8], ref_start: usize, primitives: &[RefVar]) -> Vec<u8> {
+        let mut reconstructed = reference.to_vec();
+        for primitive in primitives.iter().rev() {
+            let offset = primitive.start - ref_start;
+            let replaced = if primitive.end >= primitive.start {
+                primitive.end - primitive.start + 1
+            } else {
+                0
+            };
+            reconstructed.splice(offset..offset + replaced, primitive.alt.bytes());
+        }
+        reconstructed
+    }
+
+    proptest! {
+        #[test]
+        fn primitive_edits_reconstruct_the_alternate_haplotype(
+            reference in proptest::collection::vec(prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')], 1..10),
+            alternate in proptest::collection::vec(prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')], 0..10),
+            ref_start in 1usize..1000,
+        ) {
+            let primitives = realign_ref_var(ref_start, &reference, &alternate);
+            prop_assert_eq!(apply_primitives(&reference, ref_start, &primitives), alternate);
+        }
+    }
 
     #[test]
     fn caa_to_c_yields_two_base_deletion() {

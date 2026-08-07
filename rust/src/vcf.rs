@@ -1192,6 +1192,14 @@ pub fn matches_interval_filters(
 
 pub fn load_bed(path: &Path, reference_contigs: &BTreeSet<String>) -> Result<Vec<BedInterval>> {
     let text = read_text(path).with_context(|| format!("failed to read BED {}", path.display()))?;
+    parse_bed(&text, reference_contigs, path)
+}
+
+pub(crate) fn parse_bed(
+    text: &str,
+    reference_contigs: &BTreeSet<String>,
+    path: &Path,
+) -> Result<Vec<BedInterval>> {
     let mut intervals = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() || line.starts_with('#') {
@@ -1268,12 +1276,56 @@ pub fn parse_locations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{BufRead, Cursor};
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::tempdir;
+
+    proptest! {
+        #[test]
+        fn raw_vcf_record_round_trip_is_idempotent(
+            chrom in "[A-Za-z0-9_]{1,16}",
+            pos in 1usize..1_000_000,
+            reference in "[ACGT]{1,8}",
+            alternate in "[ACGT]{1,8}",
+            quality in 0u16..1_000,
+        ) {
+            let line = format!(
+                "{chrom}\t{pos}\t.\t{reference}\t{alternate}\t{quality}\tPASS\t.\tGT\t0/1"
+            );
+            let parsed = RawVcfRecord::from_line(&line, Path::new("property.vcf"))
+                .expect("generated VCF record parses");
+            prop_assert_eq!(parsed.to_line(), line);
+        }
+
+        #[test]
+        fn bed_and_location_ranges_agree_on_inclusive_positions(
+            start in 0usize..10_000,
+            length in 1usize..1_000,
+        ) {
+            let end = start + length;
+            let contigs = BTreeSet::from(["chr1".to_string()]);
+            let beds = parse_bed(
+                &format!("chr1\t{start}\t{end}\n"),
+                &contigs,
+                Path::new("property.bed"),
+            ).expect("generated BED parses");
+            let locations = parse_locations(
+                &format!("chr1:{}-{end}", start + 1),
+                &contigs,
+            ).expect("generated location parses");
+            let mut positions = vec![start + 1, end, end + 1];
+            if start > 0 {
+                positions.push(start);
+            }
+            for pos in positions {
+                prop_assert_eq!(beds[0].matches("chr1", pos), locations[0].matches("chr1", pos));
+            }
+        }
+    }
 
     #[test]
     fn single_position_location_matches_only_that_position() -> Result<()> {
