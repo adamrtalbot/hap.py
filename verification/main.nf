@@ -62,7 +62,7 @@ def fixtureIndexes(rel) {
 }
 
 def samples(samplesheet, transform) {
-    channel.fromPath(samplesheet).splitCsv(header: true).map(transform)
+    channel.fromPath(samplesheet).splitCsv(header: true, quote: '"').map(transform)
 }
 
 // ---------------------------------------------------------------------------

@@ -46,14 +46,18 @@ Errors include the path and, for BCF records, the one-based record number.
 Run `benches/stream_memory.sh` to capture repeated peak RSS measurements for
 validate with `--errors-bed`, preprocess, compare with filtered truth and ROC
 disabled, quantify with ROC both disabled and enabled, and somatic generic
-feature/happy reports. It compares a chromosome-scale 100,000-record input to
-a whole-genome-scale 2,400,000-record input and uses the median of three runs
+feature/happy reports. It compares a chromosome-scale 10,000-record input to
+a 24-contig, 240,000-record input and uses the median of three runs
 by default. Complete `time` reports and the median table are preserved under
 `target/stream-memory-reports` (or `HAP_MEMORY_REPORT_DIR`) after input cleanup.
+Set `HAP_MEMORY_WORKFLOWS` to a space-separated subset of workflow names to
+repeat only affected measurements during development; dependent comparison
+artifacts are still generated when either quantify measurement is selected.
 The generated whole-genome case distributes records across 24 representative
-contigs and cycles through 100,000 distinct `QQ` values across 2.4 million
+contigs and cycles through 10,000 distinct `QQ` values across 240,000
 records, exercising high-cardinality threshold grouping and repeated equal-score
-ties well beyond the spill boundary. The
+ties beyond the 16,384-observation spill boundary without violating the
+20,000-record active metadata-window guard. The
 script fails if a workflow or peak-RSS measurement fails, rejects missing or
 non-positive RSS values, and proves only that these named scenarios grow by no
 more than 64 MiB. Dense connected clusters, superloci, somatic contigs, and

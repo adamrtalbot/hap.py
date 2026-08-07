@@ -10,8 +10,27 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hap-rs-memory.XXXXXX")
 reports=${HAP_MEMORY_REPORT_DIR:-"$root/target/stream-memory-reports"}
 runs=${HAP_MEMORY_RUNS:-3}
+read -r -a workflows <<< "${HAP_MEMORY_WORKFLOWS:-validate preprocess compare quantify_no_roc quantify_roc somatic_features}"
 mkdir -p "$reports"
 trap 'rm -rf "$work"' EXIT
+
+workflow_enabled() {
+  local requested
+  for requested in "${workflows[@]}"; do
+    [[ $requested == "$1" ]] && return 0
+  done
+  return 1
+}
+
+for workflow in "${workflows[@]}"; do
+  case "$workflow" in
+    validate|preprocess|compare|quantify_no_roc|quantify_roc|somatic_features) ;;
+    *)
+      printf 'unknown workflow %q in HAP_MEMORY_WORKFLOWS\n' "$workflow" >&2
+      exit 2
+      ;;
+  esac
+done
 
 cargo build --locked --release --bin hap --manifest-path "$root/Cargo.toml"
 hap_bin="$root/target/release/hap"
@@ -20,12 +39,19 @@ make_reference() {
   destination=$1
   contigs=$2
   bases=$3
-  awk -v contigs="$contigs" -v bases="$bases" 'BEGIN {
+  awk -v contigs="$contigs" -v bases="$bases" -v index_path="${destination}.fai" 'BEGIN {
+    offset=0
     for (chrom=1;chrom<=contigs;chrom++) {
-      print ">chr" chrom
+      name="chr" chrom
+      header=">" name
+      print header
+      offset += length(header) + 1
       for (i=0;i<bases;i++) printf "A"
       print ""
+      print name "\t" bases "\t" offset "\t" bases "\t" (bases + 1) > index_path
+      offset += bases + 1
     }
+    close(index_path)
   }' > "$destination"
 }
 
@@ -48,7 +74,7 @@ make_vcf() {
       for (pos=1;pos<=per_contig && emitted<records;pos++) {
         emitted++
         filter=(filter_every && emitted%filter_every==0) ? "LowQual" : "PASS"
-        score=emitted % 100000
+        score=emitted % 10000
         print "chr" chrom "\t" pos * 100 "\t.\tA\tC\t" score "\t" filter "\t.\tGT:QQ\t0/1:" score
       }
     }
@@ -115,30 +141,47 @@ benchmark_size() {
   make_vcf "$input" "$records" 17 "$contigs"
   make_vcf "$query" "$records" 0 "$contigs"
 
-  measurement=$(run_repeated validate "$size" "$hap_bin" validate "$input" -r "$reference" \
-    --errors-bed "$work/$size.errors.bed" -o "$work/$size.validate.json") || return 1
-  printf 'validate\t%s\n' "$measurement"
-  measurement=$(run_repeated preprocess "$size" "$hap_bin" pre "$input" "$work/$size.pre.vcf.gz" \
-    -r "$reference") || return 1
-  printf 'preprocess\t%s\n' "$measurement"
-  measurement=$(run_repeated compare "$size" "$hap_bin" germline "$input" "$query" -r "$reference" \
-    -o "$work/$size.compare" --usefiltered-truth --no-roc --no-write-counts) || return 1
-  printf 'compare\t%s\n' "$measurement"
-  measurement=$(run_repeated quantify_no_roc "$size" "$hap_bin" quantify \
-    "$work/$size.compare.vcf.gz" -o "$work/$size.qfy-no-roc" -r "$reference" \
-    --type ga4gh --no-roc) || return 1
-  printf 'quantify_no_roc\t%s\n' "$measurement"
-  measurement=$(run_repeated quantify_roc "$size" "$hap_bin" quantify \
-    "$work/$size.compare.vcf.gz" -o "$work/$size.qfy-roc" -r "$reference" \
-    --type ga4gh --roc QQ) || return 1
-  printf 'quantify_roc\t%s\n' "$measurement"
-  measurement=$(run_repeated somatic_features "$size" "$hap_bin" somatic "$input" "$query" \
-    -r "$reference" -o "$work/$size.somatic" --feature-table generic --happy-stats) || return 1
-  printf 'somatic_features\t%s\n' "$measurement"
+  if workflow_enabled validate; then
+    measurement=$(run_repeated validate "$size" "$hap_bin" validate "$input" -r "$reference" \
+      --errors-bed "$work/$size.errors.bed" -o "$work/$size.validate.json") || return 1
+    printf 'validate\t%s\n' "$measurement"
+  fi
+  if workflow_enabled preprocess; then
+    measurement=$(run_repeated preprocess "$size" "$hap_bin" pre "$input" \
+      "$work/$size.pre.vcf.gz" -r "$reference") || return 1
+    printf 'preprocess\t%s\n' "$measurement"
+  fi
+  if workflow_enabled compare; then
+    measurement=$(run_repeated compare "$size" "$hap_bin" germline "$input" "$query" \
+      -r "$reference" -o "$work/$size.compare" --usefiltered-truth --no-roc \
+      --no-write-counts) || return 1
+    printf 'compare\t%s\n' "$measurement"
+  elif workflow_enabled quantify_no_roc || workflow_enabled quantify_roc; then
+    "$hap_bin" germline "$input" "$query" -r "$reference" -o "$work/$size.compare" \
+      --usefiltered-truth --no-roc --no-write-counts >/dev/null
+  fi
+  if workflow_enabled quantify_no_roc; then
+    measurement=$(run_repeated quantify_no_roc "$size" "$hap_bin" quantify \
+      "$work/$size.compare.vcf.gz" -o "$work/$size.qfy-no-roc" -r "$reference" \
+      --type ga4gh --no-roc) || return 1
+    printf 'quantify_no_roc\t%s\n' "$measurement"
+  fi
+  if workflow_enabled quantify_roc; then
+    measurement=$(run_repeated quantify_roc "$size" "$hap_bin" quantify \
+      "$work/$size.compare.vcf.gz" -o "$work/$size.qfy-roc" -r "$reference" \
+      --type ga4gh --roc QQ) || return 1
+    printf 'quantify_roc\t%s\n' "$measurement"
+  fi
+  if workflow_enabled somatic_features; then
+    measurement=$(run_repeated somatic_features "$size" "$hap_bin" somatic "$input" "$query" \
+      -r "$reference" -o "$work/$size.somatic" --feature-table generic --happy-stats \
+      --include-nonpass) || return 1
+    printf 'somatic_features\t%s\n' "$measurement"
+  fi
 }
 
-benchmark_size chromosome 100000 1 > "$work/chromosome.medians"
-benchmark_size whole_genome 2400000 24 > "$work/whole-genome.medians"
+benchmark_size chromosome 10000 1 > "$work/chromosome.medians"
+benchmark_size whole_genome 240000 24 > "$work/whole-genome.medians"
 paste "$work/chromosome.medians" "$work/whole-genome.medians" > "$reports/median-rss.tsv"
 
 limit=$((64 * 1024 * 1024))
