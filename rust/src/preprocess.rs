@@ -2773,6 +2773,7 @@ fn ref_bytes_equal(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::PreprocessArgs as PreprocessFixture;
     use std::fs;
     use tempfile::tempdir;
 
@@ -3323,13 +3324,13 @@ mod tests {
         reference: &Path,
         regions: Option<&Path>,
         targets: Option<&Path>,
-    ) -> PreprocessArgs {
+    ) -> PreprocessFixture {
         let mut index = reference.as_os_str().to_os_string();
         index.push(".fai");
         if !Path::new(&index).is_file() {
             write_test_fai(reference).expect("test reference index should be writable");
         }
-        crate::application::PreprocessArgs {
+        PreprocessFixture {
             input: input.display().to_string(),
             output: output.display().to_string(),
             version: false,
@@ -3359,8 +3360,10 @@ mod tests {
             quiet: false,
             force_interactive: false,
         }
-        .validated()
-        .unwrap()
+    }
+
+    fn run(args: PreprocessFixture) -> Result<()> {
+        super::run(args.validated()?)
     }
 
     fn write_test_fai(reference: &Path) -> Result<()> {

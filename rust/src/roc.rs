@@ -2195,17 +2195,17 @@ fn emit_contributions_with_options<
     options: &RocOptions,
     mut emit: F,
 ) {
-    let fields: Vec<&str> = row.line.split('\t').collect();
-    if fields.len() < 11 {
+    let record = row.line.raw();
+    if record.samples.len() < 2 {
         return;
     }
 
-    let info = fields[7];
+    let info = record.info.as_str();
     let subsets = extract_subsets(info);
 
-    let format_keys: Vec<&str> = fields[8].split(':').collect();
-    let truth_parts: Vec<&str> = fields[9].split(':').collect();
-    let query_parts: Vec<&str> = fields[10].split(':').collect();
+    let format_keys = record.format_keys();
+    let truth_parts: Vec<&str> = record.samples[0].split(':').collect();
+    let query_parts: Vec<&str> = record.samples[1].split(':').collect();
     let truth = Sample::new(&format_keys, &truth_parts);
     let query = Sample::new(&format_keys, &query_parts);
 
@@ -2214,10 +2214,11 @@ fn emit_contributions_with_options<
     // xcmp output sets QUAL=0 while still writing the matched per-side
     // quality into FORMAT.QQ.
     let score_field = options.score_field.as_deref().unwrap_or(&options.qq_field);
-    let truth_qq = truth.roc_value(score_field, fields[5], info);
-    let query_qq = query.roc_value(score_field, fields[5], info);
+    let truth_qq = truth.roc_value(score_field, &record.qual, info);
+    let query_qq = query.roc_value(score_field, &record.qual, info);
 
-    let filter_tags = fields[6]
+    let filter_tags = record
+        .filter
         .split(';')
         .filter(|tag| !tag.is_empty() && *tag != "." && *tag != "PASS")
         .collect::<Vec<_>>();
@@ -3119,7 +3120,7 @@ mod tests {
         );
         AnnotatedRow {
             sort_key: (chrom.to_string(), pos, 1, 0),
-            line: line.into(),
+            line: crate::compare::ComparisonRecord::fixture(line),
             query_pass,
             fp_class,
             xcmp_ctype: None,
@@ -3769,7 +3770,9 @@ mod tests {
             true,
             None,
         );
-        first.line = first.line.replace("BS=1", "BS=1;SCORE=10.0");
+        first
+            .line
+            .try_update(|record| record.info.push_str(";SCORE=10.0"));
         let mut second = annotated(
             "chr1",
             200,
@@ -3780,7 +3783,9 @@ mod tests {
             true,
             None,
         );
-        second.line = second.line.replace("BS=1", "BS=1;SCORE=10.4");
+        second
+            .line
+            .try_update(|record| record.info.push_str(";SCORE=10.4"));
         let options = RocOptions {
             qq_field: "SCORE".to_string(),
             delta: 0.0,
@@ -3853,7 +3858,8 @@ mod tests {
             false,
             None,
         );
-        row.line = row.line.replacen("\t.\tBS=1", "\tLowQual\tBS=1", 1);
+        row.line
+            .try_update(|record| record.filter = "LowQual".to_string());
         let options = RocOptions {
             ignored_filters: HashSet::from(["LowQual".to_string()]),
             ..RocOptions::default()
@@ -3882,7 +3888,8 @@ mod tests {
             false,
             None,
         );
-        row.line = row.line.replacen("\t.\tBS=1", "\tLowQual\tBS=1", 1);
+        row.line
+            .try_update(|record| record.filter = "LowQual".to_string());
         let options = RocOptions {
             roc_regions: HashSet::from(["TS_contained".to_string()]),
             ..RocOptions::default()

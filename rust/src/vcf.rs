@@ -274,17 +274,28 @@ impl ValidatedVcf {
         (self.headers, records)
     }
 
-    /// Applies a raw-format transformation transactionally and rechecks every record.
-    pub fn try_edit_records<R>(
+    /// Edits headers without touching already-checked records.
+    pub fn edit_headers<R>(&mut self, edit: impl FnOnce(&mut Vec<String>) -> R) -> R {
+        edit(&mut self.headers)
+    }
+
+    /// Applies one record edit transactionally and refreshes only its checked facts.
+    pub fn try_edit_record<R>(
         &mut self,
-        edit: impl FnOnce(&mut Vec<String>, &mut Vec<RawVcfRecord>) -> Result<R>,
+        index: usize,
+        edit: impl FnOnce(&mut RawVcfRecord) -> Result<R>,
     ) -> Result<R> {
-        let mut headers = self.headers.clone();
-        let mut records = self.records.clone();
-        let result = edit(&mut headers, &mut records)?;
-        let provenance = self.facts.iter().map(|facts| facts.provenance);
-        let checked = Self::try_from_raw_with_provenance(headers, records, provenance)?;
-        *self = checked;
+        let provenance = self
+            .facts
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("VCF record index {index} is out of bounds"))?
+            .provenance;
+        let mut raw = self.records[index].clone();
+        let result = edit(&mut raw)?;
+        let checked = ValidatedVcfRecord::try_from_raw(raw, provenance)?;
+        let (raw, facts) = checked.into_raw_and_facts();
+        self.records[index] = raw;
+        self.facts[index] = facts;
         Ok(result)
     }
 }
@@ -405,6 +416,17 @@ impl ValidatedVcfRecord {
     /// Borrows the lossless file-adapter representation.
     pub fn raw(&self) -> &RawVcfRecord {
         &self.raw
+    }
+
+    /// Applies a structured edit transactionally and rechecks the record.
+    pub fn try_update<R>(
+        &mut self,
+        edit: impl FnOnce(&mut RawVcfRecord) -> Result<R>,
+    ) -> Result<R> {
+        let mut raw = self.raw.clone();
+        let result = edit(&mut raw)?;
+        *self = Self::try_from_raw(raw, self.provenance)?;
+        Ok(result)
     }
 }
 

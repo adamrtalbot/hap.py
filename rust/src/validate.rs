@@ -858,7 +858,7 @@ mod tests {
         Ok(())
     }
 
-    fn args(input: &Path, output: &Path) -> ValidateArgs {
+    fn args(input: &Path, output: &Path) -> crate::application::ValidateArgs {
         crate::application::ValidateArgs {
             input: input.display().to_string(),
             reference: None,
@@ -874,8 +874,13 @@ mod tests {
             check_bcf_errors: false,
             all_warnings: false,
         }
-        .validated()
-        .unwrap()
+    }
+
+    fn run_with_diagnostics(
+        args: crate::application::ValidateArgs,
+        diagnostics: &mut dyn Write,
+    ) -> Result<()> {
+        super::run_with_diagnostics(args.validated()?, diagnostics)
     }
 
     #[test]

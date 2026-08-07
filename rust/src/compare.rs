@@ -118,58 +118,69 @@ pub struct AnnotatedRow {
     pub xcmp_hap_match: bool,
 }
 
-/// A rendered comparison row that retains its checked structured record.
+/// A checked comparison row; text exists only when an output adapter renders it.
 #[derive(Clone, Debug)]
 pub struct ComparisonRecord {
-    rendered: String,
     record: ValidatedVcfRecord,
 }
 
 impl ComparisonRecord {
-    fn generated(rendered: String) -> Self {
-        let raw = RawVcfRecord::from_line(&rendered, Path::new("generated-comparison-record"))
-            .expect("comparison rows are generated as valid VCF records");
+    fn checked(raw: RawVcfRecord) -> Self {
         let record =
             ValidatedVcfRecord::try_from_raw(raw, crate::domain::QueryProvenance::Unavailable)
                 .expect("comparison rows contain checked coordinates, alleles, and genotypes");
-        Self { rendered, record }
+        Self { record }
     }
 
     fn validated(&self) -> &ValidatedVcfRecord {
         &self.record
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.rendered
+    pub(crate) fn raw(&self) -> &RawVcfRecord {
+        self.record.raw()
     }
 
-    pub fn replace(&self, from: &str, to: &str) -> Self {
-        Self::generated(self.rendered.replace(from, to))
+    pub(crate) fn try_update(&mut self, edit: impl FnOnce(&mut RawVcfRecord)) {
+        self.record
+            .try_update(|record| {
+                edit(record);
+                Ok(())
+            })
+            .expect("comparison row edits preserve checked record invariants");
+    }
+
+    fn samples_contain(&self, value: &str) -> bool {
+        self.raw()
+            .samples
+            .iter()
+            .any(|sample| sample.contains(value))
+    }
+
+    fn replace_sample_fragment(&mut self, from: &str, to: &str) {
+        self.try_update(|record| {
+            for sample in &mut record.samples {
+                *sample = sample.replace(from, to);
+            }
+        });
     }
 
     #[cfg(test)]
-    pub fn replacen(&self, from: &str, to: &str, count: usize) -> Self {
-        Self::generated(self.rendered.replacen(from, to, count))
+    pub(crate) fn fixture(line: &str) -> Self {
+        let raw = RawVcfRecord::from_line(line, Path::new("comparison-test-fixture"))
+            .expect("comparison fixture must be a valid VCF record");
+        Self::checked(raw)
     }
 }
 
-impl From<String> for ComparisonRecord {
-    fn from(rendered: String) -> Self {
-        Self::generated(rendered)
-    }
-}
-
-impl std::ops::Deref for ComparisonRecord {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.rendered
+impl From<RawVcfRecord> for ComparisonRecord {
+    fn from(record: RawVcfRecord) -> Self {
+        Self::checked(record)
     }
 }
 
 impl PartialEq for ComparisonRecord {
     fn eq(&self, other: &Self) -> bool {
-        self.rendered == other.rendered
+        self.cmp(other).is_eq()
     }
 }
 
@@ -183,13 +194,19 @@ impl PartialOrd for ComparisonRecord {
 
 impl Ord for ComparisonRecord {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.rendered.cmp(&other.rendered)
-    }
-}
-
-impl std::fmt::Display for ComparisonRecord {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.rendered)
+        let left = self.raw();
+        let right = other.raw();
+        left.chrom
+            .cmp(&right.chrom)
+            .then(left.pos.cmp(&right.pos))
+            .then(left.id.cmp(&right.id))
+            .then(left.ref_allele.cmp(&right.ref_allele))
+            .then(left.alt_allele.cmp(&right.alt_allele))
+            .then(left.qual.cmp(&right.qual))
+            .then(left.filter.cmp(&right.filter))
+            .then(left.info.cmp(&right.info))
+            .then(left.format.cmp(&right.format))
+            .then(left.samples.cmp(&right.samples))
     }
 }
 
@@ -1117,24 +1134,12 @@ fn sort_comparison_rows(rows: &mut [AnnotatedRow], filtered_truth_keys: &BTreeSe
 }
 
 fn row_matches_variant_key(row: &AnnotatedRow, keys: &BTreeSet<VariantKey>) -> bool {
-    let mut fields = row.line.split('\t');
-    let (Some(chrom), Some(pos), Some(_id), Some(ref_allele), Some(alt_allele)) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
-        return false;
-    };
-    let Ok(pos) = pos.parse::<usize>() else {
-        return false;
-    };
+    let record = row.line.raw();
     keys.contains(&VariantKey {
-        chrom: chrom.to_string(),
-        pos,
-        ref_allele: ref_allele.to_string(),
-        alt_allele: alt_allele.to_string(),
+        chrom: record.chrom.clone(),
+        pos: record.pos,
+        ref_allele: record.ref_allele.clone(),
+        alt_allele: record.alt_allele.clone(),
     })
 }
 
@@ -1750,7 +1755,7 @@ fn decorate_output_rows(
         } else {
             info.join(";")
         };
-        row.line = record.to_line().into();
+        row.line = record.into();
     }
     Ok(())
 }
@@ -1773,9 +1778,9 @@ fn sanitize_requantify_handoff_rows(rows: &[AnnotatedRow]) -> Vec<AnnotatedRow> 
     rows.iter()
         .cloned()
         .map(|mut row| {
-            let mut fields = row.line.split('\t').map(str::to_string).collect::<Vec<_>>();
-            if let Some(info) = fields.get_mut(7) {
-                let entries = info
+            row.line.try_update(|record| {
+                let entries = record
+                    .info
                     .split(';')
                     .filter_map(|entry| {
                         let Some(regions) = entry.strip_prefix("Regions=") else {
@@ -1788,13 +1793,12 @@ fn sanitize_requantify_handoff_rows(rows: &[AnnotatedRow]) -> Vec<AnnotatedRow> 
                         (!retained.is_empty()).then(|| format!("Regions={}", retained.join(",")))
                     })
                     .collect::<Vec<_>>();
-                *info = if entries.is_empty() {
+                record.info = if entries.is_empty() {
                     ".".to_string()
                 } else {
                     entries.join(";")
                 };
-                row.line = fields.join("\t").into();
-            }
+            });
             row
         })
         .collect()
@@ -2066,7 +2070,7 @@ fn decorate_existing_comparison_vcf(
         .into_iter()
         .map(|record| AnnotatedRow {
             sort_key: (record.chrom.clone(), record.pos, 0, 0),
-            line: record.to_line().into(),
+            line: record.into(),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -2483,8 +2487,8 @@ fn process_cluster(
     // their BK=lm hardcode is what legacy emits in those shapes.
     if allow_haplotype_match && !hap_mismatch {
         for row in &mut rows[exact_match_pre_count..exact_match_post_count] {
-            if row.line.contains(":UNK:lm:") {
-                row.line = row.line.replace(":UNK:lm:", ":UNK:.:");
+            if row.line.samples_contain(":UNK:lm:") {
+                row.line.replace_sample_fragment(":UNK:lm:", ":UNK:.:");
             }
         }
     }
@@ -2550,8 +2554,8 @@ fn process_cluster(
     if !legacy_hap_promotions.is_empty() {
         for row in &mut rows[exact_match_post_count..] {
             if row_matches_variant_key(row, &legacy_hap_promotions)
-                && row.line.contains(":FN:am:")
-                && row.line.contains(":FP:am:")
+                && row.line.samples_contain(":FN:am:")
+                && row.line.samples_contain(":FP:am:")
             {
                 let key = legacy_hap_promotions
                     .iter()
@@ -2633,8 +2637,8 @@ fn identical_gt_exact_indel_keys(cluster: &Cluster) -> BTreeSet<VariantKey> {
 
 fn degrade_identical_exact_unk_rows(rows: &mut [AnnotatedRow], keys: &BTreeSet<VariantKey>) {
     for row in rows {
-        if row_matches_variant_key(row, keys) && row.line.contains(":UNK:lm:") {
-            row.line = row.line.replace(":UNK:lm:", ":UNK:.:");
+        if row_matches_variant_key(row, keys) && row.line.samples_contain(":UNK:lm:") {
+            row.line.replace_sample_fragment(":UNK:lm:", ":UNK:.:");
         }
     }
 }
@@ -2673,11 +2677,8 @@ fn legacy_preprocessed_snp_first_positions(cluster: &Cluster) -> BTreeSet<usize>
 }
 
 fn annotated_row_is_snp(row: &AnnotatedRow) -> bool {
-    let fields = row.line.split('\t').collect::<Vec<_>>();
-    fields.get(3).is_some_and(|reference| reference.len() == 1)
-        && fields
-            .get(4)
-            .is_some_and(|alternate| alternate.split(',').all(|allele| allele.len() == 1))
+    let record = row.line.raw();
+    record.ref_allele.len() == 1 && record.alt_allele.split(',').all(|allele| allele.len() == 1)
 }
 
 fn legacy_repetitive_indel_hap_promotions(
@@ -2743,15 +2744,12 @@ fn set_xcmp_context(rows: &mut [AnnotatedRow], ctype: &'static str, hap_match: b
 }
 
 fn annotated_row_has_unreconciled_allele(row: &AnnotatedRow) -> bool {
-    let fields = row.line.split('\t').collect::<Vec<_>>();
-    if fields.len() < 11 {
-        return false;
-    }
-    let format = fields[8].split(':').collect::<Vec<_>>();
+    let record = row.line.raw();
+    let format = record.format_keys();
     let Some(bk_index) = format.iter().position(|key| *key == "BK") else {
         return false;
     };
-    for sample in [&fields[9], &fields[10]] {
+    for sample in &record.samples {
         let values = sample.split(':').collect::<Vec<_>>();
         if values
             .get(bk_index)
@@ -5749,11 +5747,11 @@ fn derive_subset_counts(
 ) -> BTreeMap<String, BTreeMap<String, TypeCounts>> {
     let mut subsets: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
     for row in rows {
-        let fields: Vec<&str> = row.line.split('\t').collect();
-        if fields.len() < 11 {
+        let record = row.line.raw();
+        if record.samples.len() < 2 {
             continue;
         }
-        let subset_tags = info_list_values(fields[7], "Regions")
+        let subset_tags = info_list_values(&record.info, "Regions")
             .into_iter()
             .filter(|tag| *tag != "CONF")
             .collect::<Vec<_>>();
@@ -5761,12 +5759,8 @@ fn derive_subset_counts(
             continue;
         }
 
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let truth_parts: Vec<&str> = fields[9].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-
-        let truth_sample = SampleView::new(&format_keys, &truth_parts);
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let truth_sample = SampleView::new(record, 0);
+        let query_sample = SampleView::new(record, 1);
         let filtered_out = pass_only && !row.query_pass;
 
         for subset in subset_tags {
@@ -5797,13 +5791,11 @@ fn derive_fp_classes(rows: &[AnnotatedRow], pass_only: bool) -> BTreeMap<String,
         let Some(class) = row.fp_class else {
             continue;
         };
-        let fields: Vec<&str> = row.line.split('\t').collect();
-        if fields.len() < 11 {
+        let record = row.line.raw();
+        if record.samples.len() < 2 {
             continue;
         }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let query_sample = SampleView::new(record, 1);
         let Some(variant_type) = query_sample.variant_type() else {
             continue;
         };
@@ -5833,20 +5825,18 @@ fn derive_subset_fp_classes(
         let Some(class) = row.fp_class else {
             continue;
         };
-        let fields: Vec<&str> = row.line.split('\t').collect();
-        if fields.len() < 11 {
+        let record = row.line.raw();
+        if record.samples.len() < 2 {
             continue;
         }
-        let subset_tags = info_list_values(fields[7], "Regions")
+        let subset_tags = info_list_values(&record.info, "Regions")
             .into_iter()
             .filter(|tag| *tag != "CONF")
             .collect::<Vec<_>>();
         if subset_tags.is_empty() {
             continue;
         }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let query_sample = SampleView::new(record, 1);
         let Some(variant_type) = query_sample.variant_type() else {
             continue;
         };
@@ -5885,13 +5875,11 @@ fn derive_subtype_fp_classes(rows: &[AnnotatedRow], pass_only: bool) -> SubtypeF
         let Some(class) = row.fp_class else {
             continue;
         };
-        let fields: Vec<&str> = row.line.split('\t').collect();
-        if fields.len() < 11 {
+        let record = row.line.raw();
+        if record.samples.len() < 2 {
             continue;
         }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let query_sample = SampleView::new(record, 1);
         let Some((variant_type, subtypes)) = query_sample.variant_type_and_subtypes() else {
             continue;
         };
@@ -5926,20 +5914,18 @@ fn derive_subset_subtype_fp_classes(
         let Some(class) = row.fp_class else {
             continue;
         };
-        let fields: Vec<&str> = row.line.split('\t').collect();
-        if fields.len() < 11 {
+        let record = row.line.raw();
+        if record.samples.len() < 2 {
             continue;
         }
-        let subset_tags = info_list_values(fields[7], "Regions")
+        let subset_tags = info_list_values(&record.info, "Regions")
             .into_iter()
             .filter(|tag| *tag != "CONF")
             .collect::<Vec<_>>();
         if subset_tags.is_empty() {
             continue;
         }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let query_sample = SampleView::new(record, 1);
         let Some((variant_type, subtypes)) = query_sample.variant_type_and_subtypes() else {
             continue;
         };
@@ -5966,16 +5952,12 @@ fn derive_subset_subtype_fp_classes(
 fn derive_total_counts(rows: &[AnnotatedRow], pass_only: bool) -> BTreeMap<String, TypeCounts> {
     let mut totals: BTreeMap<String, TypeCounts> = BTreeMap::new();
     for row in rows {
-        let fields: Vec<&str> = row.line.split('\t').collect();
-        if fields.len() < 11 {
+        let record = row.line.raw();
+        if record.samples.len() < 2 {
             continue;
         }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let truth_parts: Vec<&str> = fields[9].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-
-        let truth_sample = SampleView::new(&format_keys, &truth_parts);
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let truth_sample = SampleView::new(record, 0);
+        let query_sample = SampleView::new(record, 1);
         let filtered_out = pass_only && !row.query_pass;
 
         if let Some(variant_type) = truth_sample.variant_type() {
@@ -6001,11 +5983,11 @@ fn derive_subset_subtype_counts(
 ) -> BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>> {
     let mut out: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>> = BTreeMap::new();
     for row in rows {
-        let fields: Vec<&str> = row.line.split('\t').collect();
-        if fields.len() < 11 {
+        let record = row.line.raw();
+        if record.samples.len() < 2 {
             continue;
         }
-        let subset_tags = info_list_values(fields[7], "Regions")
+        let subset_tags = info_list_values(&record.info, "Regions")
             .into_iter()
             .filter(|tag| *tag != "CONF")
             .collect::<Vec<_>>();
@@ -6013,12 +5995,8 @@ fn derive_subset_subtype_counts(
             continue;
         }
 
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let truth_parts: Vec<&str> = fields[9].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-
-        let truth_sample = SampleView::new(&format_keys, &truth_parts);
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let truth_sample = SampleView::new(record, 0);
+        let query_sample = SampleView::new(record, 1);
         let filtered_out = pass_only && !row.query_pass;
 
         for subset in &subset_tags {
@@ -6056,16 +6034,12 @@ fn derive_subtype_counts(
 ) -> BTreeMap<String, BTreeMap<String, TypeCounts>> {
     let mut subtypes: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
     for row in rows {
-        let fields: Vec<&str> = row.line.split('\t').collect();
-        if fields.len() < 11 {
+        let record = row.line.raw();
+        if record.samples.len() < 2 {
             continue;
         }
-        let format_keys: Vec<&str> = fields[8].split(':').collect();
-        let truth_parts: Vec<&str> = fields[9].split(':').collect();
-        let query_parts: Vec<&str> = fields[10].split(':').collect();
-
-        let truth_sample = SampleView::new(&format_keys, &truth_parts);
-        let query_sample = SampleView::new(&format_keys, &query_parts);
+        let truth_sample = SampleView::new(record, 0);
+        let query_sample = SampleView::new(record, 1);
         let filtered_out = pass_only && !row.query_pass;
 
         if let Some((variant_type, sub_list)) = truth_sample.variant_type_and_subtypes() {
@@ -6095,30 +6069,33 @@ fn derive_subtype_counts(
 }
 
 struct SampleView<'a> {
-    gt: Option<&'a str>,
-    bd: Option<&'a str>,
-    bi: Option<&'a str>,
-    bvt: Option<&'a str>,
+    record: &'a RawVcfRecord,
+    sample_index: usize,
 }
 
 impl<'a> SampleView<'a> {
-    fn new(format_keys: &[&str], sample_parts: &'a [&str]) -> Self {
-        let lookup = |name: &str| -> Option<&'a str> {
-            format_keys
-                .iter()
-                .position(|key| *key == name)
-                .and_then(|index| sample_parts.get(index).copied())
-        };
+    fn new(record: &'a RawVcfRecord, sample_index: usize) -> Self {
         Self {
-            gt: lookup("GT"),
-            bd: lookup("BD"),
-            bi: lookup("BI"),
-            bvt: lookup("BVT"),
+            record,
+            sample_index,
         }
     }
 
+    fn field(&self, name: &str) -> Option<&'a str> {
+        let index = self
+            .record
+            .format_keys()
+            .iter()
+            .position(|key| *key == name)?;
+        self.record
+            .samples
+            .get(self.sample_index)?
+            .split(':')
+            .nth(index)
+    }
+
     fn variant_type(&self) -> Option<&'a str> {
-        self.bvt.filter(|value| *value != "NOCALL")
+        self.field("BVT").filter(|value| *value != "NOCALL")
     }
 
     /// Per-row subtypes for INDEL aggregation. Multi-allelic INDELs emit
@@ -6133,7 +6110,7 @@ impl<'a> SampleView<'a> {
         if variant_type != "INDEL" {
             return None;
         }
-        let bi = self.bi?;
+        let bi = self.field("BI")?;
         let subtypes: Vec<String> = bi
             .split(',')
             .filter(|tok| !matches!(*tok, "ti" | "tv"))
@@ -6150,10 +6127,11 @@ impl<'a> SampleView<'a> {
         // filter, legacy reclassifies the truth side from TP to FN: the good
         // match doesn't count because the query record wouldn't have been
         // considered in a pass-only run.
-        let effective_bd = if demote_tp_to_fn && self.bd == Some("TP") {
+        let decision = self.field("BD");
+        let effective_bd = if demote_tp_to_fn && decision == Some("TP") {
             Some("FN")
         } else {
-            self.bd
+            decision
         };
         match effective_bd {
             Some("TP") | Some("FN") => add_sample_stats(&mut stats.truth_total, self),
@@ -6167,11 +6145,11 @@ impl<'a> SampleView<'a> {
     }
 
     fn add_query(&self, stats: &mut TypeCounts) {
-        match self.bd {
+        match self.field("BD") {
             Some("TP") | Some("FP") | Some("UNK") => add_sample_stats(&mut stats.query_total, self),
             _ => {}
         }
-        match self.bd {
+        match self.field("BD") {
             Some("TP") => add_sample_stats(&mut stats.query_tp, self),
             Some("FP") => add_sample_stats(&mut stats.query_fp, self),
             Some("UNK") => add_sample_stats(&mut stats.query_unk, self),
@@ -6182,13 +6160,13 @@ impl<'a> SampleView<'a> {
 
 fn add_sample_stats(bucket: &mut CountsBucket, sample: &SampleView<'_>) {
     bucket.total += 1;
-    if let Some("SNP") = sample.bvt {
+    if let Some("SNP") = sample.field("BVT") {
         // BI on multi-allelic hetalt SNPs is comma-separated (e.g.
         // `ti,tv` for GT=1|2 with one transition and one transversion
         // active alt). Legacy fans these out per primitive — one ti
         // and one tv contribution. Iterate the comma list and count
         // each tag once so single-allelic rows still increment by 1.
-        if let Some(bi) = sample.bi {
+        if let Some(bi) = sample.field("BI") {
             for tag in bi.split(',') {
                 match tag {
                     "ti" => bucket.ti += 1,
@@ -6209,7 +6187,7 @@ fn add_sample_stats(bucket: &mut CountsBucket, sample: &SampleView<'_>) {
     // but TRUTH-side rows preserve their original multi-allelic GT
     // through bcftools merge so the literal-only rule under-counted
     // every truth-only multi-allelic record.
-    if let Some(gt) = sample.gt {
+    if let Some(gt) = sample.field("GT") {
         let alleles: Vec<usize> = gt
             .split(['/', '|'])
             .map(|part| part.parse::<usize>().unwrap_or(0))
@@ -6277,6 +6255,34 @@ fn combined_record_qual<'a>(truth: &'a Variant, query: &'a Variant) -> &'a str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn comparison_record(
+    chrom: &str,
+    pos: usize,
+    reference: String,
+    alternate: String,
+    quality: &str,
+    filter: &str,
+    info: String,
+    format: &str,
+    truth_sample: String,
+    query_sample: String,
+) -> ComparisonRecord {
+    RawVcfRecord {
+        chrom: chrom.to_string(),
+        pos,
+        id: ".".to_string(),
+        ref_allele: reference,
+        alt_allele: alternate,
+        qual: quality.to_string(),
+        filter: filter.to_string(),
+        info,
+        format: Some(format.to_string()),
+        samples: vec![truth_sample, query_sample],
+    }
+    .into()
+}
+
 fn tp_combined_row(
     truth: &Variant,
     query: &Variant,
@@ -6291,24 +6297,30 @@ fn tp_combined_row(
         fp_class: None,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        line: format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:TP:gm:{info}:{type_label}:{truth_loc}:{qq}\t{query_gt}:TP:gm:{info}:{type_label}:{query_loc}:{qq}",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = combined_record_qual(truth, query),
-            filter = filter_for_output(&query.filter),
-            bs = block_start,
-            regions = regions,
-            truth_gt = truth.gt,
-            query_gt = query.gt,
-            info = info,
-            type_label = truth.primary_type(),
-            truth_loc = genotype_label(truth),
-            query_loc = genotype_label(query),
-            qq = query.qual,
-        ).into(),
+        line: comparison_record(
+            &truth.key.chrom,
+            truth.key.pos,
+            display_ref(truth, reference),
+            display_alt(truth),
+            combined_record_qual(truth, query),
+            filter_for_output(&query.filter),
+            format!("BS={block_start}{regions}"),
+            "GT:BD:BK:BI:BVT:BLT:QQ",
+            format!(
+                "{}:TP:gm:{info}:{}:{}:{}",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth),
+                query.qual
+            ),
+            format!(
+                "{}:TP:gm:{info}:{}:{}:{}",
+                query.gt,
+                truth.primary_type(),
+                genotype_label(query),
+                query.qual
+            ),
+        ),
     }
 }
 
@@ -6333,24 +6345,29 @@ fn unk_combined_row(
         fp_class: None,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        line: format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:UNK:lm:{info}:{type_label}:{truth_loc}:.\t{query_gt}:UNK:lm:{info}:{type_label}:{query_loc}:{qq}",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = combined_record_qual(truth, query),
-            filter = filter_for_output(&query.filter),
-            bs = block_start,
-            regions = regions,
-            truth_gt = truth.gt,
-            query_gt = query.gt,
-            info = info,
-            type_label = truth.primary_type(),
-            truth_loc = genotype_label(truth),
-            query_loc = genotype_label(query),
-            qq = query.qual,
-        ).into(),
+        line: comparison_record(
+            &truth.key.chrom,
+            truth.key.pos,
+            display_ref(truth, reference),
+            display_alt(truth),
+            combined_record_qual(truth, query),
+            filter_for_output(&query.filter),
+            format!("BS={block_start}{regions}"),
+            "GT:BD:BK:BI:BVT:BLT:QQ",
+            format!(
+                "{}:UNK:lm:{info}:{}:{}:.",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth)
+            ),
+            format!(
+                "{}:UNK:lm:{info}:{}:{}:{}",
+                query.gt,
+                truth.primary_type(),
+                genotype_label(query),
+                query.qual
+            ),
+        ),
     }
 }
 
@@ -6431,26 +6448,24 @@ fn tp_single_side_row(
             fp_class: None,
             xcmp_ctype: None,
             xcmp_hap_match: false,
-            line: format!(
-                "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{gt}:TP:gm:{info}:{type_label}:{loc}:{qq}\t./.:.:.:.:NOCALL:nocall:0",
-                chrom = variant.key.chrom,
-                pos = variant.key.pos,
-                ref = display_ref(variant, reference),
-                alt = display_alt(variant),
-                qual = variant.qual,
-                filter = truth_filter,
-                bs = block_start,
-                regions = regions,
-                gt = variant.gt,
-                info = info,
-                type_label = variant.primary_type(),
-                loc = genotype_label(variant),
-                // Truth carries QQ=. in its input VCF (qual column is "0");
-                // legacy propagates the matched query's QQ into the truth-
-                // side sample column. Accept a shared value from the caller
-                // that holds the cluster-level pairing context.
-                qq = shared_qq.unwrap_or(variant.qual.as_str()),
-            ).into(),
+            line: comparison_record(
+                &variant.key.chrom,
+                variant.key.pos,
+                display_ref(variant, reference),
+                display_alt(variant),
+                &variant.qual,
+                truth_filter,
+                format!("BS={block_start}{regions}"),
+                "GT:BD:BK:BI:BVT:BLT:QQ",
+                format!(
+                    "{}:TP:gm:{info}:{}:{}:{}",
+                    variant.gt,
+                    variant.primary_type(),
+                    genotype_label(variant),
+                    shared_qq.unwrap_or(variant.qual.as_str())
+                ),
+                "./.:.:.:.:NOCALL:nocall:0".to_string(),
+            ),
         },
         Side::Query => AnnotatedRow {
             sort_key: (
@@ -6466,22 +6481,24 @@ fn tp_single_side_row(
             fp_class: None,
             xcmp_ctype: None,
             xcmp_hap_match: false,
-            line: format!(
-                "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t./.:.:.:.:NOCALL:nocall:.\t{gt}:TP:gm:{info}:{type_label}:{loc}:{qq}",
-                chrom = variant.key.chrom,
-                pos = variant.key.pos,
-                ref = display_ref(variant, reference),
-                alt = display_alt(variant),
-                qual = variant.qual,
-                filter = filter_for_output(&variant.filter),
-                bs = block_start,
-                regions = regions,
-                gt = variant.gt,
-                info = info,
-                type_label = variant.primary_type(),
-                loc = genotype_label(variant),
-                qq = variant.qual,
-            ).into(),
+            line: comparison_record(
+                &variant.key.chrom,
+                variant.key.pos,
+                display_ref(variant, reference),
+                display_alt(variant),
+                &variant.qual,
+                filter_for_output(&variant.filter),
+                format!("BS={block_start}{regions}"),
+                "GT:BD:BK:BI:BVT:BLT:QQ",
+                "./.:.:.:.:NOCALL:nocall:.".to_string(),
+                format!(
+                    "{}:TP:gm:{info}:{}:{}:{}",
+                    variant.gt,
+                    variant.primary_type(),
+                    genotype_label(variant),
+                    variant.qual
+                ),
+            ),
         },
     }
 }
@@ -6533,28 +6550,29 @@ fn fn_fp_combined_row(
         fp_class,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        line: format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_gt}:{truth_bd}:{bk}:{truth_info}:{type_label}:{truth_loc}:.\t{query_gt}:{query_bd}:{bk}:{query_info}:{type_label}:{query_loc}:{qq}",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = combined_record_qual(truth, query),
-            filter = filter_for_output(&query.filter),
-            bs = block_start,
-            regions = regions,
-            truth_gt = truth.gt,
-            query_gt = query.gt,
-            truth_info = truth_info,
-            query_info = query_info,
-            type_label = truth.primary_type(),
-            truth_loc = genotype_label(truth),
-            query_loc = genotype_label(query),
-            qq = query.qual,
-            truth_bd = truth_bd,
-            query_bd = query_bd,
-            bk = bk,
-        ).into(),
+        line: comparison_record(
+            &truth.key.chrom,
+            truth.key.pos,
+            display_ref(truth, reference),
+            display_alt(truth),
+            combined_record_qual(truth, query),
+            filter_for_output(&query.filter),
+            format!("BS={block_start}{regions}"),
+            "GT:BD:BK:BI:BVT:BLT:QQ",
+            format!(
+                "{}:{truth_bd}:{bk}:{truth_info}:{}:{}:.",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth)
+            ),
+            format!(
+                "{}:{query_bd}:{bk}:{query_info}:{}:{}:{}",
+                query.gt,
+                truth.primary_type(),
+                genotype_label(query),
+                query.qual
+            ),
+        ),
     }
 }
 
@@ -6575,21 +6593,23 @@ fn fn_row(
         fp_class: None,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        line: format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{gt}:FN:{bk}:{info}:{type_label}:{loc}:.\t./.:.:.:.:NOCALL:nocall:0",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = truth.qual,
-            bs = block_start,
-            regions = regions,
-            gt = truth.gt,
-            bk = bk,
-            info = info,
-            type_label = truth.primary_type(),
-            loc = genotype_label(truth),
-        ).into(),
+        line: comparison_record(
+            &truth.key.chrom,
+            truth.key.pos,
+            display_ref(truth, reference),
+            display_alt(truth),
+            &truth.qual,
+            ".",
+            format!("BS={block_start}{regions}"),
+            "GT:BD:BK:BI:BVT:BLT:QQ",
+            format!(
+                "{}:FN:{bk}:{info}:{}:{}:.",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth)
+            ),
+            "./.:.:.:.:NOCALL:nocall:0".to_string(),
+        ),
     }
 }
 
@@ -6615,21 +6635,23 @@ fn unk_truth_row(
         fp_class: None,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        line: format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t{gt}:UNK:{bk}:{info}:{type_label}:{loc}:.\t./.:.:.:.:NOCALL:nocall:0",
-            chrom = truth.key.chrom,
-            pos = truth.key.pos,
-            ref = display_ref(truth, reference),
-            alt = display_alt(truth),
-            qual = truth.qual,
-            bs = block_start,
-            regions = regions,
-            gt = truth.gt,
-            bk = bk,
-            info = info,
-            type_label = truth.primary_type(),
-            loc = genotype_label(truth),
-        ).into(),
+        line: comparison_record(
+            &truth.key.chrom,
+            truth.key.pos,
+            display_ref(truth, reference),
+            display_alt(truth),
+            &truth.qual,
+            ".",
+            format!("BS={block_start}{regions}"),
+            "GT:BD:BK:BI:BVT:BLT:QQ",
+            format!(
+                "{}:UNK:{bk}:{info}:{}:{}:.",
+                truth.gt,
+                truth.primary_type(),
+                genotype_label(truth)
+            ),
+            "./.:.:.:.:NOCALL:nocall:0".to_string(),
+        ),
     }
 }
 
@@ -7016,24 +7038,24 @@ fn fp_like_row(
         fp_class,
         xcmp_ctype: None,
         xcmp_hap_match: false,
-        line: format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t{filter}\tBS={bs}{regions}\tGT:BD:BK:BI:BVT:BLT:QQ\t./.:.:.:.:NOCALL:nocall:.\t{gt}:{bd}:{bk}:{info}:{type_label}:{loc}:{qq}",
-            chrom = query.key.chrom,
-            pos = query.key.pos,
-            ref = display_ref(query, reference),
-            alt = display_alt(query),
-            qual = query.qual,
-            filter = filter_for_output(&query.filter),
-            bs = block_start,
-            regions = regions,
-            gt = query.gt,
-            bd = bd,
-            bk = bk,
-            info = info,
-            type_label = query.primary_type(),
-            loc = genotype_label(query),
-            qq = query.qual,
-        ).into(),
+        line: comparison_record(
+            &query.key.chrom,
+            query.key.pos,
+            display_ref(query, reference),
+            display_alt(query),
+            &query.qual,
+            filter_for_output(&query.filter),
+            format!("BS={block_start}{regions}"),
+            "GT:BD:BK:BI:BVT:BLT:QQ",
+            "./.:.:.:.:NOCALL:nocall:.".to_string(),
+            format!(
+                "{}:{bd}:{bk}:{info}:{}:{}:{}",
+                query.gt,
+                query.primary_type(),
+                genotype_label(query),
+                query.qual
+            ),
+        ),
     }
 }
 
@@ -7448,18 +7470,48 @@ mod scratch_tests {
         root
     }
 
-    fn args(report_prefix: PathBuf, scratch_parent: &Path, keep_scratch: bool) -> CompareArgs {
+    fn args(report_prefix: PathBuf, scratch_parent: &Path, keep_scratch: bool) -> RawCompareArgs {
         let mut args = RawCompareArgs::with_paths(
             fixture_path("truth.vcf").display().to_string(),
             fixture_path("query.vcf").display().to_string(),
             fixture_path("ref.fa").display().to_string(),
             report_prefix.display().to_string(),
-        )
-        .validated()
-        .unwrap();
+        );
         args.scratch_prefix = Some(scratch_parent.display().to_string());
         args.keep_scratch = keep_scratch;
         args
+    }
+
+    fn run(args: RawCompareArgs) -> Result<()> {
+        super::run(args.validated()?)
+    }
+
+    fn build_preprocess_args(
+        args: &RawCompareArgs,
+        input: &str,
+        output: &Path,
+        pass_only: bool,
+        preprocess_enabled: bool,
+    ) -> Result<PreprocessArgs> {
+        super::build_preprocess_args(
+            &args.clone().validated()?,
+            input,
+            output,
+            pass_only,
+            preprocess_enabled,
+        )
+    }
+
+    fn effective_decomposition(args: &RawCompareArgs) -> bool {
+        super::effective_decomposition(&args.clone().validated().expect("valid compare fixture"))
+    }
+
+    fn initialize_compare_log(args: &RawCompareArgs) -> Result<()> {
+        super::initialize_compare_log(&args.clone().validated()?)
+    }
+
+    fn log_compare_info(args: &RawCompareArgs, message: &str) -> Result<()> {
+        super::log_compare_info(&args.clone().validated()?, message)
     }
 
     #[test]
@@ -7897,14 +7949,12 @@ mod scratch_tests {
     fn subset_derivation_stops_regions_at_the_next_info_field() {
         let rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            line: concat!(
+            line: ComparisonRecord::fixture(concat!(
                 "chr1\t7\t.\tA\tC\t30\tPASS\t",
                 "BS=7;Regions=CONF,TS_boundary,TS_contained;AF=0.5;VTC=nuc__s\t",
                 "GT:BD:BK:BVT:BLT:BI\t",
                 "0/1:TP:gm:SNP:het:ti\t0/1:TP:gm:SNP:het:ti"
-            )
-            .to_string()
-            .into(),
+            )),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -7927,13 +7977,11 @@ mod scratch_tests {
     fn requantify_handoff_drops_only_provisional_truth_set_membership() {
         let rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            line: concat!(
+            line: ComparisonRecord::fixture(concat!(
                 "chr1\t7\t.\tA\tC\t30\tPASS\t",
                 "BS=7;Regions=CONF,TS_boundary,EXTRA,TS_contained;RegionsExtent=7-7\t",
                 "GT:BD\t0/1:TP\t0/1:TP"
-            )
-            .to_string()
-            .into(),
+            )),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -7945,15 +7993,19 @@ mod scratch_tests {
         assert!(
             rows[0]
                 .line
+                .raw()
+                .info
                 .contains("Regions=CONF,TS_boundary,EXTRA,TS_contained")
         );
         assert!(
             sanitized[0]
                 .line
+                .raw()
+                .info
                 .contains("BS=7;Regions=CONF,EXTRA;RegionsExtent=7-7")
         );
-        assert!(!sanitized[0].line.contains("TS_boundary"));
-        assert!(!sanitized[0].line.contains("TS_contained"));
+        assert!(!sanitized[0].line.raw().info.contains("TS_boundary"));
+        assert!(!sanitized[0].line.raw().info.contains("TS_contained"));
     }
 
     #[test]
@@ -7964,9 +8016,7 @@ mod scratch_tests {
             fixture_path("query.vcf").display().to_string(),
             fixture_path("ref.fa").display().to_string(),
             root.join("result").display().to_string(),
-        )
-        .validated()
-        .unwrap();
+        );
         options.scratch_prefix = Some(root.join("scratch").display().to_string());
         options.engine = CompareEngine::Vcfeval;
         options.engine_vcfeval = Some("definitely-absent-rtg-for-test".to_string());
@@ -8043,9 +8093,7 @@ mod scratch_tests {
                 fixture.join("query.vcf").display().to_string(),
                 fixture.join("ref.fa").display().to_string(),
                 prefix.display().to_string(),
-            )
-            .validated()
-            .unwrap();
+            );
             options.scratch_prefix = Some(root.join("scratch").display().to_string());
             options
         };
@@ -8081,13 +8129,11 @@ mod scratch_tests {
         .unwrap();
         let mut rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            line: concat!(
+            line: ComparisonRecord::fixture(concat!(
                 "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
                 "GT:BD:BK:BVT:BLT:QQ\t",
                 "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
-            )
-            .to_string()
-            .into(),
+            )),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -8095,14 +8141,14 @@ mod scratch_tests {
         }];
         decorate_output_rows(&mut rows, &[source], &[], true, true, "QUAL").unwrap();
         assert!(
-            rows[0].line.contains(concat!(
+            rows[0].line.raw().info.contains(concat!(
                 "BS=7;IQQ=30;SCORE=9;ctype=simple:match;gtt1=gt_het;",
                 "gtt2=gt_het;kind=match;type=TP;Regions=CONF;RegionsExtent=7-7;",
                 "XCMP=TP:match:gt_het:gt_het:simple:match;",
                 "VTC=nuc__s,al__s,het__rs"
             )),
             "{}",
-            rows[0].line
+            rows[0].line.raw().info
         );
         let headers = build_vcf_headers(&[], &[], false, true, true, "QUAL");
         assert!(
@@ -8140,13 +8186,11 @@ mod scratch_tests {
         .unwrap();
         let mut rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            line: concat!(
+            line: ComparisonRecord::fixture(concat!(
                 "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
                 "GT:BD:BK:BVT:BLT:QQ\t",
                 "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
-            )
-            .to_string()
-            .into(),
+            )),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -8155,7 +8199,7 @@ mod scratch_tests {
 
         decorate_output_rows(&mut rows, &[source], &[], true, false, "INFO.SCORE").unwrap();
 
-        let record = RawVcfRecord::from_line(&rows[0].line, Path::new("output.vcf")).unwrap();
+        let record = rows[0].line.raw();
         assert!(record.info.contains("SCORE=9"));
         assert!(!record.info.contains("INFO.SCORE="));
         assert!(!record.info.contains("IQQ="));
@@ -8580,14 +8624,13 @@ mod memory_guards {
         let truth = variant(25, "A", "G", "1/1").with_qual("60");
         let query = variant(25, "A", "G", "1/1").with_qual("55");
         let row = tp_combined_row(&truth, &query, "A", 25, "");
-        let fields = row.line.split('\t').collect::<Vec<_>>();
-        assert_eq!(fields[5], "60");
-        assert!(fields[9].ends_with(":55"));
-        assert!(fields[10].ends_with(":55"));
+        assert_eq!(row.line.raw().qual, "60");
+        assert!(row.line.raw().samples[0].ends_with(":55"));
+        assert!(row.line.raw().samples[1].ends_with(":55"));
 
         let higher_query = query.with_qual("65");
         let row = tp_combined_row(&truth, &higher_query, "A", 25, "");
-        assert_eq!(row.line.split('\t').nth(5), Some("65"));
+        assert_eq!(row.line.raw().qual, "65");
     }
 
     #[test]
@@ -8679,7 +8722,9 @@ mod memory_guards {
     fn filtered_truth_counterpart_sorts_first_at_shared_locus() {
         let row = |alt: &str, side_rank| AnnotatedRow {
             sort_key: ("chr21".to_string(), 15576177, side_rank, 0),
-            line: format!("chr21\t15576177\t.\tG\t{alt}\t0\t.\tBS=15576177\tGT\t./.\t0/1").into(),
+            line: ComparisonRecord::fixture(&format!(
+                "chr21\t15576177\t.\tG\t{alt}\t0\t.\tBS=15576177\tGT\t./.\t0/1"
+            )),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -8695,7 +8740,8 @@ mod memory_guards {
 
         sort_comparison_rows(&mut rows, &keys);
 
-        assert!(rows[0].line.contains("\tG\tA\t"));
+        assert_eq!(rows[0].line.raw().ref_allele, "G");
+        assert_eq!(rows[0].line.raw().alt_allele, "A");
     }
 
     #[test]

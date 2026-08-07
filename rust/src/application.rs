@@ -52,13 +52,6 @@ impl<T> Deref for Validated<T> {
     }
 }
 
-#[cfg(test)]
-impl<T> std::ops::DerefMut for Validated<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
 fn require_text(value: &str, field: &'static str) -> ValidationResult {
     if value.trim().is_empty() {
         return Err(RequestValidationError::new(field, "must not be empty"));
@@ -388,13 +381,6 @@ impl Deref for ValidatedCompareArgs {
 
     fn deref(&self) -> &Self::Target {
         &self.values
-    }
-}
-
-#[cfg(test)]
-impl std::ops::DerefMut for ValidatedCompareArgs {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.values
     }
 }
 
@@ -816,32 +802,10 @@ pub struct ValidatedQuantifyArgs {
 
 impl ValidatedQuantifyArgs {
     pub fn output_plan(&self) -> OutputPlan {
-        #[cfg(test)]
-        {
-            let _retained_plan = &self.output_plan;
-            OutputPlan::new(
-                &self.values.report_prefix,
-                self.values.write_counts,
-                !self.values.no_json,
-                self.values.write_vcf.then_some(if self.values.bcf {
-                    VariantOutputFormat::Bcf
-                } else {
-                    VariantOutputFormat::Vcf
-                }),
-            )
-            .expect("tests mutate only output-plan values that remain valid")
-        }
-        #[cfg(not(test))]
         self.output_plan.clone()
     }
 
     pub fn input_path(&self) -> Option<&Path> {
-        #[cfg(test)]
-        {
-            let _retained_input = &self.input;
-            Some(Path::new(&self.values.input_vcf))
-        }
-        #[cfg(not(test))]
         self.input.as_deref()
     }
 }
@@ -851,13 +815,6 @@ impl Deref for ValidatedQuantifyArgs {
 
     fn deref(&self) -> &Self::Target {
         &self.values
-    }
-}
-
-#[cfg(test)]
-impl std::ops::DerefMut for ValidatedQuantifyArgs {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.values
     }
 }
 

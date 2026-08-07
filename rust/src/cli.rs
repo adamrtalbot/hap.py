@@ -1463,7 +1463,13 @@ impl TryFrom<SomaticArgs> for crate::application::ValidatedSomaticArgs {
     type Error = crate::application::RequestValidationError;
 
     fn try_from(args: SomaticArgs) -> Result<Self, Self::Error> {
-        crate::application::SomaticArgs {
+        crate::application::SomaticArgs::from(args).validated()
+    }
+}
+
+impl From<SomaticArgs> for crate::application::SomaticArgs {
+    fn from(args: SomaticArgs) -> Self {
+        Self {
             truth: args.truth,
             query: args.query,
             output: args.output,
@@ -1507,7 +1513,6 @@ impl TryFrom<SomaticArgs> for crate::application::ValidatedSomaticArgs {
             verbose: args.verbose,
             quiet: args.quiet,
         }
-        .validated()
     }
 }
 

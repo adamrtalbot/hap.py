@@ -190,8 +190,8 @@ fn run_with_metric_indices_source(
     let reference_contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
     let (confidence, stratifications, stratification_levels) =
         load_regions(&args, &reference_contigs)?;
-    input.try_edit_records(|_, records| {
-        for record in records.iter_mut() {
+    for index in 0..input.records().len() {
+        input.try_edit_record(index, |record| {
             if args.preserve_info {
                 let extent = legacy_regions_extent(record);
                 set_info_value(&mut record.info, "RegionsExtent", &extent);
@@ -214,15 +214,18 @@ fn run_with_metric_indices_source(
             } else {
                 reannotate_ga4gh_record(record);
             }
-        }
-        propagate_superlocus_annotations_for_samples(
-            records,
-            annotation_type,
-            benchmark_samples,
-            mode.preserve_missing_query_qq,
-            mode.inherit_same_position_tp_qq,
-        );
-        for record in records.iter_mut() {
+            Ok(())
+        })?;
+    }
+    propagate_checked_superlocus_annotations_for_samples(
+        &mut input,
+        annotation_type,
+        benchmark_samples,
+        mode.preserve_missing_query_qq,
+        mode.inherit_same_position_tp_qq,
+    )?;
+    for index in 0..input.records().len() {
+        input.try_edit_record(index, |record| {
             decorate_quantified_record_for_samples(
                 record,
                 annotation_type,
@@ -234,10 +237,10 @@ fn run_with_metric_indices_source(
             if annotation_type == "ga4gh" {
                 normalize_integer_like_format_values(record, "QQ");
             }
-        }
-        Ok(())
-    })?;
-    input.try_edit_records(|headers, _| {
+            Ok(())
+        })?;
+    }
+    input.edit_headers(|headers| {
         if args.write_vcf {
             ensure_info_header(
                 headers,
@@ -270,8 +273,7 @@ fn run_with_metric_indices_source(
                 }
             }
         }
-        Ok(())
-    })?;
+    });
     let records = input.records();
     let subset_size = contigs_in_input(records)
         .into_iter()
@@ -896,6 +898,7 @@ fn propagate_superlocus_annotations(records: &mut [RawVcfRecord], annotation_typ
     );
 }
 
+#[cfg(test)]
 fn propagate_superlocus_annotations_for_samples(
     records: &mut [RawVcfRecord],
     annotation_type: &str,
@@ -956,6 +959,89 @@ fn propagate_superlocus_annotations_for_samples(
         }
         start = end;
     }
+}
+
+#[derive(Debug)]
+struct CheckedSuperlocusPlan {
+    start: usize,
+    end: usize,
+    region: Option<&'static str>,
+    ga4gh: Option<Ga4ghSuperlocusContext>,
+}
+
+fn propagate_checked_superlocus_annotations_for_samples(
+    input: &mut ValidatedVcf,
+    annotation_type: &str,
+    samples: BenchmarkSamples,
+    preserve_missing_query_qq: bool,
+    inherit_same_position_tp_qq: bool,
+) -> Result<()> {
+    let plans = {
+        let records = input.records();
+        let mut plans = Vec::new();
+        let mut start = 0usize;
+        while start < records.len() {
+            let chrom = records[start].chrom.clone();
+            let bs = benchmark_superlocus(&records[start].info);
+            let mut end = start + 1;
+            if bs.is_some() {
+                while end < records.len()
+                    && records[end].chrom == chrom
+                    && benchmark_superlocus(&records[end].info) == bs
+                {
+                    end += 1;
+                }
+            }
+            let block = &records[start..end];
+            let has_confident = block.iter().any(|record| has_region(&record.info, "CONF"));
+            let has_non_confident = block.iter().any(|record| {
+                !has_region(&record.info, "CONF") || has_region(&record.info, "TS_boundary")
+            });
+            let region = if has_confident && has_non_confident {
+                Some("TS_boundary")
+            } else if has_confident {
+                Some("TS_contained")
+            } else {
+                None
+            };
+            plans.push(CheckedSuperlocusPlan {
+                start,
+                end,
+                region,
+                ga4gh: (annotation_type != "xcmp")
+                    .then(|| ga4gh_superlocus_context(block, samples)),
+            });
+            start = end;
+        }
+        plans
+    };
+
+    for plan in plans {
+        for index in plan.start..plan.end {
+            input.try_edit_record(index, |record| {
+                if let Some(region) = plan.region {
+                    merge_region_tags(&mut record.info, &[region.to_string()]);
+                }
+                if annotation_type == "xcmp" {
+                    if let Some(truth) = samples.truth
+                        && record.sample_map(truth).get("BD").map(String::as_str) != Some("TP")
+                    {
+                        set_format_value(record, truth, "QQ", ".");
+                    }
+                } else if let Some(context) = &plan.ga4gh {
+                    apply_ga4gh_superlocus_context(
+                        record,
+                        context,
+                        samples,
+                        preserve_missing_query_qq,
+                        inherit_same_position_tp_qq,
+                    );
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn benchmark_superlocus(info: &str) -> Option<i64> {
@@ -1362,12 +1448,17 @@ fn ensure_info_header(headers: &mut Vec<String>, id: &str, declaration: &str) {
     headers.insert(index, declaration.to_string());
 }
 
-fn propagate_ga4gh_superlocus_for_samples(
-    records: &mut [RawVcfRecord],
+#[derive(Clone, Debug)]
+struct Ga4ghSuperlocusContext {
+    same_position_tp_qq: BTreeMap<usize, String>,
+    minimum_tp_qq: Option<String>,
+    block_filters: BTreeSet<String>,
+}
+
+fn ga4gh_superlocus_context(
+    records: &[RawVcfRecord],
     samples: BenchmarkSamples,
-    preserve_missing_query_qq: bool,
-    inherit_same_position_tp_qq: bool,
-) {
+) -> Ga4ghSuperlocusContext {
     let mut same_position_tp_qq = BTreeMap::<usize, String>::new();
     if let Some(query_index) = samples.query {
         for record in records.iter() {
@@ -1413,59 +1504,93 @@ fn propagate_ga4gh_superlocus_for_samples(
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
 
-    for record in records {
-        let truth_tp = samples.truth.is_some_and(|truth| {
-            record.sample_map(truth).get("BD").map(String::as_str) == Some("TP")
-        });
-        if let Some(query) = samples.query {
-            let query_sample = record.sample_map(query);
-            let query_qq = query_sample.get("QQ").cloned();
-            if !preserve_missing_query_qq && query_qq.as_deref().is_none_or(|value| value == ".") {
-                let inherited = (truth_tp && inherit_same_position_tp_qq)
-                    .then(|| same_position_tp_qq.get(&record.pos))
-                    .flatten()
-                    .map(String::as_str)
-                    .unwrap_or("0");
-                set_format_value(record, query, "QQ", inherited);
-            }
-        }
-        let query = samples
-            .query
-            .map(|query| record.sample_map(query))
-            .unwrap_or_default();
-        let direct_query_qq = (query.get("BD").map(String::as_str) == Some("TP"))
-            .then(|| query.get("QQ").cloned())
-            .flatten()
-            .filter(|score| {
-                score != "." && score.parse::<f64>().is_ok_and(|value| value.is_finite())
-            });
-        let truth_qq = if truth_tp {
-            direct_query_qq.as_ref().or(minimum_tp_qq.as_ref())
-        } else {
-            None
-        };
-        if let Some(truth) = samples.truth {
-            set_format_value(
-                record,
-                truth,
-                "QQ",
-                truth_qq.map(String::as_str).unwrap_or("."),
-            );
-        }
+    Ga4ghSuperlocusContext {
+        same_position_tp_qq,
+        minimum_tp_qq,
+        block_filters,
+    }
+}
 
-        if truth_tp
-            && query.get("BVT").map(String::as_str) == Some("NOCALL")
-            && !block_filters.is_empty()
-        {
-            let mut filters = record
-                .filter
-                .split(';')
-                .filter(|filter| !filter.is_empty() && *filter != "." && *filter != "PASS")
-                .map(str::to_string)
-                .collect::<BTreeSet<_>>();
-            filters.extend(block_filters.iter().cloned());
-            record.filter = filters.into_iter().collect::<Vec<_>>().join(";");
+fn apply_ga4gh_superlocus_context(
+    record: &mut RawVcfRecord,
+    context: &Ga4ghSuperlocusContext,
+    samples: BenchmarkSamples,
+    preserve_missing_query_qq: bool,
+    inherit_same_position_tp_qq: bool,
+) {
+    let Ga4ghSuperlocusContext {
+        same_position_tp_qq,
+        minimum_tp_qq,
+        block_filters,
+    } = context;
+    let truth_tp = samples
+        .truth
+        .is_some_and(|truth| record.sample_map(truth).get("BD").map(String::as_str) == Some("TP"));
+    if let Some(query) = samples.query {
+        let query_sample = record.sample_map(query);
+        let query_qq = query_sample.get("QQ").cloned();
+        if !preserve_missing_query_qq && query_qq.as_deref().is_none_or(|value| value == ".") {
+            let inherited = (truth_tp && inherit_same_position_tp_qq)
+                .then(|| same_position_tp_qq.get(&record.pos))
+                .flatten()
+                .map(String::as_str)
+                .unwrap_or("0");
+            set_format_value(record, query, "QQ", inherited);
         }
+    }
+    let query = samples
+        .query
+        .map(|query| record.sample_map(query))
+        .unwrap_or_default();
+    let direct_query_qq = (query.get("BD").map(String::as_str) == Some("TP"))
+        .then(|| query.get("QQ").cloned())
+        .flatten()
+        .filter(|score| score != "." && score.parse::<f64>().is_ok_and(|value| value.is_finite()));
+    let truth_qq = if truth_tp {
+        direct_query_qq.as_ref().or(minimum_tp_qq.as_ref())
+    } else {
+        None
+    };
+    if let Some(truth) = samples.truth {
+        set_format_value(
+            record,
+            truth,
+            "QQ",
+            truth_qq.map(String::as_str).unwrap_or("."),
+        );
+    }
+
+    if truth_tp
+        && query.get("BVT").map(String::as_str) == Some("NOCALL")
+        && !block_filters.is_empty()
+    {
+        let mut filters = record
+            .filter
+            .split(';')
+            .filter(|filter| !filter.is_empty() && *filter != "." && *filter != "PASS")
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        filters.extend(block_filters.iter().cloned());
+        record.filter = filters.into_iter().collect::<Vec<_>>().join(";");
+    }
+}
+
+#[cfg(test)]
+fn propagate_ga4gh_superlocus_for_samples(
+    records: &mut [RawVcfRecord],
+    samples: BenchmarkSamples,
+    preserve_missing_query_qq: bool,
+    inherit_same_position_tp_qq: bool,
+) {
+    let context = ga4gh_superlocus_context(records, samples);
+    for record in records {
+        apply_ga4gh_superlocus_context(
+            record,
+            &context,
+            samples,
+            preserve_missing_query_qq,
+            inherit_same_position_tp_qq,
+        );
     }
 }
 
@@ -3176,6 +3301,7 @@ fn write_metrics_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::QuantifyArgs as QuantifyFixture;
     use flate2::read::GzDecoder;
     use std::io::Read;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3222,8 +3348,8 @@ mod tests {
         input
     }
 
-    fn args(root: &Path) -> QuantifyArgs {
-        crate::application::QuantifyArgs {
+    fn args(root: &Path) -> QuantifyFixture {
+        QuantifyFixture {
             input_vcf: indexed_fixture(root).display().to_string(),
             report_prefix: root.join("result").display().to_string(),
             reference: fixture("ref.fa").display().to_string(),
@@ -3251,8 +3377,26 @@ mod tests {
             ci_alpha: 0.0,
             no_json: true,
         }
-        .validated()
-        .unwrap()
+    }
+
+    fn run(args: QuantifyFixture) -> Result<()> {
+        super::run(args.validated()?)
+    }
+
+    fn run_from_compare(
+        args: QuantifyFixture,
+        headers: Vec<String>,
+        records: Vec<ValidatedVcfRecord>,
+        mode: CompareQuantifyMode,
+    ) -> Result<()> {
+        super::run_from_compare(args.validated_for_records()?, headers, records, mode)
+    }
+
+    fn load_regions(
+        args: &QuantifyFixture,
+        reference_contigs: &BTreeSet<String>,
+    ) -> Result<LoadedRegions> {
+        super::load_regions(&args.clone().validated()?, reference_contigs)
     }
 
     #[test]

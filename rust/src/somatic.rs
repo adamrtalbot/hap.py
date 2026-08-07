@@ -3801,7 +3801,7 @@ mod tests {
     use crate::cli::{Cli, Command};
     use clap::Parser;
 
-    fn parsed_somatic(extra: &[&str]) -> SomaticArgs {
+    fn parsed_somatic(extra: &[&str]) -> crate::application::SomaticArgs {
         let mut argv = vec![
             "hap",
             "somatic",
@@ -3817,7 +3817,15 @@ mod tests {
         let Command::Somatic(args) = cli.command else {
             panic!("somatic command expected");
         };
-        args.try_into().expect("test arguments should validate")
+        args.into()
+    }
+
+    fn run(args: crate::application::SomaticArgs) -> Result<()> {
+        super::run(args.validated()?)
+    }
+
+    fn validate_args(args: &crate::application::SomaticArgs) -> Result<()> {
+        super::validate_args(&args.clone().validated()?)
     }
 
     fn interval(start: usize, end: usize, label: &str) -> AmbiguousInterval {
@@ -3954,7 +3962,9 @@ mod tests {
         args.scratch_prefix = Some(scratch.display().to_string());
         args.logfile = Some(logfile.display().to_string());
         args.verbose = true;
-        let mut controls = SomaticOperationalControls::prepare(&args).expect("prepare controls");
+        let validated = args.validated().expect("valid operational controls");
+        let mut controls =
+            SomaticOperationalControls::prepare(&validated).expect("prepare controls");
         assert!(controls.scratch.path.is_dir());
         assert!(!controls.should_print_summary());
         controls.info("operational log marker").expect("write log");
@@ -3968,6 +3978,7 @@ mod tests {
 
         let mut quiet_args = parsed_somatic(&[]);
         quiet_args.quiet = true;
+        let quiet_args = quiet_args.validated().expect("valid quiet controls");
         let quiet = SomaticOperationalControls::prepare(&quiet_args).expect("prepare quiet mode");
         assert!(!quiet.should_print_summary());
         let quiet_path = quiet.scratch.path.clone();
@@ -3976,6 +3987,7 @@ mod tests {
 
         let mut keep_args = parsed_somatic(&[]);
         keep_args.keep_scratch = true;
+        let keep_args = keep_args.validated().expect("valid kept controls");
         let keep = SomaticOperationalControls::prepare(&keep_args).expect("prepare kept scratch");
         let keep_path = keep.scratch.path.clone();
         keep.scratch.cleanup().expect("keep scratch");
