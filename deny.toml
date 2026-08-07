@@ -1,0 +1,43 @@
+[graph]
+# flate2 intentionally uses miniz_oxide only on wasm32, where zlib-rs is not
+# available. Release binaries target these native platforms; on them zlib-rs
+# must remain the only selected compression implementation.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+]
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+deny = [
+    { crate = "cloudflare-zlib-sys", reason = "zlib-rs is the sole approved compression backend" },
+    { crate = "libdeflater", reason = "zlib-rs is the sole approved compression backend" },
+    { crate = "libdeflate-sys", reason = "zlib-rs is the sole approved compression backend" },
+    { crate = "libz-ng-sys", reason = "zlib-rs is the sole approved compression backend" },
+    { crate = "libz-sys", reason = "zlib-rs is the sole approved compression backend" },
+    { crate = "miniz_oxide", reason = "zlib-rs is the sole approved compression backend" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

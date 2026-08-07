@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "components": [
+    {
+      "name": "Cephes math routines from SciPy 1.2.1",
+      "kind": "source-port",
+      "source": "https://github.com/scipy/scipy/tree/c3fa90dcfcaef71658744c73578e9e7d915c81e9/scipy/special/cephes",
+      "revision": "c3fa90dcfcaef71658744c73578e9e7d915c81e9",
+      "license": "BSD-3-Clause",
+      "notice": "THIRD_PARTY_LICENSES/cephes.txt",
+      "paths": ["rust/src/cephes.rs"]
+    },
+    {
+      "name": "musl Arm math routines",
+      "kind": "source-port",
+      "source": "https://git.musl-libc.org/cgit/musl/tree/src/math?id=0784374d561435f7c787a555aeab8ede699ed298",
+      "revision": "0784374d561435f7c787a555aeab8ede699ed298",
+      "license": "MIT",
+      "notice": "THIRD_PARTY_LICENSES/musl-arm-math.txt",
+      "paths": ["rust/src/cephes/glibc239.rs"]
+    },
+    {
+      "name": "RTG Tools vcfeval behavior port",
+      "kind": "source-port",
+      "source": "https://github.com/RealTimeGenomics/rtg-tools/tree/32d4c2d2d340cb0288f68ddd008d29564bcfef13",
+      "revision": "32d4c2d2d340cb0288f68ddd008d29564bcfef13",
+      "license": "BSD-2-Clause",
+      "notice": "THIRD_PARTY_LICENSES/rtg-tools.txt",
+      "paths": ["rust/src/vcfeval.rs"]
+    },
+    {
+      "name": "EBI VCF Validator conformance fixtures",
+      "kind": "fixture",
+      "source": "https://github.com/EBIvariation/vcf-validator/tree/0aacc4a44430ab9cee87d9925aacb28a2fb0a9fb/test/input_files",
+      "revision": "0aacc4a44430ab9cee87d9925aacb28a2fb0a9fb",
+      "license": "Apache-2.0",
+      "notice": "THIRD_PARTY_LICENSES/ebi-vcf-validator-apache-2.0.txt",
+      "paths": [
+        "verification/assets/fixtures/external/ebi-vcf-validator/README.md",
+        "verification/assets/fixtures/external/ebi-vcf-validator/failed_body_samples_ploidy_000.vcf",
+        "verification/assets/fixtures/external/ebi-vcf-validator/passed_meta_format_P_1.vcf"
+      ],
+      "sha256": {
+        "verification/assets/fixtures/external/ebi-vcf-validator/README.md": "9a523a95277f0e6faf9521b3b792a785034fc34edf02b87c7a2bd0bddb5afc73",
+        "verification/assets/fixtures/external/ebi-vcf-validator/failed_body_samples_ploidy_000.vcf": "92271c32027f458fb3a89fe13b11210d3a219beca50329327f4d243776e2c209",
+        "verification/assets/fixtures/external/ebi-vcf-validator/passed_meta_format_P_1.vcf": "7a94657671a660a4d4525f6d01234d9d17ae0414cc367546617863180fcb7aba"
+      }
+    }
+  ]
+}

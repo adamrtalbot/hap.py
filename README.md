@@ -78,4 +78,6 @@ installation, each command, file formats, verification, and development.
 
 The Simplified BSD License covers `hap-rs`. See
 [`LICENSE.txt`](LICENSE.txt) and [`THIRD_PARTY_LICENSES/`](THIRD_PARTY_LICENSES/)
-for details.
+for details. The machine-checkable
+[`manifest.json`](THIRD_PARTY_LICENSES/manifest.json) maps imported source and
+fixture files to immutable upstream revisions and packaged notices.

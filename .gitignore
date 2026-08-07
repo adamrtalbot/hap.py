@@ -19,6 +19,7 @@
 /verification/.targeted-results-*/
 /verification/.targeted-*/
 /verification/.ruff_cache/
+/verification/.nf-test-*.nf
 **/.hap_scratch/
 /tmp_xcmp_test/
 /hap_germline_stageA.log

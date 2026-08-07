@@ -98,6 +98,15 @@ PATH="../target/release:$PATH" nf-test test --ci --coverage
 Before opening a pull request, run all six lanes. `nf-test` expects 153 unique
 comparisons, each with `ok: true` and an empty `differences` list.
 
+Dependency and attribution policy can be checked locally with:
+
+```bash
+cargo audit --deny warnings
+cargo deny check
+python3 scripts/check-compression-backends.py
+python3 scripts/check-notices.py
+```
+
 ## Verification rules
 
 - Add verification coverage before changing production behavior.
