@@ -15,6 +15,7 @@ mod compare;
 mod fasta;
 mod ftx;
 mod metrics_json;
+mod output;
 mod partial_credit;
 mod preprocess;
 mod quantify;

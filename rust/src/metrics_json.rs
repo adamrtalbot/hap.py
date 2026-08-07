@@ -251,7 +251,9 @@ pub fn write_metrics_gz_for_module_with_indices(
         metrics_json_for_module_with_indices(name, module, commandline, tables, indices)?
             .as_bytes(),
     )?;
-    encoder.finish()?;
+    encoder
+        .finish()
+        .with_context(|| format!("failed to finish metrics JSON artifact {}", path.display()))?;
     Ok(())
 }
 

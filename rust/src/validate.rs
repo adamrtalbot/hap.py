@@ -1,5 +1,5 @@
 use crate::cli::ValidateArgs;
-use crate::{fasta, vcf};
+use crate::{fasta, output::OutputTransaction, vcf};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -72,8 +72,48 @@ pub fn run(args: ValidateArgs) -> Result<()> {
     run_with_diagnostics(args, &mut stderr.lock())
 }
 
-fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Result<()> {
-    validate_output_paths(&args)?;
+fn run_with_diagnostics<W: Write>(mut args: ValidateArgs, diagnostics: &mut W) -> Result<()> {
+    let outputs = [args.output_json.as_deref(), args.errors_bed.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if outputs.is_empty() {
+        return run_with_diagnostics_inner(args, diagnostics);
+    }
+    let inputs = [
+        Some(args.input.as_str()),
+        args.reference.as_deref(),
+        args.regions_bedfile.as_deref(),
+        args.targets_bedfile.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(PathBuf::from)
+    .collect::<Vec<_>>();
+    let transaction = OutputTransaction::files(&inputs, &outputs)?;
+    if let Some(output) = args.output_json.as_mut() {
+        *output = transaction
+            .staged_file(Path::new(output))?
+            .to_string_lossy()
+            .into_owned();
+    }
+    if let Some(output) = args.errors_bed.as_mut() {
+        *output = transaction
+            .staged_file(Path::new(output))?
+            .to_string_lossy()
+            .into_owned();
+    }
+    run_with_diagnostics_inner(args, diagnostics).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to produce validation outputs {}: {error:#}",
+            display_paths(&outputs)
+        )
+    })?;
+    transaction.commit()
+}
+
+fn run_with_diagnostics_inner<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Result<()> {
     let reference_contigs = if let Some(reference) = &args.reference {
         fasta::contig_lengths(Path::new(reference))?
             .into_keys()
@@ -287,51 +327,12 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
     Ok(())
 }
 
-fn validate_output_paths(args: &ValidateArgs) -> Result<()> {
-    let outputs = [args.output_json.as_deref(), args.errors_bed.as_deref()]
-        .into_iter()
-        .flatten()
-        .map(|path| Ok((path, resolved_path(path)?)))
-        .collect::<Result<Vec<_>>>()?;
-    if outputs.len() == 2 && outputs[0].1 == outputs[1].1 {
-        bail!("validation outputs must use distinct paths");
-    }
-
-    let inputs = [
-        Some(args.input.as_str()),
-        args.reference.as_deref(),
-        args.regions_bedfile.as_deref(),
-        args.targets_bedfile.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|path| Ok((path, resolved_path(path)?)))
-    .collect::<Result<Vec<_>>>()?;
-    for (output, output_path) in &outputs {
-        if let Some((input, _)) = inputs
-            .iter()
-            .find(|(_, input_path)| input_path == output_path)
-        {
-            bail!("validation output '{output}' would overwrite input '{input}'");
-        }
-    }
-    Ok(())
-}
-
-fn resolved_path(path: &str) -> Result<PathBuf> {
-    let path = Path::new(path);
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return Ok(canonical);
-    }
-    let file_name = path
-        .file_name()
-        .with_context(|| format!("path has no file name: {}", path.display()))?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-    Ok(parent.join(file_name))
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl VcfHeader {
@@ -1084,10 +1085,9 @@ mod tests {
             let mut case_args = args(&input, &output);
             case_args.check_bcf_errors = check_bcf_errors;
             let error = run_with_diagnostics(case_args, &mut Vec::new()).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "Call with invalid genotype (non-existent allele) at chr1:1"
-            );
+            let message = error.to_string();
+            assert!(message.contains(&output.display().to_string()));
+            assert!(message.contains("Call with invalid genotype (non-existent allele) at chr1:1"));
             assert!(!output.exists());
         }
         Ok(())

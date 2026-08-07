@@ -1,3 +1,4 @@
+use crate::output::OutputTransaction;
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use noodles_bgzf as bgzf;
@@ -321,38 +322,34 @@ pub fn write_raw_vcf(path: &Path, headers: &[String], records: &[RawVcfRecord]) 
     if path.extension().and_then(|extension| extension.to_str()) == Some("bcf") {
         return crate::bcf::write(path, headers, records);
     }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
     let lines: Vec<String> = records.iter().map(RawVcfRecord::to_line).collect();
     if path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
         write_indexed_vcf(path, headers, lines.iter().map(String::as_str))?;
     } else {
-        let (temporary_path, file) = create_temporary_file(path)?;
+        let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [path])?;
+        let temporary_path = transaction.staged_file(path)?.to_path_buf();
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .with_context(|| format!("failed to create VCF destination {}", path.display()))?;
         let mut writer = BufWriter::new(file);
-        let result = (|| {
+        (|| {
             write_vcf_lines(&mut writer, headers, lines.iter().map(String::as_str))?;
             writer.flush()?;
             writer
                 .get_ref()
                 .sync_all()
                 .with_context(|| format!("failed to sync {}", temporary_path.display()))?;
-            fs::rename(&temporary_path, path).with_context(|| {
-                format!(
-                    "failed to publish {} as {}",
-                    temporary_path.display(),
-                    path.display()
-                )
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary_path);
-        }
-        result?;
+            Ok::<(), anyhow::Error>(())
+        })()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to write VCF destination {}: {error:#}",
+                path.display()
+            )
+        })?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -364,6 +361,23 @@ pub fn write_raw_vcf(path: &Path, headers: &[String], records: &[RawVcfRecord]) 
 /// must be grouped by reference sequence and position-sorted within each
 /// sequence, as required by the Tabix format.
 pub fn write_indexed_vcf<'a, I>(path: &Path, headers: &[String], lines: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let sidecar_path = tabix_path(path);
+    let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [path, &sidecar_path])?;
+    let staged = transaction.staged_file(path)?.to_path_buf();
+    write_indexed_vcf_inner(&staged, headers, lines).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to write indexed VCF destination {} (index {}): {error:#}",
+            path.display(),
+            sidecar_path.display()
+        )
+    })?;
+    transaction.commit()
+}
+
+fn write_indexed_vcf_inner<'a, I>(path: &Path, headers: &[String], lines: I) -> Result<()>
 where
     I: IntoIterator<Item = &'a str>,
 {

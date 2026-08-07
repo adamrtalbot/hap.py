@@ -1,6 +1,7 @@
 use crate::cli::QuantifyArgs;
 use crate::compare::{AnnotatedRow, TypeCounts, suffixed_report_path};
 use crate::metrics_json;
+use crate::output::{OutputTransaction, benchmark_artifacts, stratification_inputs};
 use crate::report::{self, CountsBucket};
 use crate::roc;
 use crate::vcf::{self, RawVcfRecord};
@@ -123,6 +124,62 @@ pub(crate) fn run_from_compare(
 }
 
 fn run_with_metric_indices_mode(
+    mut args: QuantifyArgs,
+    mode: CompareQuantifyMode,
+) -> Result<roc::MetricIndices> {
+    let destination_prefix = PathBuf::from(&args.report_prefix);
+    let destination_vcf =
+        suffixed_report_path(&destination_prefix, if args.bcf { "bcf" } else { "vcf.gz" });
+    if args.write_vcf && paths_refer_to_same_file(Path::new(&args.input_vcf), &destination_vcf) {
+        bail!(
+            "cannot overwrite input VCF: {} would be overwritten by output {}",
+            args.input_vcf,
+            destination_vcf.display()
+        );
+    }
+    let (inputs, mut labels) = quantify_inputs(&args)?;
+    labels.extend(
+        args.roc_regions
+            .iter()
+            .filter(|label| label.as_str() != "*")
+            .cloned(),
+    );
+    let logfile = args.logfile.as_ref().map(PathBuf::from);
+    let transaction =
+        OutputTransaction::family(&inputs, &destination_prefix, benchmark_artifacts(labels))?
+            .with_files(logfile.iter())?;
+    if let Some(path) = logfile.as_deref() {
+        args.logfile = Some(
+            transaction
+                .staged_file(path)?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    args.report_prefix = transaction.staged_prefix()?.to_string_lossy().into_owned();
+    let indices = run_with_metric_indices_inner(args, mode).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to produce quantified report generation {}: {error:#}",
+            destination_prefix.display()
+        )
+    })?;
+    transaction.commit()?;
+    Ok(indices)
+}
+
+fn quantify_inputs(args: &QuantifyArgs) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let (indirect, labels) = stratification_inputs(args.strat_tsv.as_deref(), &args.strat_regions)?;
+    let mut inputs = std::iter::once(args.input_vcf.as_str())
+        .chain(std::iter::once(args.reference.as_str()))
+        .chain(args.fp_bedfile.as_deref())
+        .chain(args.adjust_conf_regions.as_deref())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    inputs.extend(indirect);
+    Ok((inputs, labels))
+}
+
+fn run_with_metric_indices_inner(
     args: QuantifyArgs,
     mode: CompareQuantifyMode,
 ) -> Result<roc::MetricIndices> {
@@ -2051,7 +2108,9 @@ fn compact_no_roc_outputs(prefix: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", all_path.display()))?;
     let mut encoder = GzEncoder::new(file, Compression::default());
     writeln!(encoder, "{}", rows.join("\n"))?;
-    encoder.finish()?;
+    encoder
+        .finish()
+        .with_context(|| format!("failed to finish ROC artifact {}", all_path.display()))?;
 
     for suffix in [
         "roc.Locations.SNP.csv.gz",
@@ -2084,7 +2143,9 @@ fn apply_stratification_levels(
         .with_context(|| format!("failed to create {}", csv_path.display()))?;
     let mut encoder = GzEncoder::new(csv_file, Compression::default());
     encoder.write_all(csv.as_bytes())?;
-    encoder.finish()?;
+    encoder
+        .finish()
+        .with_context(|| format!("failed to finish ROC artifact {}", csv_path.display()))?;
 
     if preserve_raw_table {
         let raw_path = suffixed_report_path(prefix, "roc.tsv");

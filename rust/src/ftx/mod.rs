@@ -8,7 +8,7 @@
 
 use crate::cli::{FtxArgs, resolve_legacy_reference};
 use crate::partial_credit::RefVar;
-use crate::{fasta, partial_credit, vcf};
+use crate::{fasta, output::OutputTransaction, partial_credit, vcf};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
@@ -77,7 +77,43 @@ impl Drop for ScratchRun {
     }
 }
 
-pub fn run(args: FtxArgs) -> Result<()> {
+pub fn run(mut args: FtxArgs) -> Result<()> {
+    if args.normalize {
+        args.reference = Some(resolve_legacy_reference(args.reference.as_deref()).context(
+            "no reference file found for --normalize; pass --reference or set HG19/HGREF",
+        )?);
+    }
+    let output = ftx_output_path(&args.output);
+    let inputs = std::iter::once(args.input.as_str())
+        .chain(args.reference.as_deref())
+        .chain(args.regions_bedfile.as_deref())
+        .chain(args.targets_bedfile.as_deref())
+        .chain(args.bams.iter().map(String::as_str))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let transaction = OutputTransaction::files(&inputs, [&output])?;
+    args.output = transaction
+        .staged_file(&output)?
+        .to_string_lossy()
+        .into_owned();
+    run_inner(args).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to produce feature table {}: {error:#}",
+            output.display()
+        )
+    })?;
+    transaction.commit()
+}
+
+fn ftx_output_path(output: &str) -> PathBuf {
+    if output.ends_with(".csv") {
+        PathBuf::from(output)
+    } else {
+        PathBuf::from(format!("{output}.csv"))
+    }
+}
+
+fn run_inner(args: FtxArgs) -> Result<()> {
     let label = legacy_feature_label(&args.input, args.label.as_deref());
 
     // Legacy passes the reference only to `bcftools norm`; ordinary feature
@@ -113,11 +149,7 @@ pub fn run(args: FtxArgs) -> Result<()> {
         (!bam_depths.is_empty()).then_some(&bam_depths),
     )?;
 
-    let output = if args.output.ends_with(".csv") {
-        PathBuf::from(&args.output)
-    } else {
-        PathBuf::from(format!("{}.csv", args.output))
-    };
+    let output = ftx_output_path(&args.output);
     fs::write(&output, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("failed to write {}", output.display()))?;
 

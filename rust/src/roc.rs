@@ -2998,7 +2998,9 @@ fn write_gzip_csv(path: &Path, header: &str, rows: &[String]) -> Result<()> {
     for row in rows {
         writeln!(writer, "{row}")?;
     }
-    writer.finish()?;
+    writer
+        .finish()
+        .with_context(|| format!("failed to finish ROC artifact {}", path.display()))?;
     Ok(())
 }
 

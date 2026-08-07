@@ -1,6 +1,6 @@
 use crate::cli::SomaticArgs;
 use crate::compare::suffixed_report_path;
-use crate::{fasta, ftx, strelka, vcf};
+use crate::{fasta, ftx, output::OutputTransaction, strelka, vcf};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -278,6 +278,56 @@ enum QueryClass {
 }
 
 pub fn run(mut args: SomaticArgs) -> Result<()> {
+    let destination_prefix = PathBuf::from(&args.output);
+    let inputs = somatic_inputs(&args);
+    let logfile = args.logfile.as_ref().map(PathBuf::from);
+    let transaction = OutputTransaction::family(
+        &inputs,
+        &destination_prefix,
+        [
+            "ambiclasses.csv",
+            "ambireasons.csv",
+            "features.csv",
+            "roc.csv",
+            "stats.csv",
+            "metrics.json",
+            "summary.csv",
+            "extended.csv",
+        ],
+    )?
+    .with_files(logfile.iter())?;
+    if let Some(path) = logfile.as_deref() {
+        args.logfile = Some(
+            transaction
+                .staged_file(path)?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    args.output = transaction.staged_prefix()?.to_string_lossy().into_owned();
+    run_inner(args).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to produce somatic report generation {}: {error:#}",
+            destination_prefix.display()
+        )
+    })?;
+    transaction.commit()
+}
+
+fn somatic_inputs(args: &SomaticArgs) -> Vec<PathBuf> {
+    std::iter::once(args.truth.as_str())
+        .chain(std::iter::once(args.query.as_str()))
+        .chain(std::iter::once(args.reference.as_str()))
+        .chain(args.regions_bedfile.as_deref())
+        .chain(args.targets_bedfile.as_deref())
+        .chain(args.fp_bedfile.as_deref())
+        .chain(args.ambiguous_beds.iter().map(String::as_str))
+        .chain(args.bams.iter().map(String::as_str))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn run_inner(mut args: SomaticArgs) -> Result<()> {
     if let Some(config) = args.roc.as_deref().and_then(somatic_roc_config) {
         args.feature_table = Some(config.feature_table.to_string());
     }
@@ -4669,16 +4719,31 @@ mod tests {
         args.fp_bedfile = Some(fp.display().to_string());
         args.location = Some("chr1:1-10".to_string());
         args.feature_table = Some("generic".to_string());
+        let logfile = root.join("result.log");
+        for path in [
+            root.join("result.features.csv"),
+            root.join("result.stats.csv"),
+            root.join("result.metrics.json"),
+            logfile.clone(),
+        ] {
+            fs::write(path, "old-generation").expect("seed old generation");
+        }
+        args.logfile = Some(logfile.display().to_string());
         args.quiet = true;
 
         let error = run(args).expect_err("legacy denominator parsing must reject dash ranges");
         assert!(error.to_string().contains("invalid literal for int()"));
-        assert!(
-            root.join("result.features.csv").is_file(),
-            "som.py writes the feature table before the denominator failure"
-        );
-        assert!(!root.join("result.stats.csv").exists());
-        assert!(!root.join("result.metrics.json").exists());
+        for path in [
+            root.join("result.features.csv"),
+            root.join("result.stats.csv"),
+            root.join("result.metrics.json"),
+            logfile,
+        ] {
+            assert_eq!(
+                fs::read_to_string(path).expect("read preserved artifact"),
+                "old-generation"
+            );
+        }
         validate_legacy_fp_location_denominator(Some("10"), Some("chr1:1-10"), true)
             .expect("an explicit integer denominator bypasses the legacy range bug");
 
