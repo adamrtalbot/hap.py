@@ -23,3 +23,7 @@
 /tmp_xcmp_test/
 /hap_germline_stageA.log
 /core
+/docs/node_modules/
+/docs/dist/
+/.astro/
+/docs/.astro/

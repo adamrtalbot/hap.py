@@ -1,0 +1,68 @@
+:root {
+  --sl-content-width: 55rem;
+  --sl-sidebar-width: 18rem;
+}
+
+.site-title img {
+  border-radius: 0.45rem;
+}
+
+.sl-markdown-content table:not(:where(.not-content *)) {
+  display: table;
+  width: 100%;
+  font-size: 0.88em;
+}
+
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+  padding: 0.55rem 0.8rem;
+  vertical-align: top;
+}
+
+.sl-markdown-content thead th:not(:where(.not-content *)) {
+  background: var(--sl-color-gray-6);
+  color: var(--sl-color-white);
+  font-size: 0.82em;
+  font-weight: 700;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+.sl-markdown-content tbody tr:hover:not(:where(.not-content *)) {
+  background: color-mix(in srgb, var(--sl-color-accent-low) 35%, transparent);
+}
+
+.sl-markdown-content code:not(:where(.not-content *)) {
+  overflow-wrap: anywhere;
+}
+
+.expressive-code {
+  margin-block: 1.25rem;
+}
+
+.command-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 1rem;
+  margin-block: 1.5rem;
+}
+
+.command-card {
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.8rem;
+  padding: 1rem;
+  background: color-mix(in srgb, var(--sl-color-gray-6) 55%, transparent);
+}
+
+.command-card strong {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--sl-color-white);
+  font-family: var(--__sl-font-mono);
+}
+
+@media (max-width: 50rem) {
+  .sl-markdown-content table:not(:where(.not-content *)) {
+    display: block;
+    overflow-x: auto;
+  }
+}

@@ -1,10 +1,13 @@
 # Verification
 
-This directory is the parity gate for the Rust `hap` migration.  For every
+Read the [website guide](https://adamrtalbot.github.io/hap.py/project/verification/)
+for an overview. Use this file for work in `verification/`.
+
+This directory contains the parity gate for the Rust `hap` migration. For every
 samplesheet row, Nextflow runs the named legacy hap.py tool in a pinned Wave
 image and the matching `hap` subcommand from `PATH`, then compares the emitted
-`result*` files.  nf-test fails when a comparison contains a meaningful
-difference.
+`result*` files. nf-test fails when a comparison contains a difference outside
+the metadata exclusions below.
 
 ## Lanes
 
@@ -17,10 +20,10 @@ difference.
 | QFY | `qfy.py` | `hap quantify` |
 | VCFCHECK | `vcfcheck` | `hap validate` |
 
-The six `assets/samplesheet.*.csv` files are the executable test matrix. Each
-row supplies inputs and arguments for one case. Add a row to reproduce and
-govern a newly discovered discrepancy; do not change a row, comparison rule,
-or expected output to conceal one.
+The six `assets/samplesheet.*.csv` files list the test matrix. Each row supplies
+inputs and arguments for one case. Add a row to reproduce a
+discrepancy. Keep existing rows, comparison rules, and expected outputs
+unchanged.
 
 ## Run
 
@@ -32,48 +35,44 @@ cd verification
 PATH="../target/release:$PATH" nf-test test --ci tests/main.nf.test
 ```
 
-To diagnose one lane locally, use `HAP_TEST_CASES`:
+Use `HAP_TEST_CASES` to diagnose one lane:
 
 ```bash
 PATH="../target/release:$PATH" HAP_TEST_CASES=sompy nf-test test --ci tests/main.nf.test
 ```
 
-CI must run all six lanes. A narrowed run is diagnostic only.
+CI runs all six lanes. Use a narrowed run to inspect one command.
 
-`--engine vcfeval` uses two deliberately different reference inputs in this
-gate. The pinned legacy image receives a committed RTG Tools 3.12.1 SDF
-`.tar.gz` bundle from the samplesheet's `reference_sdf` column. The Rust
-process receives only the corresponding FASTA. No host RTG or Java runtime is
-used by the product implementation. Bundle checksums and generation provenance
-are recorded beside each fixture.
+`--engine vcfeval` uses separate reference formats for the two implementations.
+Nextflow gives the pinned legacy image an RTG Tools 3.12.1 SDF `.tar.gz` bundle
+from the samplesheet's `reference_sdf` column. It gives `hap` the corresponding
+FASTA. The product runs without RTG or Java. A README beside each fixture
+records the bundle checksum and provenance.
 
 ## Comparison rules
 
-The comparator is embedded in `modules/diff.nf`. It requires equal artifact
-sets, compares ordered text and CSV content, recursively compares typed JSON,
-and records a structured difference containing the lane, case, artifact, and
-location. The only ignored fields are global runtime/provenance metadata:
+`modules/diff.nf` contains the comparator. It requires equal artifact sets,
+compares ordered text and CSV content, compares typed JSON trees, and records
+the lane, case, artifact, and location for each difference. It ignores these
+runtime and provenance fields:
 
 - JSON version, timestamp, command-line, generated description fields, and the
-  deprecated vcfeval template argument that native Rust intentionally ignores.
+  deprecated vcfeval template argument that the Rust engine ignores.
 - CSV columns named `sompyversion` and `sompycmd`.
 - VCF runtime headers such as source, date, and bcftools command/version.
 
-These exclusions are global rather than case-specific. All remaining content
-must match exactly. The resulting `verification.json` is the authoritative
-machine-readable gate result; lane-level `comparison.json` files contain the
-individual differences.
+Each exclusion applies to all cases. All remaining content must match.
+nf-test reads the combined `verification.json` to decide pass or failure. Each
+lane also writes a `comparison.json` with its differences.
 
 ## Rules for changes
 
-- Keep named lane processes visible; do not replace them with generic runners.
+- Keep the named lane processes visible.
 - Keep legacy tools unmodified inside their pinned images.
-- Keep Rust-only behavior in Rust; comparison behavior belongs in Nextflow.
-- Fix the Rust implementation when a case differs. Never bless, weaken, or
-  delete a case merely to make the gate pass.
-- Add a samplesheet row and let nf-test pinpoint the discrepancy before adding
-  a regression fix.
+- Put product behavior in Rust and artifact comparison in Nextflow.
+- Fix the Rust implementation when a case differs. Keep the case and comparison
+  rule intact.
+- Add a samplesheet row and run it before editing Rust.
 
-Third-party fixture license notices remain beside their imported files. The
-fixtures themselves are part of the test inputs and must not be removed during
-documentation cleanup.
+Keep each third-party license notice beside its imported fixture. The gate uses
+those fixtures as test inputs.

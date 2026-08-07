@@ -1,61 +1,81 @@
-# hap-rs
+<p align="center">
+  <img src="docs/src/assets/hap-rs-mark.svg" alt="hap-rs" width="180">
+</p>
 
-Pure-Rust implementation of hap.py, distributed as one `hap` executable. The
-binary provides `germline`, `somatic`, `pre`, `ftx`, `quantify`, and `validate`
-subcommands, including native BCF and CSI handling. Its native engines have no
-Python, C, C++, Java, or RTG runtime dependency. `--engine vcfeval` is
-implemented in Rust and reads the same FASTA supplied with `--reference`; it
-does not require or read an SDF reference bundle.
+<h1 align="center">hap-rs</h1>
 
-## Build and test
+<p align="center">
+  Haplotype-aware variant benchmarking in one native executable.
+</p>
+
+<p align="center">
+  <a href="https://adamrtalbot.github.io/hap.py/">Documentation</a> ·
+  <a href="https://adamrtalbot.github.io/hap.py/getting-started/quick-start/">Quick start</a> ·
+  <a href="https://adamrtalbot.github.io/hap.py/project/verification/">Verification</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+---
+
+`hap-rs` compares variant callsets, normalizes VCF data, extracts somatic
+features, calculates benchmark metrics, and validates inputs. It packages the
+established hap.py workflows as the single `hap` executable, implemented in
+Rust and verified against pinned legacy releases.
+
+## Benefits
+
+- **One executable:** run all six commands without a Python, C, C++, Java, or
+  RTG runtime.
+- **Rust comparison engines:** use `vcfeval` with a FASTA reference instead of
+  an SDF bundle.
+- **Compatible interfaces:** keep the command options and report formats that
+  existing workflows use.
+- **Common genomics formats:** read VCF, BGZF-compressed VCF, and BCF with
+  Tabix or CSI indexes.
+- **Measured parity:** 153 comparisons cover all six commands.
+
+## Commands
+
+| Command | Use it to |
+|---|---|
+| [`hap germline`](https://adamrtalbot.github.io/hap.py/tools/germline/) | Compare germline truth and query callsets using haplotypes or another engine. |
+| [`hap somatic`](https://adamrtalbot.github.io/hap.py/tools/somatic/) | Benchmark somatic calls by allele identity and genomic context. |
+| [`hap pre`](https://adamrtalbot.github.io/hap.py/tools/pre/) | Normalize, filter, and transform a VCF or BCF. |
+| [`hap ftx`](https://adamrtalbot.github.io/hap.py/tools/ftx/) | Extract caller-specific somatic features into a table. |
+| [`hap quantify`](https://adamrtalbot.github.io/hap.py/tools/quantify/) | Produce stratified metrics from an annotated comparison VCF. |
+| [`hap validate`](https://adamrtalbot.github.io/hap.py/tools/validate/) | Check VCF structure, alleles, samples, and reference consistency. |
+
+## Quick start
+
+> [!NOTE]
+> `hap-rs` has no crates.io release yet. The first release will use this
+> command.
 
 ```bash
-cargo build
-cargo test
+cargo install hap-rs
 ```
 
-Run `cargo run -- --help` for the command list and per-command help.
-
-## Release parity gate
-
-This gate is available from a source checkout, not from the published Cargo
-package.
-
-`verification/` runs each governed samplesheet row through both the pinned
-legacy reference and the local `hap` binary. The default matrix contains 153
-comparisons:
-
-| Lane | Rust command | Rows |
-|---|---|---:|
-| happy | `hap germline` | 32 |
-| sompy | `hap somatic` | 28 |
-| prepy | `hap pre` | 45 |
-| ftxpy | `hap ftx` | 27 |
-| qfy | `hap quantify` | 9 |
-| vcfcheck | `hap validate` | 12 |
-
-The gate compares the legacy and Rust artifact sets directly. It requires exact
-ordered content after only global runtime/provenance metadata is removed; a
-shared missing or extra artifact also fails. nf-test turns any structured
-difference into a failed gate.
-
-The evaluation toolchain is pinned to Nextflow 26.04.6 and nf-test 0.9.5. RTG
-Tools 3.12.1 exists only inside the pinned legacy verification image. Committed
-SDF bundles are staged into that legacy lane; the Rust lane receives FASTA
-only.
+Compare a query callset with a truth set:
 
 ```bash
-cargo build --release
-cd verification
-PATH="$PWD/../target/release:$PATH" nf-test test --ci tests/main.nf.test
+hap germline truth.vcf.gz query.vcf.gz \
+  --reference reference.fa \
+  --false-positives confident.bed \
+  --report-prefix results/sample
 ```
 
-See `verification/README.md` for the test matrix, comparison rules, and focused
-diagnostic runs.
+`hap` writes `results/sample.summary.csv` and
+`results/sample.extended.csv`. See the
+[quick start](https://adamrtalbot.github.io/hap.py/getting-started/quick-start/)
+for input requirements and output details.
 
-## Repository layout
+## Documentation
 
-- `Cargo.toml`: crate manifest and product/verification feature boundary
-- `rust/src/`: Rust implementation
-- `tests/`: integration tests and static fixtures
-- `verification/`: pinned legacy-to-Rust release gate
+The [documentation website](https://adamrtalbot.github.io/hap.py/) covers
+installation, each command, file formats, verification, and development.
+
+## License
+
+The Simplified BSD License covers `hap-rs`. See
+[`LICENSE.txt`](LICENSE.txt) and [`THIRD_PARTY_LICENSES/`](THIRD_PARTY_LICENSES/)
+for details.

@@ -1,0 +1,121 @@
+---
+title: hap-rs
+description: Haplotype-aware variant benchmarking in one native executable.
+template: doc
+tableOfContents: false
+head:
+  - tag: style
+    content: |
+      .content-panel:first-of-type { display: none !important; }
+      .main-pane { --sl-content-width: 68rem; }
+---
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+export const base = import.meta.env.BASE_URL.endsWith("/")
+  ? import.meta.env.BASE_URL
+  : `${import.meta.env.BASE_URL}/`;
+
+<div class="hero" role="banner">
+  <div class="hero-copy">
+    <p class="eyebrow">VARIANT BENCHMARKING</p>
+    <h1 id="_top">Benchmark small variants with hap-rs.</h1>
+    <p class="tagline">
+      Compare, normalize, quantify, and validate variant callsets with one
+      native Rust executable.
+    </p>
+    <div class="actions not-content">
+      <a class="primary" href={`${base}getting-started/quick-start/`}>Get started →</a>
+      <a class="secondary" href="https://github.com/adamrtalbot/hap.py">View on GitHub ↗</a>
+    </div>
+  </div>
+  <img src={`${base}favicon.svg`} alt="Two haplotype paths meeting at a variant" width="320" height="320" />
+</div>
+
+## Benefits
+
+<CardGrid stagger>
+  <Card title="One executable" icon="puzzle">
+    Run all six workflows without Python, C, C++, Java, or RTG at runtime.
+  </Card>
+  <Card title="Native engines" icon="seti:rust">
+    Run haplotype comparison, vcfeval, or somatic matching inside `hap`.
+  </Card>
+  <Card title="Compatible reports" icon="approve-check">
+    Keep the command options and report formats that existing workflows use.
+  </Card>
+  <Card title="Verification matrix" icon="rocket">
+    Check 153 cases across six commands against pinned hap.py tools.
+  </Card>
+</CardGrid>
+
+## Choose a tool
+
+<div class="command-grid not-content">
+  <a class="command-card" href={`${base}tools/germline/`}><strong>hap germline</strong>Haplotype-aware truth/query comparison.</a>
+  <a class="command-card" href={`${base}tools/somatic/`}><strong>hap somatic</strong>Allele-level somatic benchmarking.</a>
+  <a class="command-card" href={`${base}tools/pre/`}><strong>hap pre</strong>VCF normalization and transformation.</a>
+  <a class="command-card" href={`${base}tools/ftx/`}><strong>hap ftx</strong>Somatic feature extraction.</a>
+  <a class="command-card" href={`${base}tools/quantify/`}><strong>hap quantify</strong>Stratified metric generation.</a>
+  <a class="command-card" href={`${base}tools/validate/`}><strong>hap validate</strong>VCF and reference validation.</a>
+</div>
+
+## hap.py compatibility
+
+`hap-rs` reimplements the hap.py workflows in Rust. It keeps documented command
+aliases and report schemas and removes the Python, C++, Java, and RTG runtime
+dependencies. See the [quick start](./getting-started/quick-start/) and the
+[verification matrix](./project/verification/).
+
+<style>{`
+  .hero {
+    display: grid;
+    align-items: center;
+    gap: clamp(2rem, 6vw, 6rem);
+    padding-block: clamp(3rem, 9vw, 8rem);
+  }
+  .hero-copy { max-width: 44rem; }
+  .eyebrow {
+    margin: 0 0 1rem;
+    color: var(--sl-color-text-accent);
+    font-size: var(--sl-text-xs);
+    font-weight: 800;
+    letter-spacing: 0.18em;
+  }
+  .hero h1 {
+    margin: 0;
+    color: var(--sl-color-white);
+    font-size: clamp(2.7rem, 7vw, 5.6rem);
+    line-height: 0.98;
+    letter-spacing: -0.045em;
+  }
+  .tagline {
+    max-width: 40rem;
+    margin-block: 1.5rem 2rem;
+    color: var(--sl-color-gray-2);
+    font-size: clamp(1.1rem, 2vw, 1.4rem);
+  }
+  .hero > img {
+    width: min(70vw, 20rem);
+    height: auto;
+    margin-inline: auto;
+    border-radius: 25%;
+    box-shadow: 0 2rem 6rem color-mix(in srgb, var(--sl-color-accent) 25%, transparent);
+  }
+  .actions { display: flex; flex-wrap: wrap; gap: 0.8rem; }
+  .actions a {
+    border: 1px solid var(--sl-color-text-accent);
+    border-radius: 999px;
+    padding: 0.7rem 1.15rem;
+    font-weight: 700;
+    text-decoration: none;
+  }
+  .actions .primary { background: var(--sl-color-text-accent); color: var(--sl-color-black); }
+  .actions .secondary { color: var(--sl-color-white); }
+  .command-card { color: var(--sl-color-gray-2); text-decoration: none; transition: transform 120ms ease, border-color 120ms ease; }
+  .command-card:hover { transform: translateY(-2px); border-color: var(--sl-color-text-accent); }
+  @media (min-width: 53rem) {
+    .hero { grid-template-columns: minmax(0, 3fr) minmax(15rem, 1fr); }
+    .hero > img { order: 2; }
+  }
+`}</style>
