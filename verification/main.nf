@@ -79,7 +79,11 @@ workflow {
     // -----------------------------------------------------------------------
     if (cases.contains('happy')) {
         happy_rows = samples(params.happy_samplesheet) { row ->
-            def meta = [id: row.sample_id, case_name: 'happy']
+            def meta = [
+                id: row.sample_id,
+                case_name: 'happy',
+                strict_roc_order: (row.strict_roc_order ?: 'false').toString().toBoolean(),
+            ]
             def additionalStratificationBeds = (row.stratification_beds ?: '')
                 .toString()
                 .tokenize(';')

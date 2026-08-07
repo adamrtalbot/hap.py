@@ -1,0 +1,13 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100>
+##FILTER=<ID=LowQual,Description="Low quality">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TRUTH
+chr1	5	truth-60	A	G	60	PASS	.	GT	0/1
+chr1	17	truth-55	A	C	55	PASS	.	GT	0/1
+chr1	29	filtered-match	A	T	50	LowQual	.	GT	0/1
+chr1	41	filtered-only-45	A	C	45	LowQual	.	GT	0/1
+chr1	53	truth-40	A	G	40	PASS	.	GT	0/1
+chr1	65	truth-only-35	A	T	35	PASS	.	GT	0/1
+chr1	77	filtered-only-30	A	C	30	LowQual	.	GT	0/1
+chr1	89	truth-25	A	G	25	PASS	.	GT	0/1

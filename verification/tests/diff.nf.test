@@ -136,6 +136,38 @@ nextflow_process {
         }
     }
 
+    test("strict ROC contracts reject row and metrics table reordering") {
+
+        when {
+            process {
+                """
+                input[0] = Channel.of(tuple(
+                    [id: 'roc_order_strict', strict_roc_order: true],
+                    'happy',
+                    'result',
+                    [
+                        file("${projectDir}/tests/fixtures/diff/roc-order/legacy/result.roc.all.csv", checkIfExists: true),
+                        file("${projectDir}/tests/fixtures/diff/roc-order/legacy/result.metrics.json", checkIfExists: true),
+                    ],
+                    [
+                        file("${projectDir}/tests/fixtures/diff/roc-order/rust/result.roc.all.csv", checkIfExists: true),
+                        file("${projectDir}/tests/fixtures/diff/roc-order/rust/result.metrics.json", checkIfExists: true),
+                    ],
+                ))
+                """
+            }
+        }
+
+        then {
+            def comparison = new groovy.json.JsonSlurper().parse(new File(process.out.comparison[0][2]))
+            assert process.success
+            assert !comparison.ok
+            assert comparison.differences*.artifact as Set == ['result.metrics.json', 'result.roc.all.csv'] as Set
+            assert comparison.differences.find { it.artifact == 'result.roc.all.csv' }.reason == 'ordered ROC rows differ'
+            assert comparison.differences.find { it.artifact == 'result.metrics.json' }.reason == 'JSON values differ'
+        }
+    }
+
     test("rejects malformed and additional ROC rows") {
 
         when {
