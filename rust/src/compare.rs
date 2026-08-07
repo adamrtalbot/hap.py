@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -876,7 +875,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         do_roc: !args.no_roc,
         engine: args.engine.legacy_name(),
         engine_scmp_distance: args.engine_scmp_distance,
-        engine_vcfeval: &args.engine_vcfeval,
+        engine_vcfeval: args.engine_vcfeval.as_deref().unwrap_or("rtg"),
         engine_vcfeval_template: args.engine_vcfeval_template.as_deref(),
         filter_nonref: args.filter_nonref,
         filters_only: args.filters_only.as_deref(),
@@ -1097,113 +1096,22 @@ fn run_vcfeval(
         }
         strat_regions.push(format!("CONF_VARS:{}", padding_path.display()));
     }
-    let inferred_template = args
-        .reference
-        .strip_suffix(".fa")
-        .map(|stem| PathBuf::from(format!("{stem}.sdf")))
-        .filter(|path| path.is_dir());
-    let supplied_template = args
-        .engine_vcfeval_template
-        .as_deref()
-        .map(PathBuf::from)
-        .filter(|path| path.exists());
-    let template = if let Some(template) = supplied_template.or(inferred_template) {
-        template
-    } else {
-        let template = scratch.path().join("vcfeval-template.sdf");
-        let output = Command::new(&args.engine_vcfeval)
-            .arg("format")
-            .arg("-o")
-            .arg(&template)
-            .arg(&args.reference)
-            .output()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    anyhow::anyhow!(
-                        "Error running rtg tools: executable '{}' was not found",
-                        args.engine_vcfeval
-                    )
-                } else {
-                    anyhow::anyhow!(error)
-                }
-            })?;
-        if !output.status.success() {
-            bail!(
-                "Error running rtg tools. Return code was {}, output: {} / {}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        template
-    };
-
-    let output_dir = scratch.path().join("vcfeval.result");
-    let threads = args.threads.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-    });
-    let mut command = Command::new(&args.engine_vcfeval);
-    command
-        .arg("vcfeval")
-        .arg("-b")
-        .arg(truth_prep)
-        .arg("-c")
-        .arg(query_prep)
-        .arg("-t")
-        .arg(&template)
-        .arg("-o")
-        .arg(&output_dir)
-        .arg("-T")
-        .arg(threads.to_string())
-        .args(["-m", "ga4gh", "--ref-overlap"])
-        .arg(format!(
-            "--Xloose-match-distance={}",
-            args.engine_scmp_distance
-        ));
-    if !args.pass_only {
-        command.arg("--all-records");
-    }
-    if !args.roc.is_empty() {
-        command.arg("-f").arg(&args.roc);
-    }
-    let output = command.output().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            anyhow::anyhow!(
-                "Error running rtg tools / vcfeval: executable '{}' was not found",
-                args.engine_vcfeval
-            )
-        } else {
-            anyhow::anyhow!(error)
-        }
-    })?;
-    if !output.status.success() {
-        bail!(
-            "Error running rtg tools / vcfeval. Return code was {}, output: {} / {}",
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
+    if args.engine_vcfeval.is_some() || args.engine_vcfeval_template.is_some() {
+        eprintln!(
+            "warning: --engine-vcfeval-path and --engine-vcfeval-template are deprecated and ignored; --engine vcfeval is native Rust"
         );
     }
-    let vcfeval_vcf = output_dir.join("output.vcf.gz");
-    if !vcfeval_vcf.is_file() {
-        bail!(
-            "Error running rtg tools / vcfeval: expected output is absent: {}",
-            vcfeval_vcf.display()
-        );
-    }
-    if args.preserve_info {
-        // Pinned hap.py writes runinfo before preprocessing, reaches this
-        // point after RTG succeeds, then crashes while merging the original
-        // INFO fields back into the vcfeval output. The compact reference fails
-        // in the first bcftools merge; inputs that pass it hit the subsequent
-        // undefined `output_vcf` variable. Preserve that unconditional
-        // failure and its final pre-quantification artifact set.
-        let commandline = std::env::args().collect::<Vec<_>>().join(" ");
-        write_runinfo_for_args(args, explicit_bcf, prefix, &commandline)?;
-        bail!("vcfeval --preserve-info failed while restoring input INFO fields");
-    }
+    let vcfeval_vcf = scratch.path().join("vcfeval.comparison.vcf.gz");
+    crate::vcfeval::compare_files(
+        truth_prep,
+        query_prep,
+        Path::new(&args.reference),
+        crate::vcfeval::Options {
+            roc_field: &args.roc,
+            loose_match_distance: args.engine_scmp_distance,
+        },
+        &vcfeval_vcf,
+    )?;
     let roc_indices = crate::quantify::run_from_compare(
         crate::cli::QuantifyArgs {
             input_vcf: vcfeval_vcf.display().to_string(),
@@ -1233,7 +1141,11 @@ fn run_vcfeval(
             ci_alpha: args.ci_alpha,
             no_json: args.no_json,
         },
-        crate::quantify::CompareQuantifyMode::default(),
+        crate::quantify::CompareQuantifyMode {
+            inherit_same_position_tp_qq: true,
+            roc_value_from_qq: true,
+            ..Default::default()
+        },
     )?;
     if args.preserve_info || args.output_vtc {
         decorate_existing_comparison_vcf(
@@ -1458,7 +1370,7 @@ fn write_runinfo_for_args(
         do_roc: !args.no_roc,
         engine: args.engine.legacy_name(),
         engine_scmp_distance: args.engine_scmp_distance,
-        engine_vcfeval: &args.engine_vcfeval,
+        engine_vcfeval: args.engine_vcfeval.as_deref().unwrap_or("rtg"),
         engine_vcfeval_template: args.engine_vcfeval_template.as_deref(),
         filter_nonref: args.filter_nonref,
         filters_only: args.filters_only.as_deref(),
@@ -7928,8 +7840,8 @@ mod scratch_tests {
     }
 
     #[test]
-    fn missing_vcfeval_executable_has_a_legacy_style_failure() {
-        let root = test_root("vcfeval-missing");
+    fn vcfeval_ignores_deprecated_external_runtime_flags() {
+        let root = test_root("vcfeval-deprecated-flags");
         let mut options = CompareArgs::with_paths(
             fixture_path("truth.vcf").display().to_string(),
             fixture_path("query.vcf").display().to_string(),
@@ -7938,18 +7850,23 @@ mod scratch_tests {
         );
         options.scratch_prefix = Some(root.join("scratch").display().to_string());
         options.engine = CompareEngine::Vcfeval;
-        options.engine_vcfeval = "definitely-absent-rtg-for-test".to_string();
-        let error = run(options).unwrap_err().to_string();
-        assert!(error.contains("Error running rtg tools"), "{error}");
-        assert!(error.contains("was not found"), "{error}");
+        options.engine_vcfeval = Some("definitely-absent-rtg-for-test".to_string());
+        options.engine_vcfeval_template = Some(root.join("absent.sdf").display().to_string());
+        run(options).unwrap();
+        assert!(root.join("result.summary.csv").is_file());
+        let (_, records) = vcf::load_raw_vcf(&root.join("result.vcf.gz")).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0]
+                .samples
+                .iter()
+                .all(|sample| sample.contains(":TP:gm"))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn vcfeval_with_paired_bcf_inputs_keeps_vcf_handoff_and_publishes_bcf() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn native_vcfeval_with_paired_bcf_inputs_publishes_bcf_and_preserves_info() {
         let root = test_root("vcfeval-contract");
         let truth_bcf = root.join("truth.bcf");
         let query_bcf = root.join("query.bcf");
@@ -7960,55 +7877,14 @@ mod scratch_tests {
             let (headers, records) = vcf::load_raw_vcf(&source).unwrap();
             vcf::write_raw_vcf(destination, &headers, &records).unwrap();
         }
-        let ga4gh = root.join("ga4gh.vcf");
-        fs::write(
-            &ga4gh,
-            concat!(
-                "##fileformat=VCFv4.2\n",
-                "##contig=<ID=chr1,length=16>\n",
-                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n",
-                "##FORMAT=<ID=BD,Number=1,Type=String,Description=\"Decision\">\n",
-                "##FORMAT=<ID=BK,Number=1,Type=String,Description=\"Kind\">\n",
-                "##FORMAT=<ID=QQ,Number=1,Type=Float,Description=\"Quality\">\n",
-                "##INFO=<ID=IQQ,Number=1,Type=Float,Description=\"Quality\">\n",
-                "##INFO=<ID=ctype,Number=1,Type=String,Description=\"Comparison type\">\n",
-                "##INFO=<ID=gtt1,Number=1,Type=String,Description=\"Truth genotype type\">\n",
-                "##INFO=<ID=gtt2,Number=1,Type=String,Description=\"Query genotype type\">\n",
-                "##INFO=<ID=kind,Number=1,Type=String,Description=\"Match kind\">\n",
-                "##INFO=<ID=type,Number=1,Type=String,Description=\"Match type\">\n",
-                "##INFO=<ID=RegionsExtent,Number=1,Type=String,Description=\"Region extent\">\n",
-                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTRUTH\tQUERY\n",
-                "chr1\t5\t.\tG\tT\t60\tPASS\tBS=5\tGT:BD:BK:QQ\t1/1:TP:gm:60\t1/1:TP:gm:60\n",
-            ),
-        )
-        .unwrap();
-        let captured = root.join("rtg.args");
-        let fake_rtg = root.join("rtg");
-        fs::write(
-            &fake_rtg,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then out=\"$2\"; shift 2; else shift; fi\ndone\nmkdir -p \"$out\"\ngzip -c '{}' > \"$out/output.vcf.gz\"\n: > \"$out/output.vcf.gz.tbi\"\n",
-                captured.display(),
-                ga4gh.display(),
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&fake_rtg, fs::Permissions::from_mode(0o755)).unwrap();
-        let template = root.join("template.sdf");
-        fs::create_dir(&template).unwrap();
 
         let mut options = args(root.join("result"), &root.join("scratch"), false);
         options.truth = truth_bcf.display().to_string();
         options.query = query_bcf.display().to_string();
         options.engine = CompareEngine::Vcfeval;
-        options.engine_vcfeval = fake_rtg.display().to_string();
-        options.engine_vcfeval_template = Some(template.display().to_string());
         options.output_vtc = true;
         run(options).unwrap();
 
-        let invocation = fs::read_to_string(&captured).unwrap();
-        assert!(invocation.contains("truth.prep.vcf.gz"), "{invocation}");
-        assert!(invocation.contains("query.prep.vcf.gz"), "{invocation}");
         assert!(!root.join("result.vcf.gz").exists());
         let (headers, records) = vcf::load_raw_vcf(&root.join("result.bcf")).unwrap();
         assert!(headers.iter().any(|line| line.contains("ID=VTC,")));
@@ -8024,23 +7900,15 @@ mod scratch_tests {
         let preserve_scratch = root.join("preserve-scratch");
         let mut preserve = args(preserve_prefix.clone(), &preserve_scratch, false);
         preserve.engine = CompareEngine::Vcfeval;
-        preserve.engine_vcfeval = fake_rtg.display().to_string();
-        preserve.engine_vcfeval_template = Some(template.display().to_string());
         preserve.preserve_info = true;
-        let error = run(preserve).expect_err("pinned vcfeval --preserve-info crashes");
-        assert!(error.to_string().contains("vcfeval --preserve-info"));
-        let invocation = fs::read_to_string(&captured).unwrap();
-        assert!(invocation.contains("vcfeval"), "{invocation}");
+        run(preserve).unwrap();
         assert!(suffixed_report_path(&preserve_prefix, "runinfo.json").is_file());
-        for suffix in [
-            "summary.csv",
-            "extended.csv",
-            "vcf.gz",
-            "bcf",
-            "metrics.json.gz",
-        ] {
-            assert!(!suffixed_report_path(&preserve_prefix, suffix).exists());
+        for suffix in ["summary.csv", "extended.csv", "vcf.gz", "metrics.json.gz"] {
+            assert!(suffixed_report_path(&preserve_prefix, suffix).is_file());
         }
+        let (_, preserved_records) =
+            vcf::load_raw_vcf(&suffixed_report_path(&preserve_prefix, "vcf.gz")).unwrap();
+        assert_eq!(preserved_records.len(), 1);
         assert!(child_directories(&preserve_scratch).is_empty());
         fs::remove_dir_all(root).unwrap();
     }

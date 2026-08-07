@@ -46,6 +46,9 @@ pub struct MetricIndices {
 #[derive(Clone, Debug)]
 pub struct RocOptions {
     pub qq_field: String,
+    /// Optional FORMAT/INFO field used for thresholds while `qq_field`
+    /// remains the user-facing label in metrics and ROC tables.
+    pub score_field: Option<String>,
     pub ignored_filters: HashSet<String>,
     pub roc_regions: HashSet<String>,
     pub delta: f64,
@@ -70,6 +73,7 @@ impl Default for RocOptions {
     fn default() -> Self {
         Self {
             qq_field: "QUAL".to_string(),
+            score_field: None,
             ignored_filters: HashSet::new(),
             roc_regions: HashSet::from(["*".to_string()]),
             delta: 0.5,
@@ -2207,8 +2211,9 @@ fn emit_contributions_with_options<
     // record-level QUAL column would lose multi-allelic indels whose
     // xcmp output sets QUAL=0 while still writing the matched per-side
     // quality into FORMAT.QQ.
-    let truth_qq = truth.roc_value(&options.qq_field, fields[5], info);
-    let query_qq = query.roc_value(&options.qq_field, fields[5], info);
+    let score_field = options.score_field.as_deref().unwrap_or(&options.qq_field);
+    let truth_qq = truth.roc_value(score_field, fields[5], info);
+    let query_qq = query.roc_value(score_field, fields[5], info);
 
     let filter_tags = fields[6]
         .split(';')
@@ -3801,6 +3806,37 @@ mod tests {
                 "custom ROC fields need the same subtype sort snapshots as QUAL"
             );
         }
+    }
+
+    #[test]
+    fn roc_threshold_source_can_differ_from_reported_field() {
+        let row = annotated(
+            "chr1",
+            100,
+            "90",
+            "0/1:TP:gm:tv:SNP:het:90",
+            "0/1:TP:gm:tv:SNP:het:90",
+            "",
+            true,
+            None,
+        );
+        let options = RocOptions {
+            qq_field: "INFO.SCORE".to_string(),
+            score_field: Some("QQ".to_string()),
+            delta: 0.0,
+            ..RocOptions::default()
+        };
+
+        let groups = accumulate_with_options(&[row], &options);
+        let key = RowKey::new_with_qq_field("SNP", "*", "*", "ALL", "INFO.SCORE");
+        let rows = groups[&key].emit_with_delta(options.delta);
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.qq_str.as_str())
+                .collect::<Vec<_>>(),
+            vec!["*", "90.000000"]
+        );
     }
 
     #[test]

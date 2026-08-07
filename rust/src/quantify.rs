@@ -111,6 +111,8 @@ pub(crate) fn run_with_metric_indices(args: QuantifyArgs) -> Result<roc::MetricI
 pub(crate) struct CompareQuantifyMode {
     pub preserve_missing_query_qq: bool,
     pub preserve_missing_nocall_bd: bool,
+    pub inherit_same_position_tp_qq: bool,
+    pub roc_value_from_qq: bool,
 }
 
 pub(crate) fn run_from_compare(
@@ -182,6 +184,7 @@ fn run_with_metric_indices_mode(
         annotation_type,
         benchmark_samples,
         mode.preserve_missing_query_qq,
+        mode.inherit_same_position_tp_qq,
     );
     for record in &mut records {
         decorate_quantified_record_for_samples(
@@ -359,6 +362,7 @@ fn run_with_metric_indices_mode(
     rows.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
     let roc_options = roc::RocOptions {
         qq_field: args.roc.clone(),
+        score_field: mode.roc_value_from_qq.then(|| "QQ".to_string()),
         ignored_filters: args
             .roc_filter
             .as_deref()
@@ -844,6 +848,7 @@ fn propagate_superlocus_annotations(records: &mut [RawVcfRecord], annotation_typ
         annotation_type,
         BenchmarkSamples::POSITIONAL,
         false,
+        false,
     );
 }
 
@@ -852,6 +857,7 @@ fn propagate_superlocus_annotations_for_samples(
     annotation_type: &str,
     samples: BenchmarkSamples,
     preserve_missing_query_qq: bool,
+    inherit_same_position_tp_qq: bool,
 ) {
     let mut start = 0usize;
     while start < records.len() {
@@ -901,6 +907,7 @@ fn propagate_superlocus_annotations_for_samples(
                 &mut records[start..end],
                 samples,
                 preserve_missing_query_qq,
+                inherit_same_position_tp_qq,
             );
         }
         start = end;
@@ -1315,7 +1322,31 @@ fn propagate_ga4gh_superlocus_for_samples(
     records: &mut [RawVcfRecord],
     samples: BenchmarkSamples,
     preserve_missing_query_qq: bool,
+    inherit_same_position_tp_qq: bool,
 ) {
+    let mut same_position_tp_qq = BTreeMap::<usize, String>::new();
+    if let Some(query_index) = samples.query {
+        for record in records.iter() {
+            let query = record.sample_map(query_index);
+            let Some(score) = (query.get("BD").map(String::as_str) == Some("TP"))
+                .then(|| query.get("QQ").cloned())
+                .flatten()
+                .filter(|score| {
+                    score != "." && score.parse::<f64>().is_ok_and(|value| value.is_finite())
+                })
+            else {
+                continue;
+            };
+            same_position_tp_qq
+                .entry(record.pos)
+                .and_modify(|current| {
+                    if score.parse::<f64>().unwrap() < current.parse::<f64>().unwrap() {
+                        *current = score.clone();
+                    }
+                })
+                .or_insert(score);
+        }
+    }
     let minimum_tp_qq = records
         .iter()
         .filter_map(|record| {
@@ -1339,15 +1370,21 @@ fn propagate_ga4gh_superlocus_for_samples(
         .collect::<BTreeSet<_>>();
 
     for record in records {
-        if let Some(query) = samples.query {
-            let query_qq = record.sample_map(query).get("QQ").cloned();
-            if !preserve_missing_query_qq && query_qq.as_deref().is_none_or(|value| value == ".") {
-                set_format_value(record, query, "QQ", "0");
-            }
-        }
         let truth_tp = samples.truth.is_some_and(|truth| {
             record.sample_map(truth).get("BD").map(String::as_str) == Some("TP")
         });
+        if let Some(query) = samples.query {
+            let query_sample = record.sample_map(query);
+            let query_qq = query_sample.get("QQ").cloned();
+            if !preserve_missing_query_qq && query_qq.as_deref().is_none_or(|value| value == ".") {
+                let inherited = (truth_tp && inherit_same_position_tp_qq)
+                    .then(|| same_position_tp_qq.get(&record.pos))
+                    .flatten()
+                    .map(String::as_str)
+                    .unwrap_or("0");
+                set_format_value(record, query, "QQ", inherited);
+            }
+        }
         let query = samples
             .query
             .map(|query| record.sample_map(query))
@@ -3656,6 +3693,7 @@ mod tests {
             std::slice::from_mut(&mut record),
             BenchmarkSamples::POSITIONAL,
             false,
+            false,
         );
         assert_eq!(
             record.sample_map(1).get("QQ").map(String::as_str),
@@ -3684,6 +3722,7 @@ mod tests {
             std::slice::from_mut(&mut somatic_record),
             BenchmarkSamples::POSITIONAL,
             true,
+            false,
         );
         assert_eq!(
             somatic_record.sample_map(1).get("QQ").map(String::as_str),

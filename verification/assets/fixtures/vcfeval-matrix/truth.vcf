@@ -1,0 +1,15 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrV,length=120>
+##FILTER=<ID=PASS,Description="All filters passed">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TRUTH
+chrV	5	.	A	C	60	PASS	.	GT	1/1
+chrV	10	.	A	G	50	PASS	.	GT	0/1
+chrV	20	.	A	C	40	PASS	.	GT	1/1
+chrV	40	.	A	T	30	PASS	.	GT	0/1
+chrV	70	.	A	AA	55	PASS	.	GT	1/1
+chrV	80	.	AC	GT	45	PASS	.	GT	0/1
+chrV	90	.	A	C	35	PASS	.	GT	1/1
+chrV	95	.	A	C,G	25	PASS	.	GT	1/2
+chrV	105	.	A	<DEL>	20	PASS	END=107	GT	1/1

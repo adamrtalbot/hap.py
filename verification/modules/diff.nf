@@ -52,9 +52,12 @@ process DIFF_OUTPUTS {
         '/uname',
         '/metadata/required/version',
         '/metadata/required/description',
+        '/final_args/engine_vcfeval_template',
     }
     volatile_csv_columns = {'sompyversion', 'sompycmd'}
-    volatile_vcf_header = re.compile(r'^##bcftools_[^=]*(?:Command|Version)=')
+    volatile_vcf_header = re.compile(
+        r'^(?:##bcftools_[^=]*(?:Command|Version)=|##fileDate=|##source=)'
+    )
 
     def normalize_json(value, pointer=''):
         if isinstance(value, dict):

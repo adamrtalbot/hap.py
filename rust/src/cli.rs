@@ -242,8 +242,8 @@ pub struct CompareArgs {
     #[arg(long = "engine", value_enum, default_value_t = CompareEngine::Xcmp)]
     pub engine: CompareEngine,
 
-    #[arg(long = "engine-vcfeval-path", default_value = "rtg")]
-    pub engine_vcfeval: String,
+    #[arg(long = "engine-vcfeval-path")]
+    pub engine_vcfeval: Option<String>,
 
     #[arg(long = "engine-vcfeval-template")]
     pub engine_vcfeval_template: Option<String>,
@@ -359,7 +359,7 @@ impl CompareArgs {
             max_enum: 16_768,
             hb_expand: 30,
             engine: CompareEngine::Xcmp,
-            engine_vcfeval: "rtg".to_string(),
+            engine_vcfeval: None,
             engine_vcfeval_template: None,
             engine_scmp_distance: 30,
             force_interactive: false,
@@ -1888,7 +1888,7 @@ mod tests {
             panic!("germline should parse");
         };
         assert_eq!(args.engine, CompareEngine::Vcfeval);
-        assert_eq!(args.engine_vcfeval, "custom-rtg");
+        assert_eq!(args.engine_vcfeval.as_deref(), Some("custom-rtg"));
         assert_eq!(
             args.engine_vcfeval_template.as_deref(),
             Some("template.sdf")

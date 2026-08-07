@@ -17,3 +17,4 @@ pub mod strelka;
 pub mod validate;
 pub mod variant_pipeline;
 pub mod vcf;
+pub mod vcfeval;

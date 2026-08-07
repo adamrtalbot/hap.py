@@ -17,7 +17,7 @@
 
 nextflow.enable.dsl = 2
 
-include { HAPPY_LEGACY ; HAPPY_RUST } from './modules/happy'
+include { HAPPY_LEGACY ; HAPPY_RUST ; HAPPY_RUST_CONTRACT } from './modules/happy'
 include { SOMPY_LEGACY ; SOMPY_RUST } from './modules/sompy'
 include { PREPY_LEGACY ; PREPY_RUST } from './modules/prepy'
 include { FTXPY_LEGACY ; FTXPY_RUST } from './modules/ftxpy'
@@ -78,7 +78,7 @@ workflow {
     // happy: hap.py germline comparison
     // -----------------------------------------------------------------------
     if (cases.contains('happy')) {
-        happy_in = samples(params.happy_samplesheet) { row ->
+        happy_rows = samples(params.happy_samplesheet) { row ->
             def meta = [id: row.sample_id, case_name: 'happy']
             def stratificationFiles = [row.stratification_tsv, row.stratification_bed]
                 .findAll { path -> path }
@@ -94,12 +94,45 @@ workflow {
                 fixture(row.fp_bed),
                 fixtureIndexes(row.fp_bed),
                 stratificationFiles,
+                row.reference_sdf ? [fixture(row.reference_sdf)] : [],
                 (row.args ?: '').toString(),
             )
         }
 
-        HAPPY_LEGACY(happy_in)
-        HAPPY_RUST(happy_in)
+        happy_legacy_in = happy_rows.map { meta, truth, truthIndexes, query, queryIndexes, reference, referenceFai, fpBed, fpIndexes, stratificationFiles, referenceSdf, args ->
+            tuple(
+                meta,
+                truth,
+                truthIndexes,
+                query,
+                queryIndexes,
+                reference,
+                referenceFai,
+                fpBed,
+                fpIndexes,
+                stratificationFiles,
+                referenceSdf,
+                args,
+            )
+        }
+        happy_rust_in = happy_rows.map { meta, truth, truthIndexes, query, queryIndexes, reference, referenceFai, fpBed, fpIndexes, stratificationFiles, _referenceSdf, args ->
+            tuple(
+                meta,
+                truth,
+                truthIndexes,
+                query,
+                queryIndexes,
+                reference,
+                referenceFai,
+                fpBed,
+                fpIndexes,
+                stratificationFiles,
+                args,
+            )
+        }
+
+        HAPPY_LEGACY(happy_legacy_in)
+        HAPPY_RUST(happy_rust_in)
 
         happy_pair = HAPPY_LEGACY.out.outputs
             .join(HAPPY_RUST.out.outputs, by: 0)
@@ -108,6 +141,33 @@ workflow {
             }
         DIFF_HAPPY(happy_pair)
         statuses = statuses.mix(DIFF_HAPPY.out.comparison)
+
+        happy_contracts = channel.of(
+            tuple(
+                [id: 'matrix_vcfeval_deprecated_flags', case_name: 'happy'],
+                fixture('local:assets/fixtures/vcfeval-matrix/truth.vcf'),
+                fixture('local:assets/fixtures/vcfeval-matrix/query.vcf'),
+                fixture('local:assets/fixtures/vcfeval-matrix/ref.fa'),
+                fixture('local:assets/fixtures/vcfeval-matrix/ref.fa.fai'),
+                fixture('local:assets/fixtures/vcfeval-matrix/confident.bed'),
+                fixture('local:scripts/validate_vcfeval_contract.py'),
+                '--engine vcfeval --no-leftshift -D --no-adjust-conf-regions --engine-vcfeval-path /definitely/missing/rtg --engine-vcfeval-template /definitely/missing/template.sdf',
+                'deprecated_flags',
+            ),
+            tuple(
+                [id: 'matrix_vcfeval_preserve_info', case_name: 'happy'],
+                fixture('local:assets/fixtures/vcfeval-matrix/truth.vcf'),
+                fixture('local:assets/fixtures/vcfeval-matrix/query.vcf'),
+                fixture('local:assets/fixtures/vcfeval-matrix/ref.fa'),
+                fixture('local:assets/fixtures/vcfeval-matrix/ref.fa.fai'),
+                fixture('local:assets/fixtures/vcfeval-matrix/confident.bed'),
+                fixture('local:scripts/validate_vcfeval_contract.py'),
+                '--engine vcfeval --no-leftshift -D --no-adjust-conf-regions --preserve-info',
+                'preserve_info',
+            ),
+        )
+        HAPPY_RUST_CONTRACT(happy_contracts)
+        statuses = statuses.mix(HAPPY_RUST_CONTRACT.out.comparison)
     }
 
     // -----------------------------------------------------------------------

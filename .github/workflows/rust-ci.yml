@@ -37,9 +37,6 @@ jobs:
   nextflow-parity:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    defaults:
-      run:
-        shell: bash -el {0}
     env:
       HAP_BIN: ${{ github.workspace }}/target/release/hap
       NXF_SYNTAX_PARSER: v2
@@ -57,17 +54,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Install pinned RTG Tools
-        uses: mamba-org/setup-micromamba@v2
-        with:
-          environment-name: parity
-          create-args: >-
-            rtg-tools=3.12.1=hdfd78af_1
-          condarc: |
-            channels:
-              - conda-forge
-              - bioconda
 
       - name: Install indexed-VCF query tools
         run: |
@@ -89,7 +75,6 @@ jobs:
         run: |
           nextflow -version | grep 'version 26.04.6'
           nf-test version | grep 'nf-test 0.9.5'
-          rtg version | grep '3.12.1'
 
       - name: Build release binary
         run: |

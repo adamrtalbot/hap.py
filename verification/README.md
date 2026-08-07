@@ -24,15 +24,7 @@ or expected output to conceal one.
 
 ## Run
 
-Build the Rust binary and make it available on `PATH`. The full matrix also
-requires RTG Tools 3.12.1-1 for the real `--engine vcfeval` case; for example:
-
-```bash
-micromamba create -n hap-parity -c conda-forge -c bioconda rtg-tools=3.12.1=hdfd78af_1
-micromamba activate hap-parity
-```
-
-Then run the gate:
+Build the Rust binary, make it available on `PATH`, then run the gate:
 
 ```bash
 cargo build --release
@@ -48,6 +40,13 @@ PATH="../target/release:$PATH" HAP_TEST_CASES=sompy nf-test test --ci tests/main
 
 CI must run all six lanes. A narrowed run is diagnostic only.
 
+`--engine vcfeval` uses two deliberately different reference inputs in this
+gate. The pinned legacy image receives a committed RTG Tools 3.12.1 SDF
+`.tar.gz` bundle from the samplesheet's `reference_sdf` column. The Rust
+process receives only the corresponding FASTA. No host RTG or Java runtime is
+used by the product implementation. Bundle checksums and generation provenance
+are recorded beside each fixture.
+
 ## Comparison rules
 
 The comparator is embedded in `modules/diff.nf`. It requires equal artifact
@@ -55,8 +54,10 @@ sets, compares ordered text and CSV content, recursively compares typed JSON,
 and records a structured difference containing the lane, case, artifact, and
 location. The only ignored fields are global runtime/provenance metadata:
 
-- JSON version, timestamp, command-line, and generated description fields.
+- JSON version, timestamp, command-line, generated description fields, and the
+  deprecated vcfeval template argument that native Rust intentionally ignores.
 - CSV columns named `sompyversion` and `sompycmd`.
+- VCF runtime headers such as source, date, and bcftools command/version.
 
 These exclusions are global rather than case-specific. All remaining content
 must match exactly. The resulting `verification.json` is the authoritative

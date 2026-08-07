@@ -1,0 +1,18 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrV,length=120>
+##FILTER=<ID=PASS,Description="All filters passed">
+##FILTER=<ID=LowQual,Description="Low quality call">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position">
+##INFO=<ID=SCORE,Number=1,Type=Float,Description="Custom ROC score">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	QUERY
+chrV	5	.	A	C	60	PASS	SCORE=106	GT	1/1
+chrV	10	.	A	G	50	PASS	SCORE=105	GT	1/1
+chrV	23	.	A	G	40	PASS	SCORE=104	GT	1/1
+chrV	60	.	A	T	30	PASS	SCORE=103	GT	0/1
+chrV	71	.	A	AA	55	PASS	SCORE=102	GT	1/1
+chrV	80	.	A	G	45	PASS	SCORE=101	GT	0/1
+chrV	81	.	C	T	45	PASS	SCORE=100	GT	0/1
+chrV	90	.	A	C	35	LowQual	SCORE=99	GT	1/1
+chrV	95	.	A	C,G	25	PASS	SCORE=98	GT	1/2
+chrV	105	.	A	<DEL>	20	PASS	END=107;SCORE=97	GT	1/1
