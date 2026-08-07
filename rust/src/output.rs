@@ -1,10 +1,9 @@
 //! Transactional publication for complete command output generations.
 
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::hash::{Hash, Hasher};
 #[cfg(unix)]
 use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
@@ -414,17 +413,24 @@ fn validate_plan<'a>(
     inputs: &[PathBuf],
     outputs: impl IntoIterator<Item = &'a PathBuf>,
 ) -> Result<()> {
-    let input_keys = inputs
-        .iter()
-        .map(|p| Ok((p, resolved_path(p)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut seen = BTreeMap::<PathBuf, &Path>::new();
+    let mut input_keys = HashMap::<PathBuf, &Path>::new();
+    let mut input_ids = HashMap::<ExistingFileId, &Path>::new();
+    for input in inputs {
+        input_keys.entry(resolved_path(input)?).or_insert(input);
+        if let Some(identity) = existing_file_id(input) {
+            input_ids.entry(identity).or_insert(input);
+        }
+    }
+    let mut seen_keys = HashMap::<PathBuf, &Path>::new();
+    let mut seen_ids = HashMap::<ExistingFileId, &Path>::new();
     for output in outputs {
         validate_destination_type(output)?;
         let key = resolved_path(output)?;
-        if let Some(first) = seen
-            .iter()
-            .find_map(|(k, p)| (k == &key || same_existing_file(p, output)).then_some(*p))
+        let identity = existing_file_id(output);
+        if let Some(first) = seen_keys
+            .get(&key)
+            .copied()
+            .or_else(|| identity.and_then(|identity| seen_ids.get(&identity).copied()))
         {
             bail!(
                 "output destinations must use distinct paths: {} and {} refer to the same file",
@@ -432,9 +438,10 @@ fn validate_plan<'a>(
                 output.display()
             );
         }
-        if let Some((input, _)) = input_keys
-            .iter()
-            .find(|(p, k)| **k == key || same_existing_file(p, output))
+        if let Some(input) = input_keys
+            .get(&key)
+            .copied()
+            .or_else(|| identity.and_then(|identity| input_ids.get(&identity).copied()))
         {
             bail!(
                 "output {} would overwrite input {}",
@@ -442,7 +449,10 @@ fn validate_plan<'a>(
                 input.display()
             );
         }
-        seen.insert(key, output);
+        seen_keys.insert(key, output);
+        if let Some(identity) = identity {
+            seen_ids.insert(identity, output);
+        }
     }
     Ok(())
 }
@@ -460,17 +470,19 @@ fn validate_destination_type(path: &Path) -> Result<()> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ExistingFileId(u64, u64);
+
 #[cfg(unix)]
-fn same_existing_file(left: &Path, right: &Path) -> bool {
+fn existing_file_id(path: &Path) -> Option<ExistingFileId> {
     use std::os::unix::fs::MetadataExt;
-    match (fs::metadata(left), fs::metadata(right)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
-    }
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| ExistingFileId(metadata.dev(), metadata.ino()))
 }
 #[cfg(not(unix))]
-fn same_existing_file(_: &Path, _: &Path) -> bool {
-    false
+fn existing_file_id(_: &Path) -> Option<ExistingFileId> {
+    None
 }
 
 fn anchored_path(path: &Path) -> Result<PathBuf> {
@@ -606,11 +618,11 @@ fn append_suffix(prefix: &Path, suffix: &OsStr) -> PathBuf {
 }
 
 struct PublicationLocks {
-    files: Vec<File>,
+    file: File,
     _process_guard: MutexGuard<'static, ()>,
 }
 impl PublicationLocks {
-    fn acquire(destinations: &[PathBuf]) -> Result<Self> {
+    fn acquire(_destinations: &[PathBuf]) -> Result<Self> {
         let process_guard = PUBLICATION_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -621,39 +633,24 @@ impl PublicationLocks {
                 directory.display()
             )
         })?;
-        let mut coordinates = BTreeSet::new();
-        for destination in destinations {
-            coordinates.insert(resolved_path(destination)?);
-            coordinates.insert(anchored_path(destination)?);
-        }
-        let mut files = Vec::new();
-        for coordinate in coordinates {
-            let mut hasher = std::hash::DefaultHasher::new();
-            coordinate.hash(&mut hasher);
-            let path = directory.join(format!("{:016x}.lock", hasher.finish()));
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
-                .with_context(|| format!("failed to open publication lock {}", path.display()))?;
-            file.lock().with_context(|| {
-                format!("failed to lock output destination {}", coordinate.display())
-            })?;
-            files.push(file);
-        }
+        let path = directory.join("global.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open publication lock {}", path.display()))?;
+        file.lock().context("failed to lock output publication")?;
         Ok(Self {
-            files,
+            file,
             _process_guard: process_guard,
         })
     }
 }
 impl Drop for PublicationLocks {
     fn drop(&mut self) {
-        for file in self.files.iter().rev() {
-            let _ = file.unlock();
-        }
+        let _ = self.file.unlock();
     }
 }
 

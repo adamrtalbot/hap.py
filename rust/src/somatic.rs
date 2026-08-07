@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// pinned reference container resolves this to `"som.py-"` (trailing hyphen with
 /// nothing after). We reproduce the exact literal so stats.csv byte-matches.
 const SOM_VERSION: &str = "som.py-";
-const MAX_AF_BINS: usize = 10_000;
+const MAX_AF_BINS: usize = 100;
 const STATS_TYPE_ROWS: [(usize, &str); 4] =
     [(0, "indels"), (1, "SNVs"), (6, "MNPs"), (7, "others")];
 static SOMATIC_SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
@@ -4394,7 +4394,7 @@ mod tests {
             validate_args(&tiny)
                 .unwrap_err()
                 .to_string()
-                .contains("more than 10000 bins")
+                .contains("more than 100 bins")
         );
 
         assert!(parse_af_bins("0").unwrap().is_empty());

@@ -1247,4 +1247,39 @@ mod tests {
         assert_eq!(fs::read_to_string(index)?, "old-csi");
         Ok(())
     }
+
+    #[test]
+    fn injected_bcf_operations_preserve_generation_and_cleanup() -> Result<()> {
+        let directory = tempdir()?;
+        let output = directory.path().join("preserve.bcf");
+        let index = output.with_extension("bcf.csi");
+        let headers = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##contig=<ID=chr1,length=10>".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO".to_string(),
+        ];
+        let record = RawVcfRecord::from_line("chr1\t1\t.\tA\tC\t.\tPASS\t.", Path::new("in.vcf"))?;
+        for operation in [
+            FailureOperation::Writer,
+            FailureOperation::Encoder,
+            FailureOperation::Index,
+        ] {
+            fs::write(&output, "old-bcf")?;
+            fs::write(&index, "old-csi")?;
+            crate::output::set_failure_operation(Some(operation));
+            let error = write(&output, &headers, std::slice::from_ref(&record))
+                .expect_err("injected BCF operation must fail");
+            crate::output::set_failure_operation(None);
+            let logical = if operation == FailureOperation::Index {
+                &index
+            } else {
+                &output
+            };
+            assert!(error.to_string().contains(&logical.display().to_string()));
+            assert_eq!(fs::read_to_string(&output)?, "old-bcf");
+            assert_eq!(fs::read_to_string(&index)?, "old-csi");
+            assert_eq!(fs::read_dir(directory.path())?.count(), 2);
+        }
+        Ok(())
+    }
 }

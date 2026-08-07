@@ -3027,6 +3027,32 @@ fn write_optional_gzip_csv(path: &Path, header: &str, rows: &[String]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::{FailureOperation, OutputTransaction, set_failure_operation};
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn injected_roc_operations_preserve_generation_and_cleanup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("report.roc.all.csv.gz");
+
+        for operation in [FailureOperation::Writer, FailureOperation::Encoder] {
+            fs::write(&output, "old-roc")?;
+            let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [&output])?;
+            let staged = transaction.staged_file(&output)?.to_path_buf();
+            set_failure_operation(Some(operation));
+            let result = write_gzip_csv(&staged, "header", &["row".to_string()])
+                .with_context(|| format!("failed to write ROC table {}", output.display()));
+            set_failure_operation(None);
+            let error = result.expect_err("injected ROC operation must fail");
+            drop(transaction);
+
+            assert!(error.to_string().contains(&output.display().to_string()));
+            assert_eq!(fs::read_to_string(&output)?, "old-roc");
+            assert_eq!(fs::read_dir(directory.path())?.count(), 1);
+        }
+        Ok(())
+    }
 
     #[test]
     fn half_call_is_not_counted_as_heterozygous_in_roc_stats() {

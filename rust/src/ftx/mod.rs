@@ -518,6 +518,7 @@ fn pad_normalized_allele(mut variant: RefVar, reference: &[u8]) -> RefVar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::{FailureOperation, set_failure_operation};
     use std::thread;
 
     fn args(input: &Path, reference: &Path) -> FtxArgs {
@@ -564,6 +565,33 @@ mod tests {
 
         assert!(!first_path.exists());
         assert!(!second_path.exists());
+    }
+
+    #[test]
+    fn injected_csv_writer_preserves_generation_and_cleanup() -> Result<()> {
+        let (scratch, input, reference) = fixture(
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\nchr1\t1\t.\tA\tC\t60\tPASS\t.\n",
+            ">chr1\nAAAA\n",
+        );
+        let output = scratch.path().join("features.csv");
+        fs::write(&output, "old-csv")?;
+        let mut arguments = args(&input, &reference);
+        arguments.output = output.to_string_lossy().into_owned();
+
+        set_failure_operation(Some(FailureOperation::Writer));
+        let error = run(arguments).expect_err("injected CSV writer operation must fail");
+        set_failure_operation(None);
+
+        assert!(error.to_string().contains(&output.display().to_string()));
+        assert_eq!(fs::read_to_string(&output)?, "old-csv");
+        assert!(fs::read_dir(scratch.path())?.all(|entry| {
+            !entry
+                .expect("scratch entry must be readable")
+                .file_name()
+                .to_string_lossy()
+                .contains("hap-rs")
+        }));
+        Ok(())
     }
 
     #[test]
