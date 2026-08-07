@@ -233,8 +233,10 @@ fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, Annotate
     let xcmp_ctype = match fields.next() {
         Some(".") | None => None,
         Some("simple:match") => Some("simple:match"),
+        Some("simple:mismatch") => Some("simple:mismatch"),
         Some("hap:match") => Some("hap:match"),
         Some("hap:mismatch") => Some("hap:mismatch"),
+        Some("hapfail:mismatch") => Some("hapfail:mismatch"),
         Some(value) => bail!("comparison spool contains unknown XCMP context {value}"),
     };
     let xcmp_hap_match = fields.next() == Some("1");

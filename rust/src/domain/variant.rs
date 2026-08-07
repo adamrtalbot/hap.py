@@ -13,15 +13,3 @@ pub(crate) struct RawVcfRecord {
     pub(crate) format: Option<String>,
     pub(crate) samples: Vec<String>,
 }
-
-impl RawVcfRecord {
-    pub(crate) fn sample_values_contain(&self, needle: &str) -> bool {
-        self.samples.iter().any(|sample| sample.contains(needle))
-    }
-
-    pub(crate) fn replace_sample_values(&mut self, from: &str, to: &str) {
-        for sample in &mut self.samples {
-            *sample = sample.replace(from, to);
-        }
-    }
-}

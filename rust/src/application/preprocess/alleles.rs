@@ -2,7 +2,7 @@
 
 use super::genotype::{bcf_encoded_gt, project_split_ad, project_split_genotype, remap_gt};
 use super::options::SymbolicDeletionMaterialization;
-use crate::cli_compat::cli::{PreprocessArgs, SomaticGtMode};
+use crate::application::{PreprocessArgs, SomaticGtMode};
 use crate::domain::RawVcfRecord;
 use anyhow::{Result, bail};
 use std::collections::BTreeSet;

@@ -1,16 +1,13 @@
 //! Extracted cohesive responsibility from the command façade.
 
-use super::{
-    AnnotatedRow, Cluster, Side, Variant, comparison_info, fp_class_from_bk, genotype_label,
-    query_type_rank,
-};
+use super::genotype::parse_gt_alleles;
+use super::{AnnotatedRow, Cluster, SPLIT_LEFT_SHIFT_WINDOW, Side, Variant, fp_class_from_bk};
 use crate::adapters::vcf::VariantKey;
 use crate::domain::{ComparisonRecord, RawVcfRecord};
 use crate::engines::partial_credit;
 use std::collections::BTreeSet;
 
-fn comparison_record(
-    variant: &Variant,
+struct ComparisonRecordFields {
     reference: String,
     alternate: String,
     quality: String,
@@ -18,18 +15,134 @@ fn comparison_record(
     info: String,
     truth_sample: String,
     query_sample: String,
-) -> ComparisonRecord {
+}
+
+/// Returns the distinct non-reference allele strings selected by the GT.
+pub(super) fn gt_selected_nonref_alts(variant: &Variant) -> BTreeSet<String> {
+    let alts = variant.key.alt_allele.split(',').collect::<Vec<_>>();
+    parse_gt_alleles(&variant.gt)
+        .into_iter()
+        .filter(|index| *index > 0)
+        .filter_map(|index| alts.get(index - 1).copied())
+        .filter(|alt| !alt.is_empty() && *alt != "." && *alt != "*")
+        .map(str::to_string)
+        .collect()
+}
+
+/// Computes the left-shifted representation for a trimmed primitive.
+pub(super) fn compute_shift_target(
+    pos: usize,
+    ref_allele: &str,
+    alt_allele: &str,
+    bases: &[u8],
+    pos_min: usize,
+) -> (usize, String, String) {
+    if pos == 0 || ref_allele.is_empty() || pos + ref_allele.len() - 1 > bases.len() {
+        return (pos, ref_allele.to_string(), alt_allele.to_string());
+    }
+    let mut variant = partial_credit::RefVar {
+        start: pos,
+        end: pos + ref_allele.len() - 1,
+        alt: alt_allele.to_string(),
+    };
+    partial_credit::left_shift(bases, &mut variant, pos_min.max(1), true);
+    let ref_start = variant.start.saturating_sub(1);
+    let ref_end = variant.end;
+    if ref_end < ref_start || ref_end > bases.len() || variant.start < 1 {
+        return (pos, ref_allele.to_string(), alt_allele.to_string());
+    }
+    let shifted_reference = bases[ref_start..ref_end]
+        .iter()
+        .map(|base| base.to_ascii_uppercase() as char)
+        .collect::<String>();
+    if shifted_reference.is_empty() {
+        return (pos, ref_allele.to_string(), alt_allele.to_string());
+    }
+    (variant.start, shifted_reference, variant.alt)
+}
+
+/// Splits same-anchor insertions only when shifting creates a truth-orphaned
+/// primitive while another primitive remains represented at the source locus.
+pub(super) fn try_split_same_anchor_via_shift(
+    chrom: &str,
+    variant_pos: usize,
+    trimmed: &[(usize, String, String)],
+    bases: &[u8],
+    pos_min: usize,
+    cluster_truth: &[Variant],
+    cluster_neighbors: &[Variant],
+) -> Option<Vec<(usize, String, String)>> {
+    if trimmed.len() < 2
+        || !trimmed
+            .iter()
+            .all(|(_, reference, alternate)| reference.len() == 1 && alternate.len() > 1)
+    {
+        return None;
+    }
+
+    let neighbor_floor = cluster_neighbors
+        .iter()
+        .filter(|neighbor| neighbor.key.pos != variant_pos)
+        .map(|neighbor| neighbor.key.pos)
+        .max();
+    let effective_pos_min = neighbor_floor.map_or(pos_min, |floor| pos_min.max(floor));
+    let shifted = trimmed
+        .iter()
+        .map(|(pos, reference, alternate)| {
+            compute_shift_target(*pos, reference, alternate, bases, effective_pos_min)
+        })
+        .collect::<Vec<_>>();
+    let first_anchor = (shifted[0].0, shifted[0].1.as_str());
+    if shifted
+        .iter()
+        .all(|(pos, reference, _)| (*pos, reference.as_str()) == first_anchor)
+    {
+        return None;
+    }
+
+    let truth_contains = |pos: usize, reference: &str, alternate: &str| {
+        cluster_truth.iter().any(|truth| {
+            truth.key.chrom == chrom
+                && truth.key.pos == pos
+                && truth.key.ref_allele == reference
+                && truth
+                    .key
+                    .alt_allele
+                    .split(',')
+                    .any(|candidate| candidate == alternate)
+        })
+    };
+    if !trimmed
+        .iter()
+        .any(|(pos, reference, alternate)| truth_contains(*pos, reference, alternate))
+    {
+        return None;
+    }
+    if shifted
+        .iter()
+        .zip(trimmed)
+        .any(|((pos, reference, alternate), original)| {
+            (*pos != original.0 || *reference != original.1)
+                && truth_contains(*pos, reference, alternate)
+        })
+    {
+        return None;
+    }
+    Some(shifted)
+}
+
+fn comparison_record(variant: &Variant, fields: ComparisonRecordFields) -> ComparisonRecord {
     RawVcfRecord {
         chrom: variant.key.chrom.clone(),
         pos: variant.key.pos,
         id: ".".to_string(),
-        ref_allele: reference,
-        alt_allele: alternate,
-        qual: quality,
-        filter,
-        info,
+        ref_allele: fields.reference,
+        alt_allele: fields.alternate,
+        qual: fields.quality,
+        filter: fields.filter,
+        info: fields.info,
         format: Some("GT:BD:BK:BI:BVT:BLT:QQ".to_string()),
-        samples: vec![truth_sample, query_sample],
+        samples: vec![fields.truth_sample, fields.query_sample],
     }
     .into()
 }
@@ -64,25 +177,27 @@ pub(super) fn tp_combined_row(
         xcmp_hap_match: false,
         record: comparison_record(
             truth,
-            display_ref(truth, reference),
-            display_alt(truth),
-            combined_record_qual(truth, query).to_string(),
-            filter_for_output(&query.filter).to_string(),
-            format!("BS={block_start}{regions}"),
-            format!(
-                "{}:TP:gm:{info}:{}:{}:{}",
-                truth.gt,
-                truth.primary_type(),
-                genotype_label(truth),
-                query.qual
-            ),
-            format!(
-                "{}:TP:gm:{info}:{}:{}:{}",
-                query.gt,
-                truth.primary_type(),
-                genotype_label(query),
-                query.qual
-            ),
+            ComparisonRecordFields {
+                reference: display_ref(truth, reference),
+                alternate: display_alt(truth),
+                quality: combined_record_qual(truth, query).to_string(),
+                filter: filter_for_output(&query.filter).to_string(),
+                info: format!("BS={block_start}{regions}"),
+                truth_sample: format!(
+                    "{}:TP:gm:{info}:{}:{}:{}",
+                    truth.gt,
+                    truth.primary_type(),
+                    genotype_label(truth),
+                    query.qual
+                ),
+                query_sample: format!(
+                    "{}:TP:gm:{info}:{}:{}:{}",
+                    query.gt,
+                    truth.primary_type(),
+                    genotype_label(query),
+                    query.qual
+                ),
+            },
         ),
     }
 }
@@ -110,24 +225,26 @@ pub(super) fn unk_combined_row(
         xcmp_hap_match: false,
         record: comparison_record(
             truth,
-            display_ref(truth, reference),
-            display_alt(truth),
-            combined_record_qual(truth, query).to_string(),
-            filter_for_output(&query.filter).to_string(),
-            format!("BS={block_start}{regions}"),
-            format!(
-                "{}:UNK:lm:{info}:{}:{}:.",
-                truth.gt,
-                truth.primary_type(),
-                genotype_label(truth)
-            ),
-            format!(
-                "{}:UNK:lm:{info}:{}:{}:{}",
-                query.gt,
-                truth.primary_type(),
-                genotype_label(query),
-                query.qual
-            ),
+            ComparisonRecordFields {
+                reference: display_ref(truth, reference),
+                alternate: display_alt(truth),
+                quality: combined_record_qual(truth, query).to_string(),
+                filter: filter_for_output(&query.filter).to_string(),
+                info: format!("BS={block_start}{regions}"),
+                truth_sample: format!(
+                    "{}:UNK:lm:{info}:{}:{}:.",
+                    truth.gt,
+                    truth.primary_type(),
+                    genotype_label(truth)
+                ),
+                query_sample: format!(
+                    "{}:UNK:lm:{info}:{}:{}:{}",
+                    query.gt,
+                    truth.primary_type(),
+                    genotype_label(query),
+                    query.qual
+                ),
+            },
         ),
     }
 }
@@ -211,19 +328,21 @@ pub(super) fn tp_single_side_row(
             xcmp_hap_match: false,
             record: comparison_record(
                 variant,
-                display_ref(variant, reference),
-                display_alt(variant),
-                variant.qual.clone(),
-                truth_filter.to_string(),
-                format!("BS={block_start}{regions}"),
-                format!(
-                    "{}:TP:gm:{info}:{}:{}:{}",
-                    variant.gt,
-                    variant.primary_type(),
-                    genotype_label(variant),
-                    shared_qq.unwrap_or(variant.qual.as_str())
-                ),
-                "./.:.:.:.:NOCALL:nocall:0".to_string(),
+                ComparisonRecordFields {
+                    reference: display_ref(variant, reference),
+                    alternate: display_alt(variant),
+                    quality: variant.qual.clone(),
+                    filter: truth_filter.to_string(),
+                    info: format!("BS={block_start}{regions}"),
+                    truth_sample: format!(
+                        "{}:TP:gm:{info}:{}:{}:{}",
+                        variant.gt,
+                        variant.primary_type(),
+                        genotype_label(variant),
+                        shared_qq.unwrap_or(variant.qual.as_str())
+                    ),
+                    query_sample: "./.:.:.:.:NOCALL:nocall:0".to_string(),
+                },
             ),
         },
         Side::Query => AnnotatedRow {
@@ -242,19 +361,21 @@ pub(super) fn tp_single_side_row(
             xcmp_hap_match: false,
             record: comparison_record(
                 variant,
-                display_ref(variant, reference),
-                display_alt(variant),
-                variant.qual.clone(),
-                filter_for_output(&variant.filter).to_string(),
-                format!("BS={block_start}{regions}"),
-                "./.:.:.:.:NOCALL:nocall:.".to_string(),
-                format!(
-                    "{}:TP:gm:{info}:{}:{}:{}",
-                    variant.gt,
-                    variant.primary_type(),
-                    genotype_label(variant),
-                    variant.qual
-                ),
+                ComparisonRecordFields {
+                    reference: display_ref(variant, reference),
+                    alternate: display_alt(variant),
+                    quality: variant.qual.clone(),
+                    filter: filter_for_output(&variant.filter).to_string(),
+                    info: format!("BS={block_start}{regions}"),
+                    truth_sample: "./.:.:.:.:NOCALL:nocall:.".to_string(),
+                    query_sample: format!(
+                        "{}:TP:gm:{info}:{}:{}:{}",
+                        variant.gt,
+                        variant.primary_type(),
+                        genotype_label(variant),
+                        variant.qual
+                    ),
+                },
             ),
         },
     }
@@ -309,24 +430,26 @@ pub(super) fn fn_fp_combined_row(
         xcmp_hap_match: false,
         record: comparison_record(
             truth,
-            display_ref(truth, reference),
-            display_alt(truth),
-            combined_record_qual(truth, query).to_string(),
-            filter_for_output(&query.filter).to_string(),
-            format!("BS={block_start}{regions}"),
-            format!(
-                "{}:{truth_bd}:{bk}:{truth_info}:{}:{}:.",
-                truth.gt,
-                truth.primary_type(),
-                genotype_label(truth)
-            ),
-            format!(
-                "{}:{query_bd}:{bk}:{query_info}:{}:{}:{}",
-                query.gt,
-                truth.primary_type(),
-                genotype_label(query),
-                query.qual
-            ),
+            ComparisonRecordFields {
+                reference: display_ref(truth, reference),
+                alternate: display_alt(truth),
+                quality: combined_record_qual(truth, query).to_string(),
+                filter: filter_for_output(&query.filter).to_string(),
+                info: format!("BS={block_start}{regions}"),
+                truth_sample: format!(
+                    "{}:{truth_bd}:{bk}:{truth_info}:{}:{}:.",
+                    truth.gt,
+                    truth.primary_type(),
+                    genotype_label(truth)
+                ),
+                query_sample: format!(
+                    "{}:{query_bd}:{bk}:{query_info}:{}:{}:{}",
+                    query.gt,
+                    truth.primary_type(),
+                    genotype_label(query),
+                    query.qual
+                ),
+            },
         ),
     }
 }
@@ -350,18 +473,20 @@ pub(super) fn fn_row(
         xcmp_hap_match: false,
         record: comparison_record(
             truth,
-            display_ref(truth, reference),
-            display_alt(truth),
-            truth.qual.clone(),
-            ".".to_string(),
-            format!("BS={block_start}{regions}"),
-            format!(
-                "{}:FN:{bk}:{info}:{}:{}:.",
-                truth.gt,
-                truth.primary_type(),
-                genotype_label(truth)
-            ),
-            "./.:.:.:.:NOCALL:nocall:0".to_string(),
+            ComparisonRecordFields {
+                reference: display_ref(truth, reference),
+                alternate: display_alt(truth),
+                quality: truth.qual.clone(),
+                filter: ".".to_string(),
+                info: format!("BS={block_start}{regions}"),
+                truth_sample: format!(
+                    "{}:FN:{bk}:{info}:{}:{}:.",
+                    truth.gt,
+                    truth.primary_type(),
+                    genotype_label(truth)
+                ),
+                query_sample: "./.:.:.:.:NOCALL:nocall:0".to_string(),
+            },
         ),
     }
 }
@@ -390,18 +515,20 @@ pub(super) fn unk_truth_row(
         xcmp_hap_match: false,
         record: comparison_record(
             truth,
-            display_ref(truth, reference),
-            display_alt(truth),
-            truth.qual.clone(),
-            ".".to_string(),
-            format!("BS={block_start}{regions}"),
-            format!(
-                "{}:UNK:{bk}:{info}:{}:{}:.",
-                truth.gt,
-                truth.primary_type(),
-                genotype_label(truth)
-            ),
-            "./.:.:.:.:NOCALL:nocall:0".to_string(),
+            ComparisonRecordFields {
+                reference: display_ref(truth, reference),
+                alternate: display_alt(truth),
+                quality: truth.qual.clone(),
+                filter: ".".to_string(),
+                info: format!("BS={block_start}{regions}"),
+                truth_sample: format!(
+                    "{}:UNK:{bk}:{info}:{}:{}:.",
+                    truth.gt,
+                    truth.primary_type(),
+                    genotype_label(truth)
+                ),
+                query_sample: "./.:.:.:.:NOCALL:nocall:0".to_string(),
+            },
         ),
     }
 }
@@ -795,19 +922,21 @@ pub(super) fn fp_like_row(
         xcmp_hap_match: false,
         record: comparison_record(
             query,
-            display_ref(query, reference),
-            display_alt(query),
-            query.qual.clone(),
-            filter_for_output(&query.filter).to_string(),
-            format!("BS={block_start}{regions}"),
-            "./.:.:.:.:NOCALL:nocall:.".to_string(),
-            format!(
-                "{}:{bd}:{bk}:{info}:{}:{}:{}",
-                query.gt,
-                query.primary_type(),
-                genotype_label(query),
-                query.qual
-            ),
+            ComparisonRecordFields {
+                reference: display_ref(query, reference),
+                alternate: display_alt(query),
+                quality: query.qual.clone(),
+                filter: filter_for_output(&query.filter).to_string(),
+                info: format!("BS={block_start}{regions}"),
+                truth_sample: "./.:.:.:.:NOCALL:nocall:.".to_string(),
+                query_sample: format!(
+                    "{}:{bd}:{bk}:{info}:{}:{}:{}",
+                    query.gt,
+                    query.primary_type(),
+                    genotype_label(query),
+                    query.qual
+                ),
+            },
         ),
     }
 }

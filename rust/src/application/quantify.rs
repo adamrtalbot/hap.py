@@ -1,9 +1,10 @@
-use crate::adapters::metrics_json;
-use crate::adapters::report::{self, suffixed_report_path};
-use crate::adapters::vcf::{self, ValidatedVcf, ValidatedVcfRecord};
+use crate::adapters::report::suffixed_report_path;
+use crate::adapters::vcf::{
+    ValidatedVcf, ValidatedVcfRecord, open_validated_vcf, write_validated_vcf_iter,
+};
 use crate::application::roc_publication;
 use crate::application::{QuantifyArgs, ValidatedQuantifyArgs};
-use crate::domain::{AnnotatedRow, CountsBucket, Interval, RawVcfRecord, TypeCounts};
+use crate::domain::{AnnotatedRow, Interval, RawVcfRecord, TypeCounts};
 use crate::engines::roc;
 use crate::output::{OutputTransaction, benchmark_artifacts, stratification_inputs};
 use anyhow::{Context, Result, bail};
@@ -254,7 +255,7 @@ fn run_with_metric_indices_inner(
                 );
             }
             require_quantifier_index(&path)?;
-            let input = vcf::open_validated_vcf(&path)?;
+            let input = open_validated_vcf(&path)?;
             (input.headers().to_vec(), Box::new(input))
         }
         QuantifySource::Records(records) => {
@@ -314,7 +315,7 @@ fn run_with_metric_indices_inner(
         })
         .unwrap_or_default();
 
-    for record in vcf::open_validated_vcf(transformed.path())? {
+    for record in open_validated_vcf(transformed.path())? {
         let record = record?;
         let truth = benchmark_samples
             .truth
@@ -422,13 +423,13 @@ fn run_with_metric_indices_inner(
                 );
             }
         }
-        vcf::write_validated_vcf_iter(
+        write_validated_vcf_iter(
             &output_vcf,
             &headers,
-            vcf::open_validated_vcf(transformed.path())?,
+            open_validated_vcf(transformed.path())?,
         )?;
     }
-    let rows = vcf::open_validated_vcf(transformed.path())?
+    let rows = open_validated_vcf(transformed.path())?
         .enumerate()
         .filter_map(|(index, record)| match record {
             Err(error) => Some(Err(error)),

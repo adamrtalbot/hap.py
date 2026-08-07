@@ -12,27 +12,42 @@ use super::{
     LEGACY_MIN_BLOCK_VARIANTS,
 };
 use crate::adapters::vcf::{self, ValidatedVcfRecord};
-use crate::cli_compat::cli::{PreprocessArgs, SomaticGtMode};
-use crate::domain::{Interval, RawVcfRecord};
+use crate::application::{PreprocessArgs, SomaticGtMode};
+use crate::domain::Interval;
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+
+pub(super) struct BlocksplitObservationParams<'a> {
+    pub(super) args: &'a PreprocessArgs,
+    pub(super) fixchr: bool,
+    pub(super) normalization_enabled: bool,
+    pub(super) somatic_mode: Option<SomaticGtMode>,
+    pub(super) somatic_sample_names: Option<&'a [String]>,
+    pub(super) reference_sequences: &'a BTreeMap<String, String>,
+    pub(super) regions: Option<&'a [Interval]>,
+    pub(super) targets: Option<&'a [Interval]>,
+    pub(super) locations: Option<&'a [vcf::LocationFilter]>,
+}
 
 pub(super) fn collect_blocksplit_observations<I>(
     records: I,
-    args: &PreprocessArgs,
-    fixchr: bool,
-    normalization_enabled: bool,
-    somatic_mode: Option<SomaticGtMode>,
-    somatic_sample_names: Option<&[String]>,
-    reference_sequences: &std::collections::BTreeMap<String, String>,
-    regions: Option<&[Interval]>,
-    targets: Option<&[Interval]>,
-    locations: Option<&[vcf::LocationFilter]>,
+    params: BlocksplitObservationParams<'_>,
 ) -> Result<Vec<BlocksplitObservation>>
 where
     I: IntoIterator<Item = Result<ValidatedVcfRecord>>,
 {
+    let BlocksplitObservationParams {
+        args,
+        fixchr,
+        normalization_enabled,
+        somatic_mode,
+        somatic_sample_names,
+        reference_sequences,
+        regions,
+        targets,
+        locations,
+    } = params;
     let input_path = Path::new(&args.input);
     let mut observations = Vec::new();
     let mut normalized_seen = HashSet::new();

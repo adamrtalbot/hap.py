@@ -1,7 +1,7 @@
 //! Cohesive preprocessing responsibility.
 
 use crate::adapters::vcf;
-use crate::cli_compat::cli::{PreprocessArgs, PreprocessGender};
+use crate::application::{PreprocessArgs, PreprocessGender};
 use crate::domain::RawVcfRecord;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
@@ -305,7 +305,8 @@ pub(crate) fn infer_gender(path: &Path) -> Result<PreprocessGender> {
     let mut haploid_x = false;
     let mut diploid_x = false;
     for record in records {
-        observe_gender(&record?, &mut haploid_x, &mut diploid_x);
+        let record = record?;
+        observe_gender(record.raw(), &mut haploid_x, &mut diploid_x);
     }
     Ok(if haploid_x && !diploid_x {
         PreprocessGender::Male

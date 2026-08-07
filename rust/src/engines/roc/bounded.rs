@@ -41,40 +41,40 @@ const MAX_ROC_METRIC_INDEX_KEYS: usize = 500_000;
 
 /// Write `roc.all` and each non-empty Locations ROC file alongside `prefix`.
 #[derive(Clone, Debug, Default)]
-pub struct MetricIndices {
-    pub tables: BTreeMap<String, Vec<usize>>,
+pub(crate) struct MetricIndices {
+    pub(crate) tables: BTreeMap<String, Vec<usize>>,
     /// Table order produced by Python 2.7's insertion-ordered hash table
     /// iteration in `happyroc.roc`. This is data-dependent because location
     /// tables are inserted when their first raw ROC row is encountered.
-    pub table_order: Vec<String>,
+    pub(crate) table_order: Vec<String>,
 }
 
 /// Controls inherited from qfy's ROC command line.  The default deliberately
 /// remains identical to the historical hap.py invocation.
 #[derive(Clone, Debug)]
-pub struct RocOptions {
-    pub qq_field: String,
+pub(crate) struct RocOptions {
+    pub(crate) qq_field: String,
     /// Optional FORMAT/INFO field used for thresholds while `qq_field`
     /// remains the user-facing label in metrics and ROC tables.
-    pub score_field: Option<String>,
-    pub ignored_filters: HashSet<String>,
-    pub roc_regions: HashSet<String>,
-    pub delta: f64,
-    pub ci_alpha: f64,
+    pub(crate) score_field: Option<String>,
+    pub(crate) ignored_filters: HashSet<String>,
+    pub(crate) roc_regions: HashSet<String>,
+    pub(crate) delta: f64,
+    pub(crate) ci_alpha: f64,
     /// Preserve qfy's private C++ quantifier table. Legacy qfy removes this
     /// intermediate unless `--verbose` is active.
-    pub preserve_raw_table: bool,
+    pub(crate) preserve_raw_table: bool,
     /// Include threshold rows in the private table. This follows qfy's
     /// `--roc`/`--no-roc` switch independently of the public compacting pass.
-    pub output_rocs: bool,
+    pub(crate) output_rocs: bool,
     /// Full N-trimmed FASTA size used by the legacy TS_boundary lane.
     /// `None` preserves the historical caller contract where `subset_size`
     /// is also the complete reference size.
-    pub whole_reference_size: Option<usize>,
+    pub(crate) whole_reference_size: Option<usize>,
     /// Per-user-named stratification interval-union sizes.
-    pub subset_sizes: BTreeMap<String, usize>,
+    pub(crate) subset_sizes: BTreeMap<String, usize>,
     /// Per-named-subset intersection with the confidence regions.
-    pub subset_confidence_sizes: BTreeMap<String, usize>,
+    pub(crate) subset_confidence_sizes: BTreeMap<String, usize>,
 }
 
 impl Default for RocOptions {
@@ -97,7 +97,8 @@ impl Default for RocOptions {
 
 /// Write ROC artifacts and return the original pandas row indices used by
 /// legacy qfy's metrics JSON tables.
-pub fn write_roc_files(
+#[cfg(test)]
+fn write_roc_files(
     prefix: &Path,
     rows: &[AnnotatedRow],
     subset_size: usize,
@@ -107,7 +108,8 @@ pub fn write_roc_files(
 }
 
 /// Write ROC artifacts with the qfy controls supplied by the caller.
-pub fn write_roc_files_with_options(
+#[cfg(test)]
+fn write_roc_files_with_options(
     prefix: &Path,
     rows: &[AnnotatedRow],
     subset_size: usize,
@@ -123,7 +125,7 @@ pub fn write_roc_files_with_options(
     )
 }
 
-pub fn write_roc_files_with_options_iter<I, R>(
+pub(crate) fn write_roc_files_with_options_iter<I, R>(
     prefix: &Path,
     rows: I,
     subset_size: usize,
@@ -499,7 +501,10 @@ fn build_metric_indices(
                 next += 1;
             }
         }
-        tables.insert(id.to_string(), indices_for_lines(lines.lines()?, &local)?);
+        tables.insert(
+            id.to_string(),
+            indices_for_lines(lines.lines()?.map(|line| line.map_err(Into::into)), &local)?,
+        );
     }
     for (id, lines, ty) in rows.selective {
         let mut local = BTreeMap::new();
@@ -518,7 +523,10 @@ fn build_metric_indices(
                 next += 1;
             }
         }
-        tables.insert(id.clone(), indices_for_lines(lines.lines()?, &local)?);
+        tables.insert(
+            id.clone(),
+            indices_for_lines(lines.lines()?.map(|line| line.map_err(Into::into)), &local)?,
+        );
     }
     Ok(MetricIndices {
         tables,
@@ -1415,10 +1423,10 @@ impl ObservationStore {
             record,
         });
         self.next_serial += 1;
-        if self.buffer.len() >= ROC_OBSERVATION_CHUNK {
-            if let Err(error) = self.flush_chunk() {
-                self.error.get_or_insert_with(|| error.to_string());
-            }
+        if self.buffer.len() >= ROC_OBSERVATION_CHUNK
+            && let Err(error) = self.flush_chunk()
+        {
+            self.error.get_or_insert_with(|| error.to_string());
         }
     }
 
@@ -1891,10 +1899,12 @@ impl SubstatSnapshotCursor {
 
 enum EmittedRows {
     Memory(std::vec::IntoIter<EmittedRow>),
-    Disk {
-        baseline: Option<EmittedRow>,
-        merge: EmittedRowMerge,
-    },
+    Disk(Box<DiskEmittedRows>),
+}
+
+struct DiskEmittedRows {
+    baseline: Option<EmittedRow>,
+    merge: EmittedRowMerge,
 }
 
 impl Iterator for EmittedRows {
@@ -1903,7 +1913,7 @@ impl Iterator for EmittedRows {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Memory(rows) => rows.next().map(Ok),
-            Self::Disk { baseline, merge } => baseline.take().map(Ok).or_else(|| merge.next()),
+            Self::Disk(rows) => rows.baseline.take().map(Ok).or_else(|| rows.merge.next()),
         }
     }
 }
@@ -2312,7 +2322,10 @@ impl BoundedGroupAccum {
         my_subtype: &str,
         delta: f64,
     ) -> Result<EmittedRows> {
-        Ok(self.emit_internal(Some(shared_sorted), Some(my_subtype), delta))
+        Ok(EmittedRows::Memory(
+            self.emit_internal(Some(shared_sorted), Some(my_subtype), delta)
+                .into_iter(),
+        ))
     }
 
     fn emit_internal(
@@ -2698,14 +2711,14 @@ impl BoundedGroupAccum {
         if let Some(entry) = current {
             emit_level(entry.0, entry.1)?;
         }
-        Ok(EmittedRows::Disk {
+        Ok(EmittedRows::Disk(Box::new(DiskEmittedRows {
             baseline: Some(EmittedRow {
                 qq_str: "*".to_string(),
                 cum: self.baseline.clone(),
                 substats: None,
             }),
             merge: numeric_rows.finish()?,
-        })
+        })))
     }
 }
 
@@ -3842,11 +3855,7 @@ fn render_rows(
             key.subset.clone(),
             key.filter.clone(),
         )) {
-            EmittedRows::Memory(
-                accum
-                    .emit_with_shared_sort_and_delta(shared, &key.subtype, config.delta)?
-                    .into_iter(),
-            )
+            accum.emit_with_shared_sort_and_delta(shared, &key.subtype, config.delta)?
         } else {
             accum.stream_with_delta(config.delta)?
         };
@@ -4102,18 +4111,18 @@ pub(crate) fn jeffreys_interval(x: usize, n: usize, alpha: f64) -> (f64, f64) {
         return (0.0, 1.0);
     }
     let lower = if x == n {
-        crate::cephes::legacy_pow(alpha / 2.0, 1.0 / n as f64)
+        crate::domain::cephes::legacy_pow(alpha / 2.0, 1.0 / n as f64)
     } else if x <= 1 {
         0.0
     } else {
-        crate::cephes::incbi(x as f64 + 0.5, (n - x) as f64 + 0.5, alpha / 2.0)
+        crate::domain::cephes::incbi(x as f64 + 0.5, (n - x) as f64 + 0.5, alpha / 2.0)
     };
     let upper = if x == 0 {
-        1.0 - crate::cephes::legacy_pow(alpha / 2.0, 1.0 / n as f64)
+        1.0 - crate::domain::cephes::legacy_pow(alpha / 2.0, 1.0 / n as f64)
     } else if x >= n - 1 {
         1.0
     } else {
-        crate::cephes::incbi(x as f64 + 0.5, (n - x) as f64 + 0.5, 1.0 - alpha / 2.0)
+        crate::domain::cephes::incbi(x as f64 + 0.5, (n - x) as f64 + 0.5, 1.0 - alpha / 2.0)
     };
     (lower.max(0.0), upper.min(1.0))
 }
@@ -4987,7 +4996,13 @@ mod tests {
             true,
             None,
         );
-        first.line = first.line.replace("BS=1", "BS=1;SCORE=10.0");
+        first
+            .record
+            .try_update(|record| {
+                record.info = record.info.replace("BS=1", "BS=1;SCORE=10.0");
+                Ok(())
+            })
+            .unwrap();
         let mut second = annotated(
             "chr1",
             200,
@@ -4998,7 +5013,13 @@ mod tests {
             true,
             None,
         );
-        second.line = second.line.replace("BS=1", "BS=1;SCORE=10.4");
+        second
+            .record
+            .try_update(|record| {
+                record.info = record.info.replace("BS=1", "BS=1;SCORE=10.4");
+                Ok(())
+            })
+            .unwrap();
         let options = RocOptions {
             qq_field: "SCORE".to_string(),
             delta: 0.0,

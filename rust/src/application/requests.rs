@@ -33,7 +33,11 @@ impl RequestValidationError {
 
 impl fmt::Display for RequestValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "invalid {}: {}", self.field, self.message)
+        let field = match self.field {
+            "ci_alpha" => "ci-alpha",
+            field => field,
+        };
+        write!(formatter, "invalid {field}: {}", self.message)
     }
 }
 
@@ -54,7 +58,7 @@ impl<T> Deref for Validated<T> {
 
 impl<T> Validated<T> {
     /// Transfers a validated request into its owning application use case.
-    pub(in crate::application) fn into_inner(self) -> T {
+    pub(crate) fn into_inner(self) -> T {
         self.0
     }
 }
@@ -271,21 +275,7 @@ impl CompareArgs {
 
     pub(crate) fn validated(self) -> Result<ValidatedCompareArgs, RequestValidationError> {
         self.validate()?;
-        let output_plan = OutputPlan::new(
-            &self.report_prefix,
-            self.write_counts && !self.no_write_counts,
-            !self.no_json,
-            Some(if self.bcf {
-                VariantOutputFormat::Bcf
-            } else {
-                VariantOutputFormat::Vcf
-            }),
-        )
-        .map_err(|error| RequestValidationError::new("report_prefix", error.to_string()))?;
-        Ok(ValidatedCompareArgs {
-            values: self,
-            output_plan,
-        })
+        Ok(ValidatedCompareArgs { values: self })
     }
 
     #[cfg(test)]
@@ -365,24 +355,10 @@ impl CompareArgs {
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedCompareArgs {
     values: CompareArgs,
-    output_plan: OutputPlan,
 }
 
 impl ValidatedCompareArgs {
-    pub(crate) fn output_plan(&self) -> &OutputPlan {
-        &self.output_plan
-    }
-
-    pub(crate) fn try_update(
-        self,
-        update: impl FnOnce(&mut CompareArgs),
-    ) -> Result<Self, RequestValidationError> {
-        let mut values = self.values;
-        update(&mut values);
-        values.validated()
-    }
-
-    pub(in crate::application) fn into_inner(self) -> CompareArgs {
+    pub(crate) fn into_inner(self) -> CompareArgs {
         self.values
     }
 }
@@ -430,7 +406,7 @@ pub(crate) struct PreprocessArgs {
 }
 
 impl PreprocessArgs {
-    pub(crate) fn validate(&self) -> ValidationResult {
+    fn validate_common(&self) -> ValidationResult {
         require_text(&self.input, "input")?;
         require_text(&self.output, "output")?;
         require_optional_text(self.reference.as_deref(), "reference")?;
@@ -438,6 +414,11 @@ impl PreprocessArgs {
         require_optional_text(self.targets_bedfile.as_deref(), "targets_bedfile")?;
         require_optional_text(self.logfile.as_deref(), "logfile")?;
         require_threads(self.threads)?;
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self) -> ValidationResult {
+        self.validate_common()?;
         if !self.bcf
             && Path::new(&self.output)
                 .extension()
@@ -454,6 +435,14 @@ impl PreprocessArgs {
 
     pub(crate) fn validated(self) -> Result<ValidatedPreprocessArgs, RequestValidationError> {
         self.validate()?;
+        Ok(Validated(self))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validated_with_legacy_plain_vcf(
+        self,
+    ) -> Result<ValidatedPreprocessArgs, RequestValidationError> {
+        self.validate_common()?;
         Ok(Validated(self))
     }
 }
@@ -515,7 +504,7 @@ impl QuantifyArgs {
         {
             return Err(RequestValidationError::new(
                 "report_prefix",
-                "would overwrite the quantifier input",
+                "cannot overwrite input VCF",
             ));
         }
         require_optional_text(self.fp_bedfile.as_deref(), "fp_bedfile")?;
@@ -547,37 +536,7 @@ impl QuantifyArgs {
 
     pub(crate) fn validated(self) -> Result<ValidatedQuantifyArgs, RequestValidationError> {
         self.validate()?;
-        let input = Some(self.input_vcf.clone().into());
-        self.finish_validation(input)
-    }
-
-    pub(crate) fn validated_for_records(
-        self,
-    ) -> Result<ValidatedQuantifyArgs, RequestValidationError> {
-        self.validate_options()?;
-        self.finish_validation(None)
-    }
-
-    fn finish_validation(
-        self,
-        input: Option<std::path::PathBuf>,
-    ) -> Result<ValidatedQuantifyArgs, RequestValidationError> {
-        let output_plan = OutputPlan::new(
-            &self.report_prefix,
-            self.write_counts,
-            !self.no_json,
-            self.write_vcf.then_some(if self.bcf {
-                VariantOutputFormat::Bcf
-            } else {
-                VariantOutputFormat::Vcf
-            }),
-        )
-        .map_err(|error| RequestValidationError::new("report_prefix", error.to_string()))?;
-        Ok(ValidatedQuantifyArgs {
-            values: self,
-            input,
-            output_plan,
-        })
+        Ok(ValidatedQuantifyArgs { values: self })
     }
 }
 
@@ -607,10 +566,6 @@ pub(crate) struct SomaticArgs {
     pub(crate) normalize_all: bool,
     pub(crate) fixchr_truth: Option<bool>,
     pub(crate) fixchr_query: Option<bool>,
-    #[allow(dead_code, reason = "retained for legacy fixture compatibility")]
-    pub(crate) fix_chr_truth: Option<bool>,
-    #[allow(dead_code, reason = "retained for legacy fixture compatibility")]
-    pub(crate) fix_chr_query: Option<bool>,
     pub(crate) no_fixchr_truth: bool,
     pub(crate) no_fixchr_query: bool,
     pub(crate) no_order_check: bool,
@@ -795,34 +750,13 @@ pub(crate) type ValidatedSomaticArgs = Validated<SomaticArgs>;
 pub(crate) type ValidatedFtxArgs = Validated<FtxArgs>;
 pub(crate) type ValidatedValidateArgs = Validated<ValidateArgs>;
 
-impl Validated<SomaticArgs> {
-    pub(crate) fn try_update(
-        self,
-        update: impl FnOnce(&mut SomaticArgs),
-    ) -> Result<Self, RequestValidationError> {
-        let mut values = self.0;
-        update(&mut values);
-        values.validated()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedQuantifyArgs {
     values: QuantifyArgs,
-    input: Option<std::path::PathBuf>,
-    output_plan: OutputPlan,
 }
 
 impl ValidatedQuantifyArgs {
-    pub(crate) fn output_plan(&self) -> OutputPlan {
-        self.output_plan.clone()
-    }
-
-    pub(crate) fn input_path(&self) -> Option<&Path> {
-        self.input.as_deref()
-    }
-
-    pub(in crate::application) fn into_inner(self) -> QuantifyArgs {
+    pub(crate) fn into_inner(self) -> QuantifyArgs {
         self.values
     }
 }

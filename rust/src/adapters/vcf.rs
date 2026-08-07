@@ -1,6 +1,5 @@
-use crate::domain::{
-    Allele, GenomicCoordinate, GenomicPosition, Genotype, Interval, QueryProvenance, RawVcfRecord,
-};
+pub(crate) use crate::domain::ValidatedVcfRecord;
+use crate::domain::{Interval, QueryProvenance, RawVcfRecord};
 use crate::output::{FailureOperation, OutputTransaction, fail_operation};
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
@@ -166,50 +165,17 @@ fn alt_type_matches_ref(ref_allele: &str, alt_alleles: &str) -> bool {
         .all(|alt| alt != "." && !alt.starts_with('<') && alt.len() == ref_len)
 }
 
-/// A VCF/BCF record translated into checked domain values at the file adapter.
-///
-/// The original representation remains private so it can be rendered without
-/// losing header-dependent fields, while comparison code consumes coordinates,
-/// alleles, genotypes, and provenance through validated accessors.
-#[derive(Clone, Debug)]
-pub(crate) struct ValidatedVcfRecord {
-    raw: RawVcfRecord,
-    coordinate: GenomicCoordinate,
-    reference: Allele,
-    alternates: Vec<Allele>,
-    genotypes: Vec<Option<Genotype>>,
-    provenance: QueryProvenance,
-}
-
-#[derive(Clone, Debug)]
-struct ValidatedRecordFacts {
-    coordinate: GenomicCoordinate,
-    reference: Allele,
-    alternates: Vec<Allele>,
-    genotypes: Vec<Option<Genotype>>,
-    provenance: QueryProvenance,
-}
-
 /// A complete VCF/BCF payload whose records crossed the checked file boundary.
 #[derive(Clone, Debug)]
 pub(crate) struct ValidatedVcf {
     headers: Vec<String>,
-    records: Vec<RawVcfRecord>,
-    facts: Vec<ValidatedRecordFacts>,
+    records: Vec<ValidatedVcfRecord>,
 }
 
 impl ValidatedVcf {
     /// Reassembles a payload from records that are already checked.
     pub(crate) fn from_parts(headers: Vec<String>, records: Vec<ValidatedVcfRecord>) -> Self {
-        let (records, facts) = records
-            .into_iter()
-            .map(ValidatedVcfRecord::into_raw_and_facts)
-            .unzip();
-        Self {
-            headers,
-            records,
-            facts,
-        }
+        Self { headers, records }
     }
 
     /// Checks raw records with unavailable query provenance.
@@ -232,46 +198,22 @@ impl ValidatedVcf {
                 records.len()
             );
         }
-        let checked = records
+        let records = records
             .into_iter()
             .zip(provenance)
             .map(|(record, provenance)| ValidatedVcfRecord::try_from_raw(record, provenance))
             .collect::<Result<Vec<_>>>()?;
-        let (records, facts) = checked
-            .into_iter()
-            .map(ValidatedVcfRecord::into_raw_and_facts)
-            .unzip();
-        Ok(Self {
-            headers,
-            records,
-            facts,
-        })
-    }
-
-    /// Returns the VCF header lines.
-    pub(crate) fn headers(&self) -> &[String] {
-        &self.headers
+        Ok(Self { headers, records })
     }
 
     /// Returns the checked records.
-    pub(crate) fn records(&self) -> &[RawVcfRecord] {
-        &self.records
+    pub(crate) fn records(&self) -> impl Iterator<Item = &RawVcfRecord> {
+        self.records.iter().map(ValidatedVcfRecord::raw)
     }
 
     /// Splits the payload into headers and checked records without weakening them.
     pub(crate) fn into_parts(self) -> (Vec<String>, Vec<ValidatedVcfRecord>) {
-        let records = self
-            .records
-            .into_iter()
-            .zip(self.facts)
-            .map(|(raw, facts)| ValidatedVcfRecord::from_raw_and_facts(raw, facts))
-            .collect();
-        (self.headers, records)
-    }
-
-    /// Edits headers without touching already-checked records.
-    pub(crate) fn edit_headers<R>(&mut self, edit: impl FnOnce(&mut Vec<String>) -> R) -> R {
-        edit(&mut self.headers)
+        (self.headers, self.records)
     }
 
     /// Applies one record edit transactionally and refreshes only its checked facts.
@@ -280,156 +222,10 @@ impl ValidatedVcf {
         index: usize,
         edit: impl FnOnce(&mut RawVcfRecord) -> Result<R>,
     ) -> Result<R> {
-        let provenance = self
-            .facts
-            .get(index)
+        self.records
+            .get_mut(index)
             .ok_or_else(|| anyhow::anyhow!("VCF record index {index} is out of bounds"))?
-            .provenance;
-        let mut raw = self.records[index].clone();
-        let result = edit(&mut raw)?;
-        let checked = ValidatedVcfRecord::try_from_raw(raw, provenance)?;
-        let (raw, facts) = checked.into_raw_and_facts();
-        self.records[index] = raw;
-        self.facts[index] = facts;
-        Ok(result)
-    }
-}
-
-impl ValidatedVcfRecord {
-    /// Converts a raw file-adapter record into checked domain values.
-    pub(crate) fn try_from_raw(raw: RawVcfRecord, provenance: QueryProvenance) -> Result<Self> {
-        let position = GenomicPosition::new(raw.pos).map_err(|error| {
-            anyhow::anyhow!(
-                "invalid VCF position {} on contig {}: {error}",
-                raw.pos,
-                raw.chrom
-            )
-        })?;
-        let coordinate = GenomicCoordinate::new(raw.chrom.clone(), position)
-            .with_context(|| format!("invalid VCF coordinate {}:{}", raw.chrom, raw.pos))?;
-        let reference = Allele::new(raw.ref_allele.clone())
-            .with_context(|| format!("invalid REF allele at {coordinate}"))?;
-        let alternates = if raw.alt_allele == "." {
-            Vec::new()
-        } else {
-            raw.alt_allele
-                .split(',')
-                .map(|allele| {
-                    Allele::new(allele)
-                        .with_context(|| format!("invalid ALT allele {allele:?} at {coordinate}"))
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
-        let format_keys = raw.format_keys();
-        let gt_index = format_keys.iter().position(|key| *key == "GT");
-        let genotypes = raw
-            .samples
-            .iter()
-            .map(|sample| {
-                let Some(gt_index) = gt_index else {
-                    return Ok(None);
-                };
-                let Some(gt) = sample.split(':').nth(gt_index) else {
-                    return Ok(None);
-                };
-                Genotype::parse(gt, alternates.len())
-                    .map(Some)
-                    .map_err(|error| anyhow::anyhow!("invalid GT {gt:?} at {coordinate}: {error}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            raw,
-            coordinate,
-            reference,
-            alternates,
-            genotypes,
-            provenance,
-        })
-    }
-
-    fn into_raw_and_facts(self) -> (RawVcfRecord, ValidatedRecordFacts) {
-        let Self {
-            raw,
-            coordinate,
-            reference,
-            alternates,
-            genotypes,
-            provenance,
-        } = self;
-        (
-            raw,
-            ValidatedRecordFacts {
-                coordinate,
-                reference,
-                alternates,
-                genotypes,
-                provenance,
-            },
-        )
-    }
-
-    fn from_raw_and_facts(raw: RawVcfRecord, facts: ValidatedRecordFacts) -> Self {
-        Self {
-            raw,
-            coordinate: facts.coordinate,
-            reference: facts.reference,
-            alternates: facts.alternates,
-            genotypes: facts.genotypes,
-            provenance: facts.provenance,
-        }
-    }
-
-    /// Returns the checked genomic coordinate.
-    #[cfg_attr(not(test), allow(dead_code, reason = "checked record accessor"))]
-    pub(crate) fn coordinate(&self) -> &GenomicCoordinate {
-        &self.coordinate
-    }
-
-    /// Returns the checked reference allele.
-    #[cfg_attr(not(test), allow(dead_code, reason = "checked record accessor"))]
-    pub(crate) fn reference(&self) -> &Allele {
-        &self.reference
-    }
-
-    /// Returns the individually checked alternate alleles.
-    #[cfg_attr(not(test), allow(dead_code, reason = "checked record accessor"))]
-    pub(crate) fn alternates(&self) -> &[Allele] {
-        &self.alternates
-    }
-
-    /// Returns each sample's explicit genotype, or `None` when GT is absent.
-    #[cfg_attr(not(test), allow(dead_code, reason = "checked record accessor"))]
-    pub(crate) fn genotypes(&self) -> &[Option<Genotype>] {
-        &self.genotypes
-    }
-
-    /// Returns the record's query-source provenance.
-    pub(crate) const fn provenance(&self) -> QueryProvenance {
-        self.provenance
-    }
-
-    /// Borrows the lossless file-adapter representation.
-    pub(crate) fn raw(&self) -> &RawVcfRecord {
-        &self.raw
-    }
-
-    /// Applies a structured edit transactionally and rechecks the record.
-    pub(crate) fn try_update<R>(
-        &mut self,
-        edit: impl FnOnce(&mut RawVcfRecord) -> Result<R>,
-    ) -> Result<R> {
-        let mut raw = self.raw.clone();
-        let result = edit(&mut raw)?;
-        *self = Self::try_from_raw(raw, self.provenance)?;
-        Ok(result)
-    }
-}
-
-impl std::ops::Deref for ValidatedVcfRecord {
-    type Target = RawVcfRecord;
-
-    fn deref(&self) -> &Self::Target {
-        &self.raw
+            .try_update(edit)
     }
 }
 
@@ -586,13 +382,6 @@ pub(crate) fn load_raw_vcf(path: &Path) -> Result<(Vec<String>, Vec<RawVcfRecord
     Ok((headers, records))
 }
 
-/// Loads VCF/BCF and retains checked coordinates, alleles, genotypes, and provenance.
-pub(crate) fn load_validated_vcf(path: &Path) -> Result<ValidatedVcf> {
-    let mut reader = open_validated_vcf(path)?;
-    let headers = reader.headers().to_vec();
-    let records = reader.by_ref().collect::<Result<Vec<_>>>()?;
-    Ok(ValidatedVcf::from_parts(headers, records))
-}
 /// A bounded, record-at-a-time VCF/BCF reader. Only the header and current
 /// record are retained; gzip and BGZF inputs are decompressed incrementally.
 pub(crate) struct RawVcfReader {
@@ -839,11 +628,6 @@ where
     Ok(())
 }
 
-/// Serializes an already-checked VCF payload at the file output boundary.
-pub(crate) fn write_validated_vcf(path: &Path, vcf: &ValidatedVcf) -> Result<()> {
-    write_raw_vcf(path, vcf.headers(), vcf.records())
-}
-
 /// Streams checked records without exposing raw file records to application
 /// code. Validation errors from upstream iterators abort the transaction.
 pub(crate) fn write_validated_vcf_iter<I>(path: &Path, headers: &[String], records: I) -> Result<()>
@@ -855,17 +639,12 @@ where
         headers,
         records
             .into_iter()
-            .map(|record| record.map(|record| record.into_raw_and_facts().0)),
+            .map(|record| record.map(ValidatedVcfRecord::into_raw)),
     )
 }
 
-/// Writes a BGZF-compressed VCF and its Tabix v1 index without invoking
-/// external executables.
-///
-/// Record lines are validated before any destination is replaced. Records
-/// must be grouped by reference sequence and position-sorted within each
-/// sequence, as required by the Tabix format.
-pub(crate) fn write_indexed_vcf<'a, I>(path: &Path, headers: &[String], lines: I) -> Result<()>
+#[cfg(test)]
+fn write_indexed_vcf<'a, I>(path: &Path, headers: &[String], lines: I) -> Result<()>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -876,6 +655,12 @@ where
     )
 }
 
+/// Writes a BGZF-compressed VCF and its Tabix v1 index without invoking
+/// external executables.
+///
+/// Record lines are validated before any destination is replaced. Records
+/// must be grouped by reference sequence and position-sorted within each
+/// sequence, as required by the Tabix format.
 fn write_indexed_vcf_record_iter<I>(path: &Path, headers: &[String], records: I) -> Result<()>
 where
     I: IntoIterator<Item = Result<RawVcfRecord>>,
@@ -2375,7 +2160,8 @@ mod tests {
             let output = child.wait_with_output()?;
             assert!(
                 output.status.success(),
-                "publication helper failed: {}",
+                "publication helper failed with {}: {}",
+                output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
         }

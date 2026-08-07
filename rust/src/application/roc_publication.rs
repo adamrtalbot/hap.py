@@ -9,28 +9,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
-pub(crate) fn write_roc_files(
-    prefix: &Path,
-    rows: &[AnnotatedRow],
-    subset_size: usize,
-    conf_size: usize,
-) -> Result<MetricIndices> {
-    publish(prefix, roc::calculate(rows, subset_size, conf_size)?)
-}
-
-pub(crate) fn write_roc_files_with_options(
-    prefix: &Path,
-    rows: &[AnnotatedRow],
-    subset_size: usize,
-    conf_size: usize,
-    options: &RocOptions,
-) -> Result<MetricIndices> {
-    publish(
-        prefix,
-        roc::calculate_with_options(rows, subset_size, conf_size, options)?,
-    )
-}
-
 pub(crate) fn write_roc_files_with_options_iter<I, R>(
     prefix: &Path,
     rows: I,
@@ -94,15 +72,19 @@ mod tests {
     fn injected_roc_operations_preserve_generation_and_cleanup() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let output = directory.path().join("report.roc.all.csv.gz");
-        let source = directory.path().join("source.roc.all.csv.gz");
-        fs::write(&source, "new-roc")?;
+        // The engine-owned source spool is outside the destination generation;
+        // only the destination and its adjacent transaction staging file belong
+        // in this directory.
+        let mut source = tempfile::NamedTempFile::new()?;
+        source.write_all(b"new-roc")?;
+        source.flush()?;
 
         for operation in [FailureOperation::Writer, FailureOperation::Encoder] {
             fs::write(&output, "old-roc")?;
             let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [&output])?;
             let staged = transaction.staged_file(&output)?.to_path_buf();
             set_failure_operation(Some(operation));
-            let result = publish_file(&source, &staged)
+            let result = publish_file(source.path(), &staged)
                 .with_context(|| format!("failed to write ROC table {}", output.display()));
             set_failure_operation(None);
             let error = result.expect_err("injected ROC operation must fail");

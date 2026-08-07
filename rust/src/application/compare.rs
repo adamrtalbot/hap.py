@@ -4,8 +4,9 @@ use crate::application::{
     CompareArgs, CompareEngine, PreprocessArgs, PreprocessGender, QuantifyArgs, SomaticGtMode,
     ValidatedCompareArgs, comparison_io, preprocess, roc_publication,
 };
-use crate::domain::{AnnotatedRow, Interval, RawVcfRecord, TypeCounts};
-use crate::engines::partial_credit;
+#[cfg(test)]
+use crate::domain::RawVcfRecord;
+use crate::domain::{AnnotatedRow, Interval, TypeCounts};
 use crate::output::{OutputTransaction, benchmark_artifacts, stratification_inputs};
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
@@ -24,7 +25,8 @@ mod output;
 mod rows;
 mod spool;
 
-use genotype::{equivalent_gt, parse_gt_alleles};
+#[cfg(test)]
+use genotype::equivalent_gt;
 use matching::*;
 use metrics::*;
 use output::*;
@@ -908,7 +910,11 @@ fn run_inner(
         crate::application::quantify::run_from_compare_path(
             QuantifyArgs {
                 input_vcf: comparison_vcf.display().to_string(),
-                report_prefix: args.report_prefix.clone(),
+                // The outer comparison transaction owns publication to the
+                // user-facing prefix. Quantification must therefore publish
+                // into that transaction's staged family, not directly to the
+                // destination family recorded in `args`.
+                report_prefix: prefix.to_string_lossy().into_owned(),
                 reference: args.reference.clone(),
                 // Rust comparison rows already carry finalized GA4GH BD/BK/BVT
                 // sample fields. Re-quantify those decisions while adding user
@@ -949,8 +955,10 @@ fn run_inner(
             },
         )?
     } else {
-        let mut roc_options = crate::engines::roc::RocOptions::default();
-        roc_options.output_rocs = !args.no_roc;
+        let roc_options = crate::engines::roc::RocOptions {
+            output_rocs: !args.no_roc,
+            ..Default::default()
+        };
         let indices = roc_publication::write_roc_files_with_options_iter(
             prefix,
             row_file.rows()?,
@@ -1011,7 +1019,7 @@ fn run_inner(
             PreprocessGender::None => "none",
         },
         hb_expand: args.hb_expand,
-        logfile: args.logfile.as_deref(),
+        logfile: published_logfile,
         max_enum: args.max_enum,
         no_hc: args.no_hc,
         output_vtc: args.output_vtc,
@@ -1233,7 +1241,7 @@ fn run_vcfeval(
     let roc_indices = crate::application::quantify::run_from_compare(
         QuantifyArgs {
             input_vcf: String::new(),
-            report_prefix: args.report_prefix.clone(),
+            report_prefix: prefix.to_string_lossy().into_owned(),
             reference: args.reference.clone(),
             annotation_type: Some("ga4gh".to_string()),
             fp_bedfile: args.fp_bedfile.clone(),
@@ -1341,7 +1349,7 @@ fn run_scmp(
     let roc_indices = crate::application::quantify::run_from_compare(
         QuantifyArgs {
             input_vcf: String::new(),
-            report_prefix: args.report_prefix.clone(),
+            report_prefix: prefix.to_string_lossy().into_owned(),
             reference: args.reference.clone(),
             annotation_type: Some("ga4gh".to_string()),
             fp_bedfile: args.fp_bedfile.clone(),
@@ -1510,7 +1518,7 @@ fn write_runinfo_for_args(
             PreprocessGender::None => "none",
         },
         hb_expand: args.hb_expand,
-        logfile: args.logfile.as_deref(),
+        logfile: published_logfile,
         max_enum: args.max_enum,
         no_hc: args.no_hc,
         output_vtc: args.output_vtc,

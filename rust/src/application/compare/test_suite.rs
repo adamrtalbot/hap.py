@@ -11,6 +11,10 @@ mod scratch_tests {
             .into()
     }
 
+    fn run_args(args: CompareArgs) -> Result<()> {
+        super::super::run(args.validated()?)
+    }
+
     #[test]
     fn comparison_headers_merge_inputs_and_append_legacy_annotations() {
         let truth = vec![
@@ -252,7 +256,7 @@ mod scratch_tests {
         options.no_roc = true;
         options.no_write_counts = true;
         options.no_json = true;
-        run(options).unwrap();
+        run_args(options).unwrap();
 
         for suffix in [
             "summary.csv",
@@ -294,7 +298,7 @@ mod scratch_tests {
         let scratch_parent = root.join("scratch");
         let mut options = args(prefix.clone(), &scratch_parent, true);
         options.bcf = true;
-        run(options).unwrap();
+        run_args(options).unwrap();
 
         let bcf_report = suffixed_report_path(&prefix, "bcf");
         assert!(bcf_report.is_file());
@@ -340,7 +344,7 @@ mod scratch_tests {
         options.truth = truth_bcf.display().to_string();
         options.query = query_bcf.display().to_string();
         assert!(!options.bcf, "the CLI flag is intentionally absent");
-        run(options).unwrap();
+        run_args(options).unwrap();
 
         assert!(suffixed_report_path(&prefix, "bcf").is_file());
         assert!(suffixed_report_path(&prefix, "bcf.csi").is_file());
@@ -364,7 +368,7 @@ mod scratch_tests {
         let scratch_parent = root.join("scratch");
         let options = args(missing_parent.join("result"), &scratch_parent, false);
 
-        let error = run(options).expect_err("missing report parents must be rejected");
+        let error = run_args(options).expect_err("missing report parents must be rejected");
         assert!(error.to_string().contains("output path does not exist"));
         assert!(!missing_parent.exists());
         assert!(!scratch_parent.exists());
@@ -386,7 +390,7 @@ mod scratch_tests {
                 false,
             );
             options.regions_bedfile = Some(bed.display().to_string());
-            let error = run(options).expect_err("invalid -R BED must fail before comparison");
+            let error = run_args(options).expect_err("invalid -R BED must fail before comparison");
             assert!(
                 error
                     .to_string()
@@ -399,7 +403,7 @@ mod scratch_tests {
         let target_prefix = root.join("target-result");
         let mut options = args(target_prefix.clone(), &root.join("target-scratch"), false);
         options.targets_bedfile = Some(targets.display().to_string());
-        run(options).expect("-T keeps accepting overlapping or out-of-order intervals");
+        run_args(options).expect("-T keeps accepting overlapping or out-of-order intervals");
         assert!(suffixed_report_path(&target_prefix, "summary.csv").is_file());
         fs::remove_dir_all(root).unwrap();
     }
@@ -421,7 +425,7 @@ mod scratch_tests {
         let mut options = args(root.join("result"), &root.join("scratch"), false);
         options.truth = truth.display().to_string();
 
-        let error = run(options).expect_err("legacy derives default contigs from truth calls");
+        let error = run_args(options).expect_err("legacy derives default contigs from truth calls");
         assert!(
             error
                 .to_string()
@@ -436,7 +440,7 @@ mod scratch_tests {
         );
         explicit.truth = truth.display().to_string();
         explicit.locations = Some("chr1".to_string());
-        run(explicit).expect("an explicit contig bypasses legacy default-contig discovery");
+        run_args(explicit).expect("an explicit contig bypasses legacy default-contig discovery");
         assert!(suffixed_report_path(&explicit_prefix, "summary.csv").is_file());
         fs::remove_dir_all(root).unwrap();
     }
@@ -479,7 +483,7 @@ mod scratch_tests {
         options.engine = CompareEngine::ScmpDistance;
         options.bcf = true;
         options.fp_bedfile = Some(confidence.display().to_string());
-        run(options).unwrap();
+        run_args(options).unwrap();
 
         assert!(suffixed_report_path(&prefix, "bcf").is_file());
         assert!(suffixed_report_path(&prefix, "bcf.csi").is_file());
@@ -495,7 +499,7 @@ mod scratch_tests {
         let mut options = args(prefix.clone(), &root.join("scratch"), false);
         options.engine = CompareEngine::ScmpDistance;
         options.output_vtc = true;
-        run(options).unwrap();
+        run_args(options).unwrap();
 
         let (headers, records) =
             vcf::load_raw_vcf(&suffixed_report_path(&prefix, "vcf.gz")).unwrap();
@@ -508,15 +512,12 @@ mod scratch_tests {
     fn subset_derivation_stops_regions_at_the_next_info_field() {
         let rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            record: comparison_record(
-                &concat!(
-                    "chr1\t7\t.\tA\tC\t30\tPASS\t",
-                    "BS=7;Regions=CONF,TS_boundary,TS_contained;AF=0.5;VTC=nuc__s\t",
-                    "GT:BD:BK:BVT:BLT:BI\t",
-                    "0/1:TP:gm:SNP:het:ti\t0/1:TP:gm:SNP:het:ti"
-                )
-                .to_string(),
-            ),
+            record: comparison_record(concat!(
+                "chr1\t7\t.\tA\tC\t30\tPASS\t",
+                "BS=7;Regions=CONF,TS_boundary,TS_contained;AF=0.5;VTC=nuc__s\t",
+                "GT:BD:BK:BVT:BLT:BI\t",
+                "0/1:TP:gm:SNP:het:ti\t0/1:TP:gm:SNP:het:ti"
+            )),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -539,14 +540,11 @@ mod scratch_tests {
     fn requantify_handoff_drops_only_provisional_truth_set_membership() {
         let rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            record: comparison_record(
-                &concat!(
-                    "chr1\t7\t.\tA\tC\t30\tPASS\t",
-                    "BS=7;Regions=CONF,TS_boundary,EXTRA,TS_contained;RegionsExtent=7-7\t",
-                    "GT:BD\t0/1:TP\t0/1:TP"
-                )
-                .to_string(),
-            ),
+            record: comparison_record(concat!(
+                "chr1\t7\t.\tA\tC\t30\tPASS\t",
+                "BS=7;Regions=CONF,TS_boundary,EXTRA,TS_contained;RegionsExtent=7-7\t",
+                "GT:BD\t0/1:TP\t0/1:TP"
+            )),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -584,7 +582,7 @@ mod scratch_tests {
         options.engine = CompareEngine::Vcfeval;
         options.engine_vcfeval = Some("definitely-absent-rtg-for-test".to_string());
         options.engine_vcfeval_template = Some(root.join("absent.sdf").display().to_string());
-        run(options).unwrap();
+        run_args(options).unwrap();
         assert!(root.join("result.summary.csv").is_file());
         let (_, records) = vcf::load_raw_vcf(&root.join("result.vcf.gz")).unwrap();
         assert_eq!(records.len(), 1);
@@ -615,7 +613,7 @@ mod scratch_tests {
         options.query = query_bcf.display().to_string();
         options.engine = CompareEngine::Vcfeval;
         options.output_vtc = true;
-        run(options).unwrap();
+        run_args(options).unwrap();
 
         assert!(!root.join("result.vcf.gz").exists());
         let (headers, records) = vcf::load_raw_vcf(&root.join("result.bcf")).unwrap();
@@ -633,7 +631,7 @@ mod scratch_tests {
         let mut preserve = args(preserve_prefix.clone(), &preserve_scratch, false);
         preserve.engine = CompareEngine::Vcfeval;
         preserve.preserve_info = true;
-        run(preserve).unwrap();
+        run_args(preserve).unwrap();
         assert!(suffixed_report_path(&preserve_prefix, "runinfo.json").is_file());
         for suffix in ["summary.csv", "extended.csv", "vcf.gz", "metrics.json.gz"] {
             assert!(suffixed_report_path(&preserve_prefix, suffix).is_file());
@@ -662,13 +660,13 @@ mod scratch_tests {
         };
         let mut somatic = engine_args(root.join("somatic"));
         somatic.engine = CompareEngine::ScmpSomatic;
-        run(somatic).unwrap();
+        run_args(somatic).unwrap();
         let somatic_summary = fs::read_to_string(root.join("somatic.summary.csv")).unwrap();
 
         let mut distance = engine_args(root.join("distance"));
         distance.engine = CompareEngine::ScmpDistance;
         distance.engine_scmp_distance = 30;
-        run(distance).unwrap();
+        run_args(distance).unwrap();
         let distance_summary = fs::read_to_string(root.join("distance.summary.csv")).unwrap();
         // Legacy AlleleMatcher's RefVar constructor uses ALT length for the
         // reference end. Consequently these two ordinary VCF-equivalent
@@ -676,7 +674,7 @@ mod scratch_tests {
         // distance mode still pairs their overlapping intervals.
         assert_ne!(somatic_summary, distance_summary);
 
-        run(engine_args(root.join("xcmp"))).unwrap();
+        run_args(engine_args(root.join("xcmp"))).unwrap();
         let xcmp_summary = fs::read_to_string(root.join("xcmp.summary.csv")).unwrap();
         assert_ne!(somatic_summary, xcmp_summary);
         assert!(distance_summary.contains("INDEL,ALL,1,1,0,1,0,0"));
@@ -692,14 +690,11 @@ mod scratch_tests {
         .unwrap();
         let mut rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            record: comparison_record(
-                &concat!(
-                    "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
-                    "GT:BD:BK:BVT:BLT:QQ\t",
-                    "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
-                )
-                .to_string(),
-            ),
+            record: comparison_record(concat!(
+                "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
+                "GT:BD:BK:BVT:BLT:QQ\t",
+                "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
+            )),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -752,14 +747,11 @@ mod scratch_tests {
         .unwrap();
         let mut rows = vec![AnnotatedRow {
             sort_key: ("chr1".to_string(), 7, 0, 0),
-            record: comparison_record(
-                &concat!(
-                    "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
-                    "GT:BD:BK:BVT:BLT:QQ\t",
-                    "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
-                )
-                .to_string(),
-            ),
+            record: comparison_record(concat!(
+                "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
+                "GT:BD:BK:BVT:BLT:QQ\t",
+                "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
+            )),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -867,8 +859,8 @@ mod scratch_tests {
         let first = args(root.join("first/result"), &scratch_parent, false);
         let second = args(root.join("second/result"), &scratch_parent, false);
 
-        let first_run = thread::spawn(move || run(first));
-        let second_run = thread::spawn(move || run(second));
+        let first_run = thread::spawn(move || run_args(first));
+        let second_run = thread::spawn(move || run_args(second));
         first_run.join().expect("first thread panicked").unwrap();
         second_run.join().expect("second thread panicked").unwrap();
 
@@ -888,7 +880,7 @@ mod scratch_tests {
         let root = test_root("lifecycle");
         let kept_parent = root.join("kept");
         fs::create_dir(root.join("kept-output")).unwrap();
-        run(args(root.join("kept-output/result"), &kept_parent, true)).unwrap();
+        run_args(args(root.join("kept-output/result"), &kept_parent, true)).unwrap();
 
         let kept = child_directories(&kept_parent);
         assert_eq!(kept.len(), 1, "--keep-scratch retains the unique run");
@@ -901,7 +893,7 @@ mod scratch_tests {
         fs::create_dir(root.join("error-output")).unwrap();
         let mut failing = args(root.join("error-output/result"), &error_parent, false);
         failing.truth = root.join("missing.vcf").display().to_string();
-        assert!(run(failing).is_err());
+        assert!(run_args(failing).is_err());
         assert!(
             child_directories(&error_parent).is_empty(),
             "error paths must delete their invocation directory"
@@ -927,7 +919,7 @@ mod scratch_tests {
         fs::write(&tsv, "FOCUS\tfocus.bed\n").unwrap();
         let mut options = args(root.join("result"), &root.join("scratch"), false);
         options.strat_tsv = Some(tsv.display().to_string());
-        run(options).unwrap();
+        run_args(options).unwrap();
 
         let extended = fs::read_to_string(root.join("result.extended.csv")).unwrap();
         assert!(extended.lines().any(|line| line.contains(",FOCUS,")));
@@ -959,6 +951,12 @@ mod scratch_tests {
 #[cfg(test)]
 mod memory_guards {
     use super::super::*;
+
+    fn comparison_record(line: &str) -> crate::domain::ComparisonRecord {
+        RawVcfRecord::from_line(line, Path::new("comparison-test.vcf"))
+            .unwrap()
+            .into()
+    }
 
     // Class 1 pinning helper for ergonomic qual overrides in tests.
     impl Variant {
@@ -1017,10 +1015,10 @@ mod memory_guards {
     }
 
     #[test]
-    fn build_clusters_splits_at_variant_cap() {
+    fn build_clusters_does_not_split_a_connected_cluster_at_variant_cap() {
         // MAX_CLUSTER_VARIANTS + 2 variants packed within 1 bp of each other
-        // must yield at least 2 clusters — no single cluster may exceed the
-        // cap.
+        // remains one connected cluster. Production reports an explicit
+        // resource error rather than silently changing comparison semantics.
         let mut truth = Vec::new();
         for offset in 0..(MAX_CLUSTER_VARIANTS + 2) {
             truth.push(Variant {
@@ -1036,13 +1034,8 @@ mod memory_guards {
             });
         }
         let clusters = build_clusters(&truth, &[]);
-        assert!(clusters.len() >= 2, "expected split at variant cap");
-        for cluster in &clusters {
-            assert!(
-                cluster.truth.len() + cluster.query.len() <= MAX_CLUSTER_VARIANTS,
-                "cluster exceeded MAX_CLUSTER_VARIANTS"
-            );
-        }
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].truth.len(), MAX_CLUSTER_VARIANTS + 2);
     }
 
     /// Class D pin: chr21:38861935 INDEL hetalt-vs-homalt-of-shared-allele.

@@ -5,13 +5,11 @@ use super::features::csv_join;
 use super::features::write_simple_table;
 use super::metrics::python2_counter_indices;
 use super::{AmbiguousInterval, FilteredRawRecord, QueryClass};
-use crate::adapters::report;
 use crate::adapters::vcf;
 use crate::application::SomaticArgs;
 use crate::domain::{Interval, QueryProvenance, RawVcfRecord};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 

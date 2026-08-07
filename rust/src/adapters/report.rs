@@ -1,5 +1,4 @@
-use crate::adapters::vcf;
-use crate::domain::{AnnotatedRow, CountsBucket, TypeCounts};
+use crate::domain::{CountsBucket, TypeCounts};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -436,14 +435,6 @@ pub(crate) fn empty_comparison_extended_lines(subset_size: usize) -> Vec<String>
             row.join(",")
         })
         .collect()
-}
-
-pub(crate) fn write_vcf(path: &Path, headers: &[String], rows: &[AnnotatedRow]) -> Result<()> {
-    let lines = rows
-        .iter()
-        .map(|row| row.record.raw().to_line())
-        .collect::<Vec<_>>();
-    vcf::write_indexed_vcf(path, headers, lines.iter().map(String::as_str))
 }
 
 fn append_extended_stats(

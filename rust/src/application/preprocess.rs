@@ -1,10 +1,8 @@
-use crate::application::{
-    PreprocessArgs, PreprocessGender, SomaticGtMode, ValidatedPreprocessArgs,
-};
-use crate::domain::{Interval, QueryProvenance, RawVcfRecord};
+use crate::application::{PreprocessArgs, PreprocessGender, ValidatedPreprocessArgs};
+use crate::domain::QueryProvenance;
 use crate::{
     adapters::{fasta, vcf},
-    engines::{partial_credit, variant_pipeline},
+    engines::variant_pipeline,
     output::OutputTransaction,
 };
 use anyhow::{Context, Result, bail};
@@ -24,9 +22,6 @@ mod streaming;
 use alleles::*;
 use blocksplit::*;
 use canonical::*;
-use genotype::{
-    bcf_encoded_gt, expand_haploid_gt, project_split_ad, project_split_genotype, remap_gt,
-};
 use normalization::*;
 use options::*;
 use streaming::PreprocessSpool;
@@ -127,12 +122,25 @@ pub(crate) fn run(args: ValidatedPreprocessArgs) -> Result<()> {
             .to_string_lossy()
             .into_owned();
     }
-    run_inner(args).map_err(|error| {
+    let outcome = run_inner(args).map_err(|error| {
         anyhow::anyhow!(
             "failed to produce preprocess output {}: {error:#}",
             output_path.display()
         )
-    })?;
+    });
+    if let Err(error) = outcome {
+        if output_path.extension().and_then(|value| value.to_str()) == Some("vcf")
+            && staged_output.is_file()
+        {
+            transaction.commit().with_context(|| {
+                format!(
+                    "failed to publish legacy unindexed VCF {}",
+                    output_path.display()
+                )
+            })?;
+        }
+        return Err(error);
+    }
     if !index_path.as_os_str().is_empty() {
         let produced_index =
             if output_path.extension().and_then(|value| value.to_str()) == Some("bcf") {
@@ -242,15 +250,17 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
     let blocksplit_selection = if normalization_enabled && effective_threads > 1 {
         let observations = collect_blocksplit_observations(
             vcf::open_validated_vcf(input_path)?,
-            &args,
-            fixchr,
-            normalization_enabled,
-            somatic_mode,
-            somatic_sample_names.as_deref(),
-            &reference_sequences,
-            regions.as_deref(),
-            targets.as_deref(),
-            locations.as_deref(),
+            BlocksplitObservationParams {
+                args: &args,
+                fixchr,
+                normalization_enabled,
+                somatic_mode,
+                somatic_sample_names: somatic_sample_names.as_deref(),
+                reference_sequences: &reference_sequences,
+                regions: regions.as_deref(),
+                targets: targets.as_deref(),
+                locations: locations.as_deref(),
+            },
         )?;
         select_blocksplit_resets(
             &observations,

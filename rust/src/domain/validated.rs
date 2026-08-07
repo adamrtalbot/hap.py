@@ -4,6 +4,8 @@
 //! their adapters. The application core can then rely on the invariants
 //! documented by each type without repeating format-specific validation.
 
+use super::variant::RawVcfRecord;
+use anyhow::{Context, Result};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -40,8 +42,6 @@ pub(crate) enum DomainError {
     InvalidGenotype(String),
     /// A phased genotype contained only one allele slot.
     PhasedHaploidGenotype,
-    /// A sample decision was not part of the comparison vocabulary.
-    InvalidSampleDecision(String),
     /// Query provenance was neither missing nor a non-negative record index.
     #[allow(dead_code, reason = "constructed by the textual provenance adapter")]
     InvalidQueryProvenance(String),
@@ -92,10 +92,6 @@ impl fmt::Display for DomainError {
             Self::PhasedHaploidGenotype => {
                 write!(formatter, "a haploid genotype cannot be marked as phased")
             }
-            Self::InvalidSampleDecision(value) => write!(
-                formatter,
-                "invalid sample decision {value:?}; expected TP, FP, FN, UNK, AMBI, N, or ."
-            ),
             Self::InvalidQueryProvenance(value) => write!(
                 formatter,
                 "invalid query provenance {value:?}; expected '.' or a zero-based record index"
@@ -415,63 +411,6 @@ impl fmt::Display for Genotype {
     }
 }
 
-/// A benchmark decision attached to one truth or query sample.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum SampleDecision {
-    /// The sample call matched its counterpart.
-    TruePositive,
-    /// A query call did not match the truth set.
-    FalsePositive,
-    /// A truth call was absent from the query set.
-    FalseNegative,
-    /// The call was outside the assessed region or otherwise unknown.
-    Unknown,
-    /// The call could not be assigned an unambiguous decision.
-    Ambiguous,
-    /// The sample was explicitly not called or not assessed.
-    NoCall,
-    /// No decision was supplied in the file.
-    Missing,
-}
-
-impl SampleDecision {
-    /// Returns the standard VCF benchmarking code.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::TruePositive => "TP",
-            Self::FalsePositive => "FP",
-            Self::FalseNegative => "FN",
-            Self::Unknown => "UNK",
-            Self::Ambiguous => "AMBI",
-            Self::NoCall => "N",
-            Self::Missing => ".",
-        }
-    }
-}
-
-impl fmt::Display for SampleDecision {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for SampleDecision {
-    type Err = DomainError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "TP" => Ok(Self::TruePositive),
-            "FP" => Ok(Self::FalsePositive),
-            "FN" => Ok(Self::FalseNegative),
-            "UNK" => Ok(Self::Unknown),
-            "AMBI" => Ok(Self::Ambiguous),
-            "N" => Ok(Self::NoCall),
-            "." => Ok(Self::Missing),
-            _ => Err(DomainError::InvalidSampleDecision(value.to_owned())),
-        }
-    }
-}
-
 /// A checked zero-based index into the original query record collection.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct QueryRecordIndex(usize);
@@ -593,26 +532,6 @@ impl OutputPlan {
         })
     }
 
-    /// Returns the common report prefix.
-    pub(crate) fn report_prefix(&self) -> &Path {
-        &self.report_prefix
-    }
-
-    /// Returns whether the extended counts report is requested.
-    pub(crate) const fn writes_counts(&self) -> bool {
-        self.write_counts
-    }
-
-    /// Returns whether the compressed metrics document is requested.
-    pub(crate) const fn writes_metrics(&self) -> bool {
-        self.write_metrics
-    }
-
-    /// Returns the requested annotated variant encoding, if any.
-    pub(crate) const fn variant_output(&self) -> Option<VariantOutputFormat> {
-        self.variant_output
-    }
-
     /// Returns the always-present compact summary path.
     pub(crate) fn summary_path(&self) -> PathBuf {
         self.suffixed_path("summary.csv")
@@ -649,6 +568,122 @@ impl OutputPlan {
         path.push(".");
         path.push(suffix);
         PathBuf::from(path)
+    }
+}
+
+/// A lossless VCF record whose coordinate, alleles, genotypes, and provenance
+/// have been checked before entering application and engine code.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedVcfRecord {
+    raw: RawVcfRecord,
+    coordinate: GenomicCoordinate,
+    reference: Allele,
+    alternates: Vec<Allele>,
+    genotypes: Vec<Option<Genotype>>,
+    provenance: QueryProvenance,
+}
+
+impl ValidatedVcfRecord {
+    /// Converts a raw adapter record into checked domain values.
+    pub(crate) fn try_from_raw(raw: RawVcfRecord, provenance: QueryProvenance) -> Result<Self> {
+        let position = GenomicPosition::new(raw.pos).map_err(|error| {
+            anyhow::anyhow!(
+                "invalid VCF position {} on contig {}: {error}",
+                raw.pos,
+                raw.chrom
+            )
+        })?;
+        let coordinate = GenomicCoordinate::new(raw.chrom.clone(), position)
+            .with_context(|| format!("invalid VCF coordinate {}:{}", raw.chrom, raw.pos))?;
+        let reference = Allele::new(raw.ref_allele.clone())
+            .with_context(|| format!("invalid REF allele at {coordinate}"))?;
+        let alternates = if raw.alt_allele == "." {
+            Vec::new()
+        } else {
+            raw.alt_allele
+                .split(',')
+                .map(|allele| {
+                    Allele::new(allele)
+                        .with_context(|| format!("invalid ALT allele {allele:?} at {coordinate}"))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let format_keys = raw.format_keys();
+        let gt_index = format_keys.iter().position(|key| *key == "GT");
+        let genotypes = raw
+            .samples
+            .iter()
+            .map(|sample| {
+                let Some(gt_index) = gt_index else {
+                    return Ok(None);
+                };
+                let Some(gt) = sample.split(':').nth(gt_index) else {
+                    return Ok(None);
+                };
+                Genotype::parse(gt, alternates.len())
+                    .map(Some)
+                    .map_err(|error| anyhow::anyhow!("invalid GT {gt:?} at {coordinate}: {error}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            raw,
+            coordinate,
+            reference,
+            alternates,
+            genotypes,
+            provenance,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "checked domain accessor"))]
+    pub(crate) fn coordinate(&self) -> &GenomicCoordinate {
+        &self.coordinate
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "checked domain accessor"))]
+    pub(crate) fn reference(&self) -> &Allele {
+        &self.reference
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "checked domain accessor"))]
+    pub(crate) fn alternates(&self) -> &[Allele] {
+        &self.alternates
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "checked domain accessor"))]
+    pub(crate) fn genotypes(&self) -> &[Option<Genotype>] {
+        &self.genotypes
+    }
+
+    pub(crate) const fn provenance(&self) -> QueryProvenance {
+        self.provenance
+    }
+
+    pub(crate) fn raw(&self) -> &RawVcfRecord {
+        &self.raw
+    }
+
+    pub(crate) fn into_raw(self) -> RawVcfRecord {
+        self.raw
+    }
+
+    /// Applies an edit transactionally and refreshes all checked facts.
+    pub(crate) fn try_update<R>(
+        &mut self,
+        edit: impl FnOnce(&mut RawVcfRecord) -> Result<R>,
+    ) -> Result<R> {
+        let mut raw = self.raw.clone();
+        let result = edit(&mut raw)?;
+        *self = Self::try_from_raw(raw, self.provenance)?;
+        Ok(result)
+    }
+}
+
+impl std::ops::Deref for ValidatedVcfRecord {
+    type Target = RawVcfRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
     }
 }
 
@@ -754,18 +789,6 @@ mod tests {
             Genotype::new(vec![Some(AlleleIndex::reference())], GenotypePhase::Phased),
             Err(DomainError::PhasedHaploidGenotype)
         );
-    }
-
-    #[test]
-    fn sample_decisions_round_trip_and_reject_unknown_codes() {
-        for code in ["TP", "FP", "FN", "UNK", "AMBI", "N", "."] {
-            let decision = code.parse::<SampleDecision>().unwrap();
-            assert_eq!(decision.to_string(), code);
-        }
-        assert!(matches!(
-            "MAYBE".parse::<SampleDecision>(),
-            Err(DomainError::InvalidSampleDecision(_))
-        ));
     }
 
     #[test]

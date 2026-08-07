@@ -7,7 +7,6 @@
 //! genotype rewriting stages.
 
 use crate::application::{FtxArgs, ValidatedFtxArgs};
-use crate::cli_compat::cli::resolve_legacy_reference;
 use crate::domain::RawVcfRecord;
 use crate::engines::partial_credit::RefVar;
 use crate::{
@@ -30,6 +29,25 @@ mod strelka_indel;
 mod strelka_snv;
 
 static SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Resolves the explicit reference or the legacy HG19/HGREF fallback chain.
+pub(crate) fn resolve_legacy_reference(explicit: Option<&str>) -> Option<String> {
+    if let Some(path) = explicit {
+        return Some(path.to_string());
+    }
+    for variable in ["HG19", "HGREF"] {
+        if let Some(path) = std::env::var_os(variable) {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return Some(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let fallback = Path::new("/opt/hap.py-data/hg19.fa");
+    fallback
+        .is_file()
+        .then(|| fallback.to_string_lossy().into_owned())
+}
 
 struct ScratchRun(PathBuf);
 
@@ -539,8 +557,10 @@ mod tests {
             normalize: false,
             fixchr: false,
         }
-        .validated()
-        .unwrap()
+    }
+
+    fn run(args: FtxArgs) -> Result<()> {
+        super::run(args.validated()?)
     }
 
     fn fixture(contents: &str, reference: &str) -> (ScratchRun, PathBuf, PathBuf) {

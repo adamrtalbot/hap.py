@@ -1,24 +1,24 @@
 //! Extracted cohesive responsibility from the command façade.
 
+#[cfg(test)]
+use super::XCMP_ENUMERATION_THRESHOLD;
 use super::genotype::{equivalent_gt, parse_gt_alleles};
 use super::metrics::{add_variant_stats, add_variant_stats_subtype};
 use super::rows::{
-    almismatch_same_locus, bk_for_row, cluster_query_filter, fn_fp_combined_row, fn_row,
-    fp_like_row, split_query_primitives_with_neighbors, tp_combined_row, tp_single_side_row,
-    trim_variant, unk_combined_row, unk_truth_row,
+    bk_for_row, cluster_query_filter, compute_shift_target, fn_fp_combined_row, fn_row,
+    fp_like_row, gt_selected_nonref_alts, split_query_primitives_with_neighbors, tp_combined_row,
+    tp_single_side_row, trim_variant, try_split_same_anchor_via_shift, unk_combined_row,
+    unk_truth_row,
 };
 use super::{
-    AnnotatedRow, Cluster, ComparisonConfig, Entry, Event, MAX_CLUSTER_VARIANTS, RegionState,
-    SPLIT_LEFT_SHIFT_WINDOW, Side, XCMP_ENUMERATION_THRESHOLD, row_matches_variant_key,
+    AnnotatedRow, Cluster, ComparisonConfig, ComparisonOutputs, Entry, Event, MAX_CLUSTER_VARIANTS,
+    RegionState, SPLIT_LEFT_SHIFT_WINDOW, Side, row_matches_variant_key,
 };
 use crate::adapters::vcf::{Variant, VariantKey};
 use crate::domain::{Interval, TypeCounts};
-use crate::engines::partial_credit;
 use anyhow::{Result, bail};
 use std::borrow::Borrow;
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 #[cfg(test)]
 pub(super) fn build_clusters_with_gap(
@@ -803,32 +803,6 @@ pub(super) fn cluster_signature_with_limit(
 /// when any cluster variant's GT picks an alt whose trimmed ref/alt
 /// lengths aren't both 1. Unselected alts (declared but GT=0 on both
 /// haps) don't count — legacy counts only selected alleles.
-/// The GT-selected non-reference alt strings for a single row.
-///
-/// Legacy's `SimpleDiploidCompare` computes its allele-set comparison on
-/// the allele STRINGS each side's GT actually picks, not on the raw ALT
-/// column entries. A multi-allelic truth record `T→C,TATC` with GT `1|0`
-/// selects only `C`; the `TATC` alt declared in the row never enters the
-/// per-row comparison set. Missing (`.` / `*`) and empty alts are ignored
-/// to match legacy's skip of those indices in `alleles_seen`.
-pub(super) fn gt_selected_nonref_alts(variant: &Variant) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let alts: Vec<&str> = variant.key.alt_allele.split(',').collect();
-    for allele_index in parse_gt_alleles(&variant.gt) {
-        if allele_index == 0 {
-            continue;
-        }
-        let Some(alt) = alts.get(allele_index.saturating_sub(1)).copied() else {
-            continue;
-        };
-        if alt.is_empty() || alt == "." || alt == "*" {
-            continue;
-        }
-        out.insert(alt.to_string());
-    }
-    out
-}
-
 pub(super) fn cluster_has_gt_selected_nonsnp(cluster: &Cluster) -> bool {
     for variant in cluster.truth.iter().chain(cluster.query.iter()) {
         let alts: Vec<&str> = variant.key.alt_allele.split(',').collect();
@@ -1573,149 +1547,6 @@ pub(super) fn query_primitive_splits(
         cluster_neighbors,
     )
     .is_some()
-}
-
-/// Compute the post-`partial_credit::left_shift` (pos, ref, alt) for a
-/// trimmed primitive, falling back to the input on out-of-bounds reference
-/// access. Mirrors the slide block inside
-/// `split_query_primitives_with_neighbors` so the fan-out decision and the
-/// emission share identical semantics.
-pub(super) fn compute_shift_target(
-    pos: usize,
-    ref_allele: &str,
-    alt_allele: &str,
-    bases: &[u8],
-    pos_min: usize,
-) -> (usize, String, String) {
-    if pos == 0 || ref_allele.is_empty() || pos + ref_allele.len() - 1 > bases.len() {
-        return (pos, ref_allele.to_string(), alt_allele.to_string());
-    }
-    let mut rv = partial_credit::RefVar {
-        start: pos,
-        end: pos + ref_allele.len() - 1,
-        alt: alt_allele.to_string(),
-    };
-    partial_credit::left_shift(bases, &mut rv, pos_min.max(1), true);
-    let ref_start = rv.start.saturating_sub(1);
-    let ref_end = rv.end;
-    if ref_end < ref_start || ref_end > bases.len() || rv.start < 1 {
-        return (pos, ref_allele.to_string(), alt_allele.to_string());
-    }
-    let new_ref: String = bases[ref_start..ref_end]
-        .iter()
-        .map(|&b| b.to_ascii_uppercase() as char)
-        .collect();
-    if new_ref.is_empty() {
-        return (pos, ref_allele.to_string(), alt_allele.to_string());
-    }
-    (rv.start, new_ref, rv.alt)
-}
-
-/// Class B same-anchor multi-allelic insertion fan-out. When all trimmed
-/// primitives share the same `(pos, ref)` anchor (legacy keeps these
-/// multi-allelic by default), this helper checks whether per-primitive
-/// `partial_credit::left_shift` would canonicalize at least one alt to a
-/// DISTINCT anchor while leaving its sibling at the original anchor. If
-/// that shifted alt lands at a position where the cluster's truth has no
-/// matching record, return the per-primitive shifted (pos, ref, alt)
-/// triples — the caller fans the record out into per-row primitives.
-///
-/// The truth-orphan gate distinguishes:
-/// * chr21:21690513 — truth declares `C→CACAT` only; CACAC slides to
-///   (21690501, T, TACAC) which has no truth match → fan out.
-/// * chr21:40096658 — truth declares `T→TAGATAGAG` AND `C→CAGATAGAT,...`
-///   at 40096650; TAGATAGAT slides to (40096650, C, CAGATAGAT) which IS
-///   represented in truth → keep multi-allelic and let block-level
-///   haplotype matching reconcile.
-///
-/// Returns `None` when the multi-allelic should stay intact (insertions
-/// don't shift, all shifts collapse to the same anchor, or every shifted
-/// alt has truth representation at the shifted anchor).
-pub(super) fn try_split_same_anchor_via_shift(
-    chrom: &str,
-    variant_pos: usize,
-    trimmed: &[(usize, String, String)],
-    bases: &[u8],
-    pos_min: usize,
-    cluster_truth: &[Variant],
-    cluster_neighbors: &[Variant],
-) -> Option<Vec<(usize, String, String)>> {
-    if trimmed.len() < 2 {
-        return None;
-    }
-    // Insertion-only: ref length 1, alt length > 1. Same-anchor deletions
-    // are handled separately by the existing all_same_anchor=false fan-out.
-    if !trimmed
-        .iter()
-        .all(|(_, r, a)| r.len() == 1 && a.len() > r.len())
-    {
-        return None;
-    }
-    // Per-primitive slide floor: the highest cluster-query record position
-    // strictly below the primitive's anchor (excluding the variant being
-    // shifted). Sliding onto an already-occupied locus would duplicate
-    // that record (chr21:21690513 chr21 case has a neighboring SNP
-    // T→C at 21690501; the CACAC primitive would otherwise slide on
-    // top of it — legacy stops one position above at 21690502 A→ACACA
-    // because xcmp doesn't permit two records to share an anchor).
-    let neighbor_floor = cluster_neighbors
-        .iter()
-        .filter(|n| n.key.pos != variant_pos)
-        .map(|n| n.key.pos)
-        .max();
-    let effective_pos_min = match neighbor_floor {
-        Some(n) => pos_min.max(n),
-        None => pos_min,
-    };
-    let shifted: Vec<(usize, String, String)> = trimmed
-        .iter()
-        .map(|(pos, r, a)| compute_shift_target(*pos, r, a, bases, effective_pos_min))
-        .collect();
-    let first = (shifted[0].0, shifted[0].1.clone());
-    let distinct = !shifted
-        .iter()
-        .all(|(pos, r, _)| *pos == first.0 && r == &first.1);
-    if !distinct {
-        return None;
-    }
-    // Require at least one stayer to have truth representation at the
-    // ORIGINAL (un-shifted) anchor. Without this gate a multi-allelic
-    // query whose alts shift apart but neither side matches truth (e.g.
-    // chr21:32767041 `T→TCTCACA,TCTCTCT` in a truth-less cluster) would
-    // fan out into two orphan rows, while legacy keeps it as a single
-    // hetalt UNK row. The truth match at the original anchor is what
-    // licenses the truth_subset_match-style emit (combined TP at
-    // truth's repr plus residual at the shifted anchor).
-    let any_truth_at_original = trimmed.iter().any(|(pos, r, a)| {
-        cluster_truth.iter().any(|t| {
-            t.key.chrom == chrom
-                && t.key.pos == *pos
-                && t.key.ref_allele == *r
-                && t.key.alt_allele.split(',').any(|alt| alt == a)
-        })
-    });
-    if !any_truth_at_original {
-        return None;
-    }
-    // Block fan-out when ANY shifted alt has truth representation at the
-    // shifted anchor. Legacy keeps the query as multi-allelic in those
-    // cases and lets the block-level haplotype matcher reconcile.
-    let any_truth_at_shifted = shifted.iter().enumerate().any(|(i, (p, r, a))| {
-        // Only count primitives that actually moved.
-        if *p == trimmed[i].0 && *r == trimmed[i].1 {
-            return false;
-        }
-        cluster_truth.iter().any(|t| {
-            t.key.chrom == chrom
-                && t.key.pos == *p
-                && t.key.ref_allele == *r
-                && t.key.alt_allele.split(',').any(|alt| alt == a)
-        })
-    });
-    if any_truth_at_shifted {
-        return None;
-    }
-    Some(shifted)
 }
 
 /// Truth-subset match: truth selects ALL of its declared alts AND those
@@ -3314,7 +3145,6 @@ pub(super) fn effective_refrange(variant: &Variant) -> Option<(usize, usize, boo
 /// the raw CONF bed (standard overlap/touching merge) before
 /// `variant_is_conf` consumes them, but the **un-merged sum** is what
 /// feeds `Subset.IS_CONF.Size`.
-#[cfg(test)]
 pub(super) fn gvcf2bed_padding(
     truth: &[Variant],
     target_bed: Option<&[Interval]>,

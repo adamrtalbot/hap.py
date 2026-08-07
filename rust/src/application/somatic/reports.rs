@@ -1,7 +1,7 @@
 //! Cohesive responsibility extracted from the command façade.
 
 use super::allele_frequency::{parse_af_bins, round_four, rounded_metric};
-use super::features::{csv_join, write_simple_table};
+use super::features::{csv_join, parse_csv_line, write_simple_table};
 use super::metrics::{jeffreys_ci, py_float, ratio};
 use super::{
     AmbiguousInterval, FilteredCounts, FilteredRawRecord, SOM_VERSION, SOMATIC_ROC_CHUNK,
@@ -246,26 +246,6 @@ pub(super) fn csv_column_index(headers: &[String], name: &str) -> Result<usize> 
 pub(super) fn nonempty_csv_field(row: &[String], index: usize) -> bool {
     row.get(index)
         .is_some_and(|value| !value.is_empty() && value != ".")
-}
-
-pub(super) fn parse_csv_line(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut quoted = false;
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                field.push('"');
-                chars.next();
-            }
-            '"' => quoted = !quoted,
-            ',' if !quoted => fields.push(std::mem::take(&mut field)),
-            _ => field.push(ch),
-        }
-    }
-    fields.push(field);
-    fields
 }
 
 pub(super) fn calculate_af_stats(
@@ -576,12 +556,10 @@ fn collapse_somatic_roc_chunks(
                 .context("failed to create merged somatic ROC chunk")?;
             {
                 let mut writer = BufWriter::new(output.as_file_mut());
-                let mut merge = SomaticRocMerge::open(batch)?;
-                let mut serial = 0u64;
-                while let Some(row) = merge.next() {
+                let merge = SomaticRocMerge::open(batch)?;
+                for (serial, row) in merge.enumerate() {
                     let (score, tag) = row?;
                     writeln!(writer, "{}\t{}\t{serial}", score.to_bits(), tag.code())?;
-                    serial += 1;
                 }
                 writer.flush()?;
             }
@@ -914,6 +892,7 @@ pub(super) fn validate_legacy_fp_location_denominator(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn calculate_fp_region_size(
     requested: Option<&str>,
     fp_regions: &[Interval],

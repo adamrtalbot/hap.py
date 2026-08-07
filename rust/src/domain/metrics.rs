@@ -1,3 +1,6 @@
+use super::validated::{QueryProvenance, ValidatedVcfRecord};
+use super::variant::RawVcfRecord;
+
 /// Counts accumulated for one side and classification of a benchmark.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CountsBucket {
@@ -42,18 +45,14 @@ pub(crate) struct ComparisonRecord {
 }
 
 impl ComparisonRecord {
-    pub(crate) fn checked(raw: super::RawVcfRecord) -> Self {
-        let record = ValidatedVcfRecord::try_from_raw(raw, super::QueryProvenance::Unavailable)
+    pub(crate) fn checked(raw: RawVcfRecord) -> Self {
+        let record = ValidatedVcfRecord::try_from_raw(raw, QueryProvenance::Unavailable)
             .expect("comparison rows preserve checked VCF invariants");
         Self { record }
     }
 
-    pub(crate) fn raw(&self) -> &super::RawVcfRecord {
+    pub(crate) fn raw(&self) -> &RawVcfRecord {
         self.record.raw()
-    }
-
-    pub(crate) fn validated(&self) -> &ValidatedVcfRecord {
-        &self.record
     }
 
     pub(crate) fn into_validated(self) -> ValidatedVcfRecord {
@@ -62,7 +61,7 @@ impl ComparisonRecord {
 
     pub(crate) fn try_update<R>(
         &mut self,
-        edit: impl FnOnce(&mut super::RawVcfRecord) -> anyhow::Result<R>,
+        edit: impl FnOnce(&mut RawVcfRecord) -> anyhow::Result<R>,
     ) -> anyhow::Result<R> {
         self.record.try_update(edit)
     }
@@ -86,20 +85,20 @@ impl ComparisonRecord {
     #[cfg(test)]
     pub(crate) fn fixture(line: &str) -> Self {
         Self::checked(
-            super::RawVcfRecord::from_line(line, Path::new("comparison-test-fixture"))
+            RawVcfRecord::from_line(line, std::path::Path::new("comparison-test-fixture"))
                 .expect("comparison fixture must be a valid VCF record"),
         )
     }
 }
 
-impl From<super::RawVcfRecord> for ComparisonRecord {
-    fn from(record: super::RawVcfRecord) -> Self {
+impl From<RawVcfRecord> for ComparisonRecord {
+    fn from(record: RawVcfRecord) -> Self {
         Self::checked(record)
     }
 }
 
 impl std::ops::Deref for ComparisonRecord {
-    type Target = super::RawVcfRecord;
+    type Target = RawVcfRecord;
 
     fn deref(&self) -> &Self::Target {
         self.raw()
@@ -137,5 +136,3 @@ impl Ord for ComparisonRecord {
             .then(left.samples.cmp(&right.samples))
     }
 }
-use crate::adapters::vcf::ValidatedVcfRecord;
-use std::path::Path;

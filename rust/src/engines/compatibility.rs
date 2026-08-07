@@ -3,6 +3,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScmpRefVarSpanPolicy {
     LegacyAltLength,
+    #[cfg(test)]
     ReferenceLength,
 }
 
@@ -15,12 +16,13 @@ pub(crate) enum AlleleCountArrayPolicy {
 pub(crate) fn scmp_refvar_end(
     policy: ScmpRefVarSpanPolicy,
     start: i64,
-    reference_len: usize,
+    _reference_len: usize,
     alt_len: usize,
 ) -> anyhow::Result<i64> {
     let span = match policy {
         ScmpRefVarSpanPolicy::LegacyAltLength => alt_len,
-        ScmpRefVarSpanPolicy::ReferenceLength => reference_len,
+        #[cfg(test)]
+        ScmpRefVarSpanPolicy::ReferenceLength => _reference_len,
     };
     Ok(start + i64::try_from(span)? - 1)
 }

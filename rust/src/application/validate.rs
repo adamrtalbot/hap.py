@@ -74,7 +74,10 @@ pub(crate) fn run(args: ValidateArgs) -> Result<()> {
     run_with_diagnostics(args.into_inner(), &mut stderr.lock())
 }
 
-fn run_with_diagnostics<W: Write>(mut args: RawValidateArgs, diagnostics: &mut W) -> Result<()> {
+fn run_with_diagnostics<W: Write + ?Sized>(
+    mut args: RawValidateArgs,
+    diagnostics: &mut W,
+) -> Result<()> {
     let outputs = [args.output_json.as_deref(), args.errors_bed.as_deref()]
         .into_iter()
         .flatten()
@@ -115,7 +118,10 @@ fn run_with_diagnostics<W: Write>(mut args: RawValidateArgs, diagnostics: &mut W
     transaction.commit()
 }
 
-fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut W) -> Result<()> {
+fn run_with_diagnostics_inner<W: Write + ?Sized>(
+    args: RawValidateArgs,
+    diagnostics: &mut W,
+) -> Result<()> {
     let reference_contigs = if let Some(reference) = &args.reference {
         fasta::contig_lengths(Path::new(reference))?
             .into_keys()
@@ -171,7 +177,7 @@ fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut
     let mut reported_extreme_format_value = false;
 
     for record in &mut records {
-        let mut record = record?;
+        let mut record = record.map_err(restore_legacy_genotype_error)?;
         if record.samples.len() < header.sample_count {
             writeln!(
                 diagnostics,
@@ -294,17 +300,16 @@ fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut
 
         if let Some(reference_sequences) = &reference_sequences
             && let Some(reason) = validate_record(&record, reference_sequences)
+            && let Some((_, errors)) = errors.as_mut()
         {
-            if let Some((_, errors)) = errors.as_mut() {
-                writeln!(
-                    errors,
-                    "{}\t{}\t{}\t{}",
-                    record.chrom,
-                    record.pos.saturating_sub(1),
-                    record.end_pos(),
-                    reason
-                )?;
-            }
+            writeln!(
+                errors,
+                "{}\t{}\t{}\t{}",
+                record.chrom,
+                record.pos.saturating_sub(1),
+                record.end_pos(),
+                reason
+            )?;
         }
 
         if args
@@ -377,7 +382,7 @@ impl VcfHeader {
         })
     }
 
-    fn translation_error<W: Write>(
+    fn translation_error<W: Write + ?Sized>(
         &mut self,
         record: &RawVcfRecord,
         diagnostics: &mut W,
@@ -574,6 +579,24 @@ fn location_selects_lowercase_x(location: &str) -> bool {
         == Some("x")
 }
 
+/// Keeps the checked adapter boundary while preserving vcfcheck's fatal
+/// diagnostic for a genotype that names an absent alternate allele.
+fn restore_legacy_genotype_error(error: anyhow::Error) -> anyhow::Error {
+    let message = error.to_string();
+    let Some((_, coordinate_and_error)) = message.split_once(" at ") else {
+        return error;
+    };
+    let Some((coordinate, _)) = coordinate_and_error.split_once(": allele index ") else {
+        return error;
+    };
+    if !coordinate_and_error.contains(" is out of bounds for ") {
+        return error;
+    }
+    error.context(format!(
+        "Call with invalid genotype (non-existent allele) at {coordinate}"
+    ))
+}
+
 fn inspect_genotypes(record: &RawVcfRecord) -> Result<RecordGenotypes> {
     let mut result = RecordGenotypes::default();
     let alts = record.alt_allele.split(',').collect::<Vec<_>>();
@@ -635,7 +658,7 @@ fn inspect_genotypes(record: &RawVcfRecord) -> Result<RecordGenotypes> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_warning_counts<W: Write>(
+fn update_warning_counts<W: Write + ?Sized>(
     record: &RawVcfRecord,
     genotype: &RecordGenotypes,
     previous: &mut PreviousRecord,
@@ -757,7 +780,7 @@ fn record_end(record: &RawVcfRecord) -> usize {
         .unwrap_or_else(|| record.end_pos().saturating_sub(1))
 }
 
-fn emit_warning<W: Write>(
+fn emit_warning<W: Write + ?Sized>(
     counts: &mut ValidationCounts,
     warning: usize,
     all_warnings: bool,
@@ -792,7 +815,10 @@ fn update_record_counts(
     }
 }
 
-fn write_warning_summaries<W: Write>(counts: &ValidationCounts, diagnostics: &mut W) -> Result<()> {
+fn write_warning_summaries<W: Write + ?Sized>(
+    counts: &ValidationCounts,
+    diagnostics: &mut W,
+) -> Result<()> {
     if counts.warnings[WARNING_BCFERROR] > 0 {
         writeln!(
             diagnostics,
@@ -904,7 +930,7 @@ mod tests {
         args: crate::application::ValidateArgs,
         diagnostics: &mut dyn Write,
     ) -> Result<()> {
-        super::run_with_diagnostics(args.validated()?, diagnostics)
+        super::run_with_diagnostics(args, diagnostics)
     }
 
     #[test]

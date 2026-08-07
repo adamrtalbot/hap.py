@@ -1,3 +1,4 @@
+use crate::application::ftx::resolve_legacy_reference;
 use clap::{
     Arg, ArgAction, ArgMatches, Args, Command as ClapCommand, CommandFactory, Error,
     FromArgMatches, Parser, Subcommand, ValueEnum,
@@ -281,96 +282,6 @@ pub(crate) enum CompareEngine {
     Vcfeval,
     ScmpSomatic,
     ScmpDistance,
-}
-
-impl CompareEngine {
-    pub(crate) fn legacy_name(self) -> &'static str {
-        match self {
-            Self::Xcmp => "xcmp",
-            Self::Vcfeval => "vcfeval",
-            Self::ScmpSomatic => "scmp-somatic",
-            Self::ScmpDistance => "scmp-distance",
-        }
-    }
-}
-
-impl CompareArgs {
-    /// Construct the legacy-default germline option set for internal callers.
-    /// CLI parsing supplies the same defaults through clap; keeping fixture
-    /// runners on this constructor prevents newly ported switches from
-    /// silently acquiring test-only values.
-    #[cfg(test)]
-    pub(crate) fn with_paths(
-        truth: String,
-        query: String,
-        reference: String,
-        report_prefix: String,
-    ) -> Self {
-        Self {
-            truth,
-            query,
-            reference,
-            report_prefix,
-            version: false,
-            annotation_type: None,
-            pass_only: false,
-            preprocess_truth: false,
-            convert_gvcf_truth: false,
-            convert_gvcf_query: false,
-            convert_gvcf_to_vcf: false,
-            usefiltered_truth: false,
-            filters_only: None,
-            preprocess_window: 10_000,
-            adjust_conf_regions: true,
-            no_adjust_conf_regions: false,
-            leftshift: false,
-            no_leftshift: false,
-            decompose: false,
-            no_decompose: false,
-            bcftools_norm: false,
-            fixchr: None,
-            no_fixchr: false,
-            filter_nonref: false,
-            somatic: false,
-            set_gt: None,
-            gender: PreprocessGender::Auto,
-            bcf: false,
-            regions_bedfile: None,
-            targets_bedfile: None,
-            fp_bedfile: None,
-            locations: None,
-            threads: None,
-            strat_tsv: None,
-            strat_regions: Vec::new(),
-            strat_fixchr: false,
-            write_vcf: false,
-            write_counts: true,
-            no_write_counts: false,
-            output_vtc: false,
-            preserve_info: false,
-            roc: "QUAL".to_string(),
-            no_roc: false,
-            roc_regions: Vec::new(),
-            roc_filter: None,
-            roc_delta: 0.5,
-            ci_alpha: 0.0,
-            no_json: false,
-            no_hc: false,
-            window: 50,
-            max_enum: 16_768,
-            hb_expand: 30,
-            engine: CompareEngine::Xcmp,
-            engine_vcfeval: None,
-            engine_vcfeval_template: None,
-            engine_scmp_distance: 30,
-            force_interactive: false,
-            scratch_prefix: None,
-            keep_scratch: false,
-            logfile: None,
-            verbose: false,
-            quiet: false,
-        }
-    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -1030,24 +941,6 @@ fn parse_somatic_roc(value: &str) -> Result<String, String> {
     }
 }
 
-pub(crate) fn resolve_legacy_reference(explicit: Option<&str>) -> Option<String> {
-    if let Some(path) = explicit {
-        return Some(path.to_string());
-    }
-    for variable in ["HG19", "HGREF"] {
-        if let Some(path) = std::env::var_os(variable) {
-            let path = std::path::PathBuf::from(path);
-            if path.is_file() {
-                return Some(path.to_string_lossy().into_owned());
-            }
-        }
-    }
-    let fallback = std::path::Path::new("/opt/hap.py-data/hg19.fa");
-    fallback
-        .is_file()
-        .then(|| fallback.to_string_lossy().into_owned())
-}
-
 fn default_somatic_reference() -> String {
     resolve_legacy_reference(None).unwrap_or_else(|| "/opt/hap.py-data/hg19.fa".to_string())
 }
@@ -1566,8 +1459,6 @@ impl From<SomaticArgs> for crate::application::SomaticArgs {
             normalize_all: args.normalize_all,
             fixchr_truth: args.fixchr_truth,
             fixchr_query: args.fixchr_query,
-            fix_chr_truth: args.fix_chr_truth,
-            fix_chr_query: args.fix_chr_query,
             no_fixchr_truth: args.no_fixchr_truth,
             no_fixchr_query: args.no_fixchr_query,
             no_order_check: args.no_order_check,

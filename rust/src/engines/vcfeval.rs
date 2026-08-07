@@ -164,7 +164,7 @@ pub(crate) fn compare_records(
             .ok_or_else(|| anyhow::anyhow!("reference has no contig {}", cluster.chrom))?;
         compare_cluster(cluster, &calls, reference, &mut verdicts)?;
     }
-    apply_allele_matches(&calls, &references, &mut verdicts)?;
+    apply_allele_matches(&calls, references, &mut verdicts)?;
     apply_loose_matches(&calls, options.loose_match_distance, &mut verdicts);
 
     let qq = query_scores(&merged, options.roc_field)?;
@@ -1041,9 +1041,12 @@ mod tests {
 
     #[test]
     fn symbolic_calls_are_unscored_and_have_no_match_metadata() -> Result<()> {
-        let mut records = vec![RawVcfRecord::from_line(
-            "chr1\t7\t.\tA\t<DEL>\t20\tPASS\tSCORE=97\tGT\t1/1\t1/1",
-            Path::new("symbolic.vcf"),
+        let mut records = vec![ValidatedVcfRecord::try_from_raw(
+            RawVcfRecord::from_line(
+                "chr1\t7\t.\tA\t<DEL>\t20\tPASS\tSCORE=97\tGT\t1/1\t1/1",
+                Path::new("symbolic.vcf"),
+            )?,
+            QueryProvenance::Unavailable,
         )?];
         let calls = extract_calls(&records)?;
         let verdicts = vec![

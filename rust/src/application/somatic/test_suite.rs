@@ -5,7 +5,6 @@ mod tests {
     use super::super::*;
     use crate::cli_compat::cli::{Cli, Command};
     use clap::Parser;
-    use std::io::Write as _;
 
     fn parsed_somatic(extra: &[&str]) -> SomaticArgs {
         let mut argv = vec![
@@ -23,7 +22,7 @@ mod tests {
         let Command::Somatic(args) = cli.command else {
             panic!("somatic command expected");
         };
-        args
+        args.into()
     }
 
     fn run_args(args: SomaticArgs) -> Result<()> {

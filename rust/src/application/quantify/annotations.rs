@@ -1,10 +1,9 @@
 //! Cohesive quantify annotations responsibility.
 
 use super::{BenchmarkSamples, RegionLevels};
-use crate::adapters::report::{self, suffixed_report_path};
-use crate::adapters::vcf;
+use crate::adapters::report::suffixed_report_path;
+use crate::adapters::vcf::read_text;
 use crate::domain::RawVcfRecord;
-use crate::engines::roc;
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
@@ -1115,7 +1114,7 @@ pub(super) fn apply_stratification_levels(
     }
 
     let csv_path = suffixed_report_path(prefix, "roc.all.csv.gz");
-    let csv = vcf::read_text(&csv_path)?;
+    let csv = read_text(&csv_path)?;
     let csv = rewrite_subset_levels(&csv, ',', levels);
     let csv_file = fs::File::create(&csv_path)
         .with_context(|| format!("failed to create {}", csv_path.display()))?;

@@ -757,7 +757,7 @@ fn cleanup_backups_or_rollback(
                 backups,
                 published,
                 Some(&snapshots),
-                error.context(format!(
+                anyhow::Error::new(error).context(format!(
                     "failed to remove transaction backup {}",
                     backup.display()
                 )),

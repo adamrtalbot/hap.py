@@ -1,7 +1,8 @@
 //! Extracted cohesive responsibility from the command façade.
 
 use super::AnnotatedRow;
-use crate::adapters::vcf::{self, Variant};
+use super::rows::{snp_bucket_label, subtype_label};
+use crate::adapters::vcf::Variant;
 use crate::domain::{CountsBucket, RawVcfRecord, TypeCounts};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,31 +21,6 @@ fn comparison_samples(record: &RawVcfRecord) -> Option<ComparisonSamples<'_>> {
         truth,
         query,
     })
-}
-
-#[cfg(test)]
-pub(super) fn collect_contigs(
-    truth: &[Variant],
-    query: &[Variant],
-    locations: Option<&[vcf::LocationFilter]>,
-) -> BTreeSet<String> {
-    let mut contigs = BTreeSet::new();
-    if let Some(filters) = locations {
-        for filter in filters {
-            match filter {
-                vcf::LocationFilter::Contig(chrom) => {
-                    contigs.insert(chrom.clone());
-                }
-                vcf::LocationFilter::Range { chrom, .. } => {
-                    contigs.insert(chrom.clone());
-                }
-            }
-        }
-    }
-    for variant in truth.iter().chain(query.iter()) {
-        contigs.insert(variant.key.chrom.clone());
-    }
-    contigs
 }
 
 pub(super) fn report_subset_size(
@@ -217,7 +193,12 @@ pub(super) fn derive_subset_fp_classes(
 /// in its multi-allelic BI (e.g. a hetalt FP with BI `i1_5,i6_15` adds
 /// one to both I1_5 and I6_15 — same fanout rule the truth/query stats
 /// use).
-pub(super) type SubtypeFpClasses = BTreeMap<String, BTreeMap<String, (usize, usize)>>;
+type FpClassCounts = (usize, usize);
+type FpClassMap = BTreeMap<String, FpClassCounts>;
+type NestedFpClassMap = BTreeMap<String, FpClassMap>;
+type TripleFpClassMap = BTreeMap<String, NestedFpClassMap>;
+
+pub(super) type SubtypeFpClasses = NestedFpClassMap;
 pub(super) type SubsetSubtypeFpClasses = BTreeMap<String, SubtypeFpClasses>;
 
 #[derive(Default)]
@@ -329,10 +310,7 @@ fn merge_triple_type_map(
     }
 }
 
-fn merge_pair_map(
-    target: &mut BTreeMap<String, (usize, usize)>,
-    source: BTreeMap<String, (usize, usize)>,
-) {
+fn merge_pair_map(target: &mut FpClassMap, source: FpClassMap) {
     for (key, (left, right)) in source {
         let value = target.entry(key).or_default();
         value.0 += left;
@@ -340,19 +318,13 @@ fn merge_pair_map(
     }
 }
 
-fn merge_nested_pair_map(
-    target: &mut BTreeMap<String, BTreeMap<String, (usize, usize)>>,
-    source: BTreeMap<String, BTreeMap<String, (usize, usize)>>,
-) {
+fn merge_nested_pair_map(target: &mut NestedFpClassMap, source: NestedFpClassMap) {
     for (key, values) in source {
         merge_pair_map(target.entry(key).or_default(), values);
     }
 }
 
-fn merge_triple_pair_map(
-    target: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, (usize, usize)>>>,
-    source: BTreeMap<String, BTreeMap<String, BTreeMap<String, (usize, usize)>>>,
-) {
+fn merge_triple_pair_map(target: &mut TripleFpClassMap, source: TripleFpClassMap) {
     for (key, values) in source {
         merge_nested_pair_map(target.entry(key).or_default(), values);
     }

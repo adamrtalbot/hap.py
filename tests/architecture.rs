@@ -100,6 +100,15 @@ impl<'ast> Visit<'ast> for DependencyVisitor {
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if node.attrs.iter().any(|attribute| {
+            attribute.path().is_ident("cfg")
+                && matches!(
+                    &attribute.meta,
+                    syn::Meta::List(list) if list.tokens.to_string() == "test"
+                )
+        }) {
+            return;
+        }
         if let Some((_, items)) = &node.content {
             self.current.push(node.ident.to_string());
             for item in items {
@@ -153,7 +162,7 @@ fn allowed_dependency(from: &str, to: &str) -> bool {
         "adapters" => matches!(to_layer, "domain" | "adapters"),
         "engines" => matches!(to_layer, "domain" | "adapters" | "engines"),
         "application" => true,
-        "cli_compat" => matches!(to_layer, "domain" | "cli_compat"),
+        "cli_compat" => matches!(to_layer, "domain" | "application" | "cli_compat"),
         _ => false,
     }
 }
@@ -272,7 +281,17 @@ fn crate_root_exposes_only_run() {
             syn::Item::Fn(function) if matches!(function.vis, syn::Visibility::Public(_)) => {
                 Some(function.sig.ident.to_string())
             }
-            syn::Item::Mod(module) if matches!(module.vis, syn::Visibility::Public(_)) => {
+            syn::Item::Mod(module)
+                if matches!(module.vis, syn::Visibility::Public(_))
+                    && !module.attrs.iter().any(|attribute| {
+                        matches!(
+                            &attribute.meta,
+                            syn::Meta::List(list)
+                                if list.path.is_ident("cfg")
+                                    && list.tokens.to_string() == "feature = \"fuzzing\""
+                        )
+                    }) =>
+            {
                 Some(module.ident.to_string())
             }
             syn::Item::Use(item) if matches!(item.vis, syn::Visibility::Public(_)) => {

@@ -32,28 +32,6 @@ pub(crate) struct Artifacts {
     pub(crate) raw_table: Option<tempfile::TempPath>,
 }
 
-pub(crate) fn calculate(
-    rows: &[AnnotatedRow],
-    subset_size: usize,
-    conf_size: usize,
-) -> Result<Artifacts> {
-    calculate_with_options(rows, subset_size, conf_size, &RocOptions::default())
-}
-
-pub(crate) fn calculate_with_options(
-    rows: &[AnnotatedRow],
-    subset_size: usize,
-    conf_size: usize,
-    options: &RocOptions,
-) -> Result<Artifacts> {
-    calculate_with_options_iter(
-        rows.iter().map(Ok::<_, anyhow::Error>),
-        subset_size,
-        conf_size,
-        options,
-    )
-}
-
 /// Calculate ROC reports from a fallible record stream without retaining the
 /// complete input or output tables in memory.
 pub(crate) fn calculate_with_options_iter<I, R>(

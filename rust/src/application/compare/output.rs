@@ -1,9 +1,15 @@
 //! Extracted cohesive responsibility from the command façade.
 
+#[cfg(test)]
+use super::CLUSTER_GAP_BP;
+#[cfg(test)]
+use super::Cluster;
 use super::genotype::parse_gt_alleles;
-use super::matching::{build_clusters_with_gap, effective_refrange};
+#[cfg(test)]
+use super::matching::build_clusters_with_gap;
+use super::matching::effective_refrange;
 use super::metrics::info_list_values;
-use super::{AnnotatedRow, CLUSTER_GAP_BP, Cluster, Variant, VariantKey};
+use super::{AnnotatedRow, Variant, VariantKey};
 use crate::adapters::{
     metrics_json,
     report::suffixed_report_path,

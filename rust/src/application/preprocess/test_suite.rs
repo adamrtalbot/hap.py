@@ -2,10 +2,17 @@
 
 #[cfg(test)]
 mod tests {
+    use super::super::genotype::expand_haploid_gt;
     use super::super::*;
+    use crate::application::SomaticGtMode;
+    use crate::domain::RawVcfRecord;
     use proptest::prelude::*;
     use std::fs;
     use tempfile::tempdir;
+
+    fn run(args: PreprocessArgs) -> anyhow::Result<()> {
+        super::super::run(args.validated_with_legacy_plain_vcf()?)
+    }
 
     #[test]
     fn filters_only_removes_records_carrying_only_selected_filters() {

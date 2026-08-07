@@ -3,11 +3,17 @@
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use crate::adapters::vcf;
+    use crate::domain::CountsBucket;
     use flate2::read::GzDecoder;
     use std::io::Read;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn run(args: QuantifyArgs) -> anyhow::Result<()> {
+        super::super::run(args.validated()?)
+    }
 
     fn fixture(file: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

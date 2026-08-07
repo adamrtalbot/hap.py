@@ -5,6 +5,7 @@ use crate::adapters::vcf::LocationFilter;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LocationStreamPolicy {
     IndependentLegacyStreams,
+    #[cfg(test)]
     SetUnion,
 }
 
@@ -21,7 +22,9 @@ pub(super) fn location_stream_groups(
         .collect::<Vec<_>>();
     match policy {
         LocationStreamPolicy::IndependentLegacyStreams => matching,
+        #[cfg(test)]
         LocationStreamPolicy::SetUnion if matching.is_empty() => Vec::new(),
+        #[cfg(test)]
         LocationStreamPolicy::SetUnion => vec![0],
     }
 }
@@ -36,6 +39,7 @@ pub(super) fn location_stream_final_end(
         LocationStreamPolicy::IndependentLegacyStreams => filters
             .get(stream_id)
             .and_then(|filter| location_filter_end(filter, chrom)),
+        #[cfg(test)]
         LocationStreamPolicy::SetUnion => {
             let mut maximum = None;
             for filter in filters {

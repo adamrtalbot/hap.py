@@ -8,7 +8,7 @@ use crate::{
     output::OutputTransaction,
 };
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -24,9 +24,7 @@ mod reports;
 #[cfg(test)]
 mod test_suite;
 
-use allele_frequency::{
-    format_af_interval, parse_af_bins, preserves_empty_records_af_bin, round_four, rounded_metric,
-};
+use allele_frequency::{format_af_interval, parse_af_bins, preserves_empty_records_af_bin};
 use features::*;
 use metrics::*;
 use normalization::*;

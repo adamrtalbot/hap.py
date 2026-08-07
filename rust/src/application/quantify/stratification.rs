@@ -463,7 +463,7 @@ pub(super) fn propagate_checked_superlocus_annotations_for_samples(
     preserve_missing_query_qq: bool,
     inherit_same_position_tp_qq: bool,
 ) -> Result<()> {
-    let mut edited = input.records().to_vec();
+    let mut edited = input.records().cloned().collect::<Vec<_>>();
     propagate_superlocus_annotations_for_samples(
         &mut edited,
         annotation_type,
