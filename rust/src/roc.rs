@@ -377,12 +377,12 @@ fn build_metric_indices(
             ] {
                 let baseline = legacy_row_key(&key.ty, subtype, &key.filter, &key.subset, "*");
                 if !matches!(*subtype, "ti" | "tv") {
-                    table.set(baseline, genotype == "*");
+                    table.set(baseline, genotype == "*")?;
                 } else if genotype == "*" {
                     table.set(
                         legacy_row_key(&key.ty, "*", &key.filter, &key.subset, "*"),
                         false,
-                    );
+                    )?;
                 }
                 if counts_only {
                     continue;
@@ -400,12 +400,12 @@ fn build_metric_indices(
                         table.set(
                             legacy_row_key(&key.ty, subtype, &key.filter, &key.subset, &qq),
                             true,
-                        );
+                        )?;
                     } else if matches!(*subtype, "ti" | "tv") && genotype == "*" {
                         table.set(
                             legacy_row_key(&key.ty, "*", &key.filter, &key.subset, &qq),
                             false,
-                        );
+                        )?;
                     } else if !matches!(*subtype, "ti" | "tv") {
                         // Preserve the extra empty field in the legacy
                         // genotype aggregation prefix. These rows are removed
@@ -418,14 +418,13 @@ fn build_metric_indices(
                                 key.ty, subtype, key.filter, key.subset, qq
                             ),
                             false,
-                        );
+                        )?;
                     }
                 }
             }
         }
     }
 
-    table.ensure_within_limit()?;
     let raw = table.retained_order();
     let raw_positions = raw
         .iter()
@@ -752,20 +751,18 @@ struct LegacyUnorderedRows {
     bucket_order: VecDeque<usize>,
     seen: HashSet<String>,
     typed: HashSet<String>,
-    overflow: bool,
 }
 
 impl LegacyUnorderedRows {
-    fn set(&mut self, key: String, has_type: bool) {
-        if has_type {
-            self.typed.insert(key.clone());
-        }
+    fn set(&mut self, key: String, has_type: bool) -> Result<()> {
         if self.seen.contains(&key) {
-            return;
+            if has_type {
+                self.typed.insert(key);
+            }
+            return Ok(());
         }
         if self.seen.len() >= MAX_ROC_METRIC_INDEX_KEYS {
-            self.overflow = true;
-            return;
+            bail!("ROC metric index exceeds the {MAX_ROC_METRIC_INDEX_KEYS} key resource limit");
         }
         if self.bucket_count == 0 {
             self.bucket_count = 1;
@@ -774,6 +771,9 @@ impl LegacyUnorderedRows {
             self.rehash(next_legacy_bucket(self.bucket_count, self.seen.len() + 1));
         }
         self.seen.insert(key.clone());
+        if has_type {
+            self.typed.insert(key.clone());
+        }
         let bucket = (legacy_string_hash(&key) % self.bucket_count as u64) as usize;
         if let Some(entries) = self.buckets.get_mut(&bucket) {
             entries.push_front(key);
@@ -781,6 +781,7 @@ impl LegacyUnorderedRows {
             self.buckets.insert(bucket, VecDeque::from([key]));
             self.bucket_order.push_front(bucket);
         }
+        Ok(())
     }
 
     fn rehash(&mut self, bucket_count: usize) {
@@ -811,13 +812,6 @@ impl LegacyUnorderedRows {
             .into_iter()
             .filter(|key| self.typed.contains(key))
             .collect()
-    }
-
-    fn ensure_within_limit(&self) -> Result<()> {
-        if self.overflow {
-            bail!("ROC metric index exceeds the {MAX_ROC_METRIC_INDEX_KEYS} key resource limit");
-        }
-        Ok(())
     }
 }
 
@@ -871,16 +865,18 @@ struct LegacyRawTable {
 }
 
 impl LegacyRawTable {
-    fn set(&mut self, row: &str, column: &str, value: String, has_type: bool) {
-        self.order.set(row.to_string(), has_type);
+    fn set(&mut self, row: &str, column: &str, value: String, has_type: bool) -> Result<()> {
+        self.order
+            .set(row.to_string(), has_type)
+            .with_context(|| format!("failed to admit legacy ROC row '{row}'"))?;
         self.rows
             .entry(row.to_string())
             .or_default()
             .insert(column.to_string(), value);
+        Ok(())
     }
 
     fn write(&self, path: &Path) -> Result<()> {
-        self.order.ensure_within_limit()?;
         let retained = self.order.retained_order();
         let columns = retained
             .iter()
@@ -971,7 +967,7 @@ fn write_legacy_roc_table(
                     conf_size,
                     &options.subset_sizes,
                     &options.subset_confidence_sizes,
-                );
+                )?;
                 if !counts_only && options.output_rocs {
                     sort_passes += 1;
                     let levels = if accum.observations.is_disk_backed() {
@@ -1000,7 +996,7 @@ fn write_legacy_roc_table(
                             conf_size,
                             &options.subset_sizes,
                             &options.subset_confidence_sizes,
-                        );
+                        )?;
                     }
                 }
             }
@@ -1163,7 +1159,7 @@ fn add_legacy_level(
     conf_size: usize,
     subset_sizes: &BTreeMap<String, usize>,
     subset_confidence_sizes: &BTreeMap<String, usize>,
-) {
+) -> Result<()> {
     let is_baseline = qq == "*";
     let row_key = if is_baseline || genotype == "*" {
         legacy_row_key(&key.ty, subtype, &key.filter, &key.subset, qq)
@@ -1177,7 +1173,7 @@ fn add_legacy_level(
     };
 
     if !matches!(subtype, "ti" | "tv") && genotype == "*" {
-        table.set(&row_key, "QQ", qq.to_string(), true);
+        table.set(&row_key, "QQ", qq.to_string(), true)?;
         for (column, value) in [
             ("Type", key.ty.as_str()),
             ("Subtype", subtype),
@@ -1186,10 +1182,10 @@ fn add_legacy_level(
             ("Filter", key.filter.as_str()),
             ("QQ.Field", key.qq_field.as_str()),
         ] {
-            table.set(&row_key, column, value.to_string(), true);
+            table.set(&row_key, column, value.to_string(), true)?;
         }
         for (column, value) in legacy_primary_counts(counts, counts_only) {
-            table.set(&row_key, column, value, true);
+            table.set(&row_key, column, value, true)?;
         }
         let (size, conf) = subset_size_cells(
             &key.subset,
@@ -1200,14 +1196,14 @@ fn add_legacy_level(
             subset_sizes,
             subset_confidence_sizes,
         );
-        table.set(&row_key, "Subset.Size", legacy_count_string(&size), true);
+        table.set(&row_key, "Subset.Size", legacy_count_string(&size), true)?;
         table.set(
             &row_key,
             "Subset.IS_CONF.Size",
             legacy_count_string(&conf),
             true,
-        );
-        table.set(&row_key, "Subset.Level", "0.000000".to_string(), true);
+        )?;
+        table.set(&row_key, "Subset.Level", "0.000000".to_string(), true)?;
     } else if genotype == "*" && matches!(subtype, "ti" | "tv") {
         let aggregate = legacy_row_key(&key.ty, "*", &key.filter, &key.subset, qq);
         for (metric, count) in legacy_count_buckets(counts, counts_only) {
@@ -1216,7 +1212,7 @@ fn add_legacy_level(
                 &format!("{metric}.{subtype}"),
                 legacy_usize(count),
                 false,
-            );
+            )?;
         }
     } else if genotype != "*" && !matches!(subtype, "ti" | "tv") {
         for (metric, count) in legacy_count_buckets(counts, counts_only) {
@@ -1225,9 +1221,10 @@ fn add_legacy_level(
                 &format!("{metric}.{genotype}"),
                 legacy_usize(count),
                 false,
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 fn legacy_count_buckets(counts: &Cumul, counts_only: bool) -> Vec<(&'static str, usize)> {

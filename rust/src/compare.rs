@@ -256,6 +256,7 @@ fn spool_comparison_contigs(path: &Path) -> Result<BTreeMap<String, ComparisonCo
 }
 
 const COMPARISON_METADATA_LOOKBEHIND: usize = 1_024;
+const MAX_COMPARISON_METADATA_RETAINED_RECORDS: usize = MAX_CLUSTER_VARIANTS * 2;
 
 struct ComparisonMetadataCursor {
     reader: vcf::RawVcfReader,
@@ -320,6 +321,12 @@ impl ComparisonMetadataCursor {
             if record.pos > end {
                 self.pending = Some(record);
                 break;
+            }
+            if self.retained.len() >= MAX_COMPARISON_METADATA_RETAINED_RECORDS {
+                bail!(
+                    "comparison metadata window for {chrom}:{start}-{end} exceeds the {} retained-record resource limit",
+                    MAX_COMPARISON_METADATA_RETAINED_RECORDS
+                );
             }
             self.retained.push_back(record);
         }

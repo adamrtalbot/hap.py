@@ -35,6 +35,7 @@ declared payload:
 - Quantify records per active superlocus: 1,000,000
 - Somatic records per active contig and side: 10,000,000
 - Comparison variants per active cluster: 10,000
+- Comparison metadata records per 1,024-base cursor window: 20,000
 - Rendered ROC thresholds/rows per report: 2,500,000
 - Legacy-compatible ROC metric-index keys: 500,000
 
