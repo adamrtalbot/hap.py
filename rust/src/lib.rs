@@ -5,32 +5,17 @@
 //! details so they can evolve without becoming an accidental public API.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs, rustdoc::broken_intra_doc_links)]
+#![warn(missing_docs, rustdoc::broken_intra_doc_links, unreachable_pub)]
 
-mod align;
-mod bcf;
-mod cephes;
-mod cli;
-mod compare;
-mod fasta;
-mod ftx;
-mod metrics_json;
-mod partial_credit;
-mod preprocess;
-mod quantify;
-mod report;
-mod roc;
-mod scmp;
-mod somatic;
-mod strelka;
-mod validate;
-mod variant_pipeline;
-mod vcf;
-mod vcfeval;
+mod adapters;
+mod application;
+mod cli_compat;
+mod domain;
+mod engines;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, error::ErrorKind};
-use cli::{
+use cli_compat::cli::{
     Cli, Command, legacy_unknown_argument_exit_code, process_args_with_legacy_somatic_aliases,
     requests_legacy_subcommand_version, requests_quantify_version,
     validate_legacy_germline_version_arguments,
@@ -89,19 +74,19 @@ pub fn run() -> Result<()> {
         Err(error) => error.exit(),
     };
     match cli.command {
-        Command::Germline(args) => compare::run(args),
-        Command::Somatic(args) => somatic::run(args),
+        Command::Germline(args) => application::compare::run(args),
+        Command::Somatic(args) => application::somatic::run(args),
         Command::Preprocess(args) if args.version => {
             println!("pre.py ");
             Ok(())
         }
-        Command::Preprocess(args) => preprocess::run(args),
-        Command::Ftx(args) => ftx::run(args),
+        Command::Preprocess(args) => application::preprocess::run(args),
+        Command::Ftx(args) => application::ftx::run(args),
         Command::Quantify(_) if quantify_version => {
             println!("qfy.py ");
             Ok(())
         }
-        Command::Quantify(args) => quantify::run(args),
-        Command::Validate(args) => validate::run(args),
+        Command::Quantify(args) => application::quantify::run(args),
+        Command::Validate(args) => application::validate::run(args),
     }
 }

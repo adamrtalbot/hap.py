@@ -202,6 +202,7 @@ dependencies = [
  "clap",
  "flate2",
  "noodles-bgzf",
+ "syn",
  "tempfile",
 ]
 
