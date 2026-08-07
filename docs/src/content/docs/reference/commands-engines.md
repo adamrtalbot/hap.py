@@ -33,4 +33,7 @@ prefix and core quantification tables.
 
 `hap` accepts several flags that existing wrappers pass. It ignores
 `--engine-vcfeval-path` and `--engine-vcfeval-template` because the Rust engine
-runs in process with a FASTA. See the [germline page](../../tools/germline/).
+runs in process with a FASTA. Both options warn on stderr and will be removed in
+1.0.0. Remove them from wrappers and supply `--reference <FASTA>` instead. See
+the [germline page](../../tools/germline/) and
+[compatibility policy](../../project/compatibility/).

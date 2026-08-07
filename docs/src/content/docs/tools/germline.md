@@ -43,8 +43,8 @@ hap germline truth.vcf.gz query.vcf.gz \
 | `--xcmp-enumeration-threshold <N>` | Maximum xcmp path enumeration threshold; default `16768`. |
 | `--xcmp-expand-hapblocks <N>` | xcmp haplotype-block expansion; default `30`. |
 | `--scmp-distance <N>` | Distance for `scmp-distance`; default `30`. Alias: `--lose-match-distance`. |
-| `--engine-vcfeval-path <PATH>` | Wrapper compatibility option. The Rust engine runs in process and ignores the executable path. |
-| `--engine-vcfeval-template <PATH>` | Wrapper compatibility option. The Rust engine reads `--reference` and ignores this SDF path. |
+| `--engine-vcfeval-path <PATH>` | Deprecated compatibility option. Ignored by the native engine; use `--engine vcfeval --reference <FASTA>`. Warns and will be removed in 1.0.0. |
+| `--engine-vcfeval-template <PATH>` | Deprecated compatibility option. Ignored by the native engine; use `--engine vcfeval --reference <FASTA>`. Warns and will be removed in 1.0.0. |
 
 ## Preprocessing
 

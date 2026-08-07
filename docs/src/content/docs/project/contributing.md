@@ -99,7 +99,7 @@ Once the focused case passes, run the complete gate:
 PATH="../target/release:$PATH" nf-test test --ci --coverage
 ```
 
-Before opening a pull request, run all six lanes. `nf-test` expects 153 unique
+Before opening a pull request, run all six lanes. `nf-test` expects 155 unique
 comparisons, each with `ok: true` and an empty `differences` list.
 
 ## Rules that protect the signal

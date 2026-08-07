@@ -12,6 +12,7 @@ mod bcf;
 mod cephes;
 mod cli;
 mod compare;
+mod compatibility;
 mod fasta;
 mod ftx;
 mod metrics_json;
@@ -31,24 +32,30 @@ mod vcfeval;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use cli::{
-    Cli, Command, legacy_unknown_argument_exit_code, process_args_with_legacy_somatic_aliases,
-    requests_legacy_subcommand_version, requests_quantify_version,
-    validate_legacy_germline_version_arguments,
+    Cli, Command, process_args_with_legacy_somatic_aliases, requests_legacy_subcommand_version,
+    requests_quantify_version, validate_legacy_germline_version_arguments,
 };
 
-fn exit_with_legacy_help(arguments: &[std::ffi::OsString], error: clap::Error, code: i32) -> ! {
+fn exit_with_legacy_help(
+    arguments: &[std::ffi::OsString],
+    error: clap::Error,
+    policy: compatibility::UsageErrorPolicy,
+) -> ! {
     eprint!("{error}");
+    if let Some(warning) = policy.warning() {
+        eprintln!("{warning}");
+    }
     let canonical = match arguments.get(1).and_then(|value| value.to_str()) {
         Some("germline" | "compare") => "germline",
         Some("pre" | "preprocess" | "prepy") => "pre",
         Some("quantify" | "qfy") => "quantify",
-        _ => std::process::exit(code),
+        _ => std::process::exit(policy.exit_code()),
     };
     let mut command = Cli::command();
     if let Some(subcommand) = command.find_subcommand_mut(canonical) {
         print!("{}", subcommand.render_help());
     }
-    std::process::exit(code)
+    std::process::exit(policy.exit_code())
 }
 
 /// Parse the process arguments and run the selected `hap` command.
@@ -63,7 +70,11 @@ pub fn run() -> Result<()> {
     if requests_legacy_subcommand_version(&arguments) {
         if let Err(error) = validate_legacy_germline_version_arguments(&arguments) {
             if error.kind() == ErrorKind::UnknownArgument {
-                exit_with_legacy_help(&arguments, error, 1);
+                exit_with_legacy_help(
+                    &arguments,
+                    error,
+                    compatibility::UsageErrorPolicy::LegacyFailure,
+                );
             }
             error.exit();
         }
@@ -74,20 +85,22 @@ pub fn run() -> Result<()> {
     let cli = match Cli::try_parse_from(arguments.clone()) {
         Ok(cli) => cli,
         Err(error) if error.kind() == ErrorKind::UnknownArgument => {
-            if let Some(code) = legacy_unknown_argument_exit_code(&arguments) {
-                exit_with_legacy_help(&arguments, error, code);
+            if let Some(policy) = compatibility::usage_error_policy(&arguments) {
+                exit_with_legacy_help(&arguments, error, policy);
             }
             error.exit();
         }
         Err(error)
             if error.kind() == ErrorKind::MissingRequiredArgument
-                && legacy_unknown_argument_exit_code(&arguments) == Some(1) =>
+                && compatibility::usage_error_policy(&arguments)
+                    == Some(compatibility::UsageErrorPolicy::LegacyFailure) =>
         {
             eprint!("{error}");
             std::process::exit(1);
         }
         Err(error) => error.exit(),
     };
+    compatibility::emit_deprecation_warnings(&cli.command);
     match cli.command {
         Command::Germline(args) => compare::run(args),
         Command::Somatic(args) => somatic::run(args),

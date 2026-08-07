@@ -95,7 +95,7 @@ Run the complete gate after the focused case passes:
 PATH="../target/release:$PATH" nf-test test --ci --coverage
 ```
 
-Before opening a pull request, run all six lanes. `nf-test` expects 153 unique
+Before opening a pull request, run all six lanes. `nf-test` expects 155 unique
 comparisons, each with `ok: true` and an empty `differences` list.
 
 ## Verification rules
@@ -106,6 +106,21 @@ comparisons, each with `ok: true` and an empty `differences` list.
   proven representation difference, with positive and negative regression cases.
 - Keep failing comparisons until the Rust output matches.
 - Keep the pinned legacy images unchanged.
+
+## Compatibility changes
+
+Read the [compatibility policy](docs/src/content/docs/project/compatibility.md)
+before preserving or removing a legacy quirk. New emulation needs all of:
+
+- pinned parity or captured upstream regression evidence;
+- a nearby explanatory source-and-rationale comment;
+- an inventory entry with a governance class and removal decision; and
+- separately named `legacy_only_` and `normative_` tests where both contracts
+  exist.
+
+User-facing deprecations must warn on stderr and document the replacement and
+removal release. Removing governed behavior follows the versioning and release
+note process in the compatibility policy.
 
 See [`verification/README.md`](verification/README.md) for the harness layout,
 comparison rules, and fixture details.

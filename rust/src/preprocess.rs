@@ -14,6 +14,8 @@ const LEFT_SHIFT_WINDOW: usize = 1024;
 /// block contains more than its default minimum of 100 called variants.
 const LEGACY_MIN_BLOCK_VARIANTS: usize = 100;
 const LEGACY_MAX_BLOCKS: usize = 40;
+const LOCATION_STREAM_POLICY: crate::compatibility::LocationStreamPolicy =
+    crate::compatibility::LocationStreamPolicy::IndependentLegacyStreams;
 
 #[derive(Clone, Debug)]
 struct BlocksplitObservation {
@@ -607,13 +609,12 @@ fn collect_blocksplit_observations(
             let location_groups = locations.map_or_else(
                 || vec![0],
                 |filters| {
-                    filters
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, filter)| {
-                            filter.matches(&record.chrom, pos).then_some(index)
-                        })
-                        .collect()
+                    crate::compatibility::location_stream_groups(
+                        LOCATION_STREAM_POLICY,
+                        filters,
+                        &record.chrom,
+                        pos,
+                    )
                 },
             );
             observations.push(BlocksplitObservation {
@@ -3991,7 +3992,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_comma_locations_duplicate_the_selected_stream_in_position_order() -> Result<()> {
+    fn legacy_only_parallel_overlapping_locations_duplicate_same_contig_records() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let output = directory.path().join("output.vcf.gz");
