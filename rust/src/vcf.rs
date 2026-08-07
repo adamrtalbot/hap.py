@@ -4,7 +4,7 @@ use noodles_bgzf as bgzf;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 const TBI_MAX_POSITION: usize = 1 << 29;
 const TBI_LINEAR_SHIFT: usize = 14;
 const TBI_METADATA_BIN: u32 = 37_450;
+const MAX_VCF_LINE_BYTES: usize = 64 * 1024 * 1024;
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 static PUBLICATION_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -200,21 +201,39 @@ impl RawVcfRecord {
     }
 
     pub fn to_line(&self) -> String {
-        let mut fields = vec![
-            self.chrom.clone(),
-            self.pos.to_string(),
-            self.id.clone(),
-            self.ref_allele.clone(),
-            self.alt_allele.clone(),
-            self.qual.clone(),
-            self.filter.clone(),
-            self.info.clone(),
-        ];
+        use std::fmt::Write as _;
+        let mut line = String::with_capacity(
+            self.chrom.len()
+                + self.id.len()
+                + self.ref_allele.len()
+                + self.alt_allele.len()
+                + self.qual.len()
+                + self.filter.len()
+                + self.info.len()
+                + 32,
+        );
+        write!(
+            line,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.chrom,
+            self.pos,
+            self.id,
+            self.ref_allele,
+            self.alt_allele,
+            self.qual,
+            self.filter,
+            self.info
+        )
+        .expect("writing to a String cannot fail");
         if let Some(format) = &self.format {
-            fields.push(format.clone());
-            fields.extend(self.samples.iter().cloned());
+            line.push('\t');
+            line.push_str(format);
+            for sample in &self.samples {
+                line.push('\t');
+                line.push_str(sample);
+            }
         }
-        fields.join("\t")
+        line
     }
 
     pub fn is_pass(&self) -> bool {
@@ -299,27 +318,179 @@ fn is_bgzf(bytes: &[u8]) -> bool {
 }
 
 pub fn load_raw_vcf(path: &Path) -> Result<(Vec<String>, Vec<RawVcfRecord>)> {
-    let data = read_decoded_bytes(path)?;
-    if crate::bcf::is_bcf_data(&data) {
-        return crate::bcf::decode(&data, path);
-    }
-    let text = String::from_utf8(data)
-        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
-    let mut headers = Vec::new();
-    let mut records = Vec::new();
-    for line in text.lines() {
-        if line.starts_with('#') {
-            headers.push(line.to_string());
-        } else if !line.trim().is_empty() {
-            records.push(RawVcfRecord::from_line(line, path)?);
-        }
-    }
+    let mut reader = open_raw_vcf(path)?;
+    let headers = reader.headers().to_vec();
+    let records = reader.by_ref().collect::<Result<Vec<_>>>()?;
     Ok((headers, records))
 }
 
+/// A bounded, record-at-a-time VCF/BCF reader. Only the header and current
+/// record are retained; gzip and BGZF inputs are decompressed incrementally.
+pub struct RawVcfReader {
+    headers: Vec<String>,
+    source: RecordSource,
+}
+
+enum RecordSource {
+    Vcf(VcfRecordReader),
+    Bcf(crate::bcf::RecordReader),
+}
+
+struct VcfRecordReader {
+    reader: BufReader<Box<dyn Read>>,
+    path: PathBuf,
+    pending: Option<String>,
+    line_number: usize,
+}
+
+impl RawVcfReader {
+    pub fn headers(&self) -> &[String] {
+        &self.headers
+    }
+}
+
+impl Iterator for RawVcfReader {
+    type Item = Result<RawVcfRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.source {
+            RecordSource::Bcf(reader) => reader.next_record().transpose(),
+            RecordSource::Vcf(source) => loop {
+                let line = if let Some(line) = source.pending.take() {
+                    line
+                } else {
+                    match read_bounded_line(&mut source.reader, &source.path) {
+                        Ok(Some(line)) => {
+                            source.line_number += 1;
+                            line
+                        }
+                        Ok(None) => return None,
+                        Err(error) => return Some(Err(error)),
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                return Some(
+                    RawVcfRecord::from_line(line.trim_end_matches(['\r', '\n']), &source.path)
+                        .with_context(|| {
+                            format!(
+                                "VCF record at line {} in {}",
+                                source.line_number,
+                                source.path.display()
+                            )
+                        }),
+                );
+            },
+        }
+    }
+}
+
+pub fn open_raw_vcf(path: &Path) -> Result<RawVcfReader> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut signature = [0; 2];
+    let count = file.read(&mut signature)?;
+    file.seek(SeekFrom::Start(0))?;
+    let input: Box<dyn Read> = if count == 2 && signature == [0x1f, 0x8b] {
+        Box::new(MultiGzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    let mut decoded = BufReader::new(input);
+    let prefix = decoded
+        .fill_buf()
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if crate::bcf::is_bcf_data(prefix) {
+        let reader = crate::bcf::RecordReader::new(Box::new(decoded), path)?;
+        let headers = reader.headers().to_vec();
+        return Ok(RawVcfReader {
+            headers,
+            source: RecordSource::Bcf(reader),
+        });
+    }
+
+    let mut headers = Vec::new();
+    let mut pending = None;
+    let mut line_number = 0;
+    loop {
+        let Some(line) = read_bounded_line(&mut decoded, path)? else {
+            break;
+        };
+        line_number += 1;
+        if line.starts_with('#') {
+            headers.push(line.trim_end_matches(['\r', '\n']).to_string());
+        } else if !line.trim().is_empty() {
+            pending = Some(line);
+            break;
+        }
+    }
+    Ok(RawVcfReader {
+        headers,
+        source: RecordSource::Vcf(VcfRecordReader {
+            reader: decoded,
+            path: path.to_path_buf(),
+            pending,
+            line_number,
+        }),
+    })
+}
+
+fn read_bounded_line(reader: &mut dyn BufRead, path: &Path) -> Result<Option<String>> {
+    read_line_with_limit(reader, path, MAX_VCF_LINE_BYTES)
+}
+
+fn read_line_with_limit(
+    reader: &mut dyn BufRead,
+    path: &Path,
+    maximum_bytes: usize,
+) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if available.is_empty() {
+            break;
+        }
+        let used = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if bytes
+            .len()
+            .checked_add(used)
+            .is_none_or(|length| length > maximum_bytes)
+        {
+            bail!(
+                "VCF line exceeds {maximum_bytes} byte limit in {}",
+                path.display()
+            );
+        }
+        bytes.extend_from_slice(&available[..used]);
+        reader.consume(used);
+        if bytes.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))
+        .map(Some)
+}
+
 pub fn write_raw_vcf(path: &Path, headers: &[String], records: &[RawVcfRecord]) -> Result<()> {
+    write_raw_vcf_iter(path, headers, records.iter().cloned().map(Ok))
+}
+
+pub fn write_raw_vcf_iter<I>(path: &Path, headers: &[String], records: I) -> Result<()>
+where
+    I: IntoIterator<Item = Result<RawVcfRecord>>,
+{
     if path.extension().and_then(|extension| extension.to_str()) == Some("bcf") {
-        return crate::bcf::write(path, headers, records);
+        return crate::bcf::write_iter(path, headers, records);
     }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -328,14 +499,24 @@ pub fn write_raw_vcf(path: &Path, headers: &[String], records: &[RawVcfRecord]) 
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let lines: Vec<String> = records.iter().map(RawVcfRecord::to_line).collect();
     if path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
-        write_indexed_vcf(path, headers, lines.iter().map(String::as_str))?;
+        write_indexed_vcf_lines(
+            path,
+            headers,
+            records
+                .into_iter()
+                .map(|record| record.map(|record| record.to_line())),
+        )?;
     } else {
         let (temporary_path, file) = create_temporary_file(path)?;
         let mut writer = BufWriter::new(file);
         let result = (|| {
-            write_vcf_lines(&mut writer, headers, lines.iter().map(String::as_str))?;
+            for header in headers {
+                writeln!(writer, "{header}")?;
+            }
+            for record in records {
+                writeln!(writer, "{}", record?.to_line())?;
+            }
             writer.flush()?;
             writer
                 .get_ref()
@@ -367,6 +548,17 @@ pub fn write_indexed_vcf<'a, I>(path: &Path, headers: &[String], lines: I) -> Re
 where
     I: IntoIterator<Item = &'a str>,
 {
+    write_indexed_vcf_lines(
+        path,
+        headers,
+        lines.into_iter().map(|line| Ok(line.to_string())),
+    )
+}
+
+fn write_indexed_vcf_lines<I>(path: &Path, headers: &[String], lines: I) -> Result<()>
+where
+    I: IntoIterator<Item = Result<String>>,
+{
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -374,7 +566,6 @@ where
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let records = parse_index_records(lines, path)?;
     let sidecar_path = tabix_path(path);
     let (temporary_vcf, vcf_file) = create_temporary_file(path)?;
     let (temporary_tbi, tbi_file) = match create_temporary_file(&sidecar_path) {
@@ -392,11 +583,15 @@ where
         }
 
         let mut index = TabixIndex::default();
-        for record in &records {
+        let mut order = IndexOrder::default();
+        for line in lines {
+            let line = line?;
+            let record = parse_index_record(&line, path)?;
+            order.observe(&record, path)?;
             let chunk_start = u64::from(writer.virtual_position());
-            writeln!(writer, "{}", record.line)?;
+            writeln!(writer, "{line}")?;
             let chunk_end = u64::from(writer.virtual_position());
-            index.push(record, Chunk::new(chunk_start, chunk_end))?;
+            index.push(&record, Chunk::new(chunk_start, chunk_end))?;
         }
 
         let vcf_file = writer.finish()?;
@@ -636,118 +831,104 @@ fn remove_backup(backup: &Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn write_vcf_lines<'a, W, I>(writer: &mut W, headers: &[String], lines: I) -> Result<()>
-where
-    W: Write,
-    I: IntoIterator<Item = &'a str>,
-{
-    for header in headers {
-        writeln!(writer, "{header}")?;
-    }
-    for line in lines {
-        writeln!(writer, "{line}")?;
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
-struct IndexRecord<'a> {
-    line: &'a str,
-    chrom: &'a str,
+struct IndexRecord {
+    chrom: String,
     start: usize,
     end: usize,
 }
 
-fn parse_index_records<'a, I>(lines: I, path: &Path) -> Result<Vec<IndexRecord<'a>>>
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    let mut records = Vec::new();
-    let mut closed_chromosomes = BTreeSet::new();
-    let mut current_chromosome: Option<&str> = None;
-    let mut previous_start = 0;
+fn parse_index_record(line: &str, path: &Path) -> Result<IndexRecord> {
+    if line.contains(['\n', '\r']) {
+        bail!(
+            "VCF records must contain exactly one line in {}",
+            path.display()
+        );
+    }
+    let mut fields = line.split('\t');
+    let chrom = fields
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("VCF record has no chromosome in {}", path.display()))?;
+    let position = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("VCF record has no position in {}", path.display()))?
+        .parse::<usize>()
+        .with_context(|| format!("invalid VCF position in {}", path.display()))?;
+    let _id = fields.next();
+    let reference = fields.next().ok_or_else(|| {
+        anyhow::anyhow!("VCF record has fewer than 4 fields in {}", path.display())
+    })?;
+    let alternate = fields.next().ok_or_else(|| {
+        anyhow::anyhow!("VCF record has fewer than 5 fields in {}", path.display())
+    })?;
+    let _quality = fields.next().ok_or_else(|| {
+        anyhow::anyhow!("VCF record has fewer than 6 fields in {}", path.display())
+    })?;
+    let _filter = fields.next().ok_or_else(|| {
+        anyhow::anyhow!("VCF record has fewer than 7 fields in {}", path.display())
+    })?;
+    let info = fields.next().ok_or_else(|| {
+        anyhow::anyhow!("VCF record has fewer than 8 fields in {}", path.display())
+    })?;
+    let format = fields.next();
+    let samples: Vec<&str> = fields.collect();
+    if position == 0 {
+        bail!("VCF positions must be >= 1 in {}", path.display());
+    }
+    if reference.is_empty() {
+        bail!("VCF REF alleles must not be empty in {}", path.display());
+    }
+    let start = position - 1;
+    let end = effective_vcf_end(start, reference, alternate, info, format, &samples, path)?;
+    if end > TBI_MAX_POSITION {
+        bail!(
+            "VCF record {chrom}:{position} exceeds the Tabix v1 coordinate limit (2^29); CSI is required"
+        );
+    }
+    Ok(IndexRecord {
+        chrom: chrom.to_string(),
+        start,
+        end,
+    })
+}
 
-    for line in lines {
-        if line.contains(['\n', '\r']) {
-            bail!(
-                "VCF records must contain exactly one line in {}",
-                path.display()
-            );
-        }
-        let mut fields = line.split('\t');
-        let chrom = fields
-            .next()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("VCF record has no chromosome in {}", path.display()))?;
-        let position = fields
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("VCF record has no position in {}", path.display()))?
-            .parse::<usize>()
-            .with_context(|| format!("invalid VCF position in {}", path.display()))?;
-        let _id = fields.next();
-        let reference = fields.next().ok_or_else(|| {
-            anyhow::anyhow!("VCF record has fewer than 4 fields in {}", path.display())
-        })?;
-        let alternate = fields.next().ok_or_else(|| {
-            anyhow::anyhow!("VCF record has fewer than 5 fields in {}", path.display())
-        })?;
-        let _quality = fields.next().ok_or_else(|| {
-            anyhow::anyhow!("VCF record has fewer than 6 fields in {}", path.display())
-        })?;
-        let _filter = fields.next().ok_or_else(|| {
-            anyhow::anyhow!("VCF record has fewer than 7 fields in {}", path.display())
-        })?;
-        let info = fields.next().ok_or_else(|| {
-            anyhow::anyhow!("VCF record has fewer than 8 fields in {}", path.display())
-        })?;
-        let format = fields.next();
-        let samples: Vec<&str> = fields.collect();
+#[derive(Default)]
+struct IndexOrder {
+    closed_chromosomes: BTreeSet<String>,
+    current_chromosome: Option<String>,
+    previous_start: usize,
+}
 
-        if position == 0 {
-            bail!("VCF positions must be >= 1 in {}", path.display());
-        }
-        if reference.is_empty() {
-            bail!("VCF REF alleles must not be empty in {}", path.display());
-        }
-        let start = position - 1;
-        let end = effective_vcf_end(start, reference, alternate, info, format, &samples, path)?;
-        if end > TBI_MAX_POSITION {
-            bail!(
-                "VCF record {chrom}:{position} exceeds the Tabix v1 coordinate limit (2^29); CSI is required"
-            );
-        }
-
-        match current_chromosome {
-            Some(current) if current == chrom => {
-                if start < previous_start {
+impl IndexOrder {
+    fn observe(&mut self, record: &IndexRecord, path: &Path) -> Result<()> {
+        match self.current_chromosome.as_deref() {
+            Some(current) if current == record.chrom => {
+                if record.start < self.previous_start {
                     bail!(
-                        "VCF records are not position-sorted at {chrom}:{position} in {}",
+                        "VCF records are not position-sorted at {}:{} in {}",
+                        record.chrom,
+                        record.start + 1,
                         path.display()
                     );
                 }
             }
             Some(current) => {
-                closed_chromosomes.insert(current);
-                if closed_chromosomes.contains(chrom) {
+                self.closed_chromosomes.insert(current.to_string());
+                if self.closed_chromosomes.contains(&record.chrom) {
                     bail!(
-                        "VCF records for chromosome {chrom} are not contiguous in {}",
+                        "VCF records for chromosome {} are not contiguous in {}",
+                        record.chrom,
                         path.display()
                     );
                 }
-                current_chromosome = Some(chrom);
+                self.current_chromosome = Some(record.chrom.clone());
             }
-            None => current_chromosome = Some(chrom),
+            None => self.current_chromosome = Some(record.chrom.clone()),
         }
-        previous_start = start;
-        records.push(IndexRecord {
-            line,
-            chrom,
-            start,
-            end,
-        });
+        self.previous_start = record.start;
+        Ok(())
     }
-
-    Ok(records)
 }
 
 /// Returns the record's 0-based exclusive end using HTSlib's Tabix VCF
@@ -915,15 +1096,15 @@ impl ReferenceIndex {
 }
 
 #[derive(Debug, Default)]
-struct TabixIndex<'a> {
-    names: Vec<&'a str>,
+struct TabixIndex {
+    names: Vec<String>,
     references: Vec<ReferenceIndex>,
 }
 
-impl<'a> TabixIndex<'a> {
-    fn push(&mut self, record: &IndexRecord<'a>, chunk: Chunk) -> Result<()> {
-        if self.names.last().copied() != Some(record.chrom) {
-            self.names.push(record.chrom);
+impl TabixIndex {
+    fn push(&mut self, record: &IndexRecord, chunk: Chunk) -> Result<()> {
+        if self.names.last() != Some(&record.chrom) {
+            self.names.push(record.chrom.clone());
             self.references.push(ReferenceIndex::default());
         }
         let reference = self
@@ -1040,6 +1221,7 @@ fn create_temporary_file(destination: &Path) -> Result<(PathBuf, File)> {
     )
 }
 
+#[cfg(test)]
 pub fn load_variants(
     path: &Path,
     reference_contigs: &BTreeSet<String>,
@@ -1048,61 +1230,109 @@ pub fn load_variants(
     targets: Option<&[BedInterval]>,
     locations: Option<&[LocationFilter]>,
 ) -> Result<Vec<Variant>> {
-    let text = read_text(path)?;
-    let mut variants = Vec::new();
+    open_variants(
+        path,
+        reference_contigs,
+        pass_only,
+        regions,
+        targets,
+        locations,
+    )?
+    .collect()
+}
 
-    for line in text.lines() {
-        if line.starts_with('#') || line.trim().is_empty() {
-            continue;
-        }
-        let record = RawVcfRecord::from_line(line, path)?;
-        if record.format.is_none() || record.samples.is_empty() {
-            bail!("VCF record has fewer than 10 fields in {}", path.display());
-        }
-        let chrom = normalize_chrom(&record.chrom, reference_contigs);
-        let format_keys: Vec<&str> = record
-            .format
-            .as_deref()
-            .unwrap_or_default()
-            .split(':')
-            .collect();
-        let sample_values: Vec<&str> = record.samples[0].split(':').collect();
-        let gt = extract_gt(&format_keys, &sample_values)?.to_string();
-        let effective_end = record.effective_end_pos(path)?;
+pub struct VariantReader<'a> {
+    records: RawVcfReader,
+    path: &'a Path,
+    reference_contigs: &'a BTreeSet<String>,
+    pass_only: bool,
+    regions: Option<&'a [BedInterval]>,
+    targets: Option<&'a [BedInterval]>,
+    locations: Option<&'a [LocationFilter]>,
+}
 
-        let variant = Variant {
-            key: VariantKey {
-                chrom,
-                pos: record.pos,
-                ref_allele: record.ref_allele.clone(),
-                alt_allele: record.alt_allele.clone(),
-            },
-            qual: canonical_qual(&record.qual).to_string(),
-            filter: record.filter,
-            gt: canonical_gt(&gt),
-        };
+pub fn open_variants<'a>(
+    path: &'a Path,
+    reference_contigs: &'a BTreeSet<String>,
+    pass_only: bool,
+    regions: Option<&'a [BedInterval]>,
+    targets: Option<&'a [BedInterval]>,
+    locations: Option<&'a [LocationFilter]>,
+) -> Result<VariantReader<'a>> {
+    Ok(VariantReader {
+        records: open_raw_vcf(path)?,
+        path,
+        reference_contigs,
+        pass_only,
+        regions,
+        targets,
+        locations,
+    })
+}
 
-        if pass_only && !variant.is_pass() {
-            continue;
-        }
-        if variant.key.alt_allele == "." {
-            continue;
-        }
-        if !matches_interval_filters(
-            &variant.key.chrom,
-            variant.key.pos,
-            effective_end,
-            regions,
-            targets,
-            locations,
-        ) {
-            continue;
-        }
+impl Iterator for VariantReader<'_> {
+    type Item = Result<Variant>;
 
-        variants.push(variant);
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let record = match self.records.next()? {
+                Ok(record) => record,
+                Err(error) => return Some(Err(error)),
+            };
+            if record.format.is_none() || record.samples.is_empty() {
+                return Some(Err(anyhow::anyhow!(
+                    "VCF record has fewer than 10 fields in {}",
+                    self.path.display()
+                )));
+            }
+            let chrom = normalize_chrom(&record.chrom, self.reference_contigs);
+            let format_keys: Vec<&str> = record
+                .format
+                .as_deref()
+                .unwrap_or_default()
+                .split(':')
+                .collect();
+            let sample_values: Vec<&str> = record.samples[0].split(':').collect();
+            let gt = match extract_gt(&format_keys, &sample_values) {
+                Ok(gt) => gt.to_string(),
+                Err(error) => return Some(Err(error)),
+            };
+            let effective_end = match record.effective_end_pos(self.path) {
+                Ok(end) => end,
+                Err(error) => return Some(Err(error)),
+            };
+
+            let variant = Variant {
+                key: VariantKey {
+                    chrom,
+                    pos: record.pos,
+                    ref_allele: record.ref_allele.clone(),
+                    alt_allele: record.alt_allele.clone(),
+                },
+                qual: canonical_qual(&record.qual).to_string(),
+                filter: record.filter,
+                gt: canonical_gt(&gt),
+            };
+
+            if self.pass_only && !variant.is_pass() {
+                continue;
+            }
+            if variant.key.alt_allele == "." {
+                continue;
+            }
+            if !matches_interval_filters(
+                &variant.key.chrom,
+                variant.key.pos,
+                effective_end,
+                self.regions,
+                self.targets,
+                self.locations,
+            ) {
+                continue;
+            }
+            return Some(Ok(variant));
+        }
     }
-
-    Ok(variants)
 }
 
 fn extract_gt<'a>(format_keys: &[&str], sample_values: &'a [&str]) -> Result<&'a str> {
@@ -1274,6 +1504,49 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::tempdir;
+
+    #[test]
+    fn bounded_line_reader_rejects_oversized_and_invalid_utf8_input() {
+        let path = Path::new("adversarial.vcf");
+        let mut oversized = Cursor::new(b"123456789\n".to_vec());
+        let error = read_line_with_limit(&mut oversized, path, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("8 byte limit"), "{error}");
+        assert!(error.contains("adversarial.vcf"), "{error}");
+
+        let mut invalid_utf8 = Cursor::new(vec![0xff, b'\n']);
+        let error = read_line_with_limit(&mut invalid_utf8, path, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(error.contains("adversarial.vcf"), "{error}");
+    }
+
+    #[test]
+    fn adversarial_gzip_prefixes_never_panic() -> Result<()> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("adversarial.vcf.gz");
+        let payload = b"##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\nchr1\t1\t.\tA\tC\t1\tPASS\t.\tGT\t0/1\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload)?;
+        let compressed = encoder.finish()?;
+        for end in 0..compressed.len() {
+            fs::write(&path, &compressed[..end])?;
+            let result = std::panic::catch_unwind(|| -> Result<()> {
+                let mut reader = open_raw_vcf(&path)?;
+                while reader.next().transpose()?.is_some() {}
+                Ok(())
+            });
+            assert!(result.is_ok(), "VCF gzip reader panicked for prefix {end}");
+        }
+        fs::write(&path, &compressed)?;
+        assert_eq!(open_raw_vcf(&path)?.count(), 1);
+        Ok(())
+    }
 
     #[test]
     fn single_position_location_matches_only_that_position() -> Result<()> {

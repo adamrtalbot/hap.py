@@ -97,8 +97,8 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
         .map(|text| vcf::parse_locations(text, &reference_contigs))
         .transpose()?;
 
-    let (headers, records) = vcf::load_raw_vcf(Path::new(&args.input))?;
-    let mut header = VcfHeader::from_lines(&headers)?;
+    let mut records = vcf::open_raw_vcf(Path::new(&args.input))?;
+    let mut header = VcfHeader::from_lines(records.headers())?;
     let location_is_lowercase_x = args
         .locations
         .as_deref()
@@ -116,7 +116,8 @@ fn run_with_diagnostics<W: Write>(args: ValidateArgs, diagnostics: &mut W) -> Re
     let mut previous_record_failed_to_parse = false;
     let mut reported_extreme_format_value = false;
 
-    for mut record in records {
+    for record in &mut records {
+        let mut record = record?;
         if record.samples.len() < header.sample_count {
             writeln!(
                 diagnostics,

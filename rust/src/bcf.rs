@@ -4,13 +4,17 @@ use noodles_bgzf as bgzf;
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
-#[cfg(test)]
-use std::io::Read;
-use std::io::Write;
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const BCF_MAGIC: &[u8; 5] = b"BCF\x02\x02";
+/// Hard limits are deliberately below `u32::MAX`: corrupt length fields must
+/// not be able to turn a tiny input into a multi-gigabyte allocation.
+pub(crate) const MAX_BCF_HEADER_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_BCF_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BCF_SAMPLES: usize = 1_000_000;
+const MAX_BCF_FIELDS: usize = 65_535;
 const INT8_MISSING: i8 = i8::MIN;
 const INT8_END: i8 = i8::MIN + 1;
 const INT16_MISSING: i16 = i16::MIN;
@@ -28,19 +32,21 @@ struct HeaderDictionary {
     keys: Vec<String>,
     info_types: BTreeMap<String, String>,
     format_types: BTreeMap<String, String>,
+    sample_count: usize,
 }
 
 pub(crate) fn is_bcf_data(data: &[u8]) -> bool {
     data.starts_with(BCF_MAGIC) || data.starts_with(b"BCF\x02\x01")
 }
 
+#[cfg(test)]
 pub(crate) fn decode(data: &[u8], path: &Path) -> Result<(Vec<String>, Vec<RawVcfRecord>)> {
     if !is_bcf_data(data) {
         bail!("{} is not BCF2", path.display());
     }
     let mut cursor = Cursor::new(data);
     cursor.take(5)?;
-    let header_len = cursor.u32()? as usize;
+    let header_len = checked_header_len(cursor.u32()?, path)?;
     let header_bytes = cursor.take(header_len)?;
     let header_text = std::str::from_utf8(header_bytes)
         .with_context(|| format!("BCF header in {} is not UTF-8", path.display()))?
@@ -51,13 +57,142 @@ pub(crate) fn decode(data: &[u8], path: &Path) -> Result<(Vec<String>, Vec<RawVc
         if cursor.remaining() < 8 {
             bail!("truncated BCF record header in {}", path.display());
         }
+        let record_number = records.len() + 1;
         let shared_len = cursor.u32()? as usize;
         let individual_len = cursor.u32()? as usize;
+        checked_record_lengths(shared_len, individual_len, path, record_number)?;
         let shared = cursor.take(shared_len)?;
         let individual = cursor.take(individual_len)?;
         records.push(decode_record(shared, individual, &dictionary, path)?);
     }
     Ok((dictionary.headers, records))
+}
+
+pub(crate) struct RecordReader {
+    reader: Box<dyn Read>,
+    dictionary: HeaderDictionary,
+    path: PathBuf,
+    record_number: usize,
+    payload: Vec<u8>,
+}
+
+impl RecordReader {
+    pub(crate) fn new(mut reader: Box<dyn Read>, path: &Path) -> Result<Self> {
+        let mut magic = [0; 5];
+        reader
+            .read_exact(&mut magic)
+            .with_context(|| format!("truncated BCF magic in {}", path.display()))?;
+        if magic != *BCF_MAGIC && magic != *b"BCF\x02\x01" {
+            bail!("{} is not BCF2", path.display());
+        }
+        let header_len =
+            checked_header_len(read_u32(&mut reader, "BCF header length", path)?, path)?;
+        let mut header = vec![0; header_len];
+        reader
+            .read_exact(&mut header)
+            .with_context(|| format!("truncated BCF header in {}", path.display()))?;
+        let text = std::str::from_utf8(&header)
+            .with_context(|| format!("BCF header in {} is not UTF-8", path.display()))?
+            .trim_end_matches('\0');
+        Ok(Self {
+            reader,
+            dictionary: parse_bcf_header(text)?,
+            path: path.to_path_buf(),
+            record_number: 0,
+            payload: Vec::new(),
+        })
+    }
+
+    pub(crate) fn headers(&self) -> &[String] {
+        &self.dictionary.headers
+    }
+
+    pub(crate) fn next_record(&mut self) -> Result<Option<RawVcfRecord>> {
+        let mut lengths = [0; 8];
+        let mut read = 0;
+        while read < lengths.len() {
+            match self.reader.read(&mut lengths[read..]) {
+                Ok(0) if read == 0 => return Ok(None),
+                Ok(0) => bail!(
+                    "truncated BCF record header at record {} in {}",
+                    self.record_number + 1,
+                    self.path.display()
+                ),
+                Ok(count) => read += count,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to read {}", self.path.display()));
+                }
+            }
+        }
+        self.record_number += 1;
+        let shared_len = u32::from_le_bytes(lengths[..4].try_into().unwrap()) as usize;
+        let individual_len = u32::from_le_bytes(lengths[4..].try_into().unwrap()) as usize;
+        checked_record_lengths(shared_len, individual_len, &self.path, self.record_number)?;
+        self.payload.resize(shared_len + individual_len, 0);
+        let (shared, individual) = self.payload.split_at_mut(shared_len);
+        self.reader.read_exact(shared).with_context(|| {
+            format!(
+                "truncated shared BCF data at record {} in {}",
+                self.record_number,
+                self.path.display()
+            )
+        })?;
+        self.reader.read_exact(individual).with_context(|| {
+            format!(
+                "truncated individual BCF data at record {} in {}",
+                self.record_number,
+                self.path.display()
+            )
+        })?;
+        decode_record(shared, individual, &self.dictionary, &self.path)
+            .with_context(|| {
+                format!(
+                    "failed to decode BCF record {} in {}",
+                    self.record_number,
+                    self.path.display()
+                )
+            })
+            .map(Some)
+    }
+}
+
+fn read_u32(reader: &mut dyn Read, label: &str, path: &Path) -> Result<u32> {
+    let mut bytes = [0; 4];
+    reader
+        .read_exact(&mut bytes)
+        .with_context(|| format!("truncated {label} in {}", path.display()))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn checked_header_len(raw: u32, path: &Path) -> Result<usize> {
+    let length = raw as usize;
+    if length == 0 || length > MAX_BCF_HEADER_BYTES {
+        bail!(
+            "BCF header length {length} exceeds limit {MAX_BCF_HEADER_BYTES} in {}",
+            path.display()
+        );
+    }
+    Ok(length)
+}
+
+fn checked_record_lengths(
+    shared: usize,
+    individual: usize,
+    path: &Path,
+    record: usize,
+) -> Result<()> {
+    let total = shared
+        .checked_add(individual)
+        .context("BCF record length overflow")?;
+    if shared < 24 || total > MAX_BCF_RECORD_BYTES {
+        bail!(
+            "BCF record {record} in {} has invalid lengths shared={shared}, individual={individual}; maximum combined length is {MAX_BCF_RECORD_BYTES}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Retrieve every BCF record reachable through a companion CSI index.
@@ -255,6 +390,15 @@ fn read_record<R: Read>(
         .with_context(|| format!("truncated indexed BCF record in {}", path.display()))?;
     let shared_len = u32::from_le_bytes(lengths[..4].try_into().unwrap()) as usize;
     let individual_len = u32::from_le_bytes(lengths[4..].try_into().unwrap()) as usize;
+    let total = shared_len
+        .checked_add(individual_len)
+        .context("indexed BCF record length overflow")?;
+    if shared_len < 24 || total > MAX_BCF_RECORD_BYTES {
+        bail!(
+            "indexed BCF record in {} has invalid lengths shared={shared_len}, individual={individual_len}",
+            path.display()
+        );
+    }
     let mut shared = vec![0; shared_len];
     let mut individual = vec![0; individual_len];
     reader.read_exact(&mut shared)?;
@@ -268,9 +412,14 @@ fn parse_bcf_header(text: &str) -> Result<HeaderDictionary> {
     let mut key_slots = BTreeMap::from([(0usize, "PASS".to_string())]);
     let mut info_types = BTreeMap::new();
     let mut format_types = BTreeMap::new();
+    let mut sample_count = 0;
 
     for line in text.lines() {
-        if let Some(body) = line.strip_prefix("##contig=<") {
+        if line.starts_with("#CHROM\t") {
+            sample_count = line.split('\t').count().saturating_sub(9);
+            headers.push(strip_idx_attribute(line));
+            continue;
+        } else if let Some(body) = line.strip_prefix("##contig=<") {
             let id = header_attribute(body, "ID").unwrap_or_default();
             if let Some(index) = header_attribute(body, "IDX").and_then(|v| v.parse().ok()) {
                 contig_slots.insert(index, id.to_string());
@@ -312,6 +461,7 @@ fn parse_bcf_header(text: &str) -> Result<HeaderDictionary> {
         keys,
         info_types,
         format_types,
+        sample_count,
     })
 }
 
@@ -363,13 +513,15 @@ fn decode_record(
     let mut shared = Cursor::new(shared);
     let rid = shared.i32()?;
     let pos = shared.i32()?;
-    let _rlen = shared.i32()?;
+    let rlen = shared.i32()?;
     let qual_bits = shared.u32()?;
     let allele_info = shared.u32()?;
     let fmt_sample = shared.u32()?;
-    if rid < 0 || pos < 0 {
-        bail!("negative BCF RID/POS in {}", path.display());
+    if rid < 0 || pos < 0 || rlen < 0 {
+        bail!("negative BCF RID/POS/RLEN in {}", path.display());
     }
+    pos.checked_add(rlen.max(1))
+        .context("BCF coordinate overflow")?;
     let chrom = dictionary
         .contigs
         .get(rid as usize)
@@ -379,6 +531,30 @@ fn decode_record(
     let n_allele = (allele_info >> 16) as usize;
     let n_sample = (fmt_sample & 0x00ff_ffff) as usize;
     let n_fmt = (fmt_sample >> 24) as usize;
+    if n_allele == 0
+        || n_info > MAX_BCF_FIELDS
+        || n_fmt > MAX_BCF_FIELDS
+        || n_sample > MAX_BCF_SAMPLES
+    {
+        bail!(
+            "BCF record counts exceed limits in {}: alleles={n_allele}, info={n_info}, format={n_fmt}, samples={n_sample}",
+            path.display()
+        );
+    }
+    if n_sample != dictionary.sample_count {
+        bail!(
+            "BCF sample count {n_sample} does not match header count {} in {}",
+            dictionary.sample_count,
+            path.display()
+        );
+    }
+    if n_sample > individual.len() && n_fmt > 0 {
+        bail!(
+            "BCF sample count {n_sample} is inconsistent with {} individual bytes in {}",
+            individual.len(),
+            path.display()
+        );
+    }
 
     let id = decode_typed_string(&mut shared)?;
     let mut alleles = Vec::with_capacity(n_allele);
@@ -599,6 +775,7 @@ impl<'a> Cursor<'a> {
         Self { data, offset: 0 }
     }
 
+    #[cfg(test)]
     fn remaining(&self) -> usize {
         self.data.len().saturating_sub(self.offset)
     }
@@ -687,7 +864,15 @@ fn decode_length(cursor: &mut Cursor<'_>) -> Result<usize> {
         .context("invalid BCF extended vector length")
 }
 
+#[cfg(test)]
 pub(crate) fn write(path: &Path, headers: &[String], records: &[RawVcfRecord]) -> Result<()> {
+    write_iter(path, headers, records.iter().cloned().map(Ok))
+}
+
+pub(crate) fn write_iter<I>(path: &Path, headers: &[String], records: I) -> Result<()>
+where
+    I: IntoIterator<Item = Result<RawVcfRecord>>,
+{
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -707,13 +892,14 @@ pub(crate) fn write(path: &Path, headers: &[String], records: &[RawVcfRecord]) -
         let mut chunks = vec![None::<(u64, u64)>; encoded_header.dictionary.contigs.len()];
         let mut record_counts = vec![0_u64; encoded_header.dictionary.contigs.len()];
         for record in records {
+            let record = record?;
             let rid = encoded_header
                 .contig_indexes
                 .get(&record.chrom)
                 .copied()
                 .with_context(|| format!("BCF output contig {} has no header", record.chrom))?;
             let start = u64::from(writer.virtual_position());
-            let (shared, individual) = encode_record(record, rid, &encoded_header)?;
+            let (shared, individual) = encode_record(&record, rid, &encoded_header)?;
             writer.write_all(&(shared.len() as u32).to_le_bytes())?;
             writer.write_all(&(individual.len() as u32).to_le_bytes())?;
             writer.write_all(&shared)?;
@@ -1191,6 +1377,148 @@ mod tests {
         let indexed = read_indexed_records(&output, &csi)?;
         assert_eq!(indexed["chr1"].len(), 1);
         assert_eq!(indexed["chr1"][0].to_line(), records[0].to_line());
+        Ok(())
+    }
+
+    fn minimal_header() -> Vec<u8> {
+        b"##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\0".to_vec()
+    }
+
+    #[test]
+    fn rejects_oversized_lengths_before_allocation() {
+        let path = Path::new("adversarial.bcf");
+        let mut oversized_header = BCF_MAGIC.to_vec();
+        oversized_header.extend_from_slice(&((MAX_BCF_HEADER_BYTES as u32) + 1).to_le_bytes());
+        let error = decode(&oversized_header, path).unwrap_err().to_string();
+        assert!(error.contains("header length"), "{error}");
+
+        let header = minimal_header();
+        let mut oversized_record = BCF_MAGIC.to_vec();
+        oversized_record.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        oversized_record.extend_from_slice(&header);
+        oversized_record.extend_from_slice(&(MAX_BCF_RECORD_BYTES as u32).to_le_bytes());
+        oversized_record.extend_from_slice(&1u32.to_le_bytes());
+        let error = decode(&oversized_record, path).unwrap_err().to_string();
+        assert!(error.contains("record 1"), "{error}");
+        assert!(error.contains("maximum combined length"), "{error}");
+    }
+
+    #[test]
+    fn rejects_truncated_records_with_context() {
+        let header = minimal_header();
+        let mut data = BCF_MAGIC.to_vec();
+        data.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&24u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&[0; 5]);
+        let error = decode(&data, Path::new("truncated.bcf"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("truncated BCF value"), "{error}");
+    }
+
+    #[test]
+    fn adversarial_truncation_corpus_never_panics() -> Result<()> {
+        let directory = tempdir()?;
+        let output = directory.path().join("seed.bcf");
+        let headers = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##contig=<ID=chr1,length=10>".to_string(),
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS".to_string(),
+        ];
+        let records = vec![RawVcfRecord {
+            chrom: "chr1".into(),
+            pos: 1,
+            id: ".".into(),
+            ref_allele: "A".into(),
+            alt_allele: "C".into(),
+            qual: "1".into(),
+            filter: ".".into(),
+            info: ".".into(),
+            format: Some("GT".into()),
+            samples: vec!["0/1".into()],
+        }];
+        write(&output, &headers, &records)?;
+        let seed = read_uncompressed(&output)?;
+        for end in 0..seed.len() {
+            let result = std::panic::catch_unwind(|| decode(&seed[..end], Path::new("fuzz.bcf")));
+            assert!(result.is_ok(), "decoder panicked for prefix length {end}");
+            let streaming = std::panic::catch_unwind(|| -> Result<()> {
+                let input = std::io::Cursor::new(seed[..end].to_vec());
+                let mut reader = RecordReader::new(Box::new(input), Path::new("fuzz.bcf"))?;
+                while reader.next_record()?.is_some() {}
+                Ok(())
+            });
+            assert!(
+                streaming.is_ok(),
+                "streaming decoder panicked for prefix length {end}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adversarial_coordinate_and_count_fields_return_errors_without_panics() -> Result<()> {
+        let directory = tempdir()?;
+        let output = directory.path().join("seed.bcf");
+        let headers = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##contig=<ID=chr1,length=10>".to_string(),
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS".to_string(),
+        ];
+        let records = vec![RawVcfRecord {
+            chrom: "chr1".into(),
+            pos: 1,
+            id: ".".into(),
+            ref_allele: "A".into(),
+            alt_allele: "C".into(),
+            qual: "1".into(),
+            filter: ".".into(),
+            info: ".".into(),
+            format: Some("GT".into()),
+            samples: vec!["0/1".into()],
+        }];
+        write(&output, &headers, &records)?;
+        let seed = read_uncompressed(&output)?;
+        let header_len = u32::from_le_bytes(seed[5..9].try_into().unwrap()) as usize;
+        let shared = 9 + header_len + 8;
+        let mutations = [
+            (shared, (-1_i32).to_le_bytes()),
+            (shared + 4, (-1_i32).to_le_bytes()),
+            (shared + 8, (-1_i32).to_le_bytes()),
+            (shared + 16, 0_u32.to_le_bytes()),
+            (shared + 20, 0x00ff_ffff_u32.to_le_bytes()),
+        ];
+        for (offset, replacement) in mutations {
+            let mut mutated = seed.clone();
+            mutated[offset..offset + 4].copy_from_slice(&replacement);
+            let decoded =
+                std::panic::catch_unwind(|| decode(&mutated, Path::new("mutated-counts.bcf")));
+            assert!(decoded.is_ok(), "slice decoder panicked at byte {offset}");
+            assert!(
+                decoded.unwrap().is_err(),
+                "mutation at byte {offset} was accepted"
+            );
+
+            let streamed = std::panic::catch_unwind(|| -> Result<()> {
+                let input = std::io::Cursor::new(mutated);
+                let mut reader =
+                    RecordReader::new(Box::new(input), Path::new("mutated-counts.bcf"))?;
+                while reader.next_record()?.is_some() {}
+                Ok(())
+            });
+            assert!(
+                streamed.is_ok(),
+                "streaming decoder panicked at byte {offset}"
+            );
+            assert!(
+                streamed.unwrap().is_err(),
+                "stream mutation at byte {offset} was accepted"
+            );
+        }
         Ok(())
     }
 }

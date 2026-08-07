@@ -1,9 +1,10 @@
 use crate::cli::{PreprocessArgs, PreprocessGender, SomaticGtMode};
 use crate::{fasta, partial_credit, variant_pipeline, vcf};
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeSet, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 /// Per-sample left-shift boundary used by legacy hap.py's C++ preprocess
@@ -80,7 +81,9 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
     };
     require_output_parent(&output_path)?;
     let reference_path = resolve_reference(args.reference.as_deref())?;
-    let (mut headers, records) = vcf::load_raw_vcf(Path::new(&args.input))?;
+    let input_path = Path::new(&args.input);
+    let input = vcf::open_raw_vcf(input_path)?;
+    let mut headers = input.headers().to_vec();
     require_vcf_sample(&headers)?;
     let reference_index = fasta::read_index(&reference_path)?;
     let reference_sequences = fasta::read_sequences(&reference_path)?;
@@ -113,21 +116,38 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
     if let Some(sample_names) = somatic_sample_names.as_deref() {
         append_somatic_info_headers(&mut headers, sample_names);
     }
-    let input_contigs = records.iter().map(|record| record.chrom.clone()).collect();
+    let mut input_contigs = BTreeSet::new();
+    let mut haploid_x = false;
+    let mut diploid_x = false;
+    for record in input {
+        let record = record?;
+        input_contigs.insert(record.chrom.clone());
+        if args.gender == PreprocessGender::Auto {
+            observe_gender(&record, &mut haploid_x, &mut diploid_x);
+        }
+    }
     let requested_fixchr = if args.no_fixchr {
         Some(false)
     } else {
         args.fixchr
     };
     let fixchr = resolve_fixchr(requested_fixchr, &reference_contigs, &input_contigs);
-    let gender = resolve_gender(args.gender, &records);
+    let gender = if args.gender == PreprocessGender::Auto {
+        if haploid_x && !diploid_x {
+            PreprocessGender::Male
+        } else {
+            PreprocessGender::Female
+        }
+    } else {
+        args.gender
+    };
     let leftshift = args.leftshift && !args.no_leftshift;
     let decompose = args.decompose && !args.no_decompose;
     let normalization_enabled = leftshift || decompose || gender == PreprocessGender::Male;
     let effective_threads = effective_thread_count(args.threads);
     let blocksplit_selection = if normalization_enabled && effective_threads > 1 {
         let observations = collect_blocksplit_observations(
-            &records,
+            vcf::open_raw_vcf(input_path)?,
             &args,
             fixchr,
             normalization_enabled,
@@ -148,7 +168,7 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
         BlocksplitSelection::default()
     };
 
-    let mut output = Vec::new();
+    let mut output = PreprocessSpool::new(normalization_enabled)?;
     let job_count = blocksplit_selection.jobs.as_ref().map_or(1, Vec::len);
     for job_index in 0..job_count {
         let job = blocksplit_selection
@@ -161,7 +181,8 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
         let mut prev_end_by_chrom: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut prepared_record_index = 0usize;
-        for mut record in records.iter().cloned() {
+        for record in vcf::open_raw_vcf(input_path)? {
+            let mut record = record?;
             if fixchr {
                 record.chrom = add_legacy_chr_prefix(&record.chrom);
             }
@@ -272,7 +293,7 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                     prev_end_by_chrom.remove(&record.chrom);
                 }
                 if !normalization_enabled {
-                    output.push(record);
+                    output.push(record)?;
                     continue;
                 }
                 if args.convert_gvcf_to_vcf {
@@ -448,7 +469,7 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
                         // string_fmts` loop order in `VariantWriter.cpp` combined with
                         // dynamic per-value type detection.
                         reorder_format_fields(&mut split);
-                        output.push(split);
+                        output.push(split)?;
                     }
                 }
                 // Advance the per-chromosome boundary so the next variant cannot
@@ -466,17 +487,17 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
     }
 
     if fixchr {
-        ensure_emitted_contig_headers(&mut headers, &output);
+        ensure_emitted_contig_headers(&mut headers, &output.emitted_contigs);
     }
 
     if normalization_enabled {
-        sort_normalized_records(&mut output);
         headers = canonicalize_legacy_headers(&headers);
     } else {
         ensure_pass_filter_header(&mut headers);
     }
 
-    vcf::write_raw_vcf(&output_path, &headers, &output)?;
+    let output_count = output.serial;
+    vcf::write_raw_vcf_iter(&output_path, &headers, output.finish()?)?;
     if output_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -489,15 +510,15 @@ pub fn run(args: PreprocessArgs) -> Result<()> {
     }
     logger.info(&format!(
         "Wrote {} records to {}",
-        output.len(),
+        output_count,
         output_path.display()
     ))?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_blocksplit_observations(
-    records: &[vcf::RawVcfRecord],
+fn collect_blocksplit_observations<I>(
+    records: I,
     args: &PreprocessArgs,
     fixchr: bool,
     normalization_enabled: bool,
@@ -507,13 +528,16 @@ fn collect_blocksplit_observations(
     regions: Option<&[vcf::BedInterval]>,
     targets: Option<&[vcf::BedInterval]>,
     locations: Option<&[vcf::LocationFilter]>,
-) -> Result<Vec<BlocksplitObservation>> {
+) -> Result<Vec<BlocksplitObservation>>
+where
+    I: IntoIterator<Item = Result<vcf::RawVcfRecord>>,
+{
     let input_path = Path::new(&args.input);
     let mut observations = Vec::new();
     let mut normalized_seen = HashSet::new();
 
-    for source in records {
-        let mut record = source.clone();
+    for record in records {
+        let mut record = record?;
         if fixchr {
             record.chrom = add_legacy_chr_prefix(&record.chrom);
         }
@@ -789,6 +813,7 @@ fn build_blocksplit_jobs(
 /// order even when the source VCF was indexed. Legacy's location aggregator
 /// restores position order before writing; do the same while preserving the
 /// source contig order and stable order among records at the same position.
+#[cfg(test)]
 fn sort_normalized_records(records: &mut [vcf::RawVcfRecord]) {
     let mut contig_ranks = std::collections::HashMap::new();
     let mut next_rank = 0usize;
@@ -804,6 +829,187 @@ fn sort_normalized_records(records: &mut [vcf::RawVcfRecord]) {
             .cmp(&contig_ranks[&right.chrom])
             .then(left.pos.cmp(&right.pos))
     });
+}
+
+const PREPROCESS_SORT_CHUNK_RECORDS: usize = 65_536;
+
+struct PreprocessSpool {
+    sorted: bool,
+    unsorted: tempfile::NamedTempFile,
+    chunks: Vec<tempfile::NamedTempFile>,
+    buffer: Vec<(usize, usize, usize, vcf::RawVcfRecord)>,
+    contig_ranks: HashMap<String, usize>,
+    emitted_contigs: Vec<String>,
+    next_rank: usize,
+    serial: usize,
+}
+
+impl PreprocessSpool {
+    fn new(sorted: bool) -> Result<Self> {
+        Ok(Self {
+            sorted,
+            unsorted: tempfile::NamedTempFile::new()
+                .context("failed to create preprocess spool")?,
+            chunks: Vec::new(),
+            buffer: Vec::new(),
+            contig_ranks: HashMap::new(),
+            emitted_contigs: Vec::new(),
+            next_rank: 0,
+            serial: 0,
+        })
+    }
+
+    fn push(&mut self, record: vcf::RawVcfRecord) -> Result<()> {
+        if !self.emitted_contigs.contains(&record.chrom) {
+            self.emitted_contigs.push(record.chrom.clone());
+        }
+        if !self.sorted {
+            writeln!(self.unsorted.as_file_mut(), "{}", record.to_line())?;
+            self.serial += 1;
+            return Ok(());
+        }
+        let rank = *self
+            .contig_ranks
+            .entry(record.chrom.clone())
+            .or_insert_with(|| {
+                let rank = self.next_rank;
+                self.next_rank += 1;
+                rank
+            });
+        self.buffer.push((rank, record.pos, self.serial, record));
+        self.serial += 1;
+        if self.buffer.len() >= PREPROCESS_SORT_CHUNK_RECORDS {
+            self.flush_chunk()?;
+        }
+        Ok(())
+    }
+
+    fn flush_chunk(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.buffer
+            .sort_by_key(|(rank, pos, serial, _)| (*rank, *pos, *serial));
+        let mut chunk =
+            tempfile::NamedTempFile::new().context("failed to create preprocess sort chunk")?;
+        for (rank, pos, serial, record) in self.buffer.drain(..) {
+            writeln!(
+                chunk.as_file_mut(),
+                "{rank}\t{pos}\t{serial}\t{}",
+                record.to_line()
+            )?;
+        }
+        self.chunks.push(chunk);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<PreprocessRecords> {
+        if !self.sorted {
+            let reader = vcf::open_raw_vcf(self.unsorted.path())?;
+            return Ok(PreprocessRecords::Unsorted {
+                _file: self.unsorted,
+                reader,
+            });
+        }
+        self.flush_chunk()?;
+        Ok(PreprocessRecords::Sorted(ExternalRecordMerge::new(
+            self.chunks,
+        )?))
+    }
+}
+
+enum PreprocessRecords {
+    Unsorted {
+        _file: tempfile::NamedTempFile,
+        reader: vcf::RawVcfReader,
+    },
+    Sorted(ExternalRecordMerge),
+}
+
+impl Iterator for PreprocessRecords {
+    type Item = Result<vcf::RawVcfRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Unsorted { reader, .. } => reader.next(),
+            Self::Sorted(reader) => reader.next(),
+        }
+    }
+}
+
+type SortKey = (usize, usize, usize, usize);
+
+struct ExternalRecordMerge {
+    _chunks: Vec<tempfile::NamedTempFile>,
+    readers: Vec<BufReader<File>>,
+    current: Vec<Option<vcf::RawVcfRecord>>,
+    heap: BinaryHeap<Reverse<SortKey>>,
+}
+
+impl ExternalRecordMerge {
+    fn new(chunks: Vec<tempfile::NamedTempFile>) -> Result<Self> {
+        let mut readers = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            readers.push(BufReader::new(File::open(chunk.path())?));
+        }
+        let current = vec![None; readers.len()];
+        let mut merge = Self {
+            _chunks: chunks,
+            readers,
+            current,
+            heap: BinaryHeap::new(),
+        };
+        for index in 0..merge.readers.len() {
+            merge.read_next(index)?;
+        }
+        Ok(merge)
+    }
+
+    fn read_next(&mut self, index: usize) -> Result<()> {
+        let mut line = String::new();
+        if self.readers[index].read_line(&mut line)? == 0 {
+            self.current[index] = None;
+            return Ok(());
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        let mut fields = line.splitn(4, '\t');
+        let rank = fields
+            .next()
+            .context("preprocess sort chunk lacks rank")?
+            .parse()?;
+        let pos = fields
+            .next()
+            .context("preprocess sort chunk lacks position")?
+            .parse()?;
+        let serial = fields
+            .next()
+            .context("preprocess sort chunk lacks serial")?
+            .parse()?;
+        let record = fields
+            .next()
+            .context("preprocess sort chunk lacks record")?;
+        self.current[index] = Some(vcf::RawVcfRecord::from_line(
+            record,
+            Path::new("preprocess-sort-chunk"),
+        )?);
+        self.heap.push(Reverse((rank, pos, serial, index)));
+        Ok(())
+    }
+}
+
+impl Iterator for ExternalRecordMerge {
+    type Item = Result<vcf::RawVcfRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Reverse((_, _, _, index)) = self.heap.pop()?;
+        let record = self.current[index]
+            .take()
+            .expect("heap entry has a current preprocess record");
+        if let Err(error) = self.read_next(index) {
+            return Some(Err(error));
+        }
+        Some(Ok(record))
+    }
 }
 
 fn effective_thread_count(threads: Option<usize>) -> usize {
@@ -884,7 +1090,7 @@ impl PreprocessLogger {
 /// pass notices each newly used sequence and appends a length-less contig
 /// declaration. Mirror that repair while leaving existing declarations and
 /// their order untouched.
-fn ensure_emitted_contig_headers(headers: &mut Vec<String>, records: &[vcf::RawVcfRecord]) {
+fn ensure_emitted_contig_headers(headers: &mut Vec<String>, emitted_contigs: &[String]) {
     let mut declared: BTreeSet<String> = headers
         .iter()
         .filter_map(|line| {
@@ -894,9 +1100,9 @@ fn ensure_emitted_contig_headers(headers: &mut Vec<String>, records: &[vcf::RawV
         })
         .collect();
     let mut additions = Vec::new();
-    for record in records {
-        if declared.insert(record.chrom.clone()) {
-            additions.push(format!("##contig=<ID={}>", record.chrom));
+    for chrom in emitted_contigs {
+        if declared.insert(chrom.clone()) {
+            additions.push(format!("##contig=<ID={chrom}>"));
         }
     }
     let insert_at = headers
@@ -1035,34 +1241,15 @@ fn passes_filters_only(filter: &str, filters_only: Option<&str>) -> bool {
     filter.split(';').any(|name| !excluded.contains(name))
 }
 
+#[cfg(test)]
 fn resolve_gender(requested: PreprocessGender, records: &[vcf::RawVcfRecord]) -> PreprocessGender {
     if requested != PreprocessGender::Auto {
         return requested;
     }
     let mut haploid_x = false;
     let mut diploid_x = false;
-    for record in records
-        .iter()
-        .filter(|record| matches!(record.chrom.as_str(), "X" | "chrX" | "chrx"))
-    {
-        let Some(format) = record.format.as_deref() else {
-            continue;
-        };
-        let Some(gt_index) = format.split(':').position(|field| field == "GT") else {
-            continue;
-        };
-        for sample in &record.samples {
-            let gt = sample.split(':').nth(gt_index).unwrap_or(".");
-            // vcfcheck classifies ploidy from the encoded GT vector length,
-            // including missing slots. Thus `./1` has ngt == 2 and unequal
-            // alleles (-1 and 1), so it is diploid rather than haploid.
-            let alleles: Vec<&str> = gt.split(['/', '|']).collect();
-            if alleles.len() == 1 {
-                haploid_x = true;
-            } else if alleles.len() > 2 || (alleles.len() == 2 && alleles[0] != alleles[1]) {
-                diploid_x = true;
-            }
-        }
+    for record in records {
+        observe_gender(record, &mut haploid_x, &mut diploid_x);
     }
     if haploid_x && !diploid_x {
         PreprocessGender::Male
@@ -1071,9 +1258,42 @@ fn resolve_gender(requested: PreprocessGender, records: &[vcf::RawVcfRecord]) ->
     }
 }
 
+fn observe_gender(record: &vcf::RawVcfRecord, haploid_x: &mut bool, diploid_x: &mut bool) {
+    if !matches!(record.chrom.as_str(), "X" | "chrX" | "chrx") {
+        return;
+    }
+    let Some(format) = record.format.as_deref() else {
+        return;
+    };
+    let Some(gt_index) = format.split(':').position(|field| field == "GT") else {
+        return;
+    };
+    for sample in &record.samples {
+        let gt = sample.split(':').nth(gt_index).unwrap_or(".");
+        // vcfcheck classifies ploidy from the encoded GT vector length,
+        // including missing slots. Thus `./1` has ngt == 2 and unequal
+        // alleles (-1 and 1), so it is diploid rather than haploid.
+        let alleles: Vec<&str> = gt.split(['/', '|']).collect();
+        if alleles.len() == 1 {
+            *haploid_x = true;
+        } else if alleles.len() > 2 || (alleles.len() == 2 && alleles[0] != alleles[1]) {
+            *diploid_x = true;
+        }
+    }
+}
+
 pub(crate) fn infer_gender(path: &Path) -> Result<PreprocessGender> {
-    let (_, records) = vcf::load_raw_vcf(path)?;
-    Ok(resolve_gender(PreprocessGender::Auto, &records))
+    let records = vcf::open_raw_vcf(path)?;
+    let mut haploid_x = false;
+    let mut diploid_x = false;
+    for record in records {
+        observe_gender(&record?, &mut haploid_x, &mut diploid_x);
+    }
+    Ok(if haploid_x && !diploid_x {
+        PreprocessGender::Male
+    } else {
+        PreprocessGender::Female
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

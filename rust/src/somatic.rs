@@ -4,7 +4,7 @@ use crate::{fasta, ftx, strelka, vcf};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -358,41 +358,43 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     if reuse_query {
         controls.info(&format!("Continuing from {}", query_cache.display()))?;
     }
-    let (truth_headers, mut truth_raw) = vcf::load_raw_vcf(if reuse_truth {
+    let truth_source = Path::new(&args.truth);
+    let query_source = Path::new(&args.query);
+    let truth_headers = vcf::open_raw_vcf(if reuse_truth {
         &truth_cache
     } else {
-        Path::new(&args.truth)
-    })?;
-    let (query_headers, mut query_raw) = vcf::load_raw_vcf(if reuse_query {
+        truth_source
+    })?
+    .headers()
+    .to_vec();
+    let query_headers = vcf::open_raw_vcf(if reuse_query {
         &query_cache
     } else {
-        Path::new(&args.query)
-    })?;
+        query_source
+    })?
+    .headers()
+    .to_vec();
     let bam_depths = ftx::bam_normalization_depths(&args.bams)?;
-    if normalize_truth {
-        truth_raw = normalize_somatic_records(
-            truth_raw,
-            reference_sequences
-                .as_ref()
-                .expect("normalization loaded the reference"),
-        );
-    }
-    if normalize_query {
-        query_raw = normalize_somatic_records(
-            query_raw,
-            reference_sequences
-                .as_ref()
-                .expect("normalization loaded the reference"),
-        );
-    }
     if !reuse_truth {
-        vcf::write_raw_vcf(&truth_cache, &truth_headers, &truth_raw)?;
+        prepare_somatic_cache(
+            truth_source,
+            &truth_cache,
+            &truth_headers,
+            normalize_truth,
+            reference_sequences.as_ref(),
+        )?;
     }
     if !reuse_query {
-        vcf::write_raw_vcf(&query_cache, &query_headers, &query_raw)?;
+        prepare_somatic_cache(
+            query_source,
+            &query_cache,
+            &query_headers,
+            normalize_query,
+            reference_sequences.as_ref(),
+        )?;
     }
-    let truth_raw_filtered = filter_raw_records(
-        truth_raw,
+    let truth_spools = spool_filtered_contigs(
+        &truth_cache,
         Path::new(&args.truth),
         &RawFilterOptions {
             reference_contigs: &reference_contigs,
@@ -403,8 +405,8 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
             locations: locations.as_deref(),
         },
     )?;
-    let query_raw_filtered = filter_raw_records(
-        query_raw,
+    let query_spools = spool_filtered_contigs(
+        &query_cache,
         Path::new(&args.query),
         &RawFilterOptions {
             reference_contigs: &reference_contigs,
@@ -415,8 +417,6 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
             locations: locations.as_deref(),
         },
     )?;
-    let (truth_matches, query_matches) =
-        pair_exact_records(&truth_raw_filtered, &query_raw_filtered);
     let query_depths = if bam_depths.is_empty() {
         strelka::parse_depths(&query_headers)
     } else {
@@ -427,17 +427,10 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     let mut filtered_by_type: BTreeMap<&'static str, FilteredCounts> = BTreeMap::new();
     let mut filtered_records = FilteredCounts::default();
     let mut record_counts = SomaticCounts {
-        truth_total: truth_raw_filtered.len(),
-        query_total: query_raw_filtered.len(),
+        truth_total: truth_spools.iter().map(|spool| spool.count).sum(),
+        query_total: query_spools.iter().map(|spool| spool.count).sum(),
         ..SomaticCounts::default()
     };
-    record_counts.tp = truth_matches.iter().filter(|entry| entry.is_some()).count();
-    record_counts.fn_count = truth_raw_filtered.len().saturating_sub(record_counts.tp);
-    filtered_records.tp = query_raw_filtered
-        .iter()
-        .zip(&query_matches)
-        .filter(|(record, matched)| matched.is_some() && !record.record.is_pass())
-        .count();
     let feature_table_name = args.feature_table.as_deref().unwrap_or("");
     let use_strelka_hcc_indel = feature_table_name == "hcc.strelka.indel";
     let use_caller_feature_table =
@@ -458,169 +451,221 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     let mut fn_rows: Vec<String> = Vec::new();
     let mut ambi_rows: Vec<String> = Vec::new();
     let mut unk_rows: Vec<String> = Vec::new();
-    let mut caller_tp_truth = Vec::new();
-    let mut caller_tp_query = Vec::new();
-    let mut caller_fn_truth = Vec::new();
-    let mut caller_fp_query = Vec::new();
-    let mut caller_ambi_query = Vec::new();
-    let mut caller_unk_query = Vec::new();
     let mut ambiguous_classes = BTreeMap::new();
     let mut ambiguous_reasons = BTreeMap::new();
-    for (truth_index, truth_record) in truth_raw_filtered.iter().enumerate() {
-        let Some(label) = raw_type_label(&truth_record.record) else {
-            continue;
-        };
-        by_type.entry(label).or_default().truth_total += 1;
-        if let Some(query_index) = truth_matches[truth_index] {
-            by_type.entry(label).or_default().tp += 1;
-            let query_record = &query_raw_filtered[query_index];
-            if !query_record.record.is_pass() {
-                filtered_by_type.entry(label).or_default().tp += 1;
-            }
-            if use_strelka_hcc_indel {
-                tp_rows.push(render_strelka_hcc_indel_tp_row(
-                    0,
-                    &truth_record.record,
-                    &query_record.record,
-                    &query_depths,
-                ));
-            } else if use_generic_feature_table {
-                tp_rows.push(render_generic_tp_row(
-                    0,
-                    &truth_record.record,
-                    &query_record.record,
-                ));
-            } else if use_caller_feature_table {
-                caller_tp_truth.push(truth_record.record.clone());
-                caller_tp_query.push(query_record.record.clone());
-            }
-        } else {
-            by_type.entry(label).or_default().fn_count += 1;
-            if use_strelka_hcc_indel {
-                fn_rows.push(render_strelka_hcc_indel_fn_row(0, &truth_record.record));
-            } else if use_generic_feature_table {
-                fn_rows.push(render_generic_fn_row(0, &truth_record.record));
-            } else if use_caller_feature_table {
-                caller_fn_truth.push(truth_record.record.clone());
+    let truth_spool_index = truth_spools
+        .iter()
+        .enumerate()
+        .map(|(index, spool)| (spool.chrom.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let query_spool_index = query_spools
+        .iter()
+        .enumerate()
+        .map(|(index, spool)| (spool.chrom.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut ordered_contigs = truth_spools
+        .iter()
+        .map(|spool| spool.chrom.clone())
+        .collect::<Vec<_>>();
+    ordered_contigs.extend(
+        query_spools
+            .iter()
+            .map(|spool| spool.chrom.clone())
+            .filter(|chrom| !truth_spool_index.contains_key(chrom)),
+    );
+    let truth_contigs = truth_spool_index.keys().cloned().collect::<BTreeSet<_>>();
+    for chrom in ordered_contigs {
+        let truth_raw_filtered = truth_spool_index
+            .get(&chrom)
+            .map(|index| truth_spools[*index].load())
+            .transpose()?
+            .unwrap_or_default();
+        let query_raw_filtered = query_spool_index
+            .get(&chrom)
+            .map(|index| query_spools[*index].load())
+            .transpose()?
+            .unwrap_or_default();
+        let (truth_matches, query_matches) =
+            pair_exact_records(&truth_raw_filtered, &query_raw_filtered);
+        let matched = truth_matches.iter().filter(|entry| entry.is_some()).count();
+        record_counts.tp += matched;
+        record_counts.fn_count += truth_raw_filtered.len().saturating_sub(matched);
+        filtered_records.tp += query_raw_filtered
+            .iter()
+            .zip(&query_matches)
+            .filter(|(record, matched)| matched.is_some() && !record.record.is_pass())
+            .count();
+        let mut caller_tp_truth = Vec::new();
+        let mut caller_tp_query = Vec::new();
+        let mut caller_fn_truth = Vec::new();
+        let mut caller_fp_query = Vec::new();
+        let mut caller_ambi_query = Vec::new();
+        let mut caller_unk_query = Vec::new();
+        for (truth_index, truth_record) in truth_raw_filtered.iter().enumerate() {
+            let Some(label) = raw_type_label(&truth_record.record) else {
+                continue;
+            };
+            by_type.entry(label).or_default().truth_total += 1;
+            if let Some(query_index) = truth_matches[truth_index] {
+                by_type.entry(label).or_default().tp += 1;
+                let query_record = &query_raw_filtered[query_index];
+                if !query_record.record.is_pass() {
+                    filtered_by_type.entry(label).or_default().tp += 1;
+                }
+                if use_strelka_hcc_indel {
+                    tp_rows.push(render_strelka_hcc_indel_tp_row(
+                        0,
+                        &truth_record.record,
+                        &query_record.record,
+                        &query_depths,
+                    ));
+                } else if use_generic_feature_table {
+                    tp_rows.push(render_generic_tp_row(
+                        0,
+                        &truth_record.record,
+                        &query_record.record,
+                    ));
+                } else if use_caller_feature_table {
+                    caller_tp_truth.push(truth_record.record.clone());
+                    caller_tp_query.push(query_record.record.clone());
+                }
+            } else {
+                by_type.entry(label).or_default().fn_count += 1;
+                if use_strelka_hcc_indel {
+                    fn_rows.push(render_strelka_hcc_indel_fn_row(0, &truth_record.record));
+                } else if use_generic_feature_table {
+                    fn_rows.push(render_generic_fn_row(0, &truth_record.record));
+                } else if use_caller_feature_table {
+                    caller_fn_truth.push(truth_record.record.clone());
+                }
             }
         }
-    }
 
-    for (query_index, query_record) in query_raw_filtered.iter().enumerate() {
-        let type_label = raw_type_label(&query_record.record);
-        if let Some(label) = type_label {
-            by_type.entry(label).or_default().query_total += 1;
-        }
-        if query_matches[query_index].is_some() {
-            continue;
-        }
-        // som.py classifies FP/AMBI intervals from POS through POS+len(REF),
-        // even for symbolic and gVCF records. INFO/END and FORMAT/LEN are used
-        // by bcftools -R preprocessing, not by this classification step.
-        let class = classify_query(
-            &query_record.key.chrom,
-            query_record.key.pos,
-            query_record.record.end_pos(),
-            fp_regions.as_deref().unwrap_or(&[]),
-            &ambiguous_regions,
-            count_unk,
-            ambi_fp,
-        );
-        if args.explain_ambiguous {
-            record_ambiguous_explanation(
+        for (query_index, query_record) in query_raw_filtered.iter().enumerate() {
+            let type_label = raw_type_label(&query_record.record);
+            if let Some(label) = type_label {
+                by_type.entry(label).or_default().query_total += 1;
+            }
+            if query_matches[query_index].is_some() {
+                continue;
+            }
+            // som.py classifies FP/AMBI intervals from POS through POS+len(REF),
+            // even for symbolic and gVCF records. INFO/END and FORMAT/LEN are used
+            // by bcftools -R preprocessing, not by this classification step.
+            let class = classify_query(
                 &query_record.key.chrom,
                 query_record.key.pos,
                 query_record.record.end_pos(),
-                &explanation_regions,
+                fp_regions.as_deref().unwrap_or(&[]),
+                &ambiguous_regions,
+                count_unk,
                 ambi_fp,
-                &mut ambiguous_classes,
-                &mut ambiguous_reasons,
             );
-        }
-        if let Some(label) = type_label {
-            let row = by_type.entry(label).or_default();
-            match class {
-                QueryClass::Fp => row.fp += 1,
-                QueryClass::Unk => row.unk += 1,
-                QueryClass::Ambi => row.ambi += 1,
+            if args.explain_ambiguous {
+                record_ambiguous_explanation(
+                    &query_record.key.chrom,
+                    query_record.key.pos,
+                    query_record.record.end_pos(),
+                    &explanation_regions,
+                    ambi_fp,
+                    &mut ambiguous_classes,
+                    &mut ambiguous_reasons,
+                );
             }
+            if let Some(label) = type_label {
+                let row = by_type.entry(label).or_default();
+                match class {
+                    QueryClass::Fp => row.fp += 1,
+                    QueryClass::Unk => row.unk += 1,
+                    QueryClass::Ambi => row.ambi += 1,
+                }
+                if !query_record.record.is_pass() {
+                    let filtered = filtered_by_type.entry(label).or_default();
+                    match class {
+                        QueryClass::Fp => filtered.fp += 1,
+                        QueryClass::Unk => filtered.unk += 1,
+                        QueryClass::Ambi => filtered.ambi += 1,
+                    }
+                }
+            }
+            let tag = match class {
+                QueryClass::Fp => {
+                    record_counts.fp += 1;
+                    "FP"
+                }
+                QueryClass::Unk => {
+                    record_counts.unk += 1;
+                    "UNK"
+                }
+                QueryClass::Ambi => {
+                    record_counts.ambi += 1;
+                    "AMBI"
+                }
+            };
             if !query_record.record.is_pass() {
-                let filtered = filtered_by_type.entry(label).or_default();
                 match class {
-                    QueryClass::Fp => filtered.fp += 1,
-                    QueryClass::Unk => filtered.unk += 1,
-                    QueryClass::Ambi => filtered.ambi += 1,
+                    QueryClass::Fp => filtered_records.fp += 1,
+                    QueryClass::Unk => filtered_records.unk += 1,
+                    QueryClass::Ambi => filtered_records.ambi += 1,
+                }
+            }
+            if args.feature_table.is_some() {
+                if use_strelka_hcc_indel {
+                    let row = render_strelka_hcc_indel_query_row(
+                        0,
+                        &query_record.record,
+                        tag,
+                        &query_depths,
+                    );
+                    match class {
+                        QueryClass::Fp => fp_rows.push(row),
+                        QueryClass::Unk => unk_rows.push(row),
+                        QueryClass::Ambi => ambi_rows.push(row),
+                    }
+                } else if use_generic_feature_table {
+                    let row = render_generic_query_row(0, &query_record.record, tag);
+                    match class {
+                        QueryClass::Fp => fp_rows.push(row),
+                        QueryClass::Unk => unk_rows.push(row),
+                        QueryClass::Ambi => ambi_rows.push(row),
+                    }
+                } else if use_caller_feature_table {
+                    match class {
+                        QueryClass::Fp => caller_fp_query.push(query_record.record.clone()),
+                        QueryClass::Unk => caller_unk_query.push(query_record.record.clone()),
+                        QueryClass::Ambi => caller_ambi_query.push(query_record.record.clone()),
+                    }
                 }
             }
         }
-        let tag = match class {
-            QueryClass::Fp => {
-                record_counts.fp += 1;
-                "FP"
+        if use_caller_feature_table {
+            let caller_table = build_caller_feature_table(
+                feature_table_name,
+                &truth_headers,
+                &query_headers,
+                (!bam_depths.is_empty()).then_some(&bam_depths),
+                !args.no_order_check,
+                &CallerRecordGroups {
+                    tp_truth: &caller_tp_truth,
+                    tp_query: &caller_tp_query,
+                    fn_truth: &caller_fn_truth,
+                    fp_query: &caller_fp_query,
+                    ambi_query: &caller_ambi_query,
+                    unk_query: &caller_unk_query,
+                },
+            )?;
+            if let Some(existing) = feature_header.as_deref()
+                && existing != caller_table.header
+            {
+                bail!("caller feature header changed between somatic contigs");
             }
-            QueryClass::Unk => {
-                record_counts.unk += 1;
-                "UNK"
-            }
-            QueryClass::Ambi => {
-                record_counts.ambi += 1;
-                "AMBI"
-            }
-        };
-        if !query_record.record.is_pass() {
-            match class {
-                QueryClass::Fp => filtered_records.fp += 1,
-                QueryClass::Unk => filtered_records.unk += 1,
-                QueryClass::Ambi => filtered_records.ambi += 1,
-            }
+            feature_header = Some(caller_table.header);
+            tp_rows.extend(caller_table.tp);
+            fp_rows.extend(caller_table.fp);
+            fn_rows.extend(caller_table.fn_rows);
+            ambi_rows.extend(caller_table.ambi);
+            unk_rows.extend(caller_table.unk);
         }
-        if args.feature_table.is_some() {
-            if use_strelka_hcc_indel {
-                let row =
-                    render_strelka_hcc_indel_query_row(0, &query_record.record, tag, &query_depths);
-                match class {
-                    QueryClass::Fp => fp_rows.push(row),
-                    QueryClass::Unk => unk_rows.push(row),
-                    QueryClass::Ambi => ambi_rows.push(row),
-                }
-            } else if use_generic_feature_table {
-                let row = render_generic_query_row(0, &query_record.record, tag);
-                match class {
-                    QueryClass::Fp => fp_rows.push(row),
-                    QueryClass::Unk => unk_rows.push(row),
-                    QueryClass::Ambi => ambi_rows.push(row),
-                }
-            } else if use_caller_feature_table {
-                match class {
-                    QueryClass::Fp => caller_fp_query.push(query_record.record.clone()),
-                    QueryClass::Unk => caller_unk_query.push(query_record.record.clone()),
-                    QueryClass::Ambi => caller_ambi_query.push(query_record.record.clone()),
-                }
-            }
-        }
-    }
-    if use_caller_feature_table {
-        let caller_table = build_caller_feature_table(
-            feature_table_name,
-            &truth_headers,
-            &query_headers,
-            (!bam_depths.is_empty()).then_some(&bam_depths),
-            !args.no_order_check,
-            &CallerRecordGroups {
-                tp_truth: &caller_tp_truth,
-                tp_query: &caller_tp_query,
-                fn_truth: &caller_fn_truth,
-                fp_query: &caller_fp_query,
-                ambi_query: &caller_ambi_query,
-                unk_query: &caller_unk_query,
-            },
-        )?;
-        feature_header = Some(caller_table.header);
-        tp_rows = caller_table.tp;
-        fp_rows = caller_table.fp;
-        fn_rows = caller_table.fn_rows;
-        ambi_rows = caller_table.ambi;
-        unk_rows = caller_table.unk;
     }
     let ordered_feature_rows = feature_header
         .as_ref()
@@ -703,13 +748,13 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
         has_automatic_fp_bases(fp_regions.as_deref().unwrap_or(&[]), &ambiguous_regions),
     )?;
     let empty_reference = BTreeMap::new();
-    let fp_region_size = calculate_fp_region_size(
+    let fp_region_size = calculate_fp_region_size_for_contigs(
         args.fp_region_size.as_deref(),
         fp_regions.as_deref().unwrap_or(&[]),
         &ambiguous_regions,
         locations.as_deref(),
         reference_sequences.as_ref().unwrap_or(&empty_reference),
-        &truth_raw_filtered,
+        &truth_contigs,
     );
 
     let commandline = somatic_commandline(&args);
@@ -2256,6 +2301,7 @@ fn raw_type_label(record: &vcf::RawVcfRecord) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn contigs_in_truth(truth: &[FilteredRawRecord]) -> BTreeSet<String> {
     truth
         .iter()
@@ -2329,6 +2375,7 @@ fn validate_legacy_fp_location_denominator(
     Ok(())
 }
 
+#[cfg(test)]
 fn calculate_fp_region_size(
     requested: Option<&str>,
     fp_regions: &[vcf::BedInterval],
@@ -2336,6 +2383,24 @@ fn calculate_fp_region_size(
     locations: Option<&[vcf::LocationFilter]>,
     reference_sequences: &BTreeMap<String, String>,
     truth: &[FilteredRawRecord],
+) -> usize {
+    calculate_fp_region_size_for_contigs(
+        requested,
+        fp_regions,
+        ambiguous_regions,
+        locations,
+        reference_sequences,
+        &contigs_in_truth(truth),
+    )
+}
+
+fn calculate_fp_region_size_for_contigs(
+    requested: Option<&str>,
+    fp_regions: &[vcf::BedInterval],
+    ambiguous_regions: &[AmbiguousInterval],
+    locations: Option<&[vcf::LocationFilter]>,
+    reference_sequences: &BTreeMap<String, String>,
+    truth_contigs: &BTreeSet<String>,
 ) -> usize {
     if let Some(size) = requested.and_then(|value| value.parse::<usize>().ok()) {
         return size;
@@ -2371,11 +2436,11 @@ fn calculate_fp_region_size(
             .sum();
     }
 
-    contigs_in_truth(truth)
-        .into_iter()
+    truth_contigs
+        .iter()
         .filter_map(|contig| {
             reference_sequences
-                .get(&contig)
+                .get(contig)
                 .map(|sequence| sequence.len())
         })
         .sum()
@@ -3093,6 +3158,137 @@ fn normalize_somatic_records(
     output
 }
 
+const MAX_SOMATIC_CONTIG_RECORDS: usize = 10_000_000;
+
+fn prepare_somatic_cache(
+    source: &Path,
+    cache: &Path,
+    headers: &[String],
+    normalize: bool,
+    reference_sequences: Option<&BTreeMap<String, String>>,
+) -> Result<()> {
+    if !normalize {
+        return vcf::write_raw_vcf_iter(cache, headers, vcf::open_raw_vcf(source)?);
+    }
+    let reference_sequences = reference_sequences.context("normalization requires a reference")?;
+    let mut spool = tempfile::NamedTempFile::new().context("failed to create somatic spool")?;
+    {
+        let mut writer = BufWriter::new(spool.as_file_mut());
+        for header in headers {
+            writeln!(writer, "{header}")?;
+        }
+        let mut current_chrom: Option<String> = None;
+        let mut contig_records = Vec::new();
+        for record in vcf::open_raw_vcf(source)? {
+            let record = record?;
+            if current_chrom
+                .as_deref()
+                .is_some_and(|chrom| chrom != record.chrom)
+            {
+                write_normalized_somatic_contig(
+                    &mut writer,
+                    &mut contig_records,
+                    reference_sequences,
+                )?;
+            }
+            current_chrom = Some(record.chrom.clone());
+            contig_records.push(record);
+            if contig_records.len() > MAX_SOMATIC_CONTIG_RECORDS {
+                bail!(
+                    "somatic contig in {} exceeds the {} record active-window limit",
+                    source.display(),
+                    MAX_SOMATIC_CONTIG_RECORDS
+                );
+            }
+        }
+        write_normalized_somatic_contig(&mut writer, &mut contig_records, reference_sequences)?;
+        writer.flush()?;
+    }
+    vcf::write_raw_vcf_iter(cache, headers, vcf::open_raw_vcf(spool.path())?)
+}
+
+fn write_normalized_somatic_contig(
+    writer: &mut dyn Write,
+    records: &mut Vec<vcf::RawVcfRecord>,
+    reference_sequences: &BTreeMap<String, String>,
+) -> Result<()> {
+    for record in normalize_somatic_records(std::mem::take(records), reference_sequences) {
+        writeln!(writer, "{}", record.to_line())?;
+    }
+    Ok(())
+}
+
+struct ContigSpool {
+    chrom: String,
+    file: tempfile::NamedTempFile,
+    count: usize,
+}
+
+impl ContigSpool {
+    fn load(&self) -> Result<Vec<FilteredRawRecord>> {
+        vcf::open_raw_vcf(self.file.path())?
+            .map(|record| {
+                let record = record?;
+                Ok(FilteredRawRecord {
+                    key: vcf::VariantKey {
+                        chrom: record.chrom.clone(),
+                        pos: record.pos,
+                        ref_allele: record.ref_allele.clone(),
+                        alt_allele: record.alt_allele.clone(),
+                    },
+                    record,
+                })
+            })
+            .collect()
+    }
+}
+
+fn spool_filtered_contigs(
+    path: &Path,
+    source_path: &Path,
+    options: &RawFilterOptions<'_>,
+) -> Result<Vec<ContigSpool>> {
+    let mut spools: Vec<ContigSpool> = Vec::new();
+    let mut closed = BTreeSet::new();
+    for record in vcf::open_raw_vcf(path)? {
+        let Some(record) = filter_raw_record(record?, source_path, options)? else {
+            continue;
+        };
+        if spools
+            .last()
+            .is_none_or(|spool| spool.chrom != record.key.chrom)
+        {
+            if let Some(previous) = spools.last() {
+                closed.insert(previous.chrom.clone());
+            }
+            if closed.contains(&record.key.chrom) {
+                bail!(
+                    "somatic records for chromosome {} are not contiguous in {}",
+                    record.key.chrom,
+                    path.display()
+                );
+            }
+            spools.push(ContigSpool {
+                chrom: record.key.chrom.clone(),
+                file: tempfile::NamedTempFile::new()
+                    .context("failed to create somatic contig spool")?,
+                count: 0,
+            });
+        }
+        let spool = spools.last_mut().expect("somatic spool was just created");
+        writeln!(spool.file.as_file_mut(), "{}", record.record.to_line())?;
+        spool.count += 1;
+        if spool.count > MAX_SOMATIC_CONTIG_RECORDS {
+            bail!(
+                "somatic contig {} exceeds the {} record active-window limit",
+                spool.chrom,
+                MAX_SOMATIC_CONTIG_RECORDS
+            );
+        }
+    }
+    Ok(spools)
+}
+
 fn normalize_somatic_alleles(record: &mut vcf::RawVcfRecord, reference: &[u8]) {
     let mut reference_allele = record.ref_allele.as_bytes().to_vec();
     let mut alternate = record.alt_allele.as_bytes().to_vec();
@@ -3144,6 +3340,7 @@ struct RawFilterOptions<'a> {
     locations: Option<&'a [vcf::LocationFilter]>,
 }
 
+#[cfg(test)]
 fn filter_raw_records(
     records: Vec<vcf::RawVcfRecord>,
     path: &Path,
@@ -3151,39 +3348,45 @@ fn filter_raw_records(
 ) -> Result<Vec<FilteredRawRecord>> {
     records
         .into_iter()
-        .map(|record| {
-            let key = vcf::VariantKey {
-                chrom: somatic_chrom(&record.chrom, options.reference_contigs, options.fixchr),
-                pos: record.pos,
-                ref_allele: record.ref_allele.clone(),
-                alt_allele: record.alt_allele.clone(),
-            };
-            if options.pass_only && !record.is_pass() {
-                return Ok(None);
-            }
-            if calls_terminal_non_ref(&record) {
-                return Ok(None);
-            }
-            let effective_end = record.effective_end_pos(path)?;
-            if !vcf::matches_interval_filters(
-                &key.chrom,
-                key.pos,
-                effective_end,
-                options.regions,
-                options.targets,
-                options.locations,
-            ) {
-                return Ok(None);
-            }
-            let mut normalized = record;
-            normalized.chrom = key.chrom.clone();
-            Ok(Some(FilteredRawRecord {
-                key,
-                record: normalized,
-            }))
-        })
+        .map(|record| filter_raw_record(record, path, options))
         .filter_map(|result| result.transpose())
         .collect()
+}
+
+fn filter_raw_record(
+    record: vcf::RawVcfRecord,
+    path: &Path,
+    options: &RawFilterOptions<'_>,
+) -> Result<Option<FilteredRawRecord>> {
+    let key = vcf::VariantKey {
+        chrom: somatic_chrom(&record.chrom, options.reference_contigs, options.fixchr),
+        pos: record.pos,
+        ref_allele: record.ref_allele.clone(),
+        alt_allele: record.alt_allele.clone(),
+    };
+    if options.pass_only && !record.is_pass() {
+        return Ok(None);
+    }
+    if calls_terminal_non_ref(&record) {
+        return Ok(None);
+    }
+    let effective_end = record.effective_end_pos(path)?;
+    if !vcf::matches_interval_filters(
+        &key.chrom,
+        key.pos,
+        effective_end,
+        options.regions,
+        options.targets,
+        options.locations,
+    ) {
+        return Ok(None);
+    }
+    let mut normalized = record;
+    normalized.chrom = key.chrom.clone();
+    Ok(Some(FilteredRawRecord {
+        key,
+        record: normalized,
+    }))
 }
 
 fn somatic_chrom(chrom: &str, _reference_contigs: &BTreeSet<String>, fixchr: bool) -> String {

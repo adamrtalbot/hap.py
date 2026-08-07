@@ -22,6 +22,7 @@ use crate::report::{
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{BufWriter, Write};
@@ -106,6 +107,26 @@ pub fn write_roc_files_with_options(
     conf_size: usize,
     options: &RocOptions,
 ) -> Result<MetricIndices> {
+    write_roc_files_with_options_iter(
+        prefix,
+        rows.iter().map(Ok::<_, anyhow::Error>),
+        subset_size,
+        conf_size,
+        options,
+    )
+}
+
+pub fn write_roc_files_with_options_iter<I, R>(
+    prefix: &Path,
+    rows: I,
+    subset_size: usize,
+    conf_size: usize,
+    options: &RocOptions,
+) -> Result<MetricIndices>
+where
+    I: IntoIterator<Item = Result<R>>,
+    R: Borrow<AnnotatedRow>,
+{
     if options.qq_field.is_empty() {
         bail!("ROC field cannot be empty");
     }
@@ -117,7 +138,7 @@ pub fn write_roc_files_with_options(
     {
         bail!("ROC CI alpha must be 0 (disabled) or strictly between 0 and 1");
     }
-    let groups = accumulate_with_options(rows, options);
+    let groups = accumulate_impl(rows, options)?;
 
     if !groups.values().any(|group| !group.obs.is_empty()) {
         let all = empty_comparison_extended_lines(subset_size);
@@ -1958,10 +1979,18 @@ fn sift_down(arr: &mut [ObsRecord], start: usize, first: usize, last: usize) {
 
 #[cfg(test)]
 fn accumulate(rows: &[AnnotatedRow]) -> BTreeMap<RowKey, GroupAccum> {
-    accumulate_impl(rows, &RocOptions::default())
+    accumulate_impl(
+        rows.iter().map(Ok::<_, anyhow::Error>),
+        &RocOptions::default(),
+    )
+    .expect("in-memory ROC rows are infallible")
 }
 
-fn accumulate_impl(rows: &[AnnotatedRow], options: &RocOptions) -> BTreeMap<RowKey, GroupAccum> {
+fn accumulate_impl<I, R>(rows: I, options: &RocOptions) -> Result<BTreeMap<RowKey, GroupAccum>>
+where
+    I: IntoIterator<Item = Result<R>>,
+    R: Borrow<AnnotatedRow>,
+{
     let mut groups: BTreeMap<RowKey, GroupAccum> = BTreeMap::new();
 
     // Named stratifications are configured lanes, not merely observed axes.
@@ -1983,6 +2012,8 @@ fn accumulate_impl(rows: &[AnnotatedRow], options: &RocOptions) -> BTreeMap<RowK
     > = std::collections::BTreeMap::new();
     observed_subsets.insert("*".to_string());
     for row in rows {
+        let row = row?;
+        let row = row.borrow();
         emit_contributions_with_options(
             row,
             options,
@@ -2058,14 +2089,16 @@ fn accumulate_impl(rows: &[AnnotatedRow], options: &RocOptions) -> BTreeMap<RowK
         }
     }
 
-    groups
+    Ok(groups)
 }
 
+#[cfg(test)]
 fn accumulate_with_options(
     rows: &[AnnotatedRow],
     options: &RocOptions,
 ) -> BTreeMap<RowKey, GroupAccum> {
-    accumulate_impl(rows, options)
+    accumulate_impl(rows.iter().map(Ok::<_, anyhow::Error>), options)
+        .expect("in-memory ROC rows are infallible")
 }
 
 fn roc_header(ci_alpha: f64) -> String {

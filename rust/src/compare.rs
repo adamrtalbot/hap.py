@@ -8,6 +8,7 @@ use crate::vcf::{self, RawVcfRecord, Variant, VariantKey};
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
@@ -503,11 +504,15 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         args.preprocess_truth,
     ))?;
     if args.locations.is_none() {
-        let (_, preprocessed_truth) = vcf::load_raw_vcf(&truth_prep)?;
-        if !preprocessed_truth
-            .iter()
-            .any(|record| contig_set.contains(&record.chrom))
-        {
+        let mut preprocessed_truth = vcf::open_raw_vcf(&truth_prep)?;
+        let mut common_contig = false;
+        for record in &mut preprocessed_truth {
+            if contig_set.contains(&record?.chrom) {
+                common_contig = true;
+                break;
+            }
+        }
+        if !common_contig {
             bail!("Truth and reference have no chromosomes in common!");
         }
     }
@@ -548,96 +553,36 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
 
     log_compare_info(&args, "Running Rust comparison")?;
 
-    let (truth_headers, truth_raw) = vcf::load_raw_vcf(&truth_prep)?;
-    let (query_headers, query_raw) = vcf::load_raw_vcf(&query_prep)?;
+    let truth_reader = vcf::open_raw_vcf(&truth_prep)?;
+    let truth_headers = truth_reader.headers().to_vec();
+    let query_reader = vcf::open_raw_vcf(&query_prep)?;
+    let query_headers = query_reader.headers().to_vec();
+    drop(truth_reader);
+    drop(query_reader);
 
-    let truth_variant_input =
-        materialize_variant_input(&truth_prep, scratch.path(), "truth.variants.vcf.gz")?;
-    let query_variant_input =
-        materialize_variant_input(&query_prep, scratch.path(), "query.variants.vcf.gz")?;
-    let mut truth = vcf::load_variants(
-        &truth_variant_input,
+    let filtered_truth_keys = vcf::open_variants(
+        &truth_prep,
         &contig_set,
         false,
         regions.as_deref(),
         targets.as_deref(),
         locations.as_deref(),
-    )?;
+    )?
+    .filter_map(|variant| match variant {
+        Ok(variant) if !variant.is_pass() => Some(Ok(variant.key)),
+        Ok(_) => None,
+        Err(error) => Some(Err(error)),
+    })
+    .collect::<Result<BTreeSet<_>>>()?;
     // CONF insertion padding is derived from the preprocessed truth stream,
     // including filtered records retained by `--usefiltered-truth`. xcmp
     // excludes those records as calls below, but gvcf2bed sees them first;
     // collisions with PASS records can therefore change the padding lane.
-    let truth_for_conf_padding = truth.clone();
-    let filtered_truth_keys: BTreeSet<VariantKey> = truth
-        .iter()
-        .filter(|variant| !variant.is_pass())
-        .map(|variant| variant.key.clone())
-        .collect();
-    // `--usefiltered-truth` preserves filtered records through pre.py, but
-    // legacy xcmp still excludes them from haplotype enumeration and output.
-    // This distinction matters: letting these records reach Rust comparison
-    // creates spurious truth primitives and can turn otherwise query-only
-    // calls into TPs. Keep preprocessing byte-compatible, then apply xcmp's
-    // PASS-only truth-call contract at the comparison boundary.
-    retain_xcmp_truth_calls(&mut truth);
-    let query = vcf::load_variants(
-        &query_variant_input,
-        &contig_set,
-        false,
-        regions.as_deref(),
-        targets.as_deref(),
-        locations.as_deref(),
-    )?;
-
-    let contigs_in_play = collect_contigs(&truth, &query, locations.as_deref());
-    let subset_size = report_subset_size(
-        &contig_non_n_lengths,
-        &contigs_in_play,
-        explicit_bcf,
-        args.bcf && !explicit_bcf,
-    );
-    if subset_size == 0 {
-        bail!("no reference contigs selected for analysis");
-    }
-    let mut counts: BTreeMap<String, TypeCounts> = BTreeMap::new();
-    let mut subtype_counts: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
-    for variant in &truth {
-        add_variant_stats(
-            &mut counts
-                .entry(variant.primary_type().to_string())
-                .or_default()
-                .truth_total,
-            variant,
-        );
-        add_variant_stats_subtype(
-            &mut subtype_counts,
-            variant.primary_type(),
-            variant,
-            |stats| &mut stats.truth_total,
-        );
-    }
-    for variant in &query {
-        add_variant_stats(
-            &mut counts
-                .entry(variant.primary_type().to_string())
-                .or_default()
-                .query_total,
-            variant,
-        );
-        add_variant_stats_subtype(
-            &mut subtype_counts,
-            variant.primary_type(),
-            variant,
-            |stats| &mut stats.query_total,
-        );
-    }
-
     let cluster_gap = match args.engine {
         CompareEngine::ScmpSomatic => 0,
         CompareEngine::ScmpDistance => args.engine_scmp_distance,
         CompareEngine::Xcmp | CompareEngine::Vcfeval => args.window,
     };
-    let clusters = build_clusters_with_gap(&truth, &query, cluster_gap);
     // Fold gvcf2bed-style insertion padding (derived from truth) into
     // the raw CONF bed before classification. Legacy hap.py does the
     // same in Python (hap.py:323): `args.strat_regions.append(
@@ -654,13 +599,25 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     // every interval loaded, with no cross-file dedup — see
     // QuantifyRegions::load).
     let adjust_conf = args.adjust_conf_regions && !args.no_adjust_conf_regions;
-    let gvcf_padding: Option<Vec<vcf::BedInterval>> = conf_bed.as_ref().map(|raw| {
-        if adjust_conf {
-            gvcf2bed_padding(&truth_for_conf_padding, Some(raw))
+    let gvcf_padding: Option<Vec<vcf::BedInterval>> = if let Some(raw) = conf_bed.as_deref() {
+        Some(if adjust_conf {
+            gvcf2bed_padding_iter(
+                vcf::open_variants(
+                    &truth_prep,
+                    &contig_set,
+                    false,
+                    regions.as_deref(),
+                    targets.as_deref(),
+                    locations.as_deref(),
+                )?,
+                Some(raw),
+            )?
         } else {
             Vec::new()
-        }
-    });
+        })
+    } else {
+        None
+    };
     let adjusted_conf_bed: Option<Vec<vcf::BedInterval>> = conf_bed.as_ref().map(|raw| {
         let mut combined = raw.clone();
         if let Some(pad) = gvcf_padding.as_ref() {
@@ -691,8 +648,71 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         })
         .unwrap_or(0);
     let conf_size = raw_conf_size + padding_size;
+    let truth = vcf::open_variants(
+        &truth_prep,
+        &contig_set,
+        true,
+        regions.as_deref(),
+        targets.as_deref(),
+        locations.as_deref(),
+    )?;
+    let query = vcf::open_variants(
+        &query_prep,
+        &contig_set,
+        false,
+        regions.as_deref(),
+        targets.as_deref(),
+        locations.as_deref(),
+    )?;
+    let clusters = StreamingClusters::new(truth, query, cluster_gap);
+    let mut contigs_in_play = locations
+        .as_deref()
+        .map(|locations| {
+            locations
+                .iter()
+                .map(|location| match location {
+                    vcf::LocationFilter::Contig(chrom)
+                    | vcf::LocationFilter::Range { chrom, .. } => chrom.clone(),
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut counts: BTreeMap<String, TypeCounts> = BTreeMap::new();
+    let mut subtype_counts: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
     let mut rows = Vec::new();
     for cluster in clusters {
+        let cluster = cluster?;
+        contigs_in_play.insert(cluster.chrom.clone());
+        for variant in &cluster.truth {
+            add_variant_stats(
+                &mut counts
+                    .entry(variant.primary_type().to_string())
+                    .or_default()
+                    .truth_total,
+                variant,
+            );
+            add_variant_stats_subtype(
+                &mut subtype_counts,
+                variant.primary_type(),
+                variant,
+                |stats| &mut stats.truth_total,
+            );
+        }
+        for variant in &cluster.query {
+            add_variant_stats(
+                &mut counts
+                    .entry(variant.primary_type().to_string())
+                    .or_default()
+                    .query_total,
+                variant,
+            );
+            add_variant_stats_subtype(
+                &mut subtype_counts,
+                variant.primary_type(),
+                variant,
+                |stats| &mut stats.query_total,
+            );
+        }
         process_cluster(
             &cluster,
             &reference_sequences,
@@ -708,11 +728,20 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         )?;
     }
 
+    let subset_size = report_subset_size(
+        &contig_non_n_lengths,
+        &contigs_in_play,
+        explicit_bcf,
+        args.bcf && !explicit_bcf,
+    );
+    if subset_size == 0 {
+        bail!("no reference contigs selected for analysis");
+    }
+
     sort_comparison_rows(&mut rows, &filtered_truth_keys);
-    decorate_output_rows(
+    decorate_output_rows_from_paths(
         &mut rows,
-        &truth_raw,
-        &query_raw,
+        [&truth_prep, &query_prep],
         args.preserve_info,
         args.output_vtc,
         &args.roc,
@@ -817,7 +846,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
                 // incorrectly turns the default happy setting into qfy's
                 // standalone argument error.
                 adjust_conf_regions: (adjust_conf && conf_bed.is_some())
-                    .then(|| truth_variant_input.display().to_string()),
+                    .then(|| truth_prep.display().to_string()),
                 threads: None,
                 bcf: false,
                 logfile: None,
@@ -958,19 +987,6 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     Ok(())
 }
 
-/// `vcf::load_variants` is intentionally a text-VCF reader. Preserve BCF as
-/// the preprocessing format, then materialize a private VCF view only for the
-/// xcmp/SCMP variant-selection layer that still consumes textual records.
-fn materialize_variant_input(source: &Path, scratch: &Path, name: &str) -> Result<PathBuf> {
-    if source.extension().and_then(|value| value.to_str()) != Some("bcf") {
-        return Ok(source.to_path_buf());
-    }
-    let (headers, records) = vcf::load_raw_vcf(source)?;
-    let output = scratch.join(name);
-    vcf::write_raw_vcf(&output, &headers, &records)?;
-    Ok(output)
-}
-
 /// Quantification always produces its annotated report as indexed VCF. In
 /// legacy `--bcf` mode that report is subsequently published as BCF+CSI and
 /// the temporary VCF pair is not part of the final artifact family.
@@ -981,9 +997,10 @@ fn publish_bcf_output(args: &CompareArgs, prefix: &Path) -> Result<()> {
     let vcf_path = suffixed_report_path(prefix, "vcf.gz");
     let vcf_index = suffixed_report_path(prefix, "vcf.gz.tbi");
     let bcf_path = suffixed_report_path(prefix, "bcf");
-    let (headers, records) = vcf::load_raw_vcf(&vcf_path)
+    let reader = vcf::open_raw_vcf(&vcf_path)
         .with_context(|| format!("failed to prepare BCF report from {}", vcf_path.display()))?;
-    vcf::write_raw_vcf(&bcf_path, &headers, &records)?;
+    let headers = reader.headers().to_vec();
+    vcf::write_raw_vcf_iter(&bcf_path, &headers, reader)?;
     fs::remove_file(&vcf_path)?;
     if vcf_index.exists() {
         fs::remove_file(&vcf_index)?;
@@ -991,6 +1008,7 @@ fn publish_bcf_output(args: &CompareArgs, prefix: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn retain_xcmp_truth_calls(variants: &mut Vec<Variant>) {
     variants.retain(Variant::is_pass);
 }
@@ -1054,35 +1072,32 @@ fn run_vcfeval(
         let reference = fasta::read_sequences(Path::new(&args.reference))?;
         let contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
         let raw_conf = vcf::load_bed(Path::new(conf_path), &contigs)?;
-        let (_, truth_records) = vcf::load_raw_vcf(truth_prep)?;
-        let truth = truth_records
-            .into_iter()
-            .map(|record| -> Result<Variant> {
-                let effective_end = record.effective_end_pos(truth_prep)?;
-                let span = effective_end.saturating_sub(record.pos).saturating_add(1);
-                let mut ref_allele = record.ref_allele;
-                if span > ref_allele.len()
-                    && let Some(sequence) = reference.get(&record.chrom)
-                    && let Some(slice) = sequence
-                        .as_bytes()
-                        .get(record.pos.saturating_sub(1)..effective_end)
-                {
-                    ref_allele = String::from_utf8_lossy(slice).to_ascii_uppercase();
-                }
-                Ok(Variant {
-                    key: VariantKey {
-                        chrom: record.chrom,
-                        pos: record.pos,
-                        ref_allele,
-                        alt_allele: record.alt_allele,
-                    },
-                    qual: record.qual,
-                    filter: record.filter,
-                    gt: String::new(),
-                })
+        let truth = vcf::open_raw_vcf(truth_prep)?.map(|record| -> Result<Variant> {
+            let record = record?;
+            let effective_end = record.effective_end_pos(truth_prep)?;
+            let span = effective_end.saturating_sub(record.pos).saturating_add(1);
+            let mut ref_allele = record.ref_allele;
+            if span > ref_allele.len()
+                && let Some(sequence) = reference.get(&record.chrom)
+                && let Some(slice) = sequence
+                    .as_bytes()
+                    .get(record.pos.saturating_sub(1)..effective_end)
+            {
+                ref_allele = String::from_utf8_lossy(slice).to_ascii_uppercase();
+            }
+            Ok(Variant {
+                key: VariantKey {
+                    chrom: record.chrom,
+                    pos: record.pos,
+                    ref_allele,
+                    alt_allele: record.alt_allele,
+                },
+                qual: record.qual,
+                filter: record.filter,
+                gt: String::new(),
             })
-            .collect::<Result<Vec<_>>>()?;
-        let padding = gvcf2bed_padding(&truth, Some(&raw_conf));
+        });
+        let padding = gvcf2bed_padding_iter(truth, Some(&raw_conf))?;
         let padding_path = scratch.path().join("truth.conf-vars.bed");
         let mut output = fs::File::create(&padding_path)
             .with_context(|| format!("failed to create {}", padding_path.display()))?;
@@ -1182,10 +1197,8 @@ fn run_scmp(
         let reference = fasta::read_sequences(Path::new(&args.reference))?;
         let contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
         let raw_conf = vcf::load_bed(Path::new(conf_path), &contigs)?;
-        let truth_variant_input =
-            materialize_variant_input(truth_prep, scratch.path(), "truth.scmp-variants.vcf.gz")?;
-        let truth = vcf::load_variants(&truth_variant_input, &contigs, false, None, None, None)?;
-        let padding = gvcf2bed_padding(&truth, Some(&raw_conf));
+        let truth = vcf::open_variants(truth_prep, &contigs, false, None, None, None)?;
+        let padding = gvcf2bed_padding_iter(truth, Some(&raw_conf))?;
         let padding_path = scratch.path().join("truth.conf-vars.bed");
         let mut output = fs::File::create(&padding_path)
             .with_context(|| format!("failed to create {}", padding_path.display()))?;
@@ -1479,6 +1492,7 @@ fn semantic_info_key(record: &RawVcfRecord) -> SemanticInfoKey {
     (record.chrom.clone(), record.pos, reference, alts)
 }
 
+#[cfg(test)]
 fn decorate_output_rows(
     rows: &mut [AnnotatedRow],
     truth: &[RawVcfRecord],
@@ -1490,60 +1504,88 @@ fn decorate_output_rows(
     if !preserve_info && !output_vtc && matches!(roc_field, "QUAL" | "QQ") {
         return Ok(());
     }
-    let mut preserved = BTreeMap::<InfoKey, BTreeSet<String>>::new();
-    let mut semantic_preserved = BTreeMap::<SemanticInfoKey, BTreeSet<String>>::new();
-    if preserve_info {
-        for record in truth.iter().chain(query) {
-            let key = (
-                record.chrom.clone(),
-                record.pos,
-                record.ref_allele.clone(),
-                record.alt_allele.clone(),
-            );
+    let mut decorations = DecorationIndex::default();
+    for record in truth.iter().chain(query) {
+        decorations.observe(record, preserve_info, roc_field);
+    }
+    decorate_output_rows_with_index(rows, &decorations, preserve_info, output_vtc, roc_field)
+}
+
+fn decorate_output_rows_from_paths<const N: usize>(
+    rows: &mut [AnnotatedRow],
+    paths: [&Path; N],
+    preserve_info: bool,
+    output_vtc: bool,
+    roc_field: &str,
+) -> Result<()> {
+    if !preserve_info && !output_vtc && matches!(roc_field, "QUAL" | "QQ") {
+        return Ok(());
+    }
+    let mut decorations = DecorationIndex::default();
+    for path in paths {
+        for record in vcf::open_raw_vcf(path)? {
+            decorations.observe(&record?, preserve_info, roc_field);
+        }
+    }
+    decorate_output_rows_with_index(rows, &decorations, preserve_info, output_vtc, roc_field)
+}
+
+#[derive(Default)]
+struct DecorationIndex {
+    preserved: BTreeMap<InfoKey, BTreeSet<String>>,
+    semantic_preserved: BTreeMap<SemanticInfoKey, BTreeSet<String>>,
+    roc_values: BTreeMap<InfoKey, String>,
+}
+
+impl DecorationIndex {
+    fn observe(&mut self, record: &RawVcfRecord, preserve_info: bool, roc_field: &str) {
+        let key = (
+            record.chrom.clone(),
+            record.pos,
+            record.ref_allele.clone(),
+            record.alt_allele.clone(),
+        );
+        if preserve_info {
             for field in record
                 .info
                 .split(';')
                 .filter(|field| !matches!(*field, "" | "."))
             {
-                preserved
+                self.preserved
                     .entry(key.clone())
                     .or_default()
                     .insert(field.to_string());
-                semantic_preserved
+                self.semantic_preserved
                     .entry(semantic_info_key(record))
                     .or_default()
                     .insert(field.to_string());
             }
         }
-    }
-    let mut roc_values = BTreeMap::<InfoKey, String>::new();
-    if !matches!(roc_field, "QUAL" | "QQ" | ".") {
-        for record in truth.iter().chain(query) {
+        if !matches!(roc_field, "QUAL" | "QQ" | ".") {
             let value = record
                 .info
                 .split(';')
                 .find_map(|entry| {
                     entry
                         .split_once('=')
-                        // Pinned xcmp looks up the --qq argument literally.
-                        // Prefixes such as INFO. and FORMAT. are not parsed.
                         .filter(|(key, _)| *key == roc_field)
                         .map(|(_, value)| value.to_string())
                 })
                 .or_else(|| record.sample_map(0).get(roc_field).cloned());
             if let Some(value) = value {
-                roc_values.insert(
-                    (
-                        record.chrom.clone(),
-                        record.pos,
-                        record.ref_allele.clone(),
-                        record.alt_allele.clone(),
-                    ),
-                    value,
-                );
+                self.roc_values.insert(key, value);
             }
         }
     }
+}
+
+fn decorate_output_rows_with_index(
+    rows: &mut [AnnotatedRow],
+    decorations: &DecorationIndex,
+    preserve_info: bool,
+    output_vtc: bool,
+    roc_field: &str,
+) -> Result<()> {
     for row in rows {
         let mut record = RawVcfRecord::from_line(&row.line, Path::new("comparison-output"))?;
         let key = (
@@ -1556,10 +1598,11 @@ fn decorate_output_rows(
         let regions = current.get("Regions").cloned();
         let mut base = BTreeMap::<String, String>::new();
         if preserve_info {
-            let fields = preserved
-                .get(&key)
-                .into_iter()
-                .chain(semantic_preserved.get(&semantic_info_key(&record)));
+            let fields = decorations.preserved.get(&key).into_iter().chain(
+                decorations
+                    .semantic_preserved
+                    .get(&semantic_info_key(&record)),
+            );
             for fields in fields {
                 for field in fields {
                     let field_key = field.split_once('=').map_or(field.as_str(), |(key, _)| key);
@@ -1587,14 +1630,14 @@ fn decorate_output_rows(
             let iqq = if roc_field == "QUAL" {
                 Some(comparison.iqq.as_str())
             } else {
-                roc_values.get(&key).map(String::as_str)
+                decorations.roc_values.get(&key).map(String::as_str)
             };
             if let Some(iqq) = iqq {
                 base.insert("IQQ".to_string(), format!("IQQ={iqq}"));
             }
         }
 
-        if !matches!(roc_field, "QUAL" | "QQ" | ".") && !roc_values.contains_key(&key) {
+        if !matches!(roc_field, "QUAL" | "QQ" | ".") && !decorations.roc_values.contains_key(&key) {
             // When xcmp's literal custom-field lookup misses, quantify reads
             // an absent IQQ: called query samples receive NaN, truth samples
             // remain missing, and no-call queries retain the zero sentinel.
@@ -1955,21 +1998,8 @@ fn decorate_existing_comparison_vcf(
     preserve_info: bool,
     output_vtc: bool,
 ) -> Result<()> {
-    let (mut headers, records) = vcf::load_raw_vcf(output_path)?;
-    let (_, truth) = vcf::load_raw_vcf(truth_path)?;
-    let (_, query) = vcf::load_raw_vcf(query_path)?;
-    let mut rows = records
-        .into_iter()
-        .map(|record| AnnotatedRow {
-            sort_key: (record.chrom.clone(), record.pos, 0, 0),
-            line: record.to_line(),
-            query_pass: true,
-            fp_class: None,
-            xcmp_ctype: None,
-            xcmp_hap_match: false,
-        })
-        .collect::<Vec<_>>();
-    decorate_output_rows(&mut rows, &truth, &query, preserve_info, output_vtc, "QUAL")?;
+    let reader = vcf::open_raw_vcf(output_path)?;
+    let mut headers = reader.headers().to_vec();
     if output_vtc {
         let mut chrom_index = headers
             .iter()
@@ -1989,11 +2019,32 @@ fn decorate_existing_comparison_vcf(
             }
         }
     }
-    let decorated = rows
-        .iter()
-        .map(|row| RawVcfRecord::from_line(&row.line, output_path))
-        .collect::<Result<Vec<_>>>()?;
-    vcf::write_raw_vcf(output_path, &headers, &decorated)
+    let mut decorations = DecorationIndex::default();
+    for path in [truth_path, query_path] {
+        for record in vcf::open_raw_vcf(path)? {
+            decorations.observe(&record?, preserve_info, "QUAL");
+        }
+    }
+    let decorated = reader.map(|record| {
+        let record = record?;
+        let mut row = AnnotatedRow {
+            sort_key: (record.chrom.clone(), record.pos, 0, 0),
+            line: record.to_line(),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+        };
+        decorate_output_rows_with_index(
+            std::slice::from_mut(&mut row),
+            &decorations,
+            preserve_info,
+            output_vtc,
+            "QUAL",
+        )?;
+        RawVcfRecord::from_line(&row.line, output_path)
+    });
+    vcf::write_raw_vcf_iter(output_path, &headers, decorated)
 }
 
 fn resolve_default_reference() -> Result<String> {
@@ -2092,6 +2143,7 @@ fn build_clusters(truth: &[Variant], query: &[Variant]) -> Vec<Cluster> {
     build_clusters_with_gap(truth, query, CLUSTER_GAP_BP)
 }
 
+#[cfg(test)]
 fn build_clusters_with_gap(
     truth: &[Variant],
     query: &[Variant],
@@ -2156,6 +2208,128 @@ fn build_clusters_with_gap(
         clusters.push(cluster);
     }
     clusters
+}
+
+struct StreamingClusters<T, Q>
+where
+    T: Iterator<Item = Result<Variant>>,
+    Q: Iterator<Item = Result<Variant>>,
+{
+    truth: std::iter::Peekable<T>,
+    query: std::iter::Peekable<Q>,
+    pending: Option<Entry>,
+    cluster_gap: usize,
+}
+
+impl<T, Q> StreamingClusters<T, Q>
+where
+    T: Iterator<Item = Result<Variant>>,
+    Q: Iterator<Item = Result<Variant>>,
+{
+    fn new(truth: T, query: Q, cluster_gap: usize) -> Self {
+        Self {
+            truth: truth.peekable(),
+            query: query.peekable(),
+            pending: None,
+            cluster_gap,
+        }
+    }
+
+    fn next_entry(&mut self) -> Result<Option<Entry>> {
+        if self.truth.peek().is_some_and(Result::is_err) {
+            return self.truth.next().transpose().map(|variant| {
+                variant.map(|variant| Entry {
+                    side: Side::Truth,
+                    variant,
+                })
+            });
+        }
+        if self.query.peek().is_some_and(Result::is_err) {
+            return self.query.next().transpose().map(|variant| {
+                variant.map(|variant| Entry {
+                    side: Side::Query,
+                    variant,
+                })
+            });
+        }
+        let take_truth = match (self.truth.peek(), self.query.peek()) {
+            (Some(Ok(truth)), Some(Ok(query))) => {
+                variant_stream_key(truth) <= variant_stream_key(query)
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return Ok(None),
+            (Some(_), Some(_)) => unreachable!("errors handled before ordering"),
+        };
+        let variant = if take_truth {
+            self.truth.next().transpose()?.map(|variant| Entry {
+                side: Side::Truth,
+                variant,
+            })
+        } else {
+            self.query.next().transpose()?.map(|variant| Entry {
+                side: Side::Query,
+                variant,
+            })
+        };
+        Ok(variant)
+    }
+}
+
+impl<T, Q> Iterator for StreamingClusters<T, Q>
+where
+    T: Iterator<Item = Result<Variant>>,
+    Q: Iterator<Item = Result<Variant>>,
+{
+    type Item = Result<Cluster>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = match self.pending.take() {
+            Some(entry) => entry,
+            None => match self.next_entry() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
+            },
+        };
+        let mut cluster = Cluster {
+            chrom: first.variant.key.chrom.clone(),
+            start: first.variant.key.pos,
+            end: first.variant.end_pos(),
+            truth: Vec::new(),
+            query: Vec::new(),
+        };
+        push_cluster_entry(&mut cluster, first);
+        loop {
+            let entry = match self.next_entry() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return Some(Ok(cluster)),
+                Err(error) => return Some(Err(error)),
+            };
+            let start = entry.variant.key.pos;
+            if cluster.chrom == entry.variant.key.chrom
+                && start <= cluster.end.saturating_add(self.cluster_gap)
+                && cluster.truth.len() + cluster.query.len() < MAX_CLUSTER_VARIANTS
+            {
+                cluster.end = cluster.end.max(entry.variant.end_pos());
+                push_cluster_entry(&mut cluster, entry);
+            } else {
+                self.pending = Some(entry);
+                return Some(Ok(cluster));
+            }
+        }
+    }
+}
+
+fn variant_stream_key(variant: &Variant) -> (&str, usize, usize) {
+    (&variant.key.chrom, variant.key.pos, variant.end_pos())
+}
+
+fn push_cluster_entry(cluster: &mut Cluster, entry: Entry) {
+    match entry.side {
+        Side::Truth => cluster.truth.push(entry.variant),
+        Side::Query => cluster.query.push(entry.variant),
+    }
 }
 
 fn process_cluster(
@@ -5257,10 +5431,23 @@ fn effective_refrange(variant: &Variant) -> Option<(usize, usize, bool)> {
 /// the raw CONF bed (standard overlap/touching merge) before
 /// `variant_is_conf` consumes them, but the **un-merged sum** is what
 /// feeds `Subset.IS_CONF.Size`.
+#[cfg(test)]
 fn gvcf2bed_padding(
     truth: &[Variant],
     target_bed: Option<&[vcf::BedInterval]>,
 ) -> Vec<vcf::BedInterval> {
+    gvcf2bed_padding_iter(truth.iter().map(Ok::<_, anyhow::Error>), target_bed)
+        .expect("in-memory variants are infallible")
+}
+
+fn gvcf2bed_padding_iter<I, V>(
+    truth: I,
+    target_bed: Option<&[vcf::BedInterval]>,
+) -> Result<Vec<vcf::BedInterval>>
+where
+    I: IntoIterator<Item = Result<V>>,
+    V: Borrow<Variant>,
+{
     struct ActiveInterval {
         chrom: String,
         start: i64,
@@ -5303,18 +5490,12 @@ fn gvcf2bed_padding(
         s <= p && p < e
     };
 
-    let mut sorted: Vec<&Variant> = truth.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.key
-            .chrom
-            .cmp(&b.key.chrom)
-            .then(a.key.pos.cmp(&b.key.pos))
-    });
-
     let mut out = Vec::new();
     let mut active: Option<ActiveInterval> = None;
 
-    for variant in sorted {
+    for variant in truth {
+        let variant = variant?;
+        let variant = variant.borrow();
         let ref_bytes = variant.key.ref_allele.as_bytes();
         if ref_bytes.is_empty() {
             continue;
@@ -5433,7 +5614,7 @@ fn gvcf2bed_padding(
             end: (iv.end + 1) as usize,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Merge overlapping or touching half-open bed intervals. Matches
@@ -5565,30 +5746,6 @@ fn variant_is_conf(
         }
     }
     false
-}
-
-fn collect_contigs(
-    truth: &[Variant],
-    query: &[Variant],
-    locations: Option<&[vcf::LocationFilter]>,
-) -> BTreeSet<String> {
-    let mut contigs = BTreeSet::new();
-    if let Some(filters) = locations {
-        for filter in filters {
-            match filter {
-                vcf::LocationFilter::Contig(chrom) => {
-                    contigs.insert(chrom.clone());
-                }
-                vcf::LocationFilter::Range { chrom, .. } => {
-                    contigs.insert(chrom.clone());
-                }
-            }
-        }
-    }
-    for variant in truth.iter().chain(query.iter()) {
-        contigs.insert(variant.key.chrom.clone());
-    }
-    contigs
 }
 
 fn report_subset_size(
@@ -8307,6 +8464,42 @@ mod memory_guards {
                 "cluster exceeded MAX_CLUSTER_VARIANTS"
             );
         }
+    }
+
+    #[test]
+    fn streaming_clusters_match_the_in_memory_cluster_boundaries() -> Result<()> {
+        let make = |chrom: &str, pos, reference: &str, alternate: &str| Variant {
+            key: VariantKey {
+                chrom: chrom.to_string(),
+                pos,
+                ref_allele: reference.to_string(),
+                alt_allele: alternate.to_string(),
+            },
+            qual: "30".to_string(),
+            filter: "PASS".to_string(),
+            gt: "0/1".to_string(),
+        };
+        let truth = vec![
+            make("chr1", 10, "A", "C"),
+            make("chr1", 25, "A", "G"),
+            make("chr2", 3, "T", "TA"),
+        ];
+        let query = vec![make("chr1", 11, "A", "T"), make("chr1", 40, "C", "G")];
+        let expected = build_clusters_with_gap(&truth, &query, 2);
+        let actual = StreamingClusters::new(
+            truth.into_iter().map(Ok::<_, anyhow::Error>),
+            query.into_iter().map(Ok::<_, anyhow::Error>),
+            2,
+        )
+        .collect::<Result<Vec<_>>>()?;
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.chrom, expected.chrom);
+            assert_eq!((actual.start, actual.end), (expected.start, expected.end));
+            assert_eq!(actual.truth.len(), expected.truth.len());
+            assert_eq!(actual.query.len(), expected.query.len());
+        }
+        Ok(())
     }
 
     /// Class D pin: chr21:38861935 INDEL hetalt-vs-homalt-of-shared-allele.

@@ -145,61 +145,27 @@ fn run_with_metric_indices_mode(
         );
     }
     require_quantifier_index(Path::new(&args.input_vcf))?;
-    let (mut headers, mut records) = vcf::load_raw_vcf(Path::new(&args.input_vcf))?;
-    if annotation_type == "ga4gh" {
-        validate_ga4gh_qq_fields(&headers, &records)?;
-    }
+    let input_path = Path::new(&args.input_vcf);
+    let input = vcf::open_raw_vcf(input_path)?;
+    let mut headers = input.headers().to_vec();
     let benchmark_samples = benchmark_sample_indices(&headers);
     let do_roc = args.do_roc && benchmark_samples.has_both();
     let reference = crate::fasta::read_sequences(Path::new(&args.reference))?;
     let reference_contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
     let (confidence, stratifications, stratification_levels) =
         load_regions(&args, &reference_contigs)?;
-    for record in &mut records {
-        if args.preserve_info {
-            let extent = legacy_regions_extent(record);
-            set_info_value(&mut record.info, "RegionsExtent", &extent);
-        }
-        annotate_regions_for_samples(
-            record,
-            confidence.as_deref(),
-            &stratifications,
-            annotation_type == "ga4gh",
-            benchmark_samples,
-            mode.preserve_missing_nocall_bd,
-        );
-        if annotation_type == "xcmp" {
-            reannotate_xcmp_record_for_samples(
-                record,
-                confidence.is_some(),
-                &args.roc,
-                benchmark_samples,
-            );
-        } else {
-            reannotate_ga4gh_record(record);
-        }
-    }
-    propagate_superlocus_annotations_for_samples(
-        &mut records,
+    let (transformed, input_contigs) = spool_quantified_records(
+        input,
+        &headers,
+        input_path,
         annotation_type,
+        &args,
+        mode,
         benchmark_samples,
-        mode.preserve_missing_query_qq,
-        mode.inherit_same_position_tp_qq,
-    );
-    for record in &mut records {
-        decorate_quantified_record_for_samples(
-            record,
-            annotation_type,
-            args.preserve_info,
-            args.output_vtc,
-            confidence.is_some(),
-            benchmark_samples,
-        );
-        if annotation_type == "ga4gh" {
-            normalize_integer_like_format_values(record, "QQ");
-        }
-    }
-    let subset_size = contigs_in_input(&records)
+        confidence.as_deref(),
+        &stratifications,
+    )?;
+    let subset_size = input_contigs
         .into_iter()
         .filter_map(|contig| {
             reference
@@ -235,13 +201,14 @@ fn run_with_metric_indices_mode(
         })
         .unwrap_or_default();
 
-    for record in &records {
+    for record in vcf::open_raw_vcf(transformed.path())? {
+        let record = record?;
         let truth = benchmark_samples
             .truth
-            .and_then(|sample_index| classify_side(record, sample_index));
+            .and_then(|sample_index| classify_side(&record, sample_index));
         let query = benchmark_samples
             .query
-            .and_then(|sample_index| classify_side(record, sample_index));
+            .and_then(|sample_index| classify_side(&record, sample_index));
 
         if let Some(classified) = truth {
             record_truth(&mut all_counts, &classified);
@@ -341,25 +308,30 @@ fn run_with_metric_indices_mode(
                 );
             }
         }
-        vcf::write_raw_vcf(&output_vcf, &headers, &records)?;
+        vcf::write_raw_vcf_iter(
+            &output_vcf,
+            &headers,
+            vcf::open_raw_vcf(transformed.path())?,
+        )?;
     }
-    let mut rows = records
-        .iter()
+    let rows = vcf::open_raw_vcf(transformed.path())?
         .enumerate()
-        .filter_map(|(index, record)| {
-            Some(AnnotatedRow {
-                sort_key: (record.chrom.clone(), record.pos, index, 0),
-                line: roc_record_line(record, benchmark_samples)?,
-                query_pass: record.is_pass(),
-                fp_class: benchmark_samples
-                    .query
-                    .and_then(|sample_index| query_fp_class_for_sample(record, sample_index)),
-                xcmp_ctype: None,
-                xcmp_hap_match: false,
-            })
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
+        .filter_map(|(index, record)| match record {
+            Err(error) => Some(Err(error)),
+            Ok(record) => match roc_record_line(&record, benchmark_samples) {
+                None => None,
+                Some(line) => Some(Ok(AnnotatedRow {
+                    sort_key: (record.chrom.clone(), record.pos, index, 0),
+                    line,
+                    query_pass: record.is_pass(),
+                    fp_class: benchmark_samples
+                        .query
+                        .and_then(|sample_index| query_fp_class_for_sample(&record, sample_index)),
+                    xcmp_ctype: None,
+                    xcmp_hap_match: false,
+                })),
+            },
+        });
     let roc_options = roc::RocOptions {
         qq_field: args.roc.clone(),
         score_field: mode.roc_value_from_qq.then(|| "QQ".to_string()),
@@ -380,9 +352,9 @@ fn run_with_metric_indices_mode(
         subset_sizes: stratification_sizes.clone(),
         subset_confidence_sizes: stratification_confidence_sizes.clone(),
     };
-    let roc_indices = roc::write_roc_files_with_options(
+    let roc_indices = roc::write_roc_files_with_options_iter(
         prefix,
-        &rows,
+        rows,
         subset_size,
         confidence_size.unwrap_or(0),
         &roc_options,
@@ -395,6 +367,146 @@ fn run_with_metric_indices_mode(
         write_metrics_json(prefix, args.write_counts, &roc_indices)?;
     }
     Ok(roc_indices)
+}
+
+const MAX_QUANTIFY_SUPERLOCUS_RECORDS: usize = 1_000_000;
+
+#[allow(clippy::too_many_arguments)]
+fn spool_quantified_records(
+    records: vcf::RawVcfReader,
+    headers: &[String],
+    input_path: &Path,
+    annotation_type: &str,
+    args: &QuantifyArgs,
+    mode: CompareQuantifyMode,
+    benchmark_samples: BenchmarkSamples,
+    confidence: Option<&[vcf::BedInterval]>,
+    stratifications: &RegionMap,
+) -> Result<(tempfile::NamedTempFile, BTreeSet<String>)> {
+    let mut spool = tempfile::NamedTempFile::new().context("failed to create quantify spool")?;
+    let qq_is_string = annotation_type == "ga4gh" && ga4gh_qq_is_string(headers);
+    let mut input_contigs = BTreeSet::new();
+    {
+        let mut writer = BufWriter::new(spool.as_file_mut());
+        for header in headers {
+            writeln!(writer, "{header}")?;
+        }
+        let mut group = Vec::new();
+        let mut group_key: Option<(String, i64)> = None;
+        for record in records {
+            let mut record = record?;
+            if qq_is_string {
+                validate_ga4gh_qq_record(&record)?;
+            }
+            input_contigs.insert(record.chrom.clone());
+            if args.preserve_info {
+                let extent = legacy_regions_extent(&record);
+                set_info_value(&mut record.info, "RegionsExtent", &extent);
+            }
+            annotate_regions_for_samples(
+                &mut record,
+                confidence,
+                stratifications,
+                annotation_type == "ga4gh",
+                benchmark_samples,
+                mode.preserve_missing_nocall_bd,
+            );
+            if annotation_type == "xcmp" {
+                reannotate_xcmp_record_for_samples(
+                    &mut record,
+                    confidence.is_some(),
+                    &args.roc,
+                    benchmark_samples,
+                );
+            } else {
+                reannotate_ga4gh_record(&mut record);
+            }
+
+            let key = benchmark_superlocus(&record.info)
+                .map(|superlocus| (record.chrom.clone(), superlocus));
+            if !group.is_empty() && (key.is_none() || key != group_key) {
+                flush_quantify_group(
+                    &mut writer,
+                    &mut group,
+                    annotation_type,
+                    args,
+                    mode,
+                    benchmark_samples,
+                    confidence.is_some(),
+                )?;
+            }
+            group_key = key;
+            group.push(record);
+            if group.len() > MAX_QUANTIFY_SUPERLOCUS_RECORDS {
+                bail!(
+                    "quantify superlocus in {} exceeds the {} record active-window limit",
+                    input_path.display(),
+                    MAX_QUANTIFY_SUPERLOCUS_RECORDS
+                );
+            }
+            if group_key.is_none() {
+                flush_quantify_group(
+                    &mut writer,
+                    &mut group,
+                    annotation_type,
+                    args,
+                    mode,
+                    benchmark_samples,
+                    confidence.is_some(),
+                )?;
+            }
+        }
+        flush_quantify_group(
+            &mut writer,
+            &mut group,
+            annotation_type,
+            args,
+            mode,
+            benchmark_samples,
+            confidence.is_some(),
+        )?;
+        writer.flush()?;
+    }
+    spool.as_file().sync_all()?;
+    Ok((spool, input_contigs))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_quantify_group(
+    writer: &mut dyn Write,
+    group: &mut Vec<RawVcfRecord>,
+    annotation_type: &str,
+    args: &QuantifyArgs,
+    mode: CompareQuantifyMode,
+    benchmark_samples: BenchmarkSamples,
+    has_confidence: bool,
+) -> Result<()> {
+    if group.is_empty() {
+        return Ok(());
+    }
+    propagate_superlocus_annotations_for_samples(
+        group,
+        annotation_type,
+        benchmark_samples,
+        mode.preserve_missing_query_qq,
+        mode.inherit_same_position_tp_qq,
+    );
+    for record in group.drain(..) {
+        let mut record = record;
+        decorate_quantified_record_for_samples(
+            &mut record,
+            annotation_type,
+            args.preserve_info,
+            args.output_vtc,
+            has_confidence,
+            benchmark_samples,
+        );
+        if annotation_type == "ga4gh" {
+            normalize_integer_like_format_values(&mut record, "QQ");
+        }
+        writeln!(writer, "{}", record.to_line())?;
+    }
+    Ok(())
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
@@ -499,10 +611,10 @@ fn load_regions(
         let raw_confidence = confidence.as_deref().ok_or_else(|| {
             anyhow::anyhow!("qfy --adjust-conf-regions requires --false-positives")
         })?;
-        let (_, truth_records) = vcf::load_raw_vcf(Path::new(truth_vcf)).with_context(|| {
+        let truth_records = vcf::open_raw_vcf(Path::new(truth_vcf)).with_context(|| {
             format!("failed to load --adjust-conf-regions truth VCF {truth_vcf}")
         })?;
-        let padding = truth_confidence_padding(&truth_records, raw_confidence);
+        let padding = truth_confidence_padding_iter(truth_records, raw_confidence)?;
         confidence.get_or_insert_default().extend(padding);
     }
     let mut paths = BTreeMap::<String, PathBuf>::new();
@@ -570,22 +682,33 @@ fn dynamic_region_label(raw_name: &str) -> (String, bool) {
     }
 }
 
+#[cfg(test)]
 fn truth_confidence_padding(
     records: &[RawVcfRecord],
     targets: &[vcf::BedInterval],
 ) -> Vec<vcf::BedInterval> {
-    let mut records = records.iter().collect::<Vec<_>>();
-    records.sort_by(|left, right| left.chrom.cmp(&right.chrom).then(left.pos.cmp(&right.pos)));
+    truth_confidence_padding_iter(records.iter().cloned().map(Ok::<_, anyhow::Error>), targets)
+        .expect("in-memory confidence records are infallible")
+}
+
+fn truth_confidence_padding_iter<I>(
+    records: I,
+    targets: &[vcf::BedInterval],
+) -> Result<Vec<vcf::BedInterval>>
+where
+    I: IntoIterator<Item = Result<RawVcfRecord>>,
+{
     let mut output = Vec::new();
     let mut active: Option<vcf::BedInterval> = None;
     for record in records {
+        let record = record?;
         if !targets
             .iter()
             .any(|target| target.matches(&record.chrom, record.pos))
         {
             continue;
         }
-        let (start, end) = effective_reference_range(record)
+        let (start, end) = effective_reference_range(&record)
             .map(|(start, end, _)| (start.saturating_sub(1), end))
             .unwrap_or((
                 record.pos.saturating_sub(1),
@@ -615,7 +738,7 @@ fn truth_confidence_padding(
     if let Some(interval) = active {
         output.push(interval);
     }
-    output
+    Ok(output)
 }
 
 fn resolve_stratification_path(raw_path: &str, tsv_path: &Path) -> PathBuf {
@@ -1251,40 +1374,48 @@ fn ensure_ga4gh_headers(headers: &mut Vec<String>) {
     }
 }
 
+#[cfg(test)]
 fn validate_ga4gh_qq_fields(headers: &[String], records: &[RawVcfRecord]) -> Result<()> {
-    let qq_is_string = headers.iter().any(|header| {
+    if !ga4gh_qq_is_string(headers) {
+        return Ok(());
+    }
+    for record in records {
+        validate_ga4gh_qq_record(record)?;
+    }
+    Ok(())
+}
+
+fn ga4gh_qq_is_string(headers: &[String]) -> bool {
+    headers.iter().any(|header| {
         let Some(body) = header.strip_prefix("##FORMAT=<") else {
             return false;
         };
         let fields = body.split(',').collect::<Vec<_>>();
         fields.contains(&"ID=QQ") && fields.contains(&"Type=String")
-    });
-    if !qq_is_string {
-        return Ok(());
-    }
+    })
+}
 
+fn validate_ga4gh_qq_record(record: &RawVcfRecord) -> Result<()> {
     // Legacy's numeric FORMAT reader sizes its result from the encoded BCF
     // string width. A one-character String QQ is accepted as a missing numeric
     // value, while a wider cell yields multiple values and aborts before any
     // report is published (`BCFHelpers.cpp::getFormatFloat`).
-    for record in records {
-        let Some(qq_index) = record.format_keys().iter().position(|field| *field == "QQ") else {
-            continue;
-        };
-        let encoded_width = record
-            .samples
-            .iter()
-            .filter_map(|sample| sample.split(':').nth(qq_index))
-            .map(str::len)
-            .max()
-            .unwrap_or(0);
-        if encoded_width > 1 {
-            bail!(
-                "too many QQ fields at {}:{}",
-                record.chrom,
-                record.pos.saturating_sub(1)
-            );
-        }
+    let Some(qq_index) = record.format_keys().iter().position(|field| *field == "QQ") else {
+        return Ok(());
+    };
+    let encoded_width = record
+        .samples
+        .iter()
+        .filter_map(|sample| sample.split(':').nth(qq_index))
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    if encoded_width > 1 {
+        bail!(
+            "too many QQ fields at {}:{}",
+            record.chrom,
+            record.pos.saturating_sub(1)
+        );
     }
     Ok(())
 }
@@ -2131,10 +2262,6 @@ fn rewrite_subset_levels(text: &str, delimiter: char, levels: &RegionLevels) -> 
         output.push(fields.join(&separator));
     }
     output.join("\n") + "\n"
-}
-
-fn contigs_in_input(records: &[RawVcfRecord]) -> BTreeSet<String> {
-    records.iter().map(|record| record.chrom.clone()).collect()
 }
 
 fn classify_side(record: &RawVcfRecord, sample_index: usize) -> Option<ClassifiedVariant> {
