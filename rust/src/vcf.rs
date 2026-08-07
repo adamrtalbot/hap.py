@@ -1,4 +1,4 @@
-use crate::output::OutputTransaction;
+use crate::output::{FailureOperation, OutputTransaction, fail_operation};
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use noodles_bgzf as bgzf;
@@ -335,6 +335,7 @@ pub fn write_raw_vcf(path: &Path, headers: &[String], records: &[RawVcfRecord]) 
             .with_context(|| format!("failed to create VCF destination {}", path.display()))?;
         let mut writer = BufWriter::new(file);
         (|| {
+            fail_operation(FailureOperation::Writer, path)?;
             write_vcf_lines(&mut writer, headers, lines.iter().map(String::as_str))?;
             writer.flush()?;
             writer
@@ -367,7 +368,7 @@ where
     let sidecar_path = tabix_path(path);
     let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [path, &sidecar_path])?;
     let staged = transaction.staged_file(path)?.to_path_buf();
-    write_indexed_vcf_inner(&staged, headers, lines).map_err(|error| {
+    write_indexed_vcf_inner(&staged, path, &sidecar_path, headers, lines).map_err(|error| {
         anyhow::anyhow!(
             "failed to write indexed VCF destination {} (index {}): {error:#}",
             path.display(),
@@ -377,7 +378,13 @@ where
     transaction.commit()
 }
 
-fn write_indexed_vcf_inner<'a, I>(path: &Path, headers: &[String], lines: I) -> Result<()>
+fn write_indexed_vcf_inner<'a, I>(
+    path: &Path,
+    logical_vcf: &Path,
+    logical_index: &Path,
+    headers: &[String],
+    lines: I,
+) -> Result<()>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -400,6 +407,7 @@ where
     };
 
     let result = (|| {
+        fail_operation(FailureOperation::Writer, logical_vcf)?;
         let mut writer = bgzf::io::Writer::new(vcf_file);
         for header in headers {
             writeln!(writer, "{header}")?;
@@ -413,12 +421,14 @@ where
             index.push(record, Chunk::new(chunk_start, chunk_end))?;
         }
 
+        fail_operation(FailureOperation::Encoder, logical_vcf)?;
         let vcf_file = writer.finish()?;
         vcf_file
             .sync_all()
             .with_context(|| format!("failed to sync {}", temporary_vcf.display()))?;
 
         let payload = index.finish();
+        fail_operation(FailureOperation::Index, logical_index)?;
         let mut index_writer = bgzf::io::Writer::new(tbi_file);
         index_writer.write_all(&payload)?;
         let tbi_file = index_writer.finish()?;
@@ -1436,6 +1446,36 @@ mod tests {
         assert_eq!(fs::read(&path)?, b"old-vcf");
         assert_eq!(fs::read(&index_path)?, b"old-index");
         assert_no_transaction_files(directory.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn injected_writer_and_index_failures_preserve_existing_pair() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("output.vcf.gz");
+        let index_path = tabix_path(&path);
+        let headers = [
+            "##fileformat=VCFv4.2".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO".to_string(),
+        ];
+        let records = ["chr1\t1\t.\tA\tC\t.\tPASS\t."];
+        for operation in [FailureOperation::Writer, FailureOperation::Index] {
+            fs::write(&path, b"old-vcf")?;
+            fs::write(&index_path, b"old-index")?;
+            crate::output::set_failure_operation(Some(operation));
+            let error = write_indexed_vcf(&path, &headers, records)
+                .expect_err("injected output operation must fail");
+            crate::output::set_failure_operation(None);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&index_path.display().to_string())
+                    || operation == FailureOperation::Writer
+            );
+            assert_eq!(fs::read(&path)?, b"old-vcf");
+            assert_eq!(fs::read(&index_path)?, b"old-index");
+            assert_no_transaction_files(directory.path())?;
+        }
         Ok(())
     }
 

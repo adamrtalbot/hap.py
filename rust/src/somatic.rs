@@ -1,6 +1,10 @@
 use crate::cli::SomaticArgs;
 use crate::compare::suffixed_report_path;
-use crate::{fasta, ftx, output::OutputTransaction, strelka, vcf};
+use crate::{
+    fasta, ftx,
+    output::{FailureOperation, OutputTransaction, fail_operation},
+    strelka, vcf,
+};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -281,7 +285,8 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     let destination_prefix = PathBuf::from(&args.output);
     let inputs = somatic_inputs(&args);
     let logfile = args.logfile.as_ref().map(PathBuf::from);
-    let artifacts = somatic_artifacts(&args);
+    let artifacts =
+        somatic_artifacts(&args).context("failed to plan somatic AF-bin ROC artifacts")?;
     let transaction = OutputTransaction::family(&inputs, &destination_prefix, artifacts)?
         .with_files(logfile.iter())?;
     if let Some(path) = logfile.as_deref() {
@@ -302,7 +307,7 @@ pub fn run(mut args: SomaticArgs) -> Result<()> {
     transaction.commit()
 }
 
-fn somatic_artifacts(args: &SomaticArgs) -> Vec<String> {
+fn somatic_artifacts(args: &SomaticArgs) -> Result<Vec<String>> {
     let mut artifacts = [
         "ambiclasses.csv",
         "ambireasons.csv",
@@ -317,14 +322,14 @@ fn somatic_artifacts(args: &SomaticArgs) -> Vec<String> {
     .map(str::to_string)
     .collect::<Vec<_>>();
     if args.af_strat {
-        for (start, end) in parse_af_bins(&args.af_strat_binsize) {
+        for (start, end) in parse_af_bins(&args.af_strat_binsize)? {
             let interval = format_af_interval(start, end);
             for prefix in ["records", "SNVs", "indels"] {
                 artifacts.push(format!("{prefix}.{interval}.roc.csv"));
             }
         }
     }
-    artifacts
+    Ok(artifacts)
 }
 
 fn somatic_inputs(args: &SomaticArgs) -> Vec<PathBuf> {
@@ -346,7 +351,7 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
     }
     validate_args(&args)?;
     let af_bins = if args.af_strat {
-        parse_af_bins(&args.af_strat_binsize)
+        parse_af_bins(&args.af_strat_binsize)?
     } else {
         Vec::new()
     };
@@ -911,11 +916,13 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    fail_operation(FailureOperation::Writer, &output)?;
     fs::write(&output, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("failed to write {}", output.display()))?;
     controls.print_default_summary(&lines);
 
     let metrics_json = suffixed_report_path(Path::new(&args.output), "metrics.json");
+    fail_operation(FailureOperation::Writer, &metrics_json)?;
     let explanation_enabled = args.explain_ambiguous && !args.ambiguous_beds.is_empty();
     write_legacy_metrics_json(
         &metrics_json,
@@ -1773,7 +1780,7 @@ fn write_happy_style_extended(
         _ => "NA",
     };
 
-    for (start, end) in parse_af_bins(bin_sizes) {
+    for (start, end) in parse_af_bins(bin_sizes)? {
         let inclusive_last = end >= 1.0;
         let subset = if inclusive_last {
             format!("[{start:.2},1.00]")
@@ -1900,15 +1907,25 @@ fn round_four(value: f64) -> f64 {
     (value * 10_000.0).round() / 10_000.0
 }
 
-fn parse_af_bins(raw: &str) -> Vec<(f64, f64)> {
-    let bins = raw
-        .split(',')
-        .filter_map(|part| part.parse::<f64>().ok())
-        .collect::<Vec<_>>();
+fn parse_af_bins(raw: &str) -> Result<Vec<(f64, f64)>> {
+    let fields = raw.split(',').collect::<Vec<_>>();
+    if fields.is_empty() || fields.iter().any(|field| field.trim().is_empty()) {
+        bail!("AF bin size list must not be empty");
+    }
+    let bins = fields
+        .into_iter()
+        .map(|part| {
+            part.parse::<f64>()
+                .with_context(|| format!("failed to parse AF bin size '{part}'"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut out = Vec::new();
     let mut start: f64 = 0.0;
     let mut idx = 0usize;
-    while start < 1.0 && !bins.is_empty() {
+    for _ in 0..MAX_AF_BINS {
+        if !start.is_finite() || start >= 1.0 || bins.is_empty() {
+            return Ok(out);
+        }
         let mut end = start + bins[idx];
         if end >= 1.0 {
             // Python som.py uses 1.00000001 internally so AF=1 is included,
@@ -1916,13 +1933,17 @@ fn parse_af_bins(raw: &str) -> Vec<(f64, f64)> {
             end = 1.000_000_01;
         }
         if start >= end {
-            break;
+            return Ok(out);
         }
         out.push((start, end));
         start = end;
         idx = (idx + 1) % bins.len();
     }
-    out
+    if !start.is_finite() || start >= 1.0 {
+        Ok(out)
+    } else {
+        bail!("AF bin sizes produce more than {MAX_AF_BINS} bins")
+    }
 }
 
 fn preserves_empty_records_af_bin(raw: &str, end: f64) -> bool {
@@ -1968,7 +1989,7 @@ fn calculate_af_stats(
         .collect::<Vec<_>>();
 
     let mut output = Vec::new();
-    for (start, end) in parse_af_bins(bin_sizes) {
+    for (start, end) in parse_af_bins(bin_sizes)? {
         let in_bin = |row: &[String], index: usize| {
             row.get(index)
                 .and_then(|value| value.parse::<f64>().ok())
@@ -2845,35 +2866,7 @@ fn selected_normalizations(args: &SomaticArgs) -> (bool, bool) {
 }
 
 fn validate_af_bins(raw: &str) -> Result<()> {
-    let bins = raw.split(',').collect::<Vec<_>>();
-    if bins.is_empty() || bins.iter().any(|bin| bin.trim().is_empty()) {
-        bail!("AF bin size list must not be empty");
-    }
-    let parsed = bins
-        .into_iter()
-        .map(|bin| {
-            bin.parse::<f64>()
-                .with_context(|| format!("failed to parse AF bin size '{bin}'"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut start: f64 = 0.0;
-    let mut index = 0usize;
-    for _ in 0..MAX_AF_BINS {
-        if !start.is_finite() || start >= 1.0 || parsed.is_empty() {
-            return Ok(());
-        }
-        let mut end = start + parsed[index];
-        if end >= 1.0 {
-            end = 1.000_000_01;
-        }
-        if start >= end {
-            return Ok(());
-        }
-        start = end;
-        index = (index + 1) % parsed.len();
-    }
-    bail!("AF bin sizes produce more than {MAX_AF_BINS} bins")
+    parse_af_bins(raw).map(|_| ())
 }
 
 fn classification_bed_chrom(
@@ -4404,14 +4397,14 @@ mod tests {
                 .contains("more than 10000 bins")
         );
 
-        assert!(parse_af_bins("0").is_empty());
-        assert!(parse_af_bins("-0.1").is_empty());
-        let nan = parse_af_bins("nan");
+        assert!(parse_af_bins("0").unwrap().is_empty());
+        assert!(parse_af_bins("-0.1").unwrap().is_empty());
+        let nan = parse_af_bins("nan").unwrap();
         assert_eq!(nan.len(), 1);
         assert_eq!(nan[0].0, 0.0);
         assert!(nan[0].1.is_nan());
         assert_eq!(format_af_interval(nan[0].0, nan[0].1), "0.000000-nan");
-        assert_eq!(parse_af_bins("inf"), vec![(0.0, 1.000_000_01)]);
+        assert_eq!(parse_af_bins("inf").unwrap(), vec![(0.0, 1.000_000_01)]);
         assert_eq!(format_af_interval(0.0, 1.000_000_01), "0.000000-1.000000");
     }
 
@@ -4419,7 +4412,7 @@ mod tests {
     fn af_roc_artifacts_are_declared_in_the_transaction_plan() {
         let mut args = parsed_somatic(&["--bin-afs", "--af-binsize", "0.5"]);
         args.roc = Some("generic".to_string());
-        let artifacts = somatic_artifacts(&args);
+        let artifacts = somatic_artifacts(&args).unwrap();
         for prefix in ["records", "SNVs", "indels"] {
             for interval in ["0.000000-0.500000", "0.500000-1.000000"] {
                 assert!(artifacts.contains(&format!("{prefix}.{interval}.roc.csv")));

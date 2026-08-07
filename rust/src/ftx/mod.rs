@@ -8,7 +8,11 @@
 
 use crate::cli::{FtxArgs, resolve_legacy_reference};
 use crate::partial_credit::RefVar;
-use crate::{fasta, output::OutputTransaction, partial_credit, vcf};
+use crate::{
+    fasta,
+    output::{FailureOperation, OutputTransaction, fail_operation},
+    partial_credit, vcf,
+};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
@@ -150,6 +154,7 @@ fn run_inner(args: FtxArgs) -> Result<()> {
     )?;
 
     let output = ftx_output_path(&args.output);
+    fail_operation(FailureOperation::Writer, &output)?;
     fs::write(&output, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("failed to write {}", output.display()))?;
 

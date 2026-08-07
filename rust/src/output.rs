@@ -18,6 +18,34 @@ static PUBLICATION_MUTEX: Mutex<()> = Mutex::new(());
 thread_local! {
     static FAIL_PUBLICATION_AFTER: std::cell::Cell<isize> = const { std::cell::Cell::new(-1) };
     static FAIL_BACKUP_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_OPERATION: std::cell::Cell<Option<FailureOperation>> = const { std::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailureOperation {
+    Writer,
+    Encoder,
+    Index,
+}
+
+pub(crate) fn fail_operation(operation: FailureOperation, destination: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_OPERATION.get() == Some(operation) {
+        bail!(
+            "injected {operation:?} failure for destination {}",
+            destination.display()
+        );
+    }
+    #[cfg(not(test))]
+    let _ = operation;
+    #[cfg(not(test))]
+    let _ = destination;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_failure_operation(operation: Option<FailureOperation>) {
+    FAIL_OPERATION.set(operation);
 }
 
 #[derive(Clone, Debug)]
@@ -718,12 +746,6 @@ fn cleanup_backups_or_rollback(
     backups: &[(PathBuf, PathBuf)],
     published: &[(PathBuf, PathBuf)],
 ) -> Result<()> {
-    #[cfg(test)]
-    if FAIL_BACKUP_CLEANUP.get() {
-        let error = anyhow::anyhow!("injected persistent backup cleanup failure");
-        return rollback_after_cleanup_failure(backups, published, None, error);
-    }
-
     let snapshots = match backups
         .iter()
         .map(|(backup, _)| BackupSnapshot::capture(backup))
@@ -745,6 +767,15 @@ fn cleanup_backups_or_rollback(
             );
         }
         debug_assert!(!backup.exists(), "backup {index} was not removed");
+        #[cfg(test)]
+        if index == 0 && FAIL_BACKUP_CLEANUP.get() {
+            return rollback_after_cleanup_failure(
+                backups,
+                published,
+                Some(&snapshots),
+                anyhow::anyhow!("injected persistent backup cleanup failure"),
+            );
+        }
     }
     Ok(())
 }
@@ -901,6 +932,17 @@ mod tests {
         for valid in ["summary.csv", "roc.Locations.SNP.csv.gz", "region_name"] {
             assert!(validate_artifact_component("test artifact", valid).is_ok());
         }
+    }
+
+    #[test]
+    fn writer_and_index_injection_include_destination_context() {
+        for operation in [FailureOperation::Writer, FailureOperation::Index] {
+            set_failure_operation(Some(operation));
+            let destination = Path::new("logical-output.vcf.gz.tbi");
+            let error = fail_operation(operation, destination).expect_err("failure must inject");
+            assert!(error.to_string().contains("logical-output.vcf.gz.tbi"));
+        }
+        set_failure_operation(None);
     }
 
     #[test]

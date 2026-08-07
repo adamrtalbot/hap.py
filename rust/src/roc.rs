@@ -15,6 +15,7 @@
 //! strings, exactly matching pandas `sort_values` on an object column).
 
 use crate::compare::{AnnotatedRow, suffixed_report_path};
+use crate::output::{FailureOperation, fail_operation};
 use crate::report::{
     CountsBucket, EXTENDED_HEADER, append_stats_with_missing, empty_comparison_extended_lines,
     f1_score, format_count, het_hom_ratio, metric_ratio, python_repr_float, ti_tv_ratio,
@@ -2991,6 +2992,7 @@ fn subset_size_cells(
 // ---------------------------------------------------------------------------
 
 fn write_gzip_csv(path: &Path, header: &str, rows: &[String]) -> Result<()> {
+    fail_operation(FailureOperation::Writer, path)?;
     let file = std::fs::File::create(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     let mut writer = GzEncoder::new(file, Compression::default());
@@ -2998,6 +3000,7 @@ fn write_gzip_csv(path: &Path, header: &str, rows: &[String]) -> Result<()> {
     for row in rows {
         writeln!(writer, "{row}")?;
     }
+    fail_operation(FailureOperation::Encoder, path)?;
     writer
         .finish()
         .with_context(|| format!("failed to finish ROC artifact {}", path.display()))?;

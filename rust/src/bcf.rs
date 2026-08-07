@@ -1,4 +1,4 @@
-use crate::output::OutputTransaction;
+use crate::output::{FailureOperation, OutputTransaction, fail_operation};
 use crate::vcf::RawVcfRecord;
 use anyhow::{Context, Result, bail};
 use noodles_bgzf as bgzf;
@@ -719,6 +719,7 @@ fn write_inner(
     let csi_path = path.with_extension("bcf.csi");
     let temp_csi = temporary_path(&csi_path);
     let result = (|| {
+        fail_operation(FailureOperation::Writer, logical_bcf)?;
         let mut writer = bgzf::io::Writer::new(File::create(&temp_bcf)?);
         writer.write_all(BCF_MAGIC)?;
         writer.write_all(&(encoded_header.text.len() as u32).to_le_bytes())?;
@@ -742,11 +743,13 @@ fn write_inner(
             chunks[rid as usize].get_or_insert((start, end)).1 = end;
             record_counts[rid as usize] += 1;
         }
+        fail_operation(FailureOperation::Encoder, logical_bcf)?;
         writer
             .finish()
             .with_context(|| format!("failed to finish BCF encoder for {}", logical_bcf.display()))?
             .sync_all()
             .with_context(|| format!("failed to sync BCF artifact {}", logical_bcf.display()))?;
+        fail_operation(FailureOperation::Index, logical_csi)?;
         write_csi(&temp_csi, &chunks, &record_counts)
             .with_context(|| format!("failed to write CSI artifact {}", logical_csi.display()))?;
         replace_pair(&temp_bcf, path, &temp_csi, &csi_path).with_context(|| {

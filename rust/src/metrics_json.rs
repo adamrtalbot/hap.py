@@ -1,3 +1,4 @@
+use crate::output::{FailureOperation, fail_operation};
 use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -75,6 +76,7 @@ pub fn write_compare_runinfo(
     commandline: &str,
     args: &CompareRunArgs<'_>,
 ) -> Result<()> {
+    fail_operation(FailureOperation::Writer, path)?;
     create_parent(path)?;
 
     let mut body = String::new();
@@ -243,6 +245,7 @@ pub fn write_metrics_gz_for_module_with_indices(
     tables: &[(&str, &str, &Path)],
     indices: Option<&BTreeMap<String, Vec<usize>>>,
 ) -> Result<()> {
+    fail_operation(FailureOperation::Writer, path)?;
     create_parent(path)?;
     let file =
         fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
@@ -251,6 +254,7 @@ pub fn write_metrics_gz_for_module_with_indices(
         metrics_json_for_module_with_indices(name, module, commandline, tables, indices)?
             .as_bytes(),
     )?;
+    fail_operation(FailureOperation::Encoder, path)?;
     encoder
         .finish()
         .with_context(|| format!("failed to finish metrics JSON artifact {}", path.display()))?;
