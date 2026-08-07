@@ -5,7 +5,7 @@ use crate::output::OutputTransaction;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const WARNING_REFPADDING: usize = 0;
@@ -139,8 +139,8 @@ fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut
         .map(|text| vcf::parse_locations(text, &reference_contigs))
         .transpose()?;
 
-    let (headers, records) = vcf::load_raw_vcf(Path::new(&args.input))?;
-    let mut header = VcfHeader::from_lines(&headers)?;
+    let mut records = vcf::open_validated_vcf(Path::new(&args.input))?;
+    let mut header = VcfHeader::from_lines(records.headers())?;
     let location_is_lowercase_x = args
         .locations
         .as_deref()
@@ -153,12 +153,25 @@ fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut
 
     let mut counts = ValidationCounts::default();
     let mut previous = PreviousRecord::default();
-    let mut errors = Vec::new();
+    let mut errors = args
+        .errors_bed
+        .as_deref()
+        .map(|path| {
+            let parent = Path::new(path)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            tempfile::NamedTempFile::new_in(parent)
+                .map(|file| (path.to_string(), BufWriter::new(file)))
+                .with_context(|| format!("failed to stage {path}"))
+        })
+        .transpose()?;
     let mut parsed_any_record = false;
     let mut previous_record_failed_to_parse = false;
     let mut reported_extreme_format_value = false;
 
-    for mut record in records {
+    for record in &mut records {
+        let mut record = record?;
         if record.samples.len() < header.sample_count {
             writeln!(
                 diagnostics,
@@ -174,7 +187,10 @@ fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut
             previous_record_failed_to_parse = true;
             continue;
         }
-        record.samples.truncate(header.sample_count);
+        record.try_update(|raw| {
+            raw.samples.truncate(header.sample_count);
+            Ok(())
+        })?;
 
         if let Some(parse_error) = header.format_parse_error(&record) {
             if parse_error.extreme_value && !reported_extreme_format_value {
@@ -229,7 +245,10 @@ fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut
         } else {
             vcf::normalize_chrom(&record.chrom, &reference_contigs)
         };
-        let record = RawVcfRecord { chrom, ..record };
+        record.try_update(|raw| {
+            raw.chrom = chrom;
+            Ok(())
+        })?;
 
         if let Some(filters) = locations.as_deref()
             && !filters
@@ -276,13 +295,16 @@ fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut
         if let Some(reference_sequences) = &reference_sequences
             && let Some(reason) = validate_record(&record, reference_sequences)
         {
-            errors.push(format!(
-                "{}\t{}\t{}\t{}",
-                record.chrom,
-                record.pos.saturating_sub(1),
-                record.end_pos(),
-                reason
-            ));
+            if let Some((_, errors)) = errors.as_mut() {
+                writeln!(
+                    errors,
+                    "{}\t{}\t{}\t{}",
+                    record.chrom,
+                    record.pos.saturating_sub(1),
+                    record.end_pos(),
+                    reason
+                )?;
+            }
         }
 
         if args
@@ -314,16 +336,15 @@ fn run_with_diagnostics_inner<W: Write>(args: RawValidateArgs, diagnostics: &mut
         fs::write(path, json).with_context(|| format!("failed to write {path}"))?;
     }
 
-    if let Some(path) = &args.errors_bed {
-        fs::write(
-            path,
-            if errors.is_empty() {
-                String::new()
-            } else {
-                format!("{}\n", errors.join("\n"))
-            },
-        )
-        .with_context(|| format!("failed to write {path}"))?;
+    if let Some((path, mut errors)) = errors {
+        errors
+            .flush()
+            .context("failed to flush validation errors BED")?;
+        let staged = errors.into_inner().map_err(|error| error.into_error())?;
+        staged
+            .persist(&path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("failed to publish {path}"))?;
     }
 
     Ok(())

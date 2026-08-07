@@ -8,10 +8,11 @@ use super::{AmbiguousInterval, FilteredRawRecord, QueryClass};
 use crate::adapters::report;
 use crate::adapters::vcf;
 use crate::application::SomaticArgs;
-use crate::domain::{Interval, RawVcfRecord};
+use crate::domain::{Interval, QueryProvenance, RawVcfRecord};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub(super) fn validate_args(args: &SomaticArgs) -> Result<()> {
@@ -317,6 +318,156 @@ pub(super) fn normalize_somatic_records(
     output
 }
 
+pub(super) const MAX_SOMATIC_CONTIG_RECORDS: usize = 10_000_000;
+
+pub(super) fn prepare_somatic_cache(
+    source: &Path,
+    cache: &Path,
+    headers: &[String],
+    normalize: bool,
+    reference_sequences: Option<&BTreeMap<String, String>>,
+) -> Result<()> {
+    if !normalize {
+        let records = vcf::open_validated_vcf(source)?
+            .map(|record| record.map(|record| record.raw().clone()));
+        return vcf::write_raw_vcf_iter(cache, headers, records);
+    }
+    let reference_sequences = reference_sequences.context("normalization requires a reference")?;
+    let mut spool = tempfile::NamedTempFile::new().context("failed to create somatic spool")?;
+    {
+        let mut writer = BufWriter::new(spool.as_file_mut());
+        for header in headers {
+            writeln!(writer, "{header}")?;
+        }
+        let mut current_chrom: Option<String> = None;
+        let mut contig_records = Vec::new();
+        for record in vcf::open_validated_vcf(source)? {
+            let record = record?.raw().clone();
+            if current_chrom
+                .as_deref()
+                .is_some_and(|chrom| chrom != record.chrom)
+            {
+                write_normalized_somatic_contig(
+                    &mut writer,
+                    &mut contig_records,
+                    reference_sequences,
+                )?;
+            }
+            current_chrom = Some(record.chrom.clone());
+            contig_records.push(record);
+            if contig_records.len() > MAX_SOMATIC_CONTIG_RECORDS {
+                bail!(
+                    "somatic contig in {} exceeds the {} record active-window limit",
+                    source.display(),
+                    MAX_SOMATIC_CONTIG_RECORDS
+                );
+            }
+        }
+        write_normalized_somatic_contig(&mut writer, &mut contig_records, reference_sequences)?;
+        writer.flush()?;
+    }
+    let records = vcf::open_validated_vcf(spool.path())?
+        .map(|record| record.map(|record| record.raw().clone()));
+    vcf::write_raw_vcf_iter(cache, headers, records)
+}
+
+pub(super) fn write_normalized_somatic_contig(
+    writer: &mut dyn Write,
+    records: &mut Vec<RawVcfRecord>,
+    reference_sequences: &BTreeMap<String, String>,
+) -> Result<()> {
+    for record in normalize_somatic_records(std::mem::take(records), reference_sequences) {
+        let checked = vcf::ValidatedVcfRecord::try_from_raw(record, QueryProvenance::Unavailable)?;
+        writeln!(writer, "{}", checked.raw().to_line())?;
+    }
+    Ok(())
+}
+
+pub(super) struct ContigSpool {
+    pub(super) chrom: String,
+    pub(super) path: tempfile::TempPath,
+    pub(super) count: usize,
+}
+
+impl ContigSpool {
+    pub(super) fn load(&self) -> Result<Vec<FilteredRawRecord>> {
+        vcf::open_validated_vcf(&self.path)?
+            .map(|record| {
+                let record = record?.raw().clone();
+                Ok(FilteredRawRecord {
+                    key: vcf::VariantKey {
+                        chrom: record.chrom.clone(),
+                        pos: record.pos,
+                        ref_allele: record.ref_allele.clone(),
+                        alt_allele: record.alt_allele.clone(),
+                    },
+                    record,
+                })
+            })
+            .collect()
+    }
+}
+
+pub(super) fn spool_filtered_contigs(
+    path: &Path,
+    source_path: &Path,
+    options: &RawFilterOptions<'_>,
+) -> Result<Vec<ContigSpool>> {
+    let mut spools: Vec<ContigSpool> = Vec::new();
+    let mut closed = BTreeSet::new();
+    let mut active: Option<(String, tempfile::NamedTempFile, usize)> = None;
+    for record in vcf::open_validated_vcf(path)? {
+        let Some(record) = filter_raw_record(record?.raw().clone(), source_path, options)? else {
+            continue;
+        };
+        if active
+            .as_ref()
+            .is_none_or(|(chrom, _, _)| chrom != &record.key.chrom)
+        {
+            if let Some((chrom, mut file, count)) = active.take() {
+                file.as_file_mut().flush()?;
+                closed.insert(chrom.clone());
+                spools.push(ContigSpool {
+                    chrom,
+                    path: file.into_temp_path(),
+                    count,
+                });
+            }
+            if closed.contains(&record.key.chrom) {
+                bail!(
+                    "somatic records for chromosome {} are not contiguous in {}",
+                    record.key.chrom,
+                    path.display()
+                );
+            }
+            active = Some((
+                record.key.chrom.clone(),
+                tempfile::NamedTempFile::new().context("failed to create somatic contig spool")?,
+                0,
+            ));
+        }
+        let (chrom, file, count) = active.as_mut().expect("somatic spool was just created");
+        writeln!(file.as_file_mut(), "{}", record.record.to_line())?;
+        *count += 1;
+        if *count > MAX_SOMATIC_CONTIG_RECORDS {
+            bail!(
+                "somatic contig {} exceeds the {} record active-window limit",
+                chrom,
+                MAX_SOMATIC_CONTIG_RECORDS
+            );
+        }
+    }
+    if let Some((chrom, mut file, count)) = active {
+        file.as_file_mut().flush()?;
+        spools.push(ContigSpool {
+            chrom,
+            path: file.into_temp_path(),
+            count,
+        });
+    }
+    Ok(spools)
+}
+
 pub(super) fn normalize_somatic_alleles(record: &mut RawVcfRecord, reference: &[u8]) {
     let mut reference_allele = record.ref_allele.as_bytes().to_vec();
     let mut alternate = record.alt_allele.as_bytes().to_vec();
@@ -368,6 +519,7 @@ pub(super) struct RawFilterOptions<'a> {
     pub(super) locations: Option<&'a [vcf::LocationFilter]>,
 }
 
+#[cfg(test)]
 pub(super) fn filter_raw_records(
     records: Vec<RawVcfRecord>,
     path: &Path,
@@ -375,39 +527,49 @@ pub(super) fn filter_raw_records(
 ) -> Result<Vec<FilteredRawRecord>> {
     records
         .into_iter()
-        .map(|record| {
-            let key = vcf::VariantKey {
-                chrom: somatic_chrom(&record.chrom, options.reference_contigs, options.fixchr),
-                pos: record.pos,
-                ref_allele: record.ref_allele.clone(),
-                alt_allele: record.alt_allele.clone(),
-            };
-            if options.pass_only && !record.is_pass() {
-                return Ok(None);
-            }
-            if calls_terminal_non_ref(&record) {
-                return Ok(None);
-            }
-            let effective_end = record.effective_end_pos(path)?;
-            if !vcf::matches_interval_filters(
-                &key.chrom,
-                key.pos,
-                effective_end,
-                options.regions,
-                options.targets,
-                options.locations,
-            ) {
-                return Ok(None);
-            }
-            let mut normalized = record;
-            normalized.chrom = key.chrom.clone();
-            Ok(Some(FilteredRawRecord {
-                key,
-                record: normalized,
-            }))
-        })
+        .map(|record| filter_raw_record(record, path, options))
         .filter_map(|result| result.transpose())
         .collect()
+}
+
+pub(super) fn filter_raw_record(
+    record: RawVcfRecord,
+    path: &Path,
+    options: &RawFilterOptions<'_>,
+) -> Result<Option<FilteredRawRecord>> {
+    let key = vcf::VariantKey {
+        chrom: somatic_chrom(&record.chrom, options.reference_contigs, options.fixchr),
+        pos: record.pos,
+        ref_allele: record.ref_allele.clone(),
+        alt_allele: record.alt_allele.clone(),
+    };
+    if options.pass_only && !record.is_pass() {
+        return Ok(None);
+    }
+    if calls_terminal_non_ref(&record) {
+        return Ok(None);
+    }
+    let effective_end = record.effective_end_pos(path)?;
+    if !vcf::matches_interval_filters(
+        &key.chrom,
+        key.pos,
+        effective_end,
+        options.regions,
+        options.targets,
+        options.locations,
+    ) {
+        return Ok(None);
+    }
+    let mut normalized = record;
+    normalized.chrom = key.chrom.clone();
+    let normalized =
+        vcf::ValidatedVcfRecord::try_from_raw(normalized, QueryProvenance::Unavailable)?
+            .raw()
+            .clone();
+    Ok(Some(FilteredRawRecord {
+        key,
+        record: normalized,
+    }))
 }
 
 pub(super) fn somatic_chrom(

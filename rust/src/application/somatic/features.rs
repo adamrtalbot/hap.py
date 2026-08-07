@@ -5,18 +5,67 @@ use crate::domain::RawVcfRecord;
 use crate::engines::strelka;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
-pub(super) fn renumber_feature_rows(groups: &[Vec<String>]) -> Vec<String> {
-    let mut out = Vec::new();
-    for group in groups {
-        for (idx, row) in group.iter().enumerate() {
-            let tail = row.split_once(',').map(|(_, tail)| tail).unwrap_or(row);
-            out.push(format!("{idx},{tail}"));
-        }
+pub(super) struct FeatureRowSpools {
+    groups: [tempfile::NamedTempFile; 5],
+}
+
+impl FeatureRowSpools {
+    pub(super) fn new() -> Result<Self> {
+        Ok(Self {
+            groups: [
+                tempfile::NamedTempFile::new(),
+                tempfile::NamedTempFile::new(),
+                tempfile::NamedTempFile::new(),
+                tempfile::NamedTempFile::new(),
+                tempfile::NamedTempFile::new(),
+            ]
+            .into_iter()
+            .collect::<std::io::Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("failed to initialize somatic feature spools"))?,
+        })
     }
-    out
+
+    pub(super) fn push(&mut self, group: usize, row: impl AsRef<str>) -> Result<()> {
+        writeln!(self.groups[group].as_file_mut(), "{}", row.as_ref())?;
+        Ok(())
+    }
+
+    pub(super) fn extend(
+        &mut self,
+        group: usize,
+        rows: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        for row in rows {
+            self.push(group, row)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn renumber(mut self) -> Result<tempfile::NamedTempFile> {
+        let mut ordered = tempfile::NamedTempFile::new()
+            .context("failed to create ordered somatic feature spool")?;
+        {
+            let mut writer = BufWriter::new(ordered.as_file_mut());
+            for group in &mut self.groups {
+                group.as_file_mut().flush()?;
+                for (index, row) in BufReader::new(File::open(group.path())?)
+                    .lines()
+                    .enumerate()
+                {
+                    let row = row?;
+                    let tail = row.split_once(',').map(|(_, tail)| tail).unwrap_or(&row);
+                    writeln!(writer, "{index},{tail}")?;
+                }
+            }
+            writer.flush()?;
+        }
+        Ok(ordered)
+    }
 }
 
 pub(super) struct CallerFeatureTable {

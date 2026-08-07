@@ -1,7 +1,7 @@
 use crate::application::{
     PreprocessArgs, PreprocessGender, SomaticGtMode, ValidatedPreprocessArgs,
 };
-use crate::domain::{Interval, RawVcfRecord};
+use crate::domain::{Interval, QueryProvenance, RawVcfRecord};
 use crate::{
     adapters::{fasta, vcf},
     engines::{partial_credit, variant_pipeline},
@@ -9,8 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeSet, HashSet};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 mod alleles;
@@ -20,6 +19,7 @@ mod compatibility;
 mod genotype;
 mod normalization;
 mod options;
+mod streaming;
 
 use alleles::*;
 use blocksplit::*;
@@ -29,6 +29,7 @@ use genotype::{
 };
 use normalization::*;
 use options::*;
+use streaming::PreprocessSpool;
 
 pub(crate) use canonical::{canonicalize_legacy_headers, structured_header_identity};
 pub(crate) use options::infer_gender;
@@ -174,7 +175,9 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
     let output_path = preprocess_output_path(&args);
     require_output_parent(&output_path)?;
     let reference_path = resolve_reference(args.reference.as_deref())?;
-    let (mut headers, records) = vcf::load_raw_vcf(Path::new(&args.input))?;
+    let input_path = Path::new(&args.input);
+    let input = vcf::open_validated_vcf(input_path)?;
+    let mut headers = input.headers().to_vec();
     require_vcf_sample(&headers)?;
     let reference_index = fasta::read_index(&reference_path)?;
     let reference_sequences = fasta::read_sequences(&reference_path)?;
@@ -207,21 +210,38 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
     if let Some(sample_names) = somatic_sample_names.as_deref() {
         append_somatic_info_headers(&mut headers, sample_names);
     }
-    let input_contigs = records.iter().map(|record| record.chrom.clone()).collect();
+    let mut input_contigs = BTreeSet::new();
+    let mut haploid_x = false;
+    let mut diploid_x = false;
+    for record in input {
+        let record = record?;
+        input_contigs.insert(record.chrom.clone());
+        if args.gender == PreprocessGender::Auto {
+            observe_gender(&record, &mut haploid_x, &mut diploid_x);
+        }
+    }
     let requested_fixchr = if args.no_fixchr {
         Some(false)
     } else {
         args.fixchr
     };
     let fixchr = resolve_fixchr(requested_fixchr, &reference_contigs, &input_contigs);
-    let gender = resolve_gender(args.gender, &records);
+    let gender = if args.gender == PreprocessGender::Auto {
+        if haploid_x && !diploid_x {
+            PreprocessGender::Male
+        } else {
+            PreprocessGender::Female
+        }
+    } else {
+        args.gender
+    };
     let leftshift = args.leftshift && !args.no_leftshift;
     let decompose = args.decompose && !args.no_decompose;
     let normalization_enabled = leftshift || decompose || gender == PreprocessGender::Male;
     let effective_threads = effective_thread_count(args.threads);
     let blocksplit_selection = if normalization_enabled && effective_threads > 1 {
         let observations = collect_blocksplit_observations(
-            &records,
+            vcf::open_validated_vcf(input_path)?,
             &args,
             fixchr,
             normalization_enabled,
@@ -242,7 +262,7 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
         BlocksplitSelection::default()
     };
 
-    let mut output = Vec::new();
+    let mut output = PreprocessSpool::new(normalization_enabled)?;
     let job_count = blocksplit_selection.jobs.as_ref().map_or(1, Vec::len);
     for job_index in 0..job_count {
         let job = blocksplit_selection
@@ -255,7 +275,8 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
         let mut prev_end_by_chrom: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut prepared_record_index = 0usize;
-        for mut record in records.iter().cloned() {
+        for record in vcf::open_validated_vcf(input_path)? {
+            let mut record = record?.raw().clone();
             if fixchr {
                 record.chrom = add_legacy_chr_prefix(&record.chrom);
             }
@@ -366,7 +387,10 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
                     prev_end_by_chrom.remove(&record.chrom);
                 }
                 if !normalization_enabled {
-                    output.push(record);
+                    output.push(vcf::ValidatedVcfRecord::try_from_raw(
+                        record,
+                        QueryProvenance::Unavailable,
+                    )?)?;
                     continue;
                 }
                 if args.convert_gvcf_to_vcf {
@@ -542,7 +566,10 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
                         // string_fmts` loop order in `VariantWriter.cpp` combined with
                         // dynamic per-value type detection.
                         reorder_format_fields(&mut split);
-                        output.push(split);
+                        output.push(vcf::ValidatedVcfRecord::try_from_raw(
+                            split,
+                            QueryProvenance::Unavailable,
+                        )?)?;
                     }
                 }
                 // Advance the per-chromosome boundary so the next variant cannot
@@ -560,17 +587,17 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
     }
 
     if fixchr {
-        ensure_emitted_contig_headers(&mut headers, &output);
+        ensure_emitted_contig_headers(&mut headers, &output.emitted_contigs);
     }
 
     if normalization_enabled {
-        sort_normalized_records(&mut output);
         headers = canonicalize_legacy_headers(&headers);
     } else {
         ensure_pass_filter_header(&mut headers);
     }
 
-    vcf::write_raw_vcf(&output_path, &headers, &output)?;
+    let output_count = output.serial;
+    vcf::write_validated_vcf_iter(&output_path, &headers, output.finish()?)?;
     if output_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -583,7 +610,7 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
     }
     logger.info(&format!(
         "Wrote {} records to {}",
-        output.len(),
+        output_count,
         output_path.display()
     ))?;
     Ok(())

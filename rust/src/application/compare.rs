@@ -4,7 +4,7 @@ use crate::application::{
     CompareArgs, CompareEngine, PreprocessArgs, PreprocessGender, QuantifyArgs, SomaticGtMode,
     ValidatedCompareArgs, comparison_io, preprocess, roc_publication,
 };
-use crate::domain::{AnnotatedRow, CountsBucket, Interval, RawVcfRecord, TypeCounts};
+use crate::domain::{AnnotatedRow, Interval, RawVcfRecord, TypeCounts};
 use crate::engines::partial_credit;
 use crate::output::{OutputTransaction, benchmark_artifacts, stratification_inputs};
 use anyhow::{Context, Result, bail};
@@ -22,12 +22,14 @@ mod matching;
 mod metrics;
 mod output;
 mod rows;
+mod spool;
 
 use genotype::{equivalent_gt, parse_gt_alleles};
 use matching::*;
 use metrics::*;
 use output::*;
 use rows::*;
+use spool::*;
 
 static SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -534,11 +536,15 @@ fn run_inner(
         .validated()?,
     )?;
     if args.locations.is_none() {
-        let (_, preprocessed_truth) = vcf::load_raw_vcf(&truth_prep)?;
-        if !preprocessed_truth
-            .iter()
-            .any(|record| contig_set.contains(&record.chrom))
-        {
+        let mut preprocessed_truth = vcf::open_validated_vcf(&truth_prep)?;
+        let mut common_contig = false;
+        for record in &mut preprocessed_truth {
+            if contig_set.contains(&record?.raw().chrom) {
+                common_contig = true;
+                break;
+            }
+        }
+        if !common_contig {
             bail!("Truth and reference have no chromosomes in common!");
         }
     }
@@ -584,96 +590,14 @@ fn run_inner(
 
     log_compare_info(&args, "Running Rust comparison")?;
 
-    let (truth_headers, truth_raw) = vcf::load_raw_vcf(&truth_prep)?;
-    let (query_headers, query_raw) = vcf::load_raw_vcf(&query_prep)?;
-
-    let truth_variant_input =
-        materialize_variant_input(&truth_prep, scratch.path(), "truth.variants.vcf.gz")?;
-    let query_variant_input =
-        materialize_variant_input(&query_prep, scratch.path(), "query.variants.vcf.gz")?;
-    let mut truth = vcf::load_variants(
-        &truth_variant_input,
-        &contig_set,
-        false,
-        regions.as_deref(),
-        targets.as_deref(),
-        locations.as_deref(),
-    )?;
-    // CONF insertion padding is derived from the preprocessed truth stream,
-    // including filtered records retained by `--usefiltered-truth`. xcmp
-    // excludes those records as calls below, but gvcf2bed sees them first;
-    // collisions with PASS records can therefore change the padding lane.
-    let truth_for_conf_padding = truth.clone();
-    let filtered_truth_keys: BTreeSet<VariantKey> = truth
-        .iter()
-        .filter(|variant| !variant.is_pass())
-        .map(|variant| variant.key.clone())
-        .collect();
-    // `--usefiltered-truth` preserves filtered records through pre.py, but
-    // legacy xcmp still excludes them from haplotype enumeration and output.
-    // This distinction matters: letting these records reach Rust comparison
-    // creates spurious truth primitives and can turn otherwise query-only
-    // calls into TPs. Keep preprocessing byte-compatible, then apply xcmp's
-    // PASS-only truth-call contract at the comparison boundary.
-    retain_xcmp_truth_calls(&mut truth);
-    let query = vcf::load_variants(
-        &query_variant_input,
-        &contig_set,
-        false,
-        regions.as_deref(),
-        targets.as_deref(),
-        locations.as_deref(),
-    )?;
-
-    let contigs_in_play = collect_contigs(&truth, &query, locations.as_deref());
-    let subset_size = report_subset_size(
-        &contig_non_n_lengths,
-        &contigs_in_play,
-        explicit_bcf,
-        args.bcf && !explicit_bcf,
-    );
-    if subset_size == 0 {
-        bail!("no reference contigs selected for analysis");
-    }
-    let mut counts: BTreeMap<String, TypeCounts> = BTreeMap::new();
-    let mut subtype_counts: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
-    for variant in &truth {
-        add_variant_stats(
-            &mut counts
-                .entry(variant.primary_type().to_string())
-                .or_default()
-                .truth_total,
-            variant,
-        );
-        add_variant_stats_subtype(
-            &mut subtype_counts,
-            variant.primary_type(),
-            variant,
-            |stats| &mut stats.truth_total,
-        );
-    }
-    for variant in &query {
-        add_variant_stats(
-            &mut counts
-                .entry(variant.primary_type().to_string())
-                .or_default()
-                .query_total,
-            variant,
-        );
-        add_variant_stats_subtype(
-            &mut subtype_counts,
-            variant.primary_type(),
-            variant,
-            |stats| &mut stats.query_total,
-        );
-    }
+    let truth_headers = vcf::open_validated_vcf(&truth_prep)?.headers().to_vec();
+    let query_headers = vcf::open_validated_vcf(&query_prep)?.headers().to_vec();
 
     let cluster_gap = match args.engine {
         CompareEngine::ScmpSomatic => 0,
         CompareEngine::ScmpDistance => args.engine_scmp_distance,
         CompareEngine::Xcmp | CompareEngine::Vcfeval => args.window,
     };
-    let clusters = build_clusters_with_gap(&truth, &query, cluster_gap);
     // Fold gvcf2bed-style insertion padding (derived from truth) into
     // the raw CONF bed before classification. Legacy hap.py does the
     // same in Python (hap.py:323): `args.strat_regions.append(
@@ -690,13 +614,25 @@ fn run_inner(
     // every interval loaded, with no cross-file dedup — see
     // QuantifyRegions::load).
     let adjust_conf = args.adjust_conf_regions && !args.no_adjust_conf_regions;
-    let gvcf_padding: Option<Vec<Interval>> = conf_bed.as_ref().map(|raw| {
-        if adjust_conf {
-            gvcf2bed_padding(&truth_for_conf_padding, Some(raw))
+    let gvcf_padding: Option<Vec<Interval>> = if let Some(raw) = conf_bed.as_deref() {
+        Some(if adjust_conf {
+            gvcf2bed_padding_iter(
+                vcf::open_variants(
+                    &truth_prep,
+                    &contig_set,
+                    false,
+                    regions.as_deref(),
+                    targets.as_deref(),
+                    locations.as_deref(),
+                )?,
+                Some(raw),
+            )?
         } else {
             Vec::new()
-        }
-    });
+        })
+    } else {
+        None
+    };
     let adjusted_conf_bed: Option<Vec<Interval>> = conf_bed.as_ref().map(|raw| {
         let mut combined = raw.clone();
         if let Some(pad) = gvcf_padding.as_ref() {
@@ -727,8 +663,100 @@ fn run_inner(
         })
         .unwrap_or(0);
     let conf_size = raw_conf_size + padding_size;
-    let mut rows = Vec::new();
+
+    let truth = vcf::open_variants(
+        &truth_prep,
+        &contig_set,
+        true,
+        regions.as_deref(),
+        targets.as_deref(),
+        locations.as_deref(),
+    )?;
+    let query = vcf::open_variants(
+        &query_prep,
+        &contig_set,
+        false,
+        regions.as_deref(),
+        targets.as_deref(),
+        locations.as_deref(),
+    )?;
+    let clusters = StreamingClusters::new(truth, query, cluster_gap);
+    let mut contigs_in_play = locations
+        .as_deref()
+        .map(|locations| {
+            locations
+                .iter()
+                .map(|location| match location {
+                    vcf::LocationFilter::Contig(chrom)
+                    | vcf::LocationFilter::Range { chrom, .. } => chrom.clone(),
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut counts: BTreeMap<String, TypeCounts> = BTreeMap::new();
+    let mut subtype_counts: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
+    let mut row_spool = ComparisonRowSpool::new();
+    let needs_decoration =
+        args.preserve_info || args.output_vtc || !matches!(args.roc.as_str(), "QUAL" | "QQ");
+    let truth_metadata = spool_comparison_contigs(&truth_prep)?;
+    let query_metadata = if needs_decoration {
+        spool_comparison_contigs(&query_prep)?
+    } else {
+        BTreeMap::new()
+    };
+    let mut active_metadata: Option<ActiveComparisonMetadata> = None;
     for cluster in clusters {
+        let cluster = cluster?;
+        if active_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.chrom != cluster.chrom)
+        {
+            let truth_cursor = truth_metadata
+                .get(&cluster.chrom)
+                .map(ComparisonMetadataCursor::open)
+                .transpose()?;
+            let query_cursor = query_metadata
+                .get(&cluster.chrom)
+                .map(ComparisonMetadataCursor::open)
+                .transpose()?;
+            active_metadata = Some(ActiveComparisonMetadata {
+                chrom: cluster.chrom.clone(),
+                truth: truth_cursor,
+                query: query_cursor,
+            });
+        }
+        contigs_in_play.insert(cluster.chrom.clone());
+        for variant in &cluster.truth {
+            add_variant_stats(
+                &mut counts
+                    .entry(variant.primary_type().to_string())
+                    .or_default()
+                    .truth_total,
+                variant,
+            );
+            add_variant_stats_subtype(
+                &mut subtype_counts,
+                variant.primary_type(),
+                variant,
+                |stats| &mut stats.truth_total,
+            );
+        }
+        for variant in &cluster.query {
+            add_variant_stats(
+                &mut counts
+                    .entry(variant.primary_type().to_string())
+                    .or_default()
+                    .query_total,
+                variant,
+            );
+            add_variant_stats_subtype(
+                &mut subtype_counts,
+                variant.primary_type(),
+                variant,
+                |stats| &mut stats.query_total,
+            );
+        }
+        let mut cluster_rows = Vec::new();
         process_cluster(
             &cluster,
             &reference_sequences,
@@ -740,66 +768,104 @@ fn run_inner(
             },
             &mut counts,
             &mut subtype_counts,
-            &mut rows,
+            &mut cluster_rows,
         )?;
+        let mut emitted_start = cluster.start;
+        let mut emitted_end = cluster.end;
+        for row in &cluster_rows {
+            let record = row.record.raw();
+            emitted_start = emitted_start.min(record.pos);
+            emitted_end = emitted_end.max(record.end_pos());
+        }
+        let mut filtered_truth_keys = BTreeSet::new();
+        let mut decorations = DecorationIndex::default();
+        let metadata = active_metadata
+            .as_mut()
+            .expect("comparison metadata cursor was initialized");
+        if let Some(truth_cursor) = &mut metadata.truth {
+            truth_cursor.collect(
+                &cluster.chrom,
+                emitted_start,
+                emitted_end,
+                &mut filtered_truth_keys,
+                &mut decorations,
+                args.preserve_info,
+                &args.roc,
+                true,
+            )?;
+        }
+        if needs_decoration && let Some(query_cursor) = &mut metadata.query {
+            query_cursor.collect(
+                &cluster.chrom,
+                emitted_start,
+                emitted_end,
+                &mut filtered_truth_keys,
+                &mut decorations,
+                args.preserve_info,
+                &args.roc,
+                false,
+            )?;
+        }
+        for mut row in cluster_rows {
+            let sort_line = row.record.raw().to_line();
+            let filtered_match = row_matches_variant_key(&row, &filtered_truth_keys);
+            if needs_decoration {
+                decorate_output_rows_with_index(
+                    std::slice::from_mut(&mut row),
+                    &decorations,
+                    args.preserve_info,
+                    args.output_vtc,
+                    &args.roc,
+                )?;
+            }
+            row_spool.push(row, filtered_match, sort_line)?;
+        }
+    }
+    let row_file = row_spool.finish()?;
+    let subset_size = report_subset_size(
+        &contig_non_n_lengths,
+        &contigs_in_play,
+        explicit_bcf,
+        args.bcf && !explicit_bcf,
+    );
+    if subset_size == 0 {
+        bail!("no reference contigs selected for analysis");
     }
 
-    sort_comparison_rows(&mut rows, &filtered_truth_keys);
-    decorate_output_rows(
-        &mut rows,
-        &truth_raw,
-        &query_raw,
-        args.preserve_info,
-        args.output_vtc,
-        &args.roc,
-    )?;
-
-    let all_counts = derive_total_counts(&rows, false);
-    let pass_counts = derive_total_counts(&rows, true);
-    let all_subtype = derive_subtype_counts(&rows, false);
-    let pass_subtype = derive_subtype_counts(&rows, true);
-    let all_subset = derive_subset_counts(&rows, false);
-    let pass_subset = derive_subset_counts(&rows, true);
-    let all_subset_subtype = derive_subset_subtype_counts(&rows, false);
-    let pass_subset_subtype = derive_subset_subtype_counts(&rows, true);
-    let all_fp = derive_fp_classes(&rows, false);
-    let pass_fp = derive_fp_classes(&rows, true);
-    let all_subset_fp = derive_subset_fp_classes(&rows, false);
-    let pass_subset_fp = derive_subset_fp_classes(&rows, true);
-    let all_subtype_fp = derive_subtype_fp_classes(&rows, false);
-    let pass_subtype_fp = derive_subtype_fp_classes(&rows, true);
-    let all_subset_subtype_fp = derive_subset_subtype_fp_classes(&rows, false);
-    let pass_subset_subtype_fp = derive_subset_subtype_fp_classes(&rows, true);
+    let mut tallies = FoldedComparisonReports::default();
+    for row in row_file.rows()? {
+        tallies.observe(&row?);
+    }
     report::write_summary(
         &suffixed_report_path(prefix, "summary.csv"),
-        &all_counts,
-        &pass_counts,
-        &all_fp,
-        &pass_fp,
+        &tallies.all_counts,
+        &tallies.pass_counts,
+        &tallies.all_fp,
+        &tallies.pass_fp,
     )?;
     let write_counts = args.write_counts && !args.no_write_counts;
     if write_counts {
         report::write_extended(
             &suffixed_report_path(prefix, "extended.csv"),
-            &all_counts,
-            &pass_counts,
-            &all_subtype,
-            &pass_subtype,
+            &tallies.all_counts,
+            &tallies.pass_counts,
+            &tallies.all_subtype,
+            &tallies.pass_subtype,
             subset_size,
             conf_size,
             conf_bed.is_some(),
-            &all_subset,
-            &pass_subset,
-            &all_subset_subtype,
-            &pass_subset_subtype,
-            &all_fp,
-            &pass_fp,
-            &all_subset_fp,
-            &pass_subset_fp,
-            &all_subtype_fp,
-            &pass_subtype_fp,
-            &all_subset_subtype_fp,
-            &pass_subset_subtype_fp,
+            &tallies.all_subset,
+            &tallies.pass_subset,
+            &tallies.all_subset_subtype,
+            &tallies.pass_subset_subtype,
+            &tallies.all_fp,
+            &tallies.pass_fp,
+            &tallies.all_subset_fp,
+            &tallies.pass_subset_fp,
+            &tallies.all_subtype_fp,
+            &tallies.pass_subtype_fp,
+            &tallies.all_subset_subtype_fp,
+            &tallies.pass_subset_subtype_fp,
         )?;
     }
     let vcf_headers = build_vcf_headers(
@@ -818,14 +884,30 @@ fn run_inner(
         || args.roc_regions.iter().any(|region| region != "*")
         || (args.roc_delta - 0.5).abs() > f64::EPSILON
         || args.ci_alpha != 0.0;
-    let requantify_rows = requantify.then(|| sanitize_requantify_handoff_rows(&rows));
-    if !requantify {
-        report::write_vcf(&suffixed_report_path(prefix, "vcf.gz"), &vcf_headers, &rows)?;
-    }
+    let comparison_vcf = if requantify {
+        scratch.path().join("comparison.vcf.gz")
+    } else {
+        suffixed_report_path(prefix, "vcf.gz")
+    };
+    vcf::write_validated_vcf_iter(
+        &comparison_vcf,
+        &vcf_headers,
+        row_file.rows()?.map(|row| {
+            row.map(|row| {
+                if requantify {
+                    sanitize_requantify_handoff_row(row)
+                } else {
+                    row
+                }
+                .record
+                .into_validated()
+            })
+        }),
+    )?;
     let roc_indices = if requantify {
-        crate::application::quantify::run_from_compare(
+        crate::application::quantify::run_from_compare_path(
             QuantifyArgs {
-                input_vcf: String::new(),
+                input_vcf: comparison_vcf.display().to_string(),
                 report_prefix: args.report_prefix.clone(),
                 reference: args.reference.clone(),
                 // Rust comparison rows already carry finalized GA4GH BD/BK/BVT
@@ -846,7 +928,7 @@ fn run_inner(
                 // incorrectly turns the default happy setting into qfy's
                 // standalone argument error.
                 adjust_conf_regions: (adjust_conf && conf_bed.is_some())
-                    .then(|| truth_variant_input.display().to_string()),
+                    .then(|| truth_prep.display().to_string()),
                 threads: None,
                 bcf: false,
                 logfile: None,
@@ -861,21 +943,21 @@ fn run_inner(
                 ci_alpha: args.ci_alpha,
                 no_json: args.no_json,
             },
-            vcf_headers.clone(),
-            requantify_rows
-                .as_ref()
-                .expect("requantification rows exist")
-                .iter()
-                .cloned()
-                .map(|row| row.record.into_validated())
-                .collect(),
             crate::application::quantify::CompareQuantifyMode {
                 preserve_missing_nocall_bd: args.usefiltered_truth,
                 ..Default::default()
             },
         )?
     } else {
-        let indices = roc_publication::write_roc_files(prefix, &rows, subset_size, conf_size)?;
+        let mut roc_options = crate::engines::roc::RocOptions::default();
+        roc_options.output_rocs = !args.no_roc;
+        let indices = roc_publication::write_roc_files_with_options_iter(
+            prefix,
+            row_file.rows()?,
+            subset_size,
+            conf_size,
+            &roc_options,
+        )?;
         if args.no_roc {
             compact_no_roc_outputs(prefix)?;
         }
@@ -1028,10 +1110,12 @@ fn publish_bcf_output(args: &CompareArgs, prefix: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn retain_xcmp_truth_calls(variants: &mut Vec<Variant>) {
     variants.retain(Variant::is_pass);
 }
 
+#[cfg(test)]
 fn sort_comparison_rows(rows: &mut [AnnotatedRow], filtered_truth_keys: &BTreeSet<VariantKey>) {
     rows.sort_by(|left, right| {
         left.sort_key

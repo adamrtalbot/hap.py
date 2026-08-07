@@ -11,15 +11,15 @@ use super::{
     BlocksplitContigState, BlocksplitJob, BlocksplitObservation, BlocksplitSelection,
     LEGACY_MIN_BLOCK_VARIANTS,
 };
-use crate::adapters::vcf;
+use crate::adapters::vcf::{self, ValidatedVcfRecord};
 use crate::cli_compat::cli::{PreprocessArgs, SomaticGtMode};
 use crate::domain::{Interval, RawVcfRecord};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;
 
-pub(super) fn collect_blocksplit_observations(
-    records: &[RawVcfRecord],
+pub(super) fn collect_blocksplit_observations<I>(
+    records: I,
     args: &PreprocessArgs,
     fixchr: bool,
     normalization_enabled: bool,
@@ -29,13 +29,16 @@ pub(super) fn collect_blocksplit_observations(
     regions: Option<&[Interval]>,
     targets: Option<&[Interval]>,
     locations: Option<&[vcf::LocationFilter]>,
-) -> Result<Vec<BlocksplitObservation>> {
+) -> Result<Vec<BlocksplitObservation>>
+where
+    I: IntoIterator<Item = Result<ValidatedVcfRecord>>,
+{
     let input_path = Path::new(&args.input);
     let mut observations = Vec::new();
     let mut normalized_seen = HashSet::new();
 
-    for source in records {
-        let mut record = source.clone();
+    for record in records {
+        let mut record = record?.raw().clone();
         if fixchr {
             record.chrom = add_legacy_chr_prefix(&record.chrom);
         }

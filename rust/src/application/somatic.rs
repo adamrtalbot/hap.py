@@ -5,12 +5,12 @@ use crate::{
     adapters::{fasta, vcf},
     application::ftx,
     engines::strelka,
-    output::{FailureOperation, OutputTransaction, fail_operation},
+    output::OutputTransaction,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +20,9 @@ mod features;
 mod metrics;
 mod normalization;
 mod reports;
+
+#[cfg(test)]
+mod test_suite;
 
 use allele_frequency::{
     format_af_interval, parse_af_bins, preserves_empty_records_af_bin, round_four, rounded_metric,
@@ -35,6 +38,8 @@ use reports::*;
 /// nothing after). We reproduce the exact literal so stats.csv byte-matches.
 const SOM_VERSION: &str = "som.py-";
 const MAX_AF_BINS: usize = 100;
+const SOMATIC_ROC_CHUNK: usize = 16_384;
+const SOMATIC_ROC_MERGE_FAN_IN: usize = 32;
 const STATS_TYPE_ROWS: [(usize, &str); 4] =
     [(0, "indels"), (1, "SNVs"), (6, "MNPs"), (7, "others")];
 static SOMATIC_SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
@@ -443,41 +448,43 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
     if reuse_query {
         controls.info(&format!("Continuing from {}", query_cache.display()))?;
     }
-    let (truth_headers, mut truth_raw) = vcf::load_raw_vcf(if reuse_truth {
+    let truth_source = Path::new(&args.truth);
+    let query_source = Path::new(&args.query);
+    let truth_headers = vcf::open_validated_vcf(if reuse_truth {
         &truth_cache
     } else {
-        Path::new(&args.truth)
-    })?;
-    let (query_headers, mut query_raw) = vcf::load_raw_vcf(if reuse_query {
+        truth_source
+    })?
+    .headers()
+    .to_vec();
+    let query_headers = vcf::open_validated_vcf(if reuse_query {
         &query_cache
     } else {
-        Path::new(&args.query)
-    })?;
+        query_source
+    })?
+    .headers()
+    .to_vec();
     let bam_depths = ftx::bam_normalization_depths(&args.bams)?;
-    if normalize_truth {
-        truth_raw = normalize_somatic_records(
-            truth_raw,
-            reference_sequences
-                .as_ref()
-                .expect("normalization loaded the reference"),
-        );
-    }
-    if normalize_query {
-        query_raw = normalize_somatic_records(
-            query_raw,
-            reference_sequences
-                .as_ref()
-                .expect("normalization loaded the reference"),
-        );
-    }
     if !reuse_truth {
-        vcf::write_raw_vcf(&truth_cache, &truth_headers, &truth_raw)?;
+        prepare_somatic_cache(
+            truth_source,
+            &truth_cache,
+            &truth_headers,
+            normalize_truth,
+            reference_sequences.as_ref(),
+        )?;
     }
     if !reuse_query {
-        vcf::write_raw_vcf(&query_cache, &query_headers, &query_raw)?;
+        prepare_somatic_cache(
+            query_source,
+            &query_cache,
+            &query_headers,
+            normalize_query,
+            reference_sequences.as_ref(),
+        )?;
     }
-    let truth_raw_filtered = filter_raw_records(
-        truth_raw,
+    let truth_spools = spool_filtered_contigs(
+        &truth_cache,
         Path::new(&args.truth),
         &RawFilterOptions {
             reference_contigs: &reference_contigs,
@@ -488,8 +495,8 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             locations: locations.as_deref(),
         },
     )?;
-    let query_raw_filtered = filter_raw_records(
-        query_raw,
+    let query_spools = spool_filtered_contigs(
+        &query_cache,
         Path::new(&args.query),
         &RawFilterOptions {
             reference_contigs: &reference_contigs,
@@ -500,8 +507,6 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             locations: locations.as_deref(),
         },
     )?;
-    let (truth_matches, query_matches) =
-        pair_exact_records(&truth_raw_filtered, &query_raw_filtered);
     let query_depths = if bam_depths.is_empty() {
         strelka::parse_depths(&query_headers)
     } else {
@@ -512,17 +517,10 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
     let mut filtered_by_type: BTreeMap<&'static str, FilteredCounts> = BTreeMap::new();
     let mut filtered_records = FilteredCounts::default();
     let mut record_counts = SomaticCounts {
-        truth_total: truth_raw_filtered.len(),
-        query_total: query_raw_filtered.len(),
+        truth_total: truth_spools.iter().map(|spool| spool.count).sum(),
+        query_total: query_spools.iter().map(|spool| spool.count).sum(),
         ..SomaticCounts::default()
     };
-    record_counts.tp = truth_matches.iter().filter(|entry| entry.is_some()).count();
-    record_counts.fn_count = truth_raw_filtered.len().saturating_sub(record_counts.tp);
-    filtered_records.tp = query_raw_filtered
-        .iter()
-        .zip(&query_matches)
-        .filter(|(record, matched)| matched.is_some() && !record.record.is_pass())
-        .count();
     let feature_table_name = args.feature_table.as_deref().unwrap_or("");
     let use_strelka_hcc_indel = feature_table_name == "hcc.strelka.indel";
     let use_caller_feature_table =
@@ -538,178 +536,230 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
     } else {
         None
     };
-    let mut tp_rows: Vec<String> = Vec::new();
-    let mut fp_rows: Vec<String> = Vec::new();
-    let mut fn_rows: Vec<String> = Vec::new();
-    let mut ambi_rows: Vec<String> = Vec::new();
-    let mut unk_rows: Vec<String> = Vec::new();
-    let mut caller_tp_truth = Vec::new();
-    let mut caller_tp_query = Vec::new();
-    let mut caller_fn_truth = Vec::new();
-    let mut caller_fp_query = Vec::new();
-    let mut caller_ambi_query = Vec::new();
-    let mut caller_unk_query = Vec::new();
+    let mut feature_rows = FeatureRowSpools::new()?;
     let mut ambiguous_classes = BTreeMap::new();
     let mut ambiguous_reasons = BTreeMap::new();
-    for (truth_index, truth_record) in truth_raw_filtered.iter().enumerate() {
-        let Some(label) = raw_type_label(&truth_record.record) else {
-            continue;
-        };
-        by_type.entry(label).or_default().truth_total += 1;
-        if let Some(query_index) = truth_matches[truth_index] {
-            by_type.entry(label).or_default().tp += 1;
-            let query_record = &query_raw_filtered[query_index];
-            if !query_record.record.is_pass() {
-                filtered_by_type.entry(label).or_default().tp += 1;
-            }
-            if use_strelka_hcc_indel {
-                tp_rows.push(render_strelka_hcc_indel_tp_row(
-                    0,
-                    &truth_record.record,
-                    &query_record.record,
-                    &query_depths,
-                ));
-            } else if use_generic_feature_table {
-                tp_rows.push(render_generic_tp_row(
-                    0,
-                    &truth_record.record,
-                    &query_record.record,
-                ));
-            } else if use_caller_feature_table {
-                caller_tp_truth.push(truth_record.record.clone());
-                caller_tp_query.push(query_record.record.clone());
-            }
-        } else {
-            by_type.entry(label).or_default().fn_count += 1;
-            if use_strelka_hcc_indel {
-                fn_rows.push(render_strelka_hcc_indel_fn_row(0, &truth_record.record));
-            } else if use_generic_feature_table {
-                fn_rows.push(render_generic_fn_row(0, &truth_record.record));
-            } else if use_caller_feature_table {
-                caller_fn_truth.push(truth_record.record.clone());
+    let truth_spool_index = truth_spools
+        .iter()
+        .enumerate()
+        .map(|(index, spool)| (spool.chrom.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let query_spool_index = query_spools
+        .iter()
+        .enumerate()
+        .map(|(index, spool)| (spool.chrom.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut ordered_contigs = truth_spools
+        .iter()
+        .map(|spool| spool.chrom.clone())
+        .collect::<Vec<_>>();
+    ordered_contigs.extend(
+        query_spools
+            .iter()
+            .map(|spool| spool.chrom.clone())
+            .filter(|chrom| !truth_spool_index.contains_key(chrom)),
+    );
+    let truth_contigs = truth_spool_index.keys().cloned().collect::<BTreeSet<_>>();
+    for chrom in ordered_contigs {
+        let truth_raw_filtered = truth_spool_index
+            .get(&chrom)
+            .map(|index| truth_spools[*index].load())
+            .transpose()?
+            .unwrap_or_default();
+        let query_raw_filtered = query_spool_index
+            .get(&chrom)
+            .map(|index| query_spools[*index].load())
+            .transpose()?
+            .unwrap_or_default();
+        let (truth_matches, query_matches) =
+            pair_exact_records(&truth_raw_filtered, &query_raw_filtered);
+        let matched = truth_matches.iter().filter(|entry| entry.is_some()).count();
+        record_counts.tp += matched;
+        record_counts.fn_count += truth_raw_filtered.len().saturating_sub(matched);
+        filtered_records.tp += query_raw_filtered
+            .iter()
+            .zip(&query_matches)
+            .filter(|(record, matched)| matched.is_some() && !record.record.is_pass())
+            .count();
+        let mut caller_tp_truth = Vec::new();
+        let mut caller_tp_query = Vec::new();
+        let mut caller_fn_truth = Vec::new();
+        let mut caller_fp_query = Vec::new();
+        let mut caller_ambi_query = Vec::new();
+        let mut caller_unk_query = Vec::new();
+        for (truth_index, truth_record) in truth_raw_filtered.iter().enumerate() {
+            let Some(label) = raw_type_label(&truth_record.record) else {
+                continue;
+            };
+            by_type.entry(label).or_default().truth_total += 1;
+            if let Some(query_index) = truth_matches[truth_index] {
+                by_type.entry(label).or_default().tp += 1;
+                let query_record = &query_raw_filtered[query_index];
+                if !query_record.record.is_pass() {
+                    filtered_by_type.entry(label).or_default().tp += 1;
+                }
+                if use_strelka_hcc_indel {
+                    feature_rows.push(
+                        0,
+                        render_strelka_hcc_indel_tp_row(
+                            0,
+                            &truth_record.record,
+                            &query_record.record,
+                            &query_depths,
+                        ),
+                    )?;
+                } else if use_generic_feature_table {
+                    feature_rows.push(
+                        0,
+                        render_generic_tp_row(0, &truth_record.record, &query_record.record),
+                    )?;
+                } else if use_caller_feature_table {
+                    caller_tp_truth.push(truth_record.record.clone());
+                    caller_tp_query.push(query_record.record.clone());
+                }
+            } else {
+                by_type.entry(label).or_default().fn_count += 1;
+                if use_strelka_hcc_indel {
+                    feature_rows
+                        .push(2, render_strelka_hcc_indel_fn_row(0, &truth_record.record))?;
+                } else if use_generic_feature_table {
+                    feature_rows.push(2, render_generic_fn_row(0, &truth_record.record))?;
+                } else if use_caller_feature_table {
+                    caller_fn_truth.push(truth_record.record.clone());
+                }
             }
         }
-    }
 
-    for (query_index, query_record) in query_raw_filtered.iter().enumerate() {
-        let type_label = raw_type_label(&query_record.record);
-        if let Some(label) = type_label {
-            by_type.entry(label).or_default().query_total += 1;
-        }
-        if query_matches[query_index].is_some() {
-            continue;
-        }
-        // som.py classifies FP/AMBI intervals from POS through POS+len(REF),
-        // even for symbolic and gVCF records. INFO/END and FORMAT/LEN are used
-        // by bcftools -R preprocessing, not by this classification step.
-        let class = classify_query(
-            &query_record.key.chrom,
-            query_record.key.pos,
-            query_record.record.end_pos(),
-            fp_regions.as_deref().unwrap_or(&[]),
-            &ambiguous_regions,
-            count_unk,
-            ambi_fp,
-        );
-        if args.explain_ambiguous {
-            record_ambiguous_explanation(
+        for (query_index, query_record) in query_raw_filtered.iter().enumerate() {
+            let type_label = raw_type_label(&query_record.record);
+            if let Some(label) = type_label {
+                by_type.entry(label).or_default().query_total += 1;
+            }
+            if query_matches[query_index].is_some() {
+                continue;
+            }
+            // som.py classifies FP/AMBI intervals from POS through POS+len(REF),
+            // even for symbolic and gVCF records. INFO/END and FORMAT/LEN are used
+            // by bcftools -R preprocessing, not by this classification step.
+            let class = classify_query(
                 &query_record.key.chrom,
                 query_record.key.pos,
                 query_record.record.end_pos(),
-                &explanation_regions,
+                fp_regions.as_deref().unwrap_or(&[]),
+                &ambiguous_regions,
+                count_unk,
                 ambi_fp,
-                &mut ambiguous_classes,
-                &mut ambiguous_reasons,
             );
-        }
-        if let Some(label) = type_label {
-            let row = by_type.entry(label).or_default();
-            match class {
-                QueryClass::Fp => row.fp += 1,
-                QueryClass::Unk => row.unk += 1,
-                QueryClass::Ambi => row.ambi += 1,
+            if args.explain_ambiguous {
+                record_ambiguous_explanation(
+                    &query_record.key.chrom,
+                    query_record.key.pos,
+                    query_record.record.end_pos(),
+                    &explanation_regions,
+                    ambi_fp,
+                    &mut ambiguous_classes,
+                    &mut ambiguous_reasons,
+                );
             }
+            if let Some(label) = type_label {
+                let row = by_type.entry(label).or_default();
+                match class {
+                    QueryClass::Fp => row.fp += 1,
+                    QueryClass::Unk => row.unk += 1,
+                    QueryClass::Ambi => row.ambi += 1,
+                }
+                if !query_record.record.is_pass() {
+                    let filtered = filtered_by_type.entry(label).or_default();
+                    match class {
+                        QueryClass::Fp => filtered.fp += 1,
+                        QueryClass::Unk => filtered.unk += 1,
+                        QueryClass::Ambi => filtered.ambi += 1,
+                    }
+                }
+            }
+            let tag = match class {
+                QueryClass::Fp => {
+                    record_counts.fp += 1;
+                    "FP"
+                }
+                QueryClass::Unk => {
+                    record_counts.unk += 1;
+                    "UNK"
+                }
+                QueryClass::Ambi => {
+                    record_counts.ambi += 1;
+                    "AMBI"
+                }
+            };
             if !query_record.record.is_pass() {
-                let filtered = filtered_by_type.entry(label).or_default();
                 match class {
-                    QueryClass::Fp => filtered.fp += 1,
-                    QueryClass::Unk => filtered.unk += 1,
-                    QueryClass::Ambi => filtered.ambi += 1,
+                    QueryClass::Fp => filtered_records.fp += 1,
+                    QueryClass::Unk => filtered_records.unk += 1,
+                    QueryClass::Ambi => filtered_records.ambi += 1,
+                }
+            }
+            if args.feature_table.is_some() {
+                if use_strelka_hcc_indel {
+                    let row = render_strelka_hcc_indel_query_row(
+                        0,
+                        &query_record.record,
+                        tag,
+                        &query_depths,
+                    );
+                    match class {
+                        QueryClass::Fp => feature_rows.push(1, row)?,
+                        QueryClass::Unk => feature_rows.push(4, row)?,
+                        QueryClass::Ambi => feature_rows.push(3, row)?,
+                    }
+                } else if use_generic_feature_table {
+                    let row = render_generic_query_row(0, &query_record.record, tag);
+                    match class {
+                        QueryClass::Fp => feature_rows.push(1, row)?,
+                        QueryClass::Unk => feature_rows.push(4, row)?,
+                        QueryClass::Ambi => feature_rows.push(3, row)?,
+                    }
+                } else if use_caller_feature_table {
+                    match class {
+                        QueryClass::Fp => caller_fp_query.push(query_record.record.clone()),
+                        QueryClass::Unk => caller_unk_query.push(query_record.record.clone()),
+                        QueryClass::Ambi => caller_ambi_query.push(query_record.record.clone()),
+                    }
                 }
             }
         }
-        let tag = match class {
-            QueryClass::Fp => {
-                record_counts.fp += 1;
-                "FP"
+        if use_caller_feature_table {
+            let caller_table = build_caller_feature_table(
+                feature_table_name,
+                &truth_headers,
+                &query_headers,
+                (!bam_depths.is_empty()).then_some(&bam_depths),
+                !args.no_order_check,
+                &CallerRecordGroups {
+                    tp_truth: &caller_tp_truth,
+                    tp_query: &caller_tp_query,
+                    fn_truth: &caller_fn_truth,
+                    fp_query: &caller_fp_query,
+                    ambi_query: &caller_ambi_query,
+                    unk_query: &caller_unk_query,
+                },
+            )?;
+            if let Some(existing) = feature_header.as_deref()
+                && existing != caller_table.header
+            {
+                bail!("caller feature header changed between somatic contigs");
             }
-            QueryClass::Unk => {
-                record_counts.unk += 1;
-                "UNK"
-            }
-            QueryClass::Ambi => {
-                record_counts.ambi += 1;
-                "AMBI"
-            }
-        };
-        if !query_record.record.is_pass() {
-            match class {
-                QueryClass::Fp => filtered_records.fp += 1,
-                QueryClass::Unk => filtered_records.unk += 1,
-                QueryClass::Ambi => filtered_records.ambi += 1,
-            }
+            feature_header = Some(caller_table.header);
+            feature_rows.extend(0, caller_table.tp)?;
+            feature_rows.extend(1, caller_table.fp)?;
+            feature_rows.extend(2, caller_table.fn_rows)?;
+            feature_rows.extend(3, caller_table.ambi)?;
+            feature_rows.extend(4, caller_table.unk)?;
         }
-        if args.feature_table.is_some() {
-            if use_strelka_hcc_indel {
-                let row =
-                    render_strelka_hcc_indel_query_row(0, &query_record.record, tag, &query_depths);
-                match class {
-                    QueryClass::Fp => fp_rows.push(row),
-                    QueryClass::Unk => unk_rows.push(row),
-                    QueryClass::Ambi => ambi_rows.push(row),
-                }
-            } else if use_generic_feature_table {
-                let row = render_generic_query_row(0, &query_record.record, tag);
-                match class {
-                    QueryClass::Fp => fp_rows.push(row),
-                    QueryClass::Unk => unk_rows.push(row),
-                    QueryClass::Ambi => ambi_rows.push(row),
-                }
-            } else if use_caller_feature_table {
-                match class {
-                    QueryClass::Fp => caller_fp_query.push(query_record.record.clone()),
-                    QueryClass::Unk => caller_unk_query.push(query_record.record.clone()),
-                    QueryClass::Ambi => caller_ambi_query.push(query_record.record.clone()),
-                }
-            }
-        }
-    }
-    if use_caller_feature_table {
-        let caller_table = build_caller_feature_table(
-            feature_table_name,
-            &truth_headers,
-            &query_headers,
-            (!bam_depths.is_empty()).then_some(&bam_depths),
-            !args.no_order_check,
-            &CallerRecordGroups {
-                tp_truth: &caller_tp_truth,
-                tp_query: &caller_tp_query,
-                fn_truth: &caller_fn_truth,
-                fp_query: &caller_fp_query,
-                ambi_query: &caller_ambi_query,
-                unk_query: &caller_unk_query,
-            },
-        )?;
-        feature_header = Some(caller_table.header);
-        tp_rows = caller_table.tp;
-        fp_rows = caller_table.fp;
-        fn_rows = caller_table.fn_rows;
-        ambi_rows = caller_table.ambi;
-        unk_rows = caller_table.unk;
     }
     let ordered_feature_rows = feature_header
         .as_ref()
-        .map(|_| renumber_feature_rows(&[tp_rows, fp_rows, fn_rows, ambi_rows, unk_rows]));
+        .map(|_| feature_rows.renumber())
+        .transpose()?;
 
     // som.py writes feature and ambiguity detail artifacts before it derives
     // the FP denominator. Preserve that order because the legacy range/FP
@@ -729,45 +779,50 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         )?;
     }
     if let Some(header) = feature_header.as_deref() {
-        let ordered_rows = ordered_feature_rows.as_deref().unwrap_or_default();
-        fs::write(
-            suffixed_report_path(Path::new(&args.output), "features.csv"),
-            format!("{header}\n{}\n", ordered_rows.join("\n")),
-        )
-        .with_context(|| format!("failed to write {}.features.csv", args.output))?;
+        let ordered_rows = ordered_feature_rows
+            .as_ref()
+            .context("missing ordered somatic feature spool")?;
+        let features_path = suffixed_report_path(Path::new(&args.output), "features.csv");
+        let mut features = BufWriter::new(File::create(&features_path)?);
+        writeln!(features, "{header}")?;
+        std::io::copy(&mut File::open(ordered_rows.path())?, &mut features)?;
+        features
+            .flush()
+            .with_context(|| format!("failed to write {}", features_path.display()))?;
         if let Some(roc_name) = args.roc.as_deref() {
             write_somatic_roc(
                 &suffixed_report_path(Path::new(&args.output), "roc.csv"),
                 header,
-                ordered_rows,
+                ordered_rows.path(),
                 roc_name,
             )?;
             if args.af_strat {
                 for &(start, end) in &af_bins {
-                    let rows = feature_rows_for_af_roc(
+                    let Some(rows) = feature_rows_for_af_roc(
                         header,
-                        ordered_rows,
+                        ordered_rows.path(),
                         start,
                         end,
                         &args.af_strat_truth,
                         &args.af_strat_query,
-                    )?;
-                    if rows.is_empty() {
+                    )?
+                    else {
                         continue;
-                    }
+                    };
                     for prefix in ["records", "SNVs", "indels"] {
                         let type_label = (prefix != "records").then_some(prefix);
-                        let rows = feature_rows_for_type(&rows, header, type_label)?;
-                        if rows.is_empty() {
+                        let Some(typed_rows) =
+                            feature_rows_for_type(rows.path(), header, type_label)?
+                        else {
                             continue;
-                        }
+                        };
                         let path = PathBuf::from(format!(
                             "{}.{}.{}.roc.csv",
                             args.output,
                             prefix,
                             format_af_interval(start, end)
                         ));
-                        write_somatic_roc(&path, header, &rows, roc_name)?;
+                        write_somatic_roc(&path, header, typed_rows.path(), roc_name)?;
                     }
                 }
             }
@@ -788,13 +843,13 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         has_automatic_fp_bases(fp_regions.as_deref().unwrap_or(&[]), &ambiguous_regions),
     )?;
     let empty_reference = BTreeMap::new();
-    let fp_region_size = calculate_fp_region_size(
+    let fp_region_size = calculate_fp_region_size_for_contigs(
         args.fp_region_size.as_deref(),
         fp_regions.as_deref().unwrap_or(&[]),
         &ambiguous_regions,
         locations.as_deref(),
         reference_sequences.as_ref().unwrap_or(&empty_reference),
-        &truth_raw_filtered,
+        &truth_contigs,
     );
 
     let commandline = somatic_commandline(&args);
@@ -896,7 +951,10 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             let type_label = (prefix != "records").then_some(prefix);
             let af_counts = calculate_af_stats(
                 header,
-                ordered_feature_rows.as_deref().unwrap_or_default(),
+                ordered_feature_rows
+                    .as_ref()
+                    .context("missing ordered somatic feature spool")?
+                    .path(),
                 &args.af_strat_binsize,
                 &args.af_strat_truth,
                 &args.af_strat_query,
@@ -933,13 +991,11 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fail_operation(FailureOperation::Writer, &output)?;
     fs::write(&output, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("failed to write {}", output.display()))?;
     controls.print_default_summary(&lines);
 
     let metrics_json = suffixed_report_path(Path::new(&args.output), "metrics.json");
-    fail_operation(FailureOperation::Writer, &metrics_json)?;
     let explanation_enabled = args.explain_ambiguous && !args.ambiguous_beds.is_empty();
     write_legacy_metrics_json(
         &metrics_json,
@@ -951,19 +1007,21 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
     )?;
 
     if let Some(header) = feature_header.as_deref() {
-        let ordered_rows = ordered_feature_rows.as_deref().unwrap_or_default();
+        let ordered_rows = ordered_feature_rows
+            .as_ref()
+            .context("missing ordered somatic feature spool")?;
         if args.happy_stats {
             write_happy_style_summary(
                 &suffixed_report_path(Path::new(&args.output), "summary.csv"),
                 header,
-                ordered_rows,
+                ordered_rows.path(),
                 feature_table_name,
             )?;
             if args.af_strat {
                 write_happy_style_extended(
                     &suffixed_report_path(Path::new(&args.output), "extended.csv"),
                     header,
-                    ordered_rows,
+                    ordered_rows.path(),
                     feature_table_name,
                     &args.af_strat_binsize,
                     &args.af_strat_truth,
@@ -975,6 +1033,3 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
     controls.info("Somatic comparison complete")?;
     controls.scratch.cleanup()
 }
-
-#[cfg(test)]
-mod test_suite;

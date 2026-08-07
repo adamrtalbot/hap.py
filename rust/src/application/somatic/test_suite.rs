@@ -5,6 +5,7 @@ mod tests {
     use super::super::*;
     use crate::cli_compat::cli::{Cli, Command};
     use clap::Parser;
+    use std::io::Write as _;
 
     fn parsed_somatic(extra: &[&str]) -> SomaticArgs {
         let mut argv = vec![
@@ -23,6 +24,19 @@ mod tests {
             panic!("somatic command expected");
         };
         args
+    }
+
+    fn run_args(args: SomaticArgs) -> Result<()> {
+        run(args.validated().expect("test arguments must validate"))
+    }
+
+    fn feature_spool(rows: &[String]) -> tempfile::NamedTempFile {
+        let mut spool = tempfile::NamedTempFile::new().expect("feature spool");
+        for row in rows {
+            writeln!(spool, "{row}").expect("write feature row");
+        }
+        spool.flush().expect("flush feature spool");
+        spool
     }
 
     fn interval(start: usize, end: usize, label: &str) -> AmbiguousInterval {
@@ -211,7 +225,7 @@ mod tests {
             args.scratch_prefix = Some(scratch.display().to_string());
             args.cont = cont;
             args.quiet = true;
-            run(args).expect("run somatic comparison");
+            run_args(args).expect("run somatic comparison");
         };
 
         comparison(&root.join("first"), false);
@@ -255,7 +269,7 @@ mod tests {
         args.explain_ambiguous = true;
         args.fp_region_size = Some("10".to_string());
         args.quiet = true;
-        run(args).expect("explanation run must not require a reference or feature table");
+        run_args(args).expect("explanation run must not require a reference or feature table");
 
         assert!(!root.join("result.features.csv").exists());
         assert!(
@@ -301,7 +315,7 @@ mod tests {
         args.explain_ambiguous = true;
         args.fp_region_size = Some("10".to_string());
         args.quiet = true;
-        run(args).expect("empty explanation comparison must succeed");
+        run_args(args).expect("empty explanation comparison must succeed");
 
         assert!(!root.join("result.ambiclasses.csv").exists());
         assert!(!root.join("result.ambireasons.csv").exists());
@@ -353,7 +367,7 @@ mod tests {
         args.ambiguous_beds = vec![ambiguous.display().to_string()];
         args.explain_ambiguous = true;
         args.quiet = true;
-        run(args).expect("labeled FP regions must supply the automatic denominator");
+        run_args(args).expect("labeled FP regions must supply the automatic denominator");
 
         let stats = fs::read_to_string(root.join("result.stats.csv")).expect("read stats");
         assert!(
@@ -409,7 +423,7 @@ mod tests {
         args.output = root.join("result").display().to_string();
         args.reference = reference.display().to_string();
         args.quiet = true;
-        run(args).expect("run truth-only automatic denominator comparison");
+        run_args(args).expect("run truth-only automatic denominator comparison");
 
         let stats = fs::read_to_string(root.join("result.stats.csv")).expect("read stats");
         assert!(
@@ -440,7 +454,7 @@ mod tests {
         args.reference = root.join("missing.fa").display().to_string();
         args.fp_bedfile = Some(fp.display().to_string());
         args.quiet = true;
-        run(args).expect("usable FP BED must avoid loading the missing reference");
+        run_args(args).expect("usable FP BED must avoid loading the missing reference");
 
         let stats = fs::read_to_string(root.join("result.stats.csv")).expect("read stats");
         let snv = stats
@@ -472,7 +486,7 @@ mod tests {
         args.feature_table = Some("generic".to_string());
         args.fp_region_size = Some("10".to_string());
         args.quiet = true;
-        let error = run(args).expect_err("normalization must load the missing reference");
+        let error = run_args(args).expect_err("normalization must load the missing reference");
         assert!(error.to_string().contains("failed to read"));
 
         fs::remove_dir_all(&root).expect("remove normalization test root");
@@ -603,7 +617,7 @@ mod tests {
             args.af_strat_query = "QUAL".to_string();
             args.fp_region_size = Some("10".to_string());
             args.quiet = true;
-            run(args).unwrap_or_else(|error| panic!("AF edge {value:?} failed: {error}"));
+            run_args(args).unwrap_or_else(|error| panic!("AF edge {value:?} failed: {error}"));
 
             let stats = fs::read_to_string(root.join(format!("{label}.stats.csv")))
                 .expect("read AF edge stats");
@@ -874,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn fp_bed_with_dash_range_preserves_legacy_late_failure_artifacts() {
+    fn fp_bed_with_dash_range_rolls_back_the_output_generation() {
         let root = unique_test_dir("fp-range-failure");
         let truth = root.join("truth.vcf");
         let query = root.join("query.vcf");
@@ -894,12 +908,9 @@ mod tests {
         args.feature_table = Some("generic".to_string());
         args.quiet = true;
 
-        let error = run(args).expect_err("legacy denominator parsing must reject dash ranges");
+        let error = run_args(args).expect_err("legacy denominator parsing must reject dash ranges");
         assert!(error.to_string().contains("invalid literal for int()"));
-        assert!(
-            root.join("result.features.csv").is_file(),
-            "som.py writes the feature table before the denominator failure"
-        );
+        assert!(!root.join("result.features.csv").exists());
         assert!(!root.join("result.stats.csv").exists());
         assert!(!root.join("result.metrics.json").exists());
         validate_legacy_fp_location_denominator(Some("10"), Some("chr1:1-10"), true)
@@ -1270,10 +1281,11 @@ mod tests {
             "0,chr1,20,FN,,A,,C,,0.8,".to_string(),
             "0,chr1,30,FP,A,,C,,,0.7,0.1".to_string(),
         ];
+        let rows = feature_spool(&rows);
         write_happy_style_extended(
             output.path(),
             header,
-            &rows,
+            rows.path(),
             "hcc.strelka.snv",
             "0.5",
             "TRUTH_AF",
@@ -1299,7 +1311,8 @@ mod tests {
             "0,chr1,40,UNK,A,,C,,,,0.7".to_string(),
             "0,chr1,50,AMBI,A,,C,,,,1.0".to_string(),
         ];
-        let bins = calculate_af_stats(header, &rows, "0.5", "TRUTH_AF", "QUERY_AF", None)
+        let rows = feature_spool(&rows);
+        let bins = calculate_af_stats(header, rows.path(), "0.5", "TRUTH_AF", "QUERY_AF", None)
             .expect("AF stats");
         assert_eq!(bins.len(), 2);
         assert_eq!(bins[0].2.truth_total, 1);
@@ -1325,7 +1338,8 @@ mod tests {
             "0,chr1,40,AMBI,A,,C,,".to_string(),
             "0,chr1,50,UNK,A,,C,,".to_string(),
         ];
-        write_happy_style_summary(output.path(), header, &rows, "hcc.strelka.indel")
+        let rows = feature_spool(&rows);
+        write_happy_style_summary(output.path(), header, rows.path(), "hcc.strelka.indel")
             .expect("happy summary");
         let text = fs::read_to_string(output.path()).expect("read happy summary");
         let expected = concat!(
@@ -1394,7 +1408,9 @@ mod tests {
             "0,chr1,20,FP,5.00000000,LowEVS,ref".to_string(),
             "0,chr1,30,FN,,,".to_string(),
         ];
-        write_somatic_roc(output.path(), header, &rows, "strelka.snv").expect("write somatic ROC");
+        let rows = feature_spool(&rows);
+        write_somatic_roc(output.path(), header, rows.path(), "strelka.snv")
+            .expect("write somatic ROC");
         assert_eq!(
             fs::read_to_string(output.path()).expect("read ROC"),
             concat!(
@@ -1411,7 +1427,8 @@ mod tests {
         let output = tempfile::NamedTempFile::new().expect("temporary ROC");
         let header = ",CHROM,POS,tag,QSS_NT,FILTER,NT";
         let rows = vec!["0,chr1,10,TP,10.00000000,,ref".to_string()];
-        write_somatic_roc(output.path(), header, &rows, "strelka.snv.qss")
+        let rows = feature_spool(&rows);
+        write_somatic_roc(output.path(), header, rows.path(), "strelka.snv.qss")
             .expect("write integer-rate somatic ROC");
         assert_eq!(
             fs::read_to_string(output.path()).expect("read ROC"),

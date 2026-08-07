@@ -9,6 +9,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 pub(super) fn sort_normalized_records(records: &mut [RawVcfRecord]) {
     let mut contig_ranks = std::collections::HashMap::new();
     let mut next_rank = 0usize;
@@ -104,7 +105,7 @@ impl PreprocessLogger {
 /// pass notices each newly used sequence and appends a length-less contig
 /// declaration. Mirror that repair while leaving existing declarations and
 /// their order untouched.
-pub(super) fn ensure_emitted_contig_headers(headers: &mut Vec<String>, records: &[RawVcfRecord]) {
+pub(super) fn ensure_emitted_contig_headers(headers: &mut Vec<String>, emitted_contigs: &[String]) {
     let mut declared: BTreeSet<String> = headers
         .iter()
         .filter_map(|line| {
@@ -114,9 +115,9 @@ pub(super) fn ensure_emitted_contig_headers(headers: &mut Vec<String>, records: 
         })
         .collect();
     let mut additions = Vec::new();
-    for record in records {
-        if declared.insert(record.chrom.clone()) {
-            additions.push(format!("##contig=<ID={}>", record.chrom));
+    for chrom in emitted_contigs {
+        if declared.insert(chrom.clone()) {
+            additions.push(format!("##contig=<ID={chrom}>"));
         }
     }
     let insert_at = headers
@@ -255,6 +256,7 @@ pub(super) fn passes_filters_only(filter: &str, filters_only: Option<&str>) -> b
     filter.split(';').any(|name| !excluded.contains(name))
 }
 
+#[cfg(test)]
 pub(super) fn resolve_gender(
     requested: PreprocessGender,
     records: &[RawVcfRecord],
@@ -264,28 +266,8 @@ pub(super) fn resolve_gender(
     }
     let mut haploid_x = false;
     let mut diploid_x = false;
-    for record in records
-        .iter()
-        .filter(|record| matches!(record.chrom.as_str(), "X" | "chrX" | "chrx"))
-    {
-        let Some(format) = record.format.as_deref() else {
-            continue;
-        };
-        let Some(gt_index) = format.split(':').position(|field| field == "GT") else {
-            continue;
-        };
-        for sample in &record.samples {
-            let gt = sample.split(':').nth(gt_index).unwrap_or(".");
-            // vcfcheck classifies ploidy from the encoded GT vector length,
-            // including missing slots. Thus `./1` has ngt == 2 and unequal
-            // alleles (-1 and 1), so it is diploid rather than haploid.
-            let alleles: Vec<&str> = gt.split(['/', '|']).collect();
-            if alleles.len() == 1 {
-                haploid_x = true;
-            } else if alleles.len() > 2 || (alleles.len() == 2 && alleles[0] != alleles[1]) {
-                diploid_x = true;
-            }
-        }
+    for record in records {
+        observe_gender(record, &mut haploid_x, &mut diploid_x);
     }
     if haploid_x && !diploid_x {
         PreprocessGender::Male
@@ -294,9 +276,42 @@ pub(super) fn resolve_gender(
     }
 }
 
+pub(super) fn observe_gender(record: &RawVcfRecord, haploid_x: &mut bool, diploid_x: &mut bool) {
+    if !matches!(record.chrom.as_str(), "X" | "chrX" | "chrx") {
+        return;
+    }
+    let Some(format) = record.format.as_deref() else {
+        return;
+    };
+    let Some(gt_index) = format.split(':').position(|field| field == "GT") else {
+        return;
+    };
+    for sample in &record.samples {
+        let gt = sample.split(':').nth(gt_index).unwrap_or(".");
+        // vcfcheck classifies ploidy from the encoded GT vector length,
+        // including missing slots. Thus `./1` has ngt == 2 and unequal
+        // alleles (-1 and 1), so it is diploid rather than haploid.
+        let alleles: Vec<&str> = gt.split(['/', '|']).collect();
+        if alleles.len() == 1 {
+            *haploid_x = true;
+        } else if alleles.len() > 2 || (alleles.len() == 2 && alleles[0] != alleles[1]) {
+            *diploid_x = true;
+        }
+    }
+}
+
 pub(crate) fn infer_gender(path: &Path) -> Result<PreprocessGender> {
-    let (_, records) = vcf::load_raw_vcf(path)?;
-    Ok(resolve_gender(PreprocessGender::Auto, &records))
+    let records = vcf::open_validated_vcf(path)?;
+    let mut haploid_x = false;
+    let mut diploid_x = false;
+    for record in records {
+        observe_gender(&record?, &mut haploid_x, &mut diploid_x);
+    }
+    Ok(if haploid_x && !diploid_x {
+        PreprocessGender::Male
+    } else {
+        PreprocessGender::Female
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

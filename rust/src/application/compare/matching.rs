@@ -15,10 +15,12 @@ use crate::adapters::vcf::{Variant, VariantKey};
 use crate::domain::{Interval, TypeCounts};
 use crate::engines::partial_credit;
 use anyhow::{Result, bail};
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+#[cfg(test)]
 pub(super) fn build_clusters_with_gap(
     truth: &[Variant],
     query: &[Variant],
@@ -50,8 +52,7 @@ pub(super) fn build_clusters_with_gap(
         match &mut current {
             Some(cluster)
                 if cluster.chrom == entry.variant.key.chrom
-                    && start <= cluster.end.saturating_add(cluster_gap)
-                    && cluster.truth.len() + cluster.query.len() < MAX_CLUSTER_VARIANTS =>
+                    && start <= cluster.end.saturating_add(cluster_gap) =>
             {
                 cluster.end = cluster.end.max(end);
                 match entry.side {
@@ -83,6 +84,139 @@ pub(super) fn build_clusters_with_gap(
         clusters.push(cluster);
     }
     clusters
+}
+
+pub(super) struct StreamingClusters<T, Q>
+where
+    T: Iterator<Item = Result<Variant>>,
+    Q: Iterator<Item = Result<Variant>>,
+{
+    truth: std::iter::Peekable<T>,
+    query: std::iter::Peekable<Q>,
+    pending: Option<Entry>,
+    cluster_gap: usize,
+}
+
+impl<T, Q> StreamingClusters<T, Q>
+where
+    T: Iterator<Item = Result<Variant>>,
+    Q: Iterator<Item = Result<Variant>>,
+{
+    pub(super) fn new(truth: T, query: Q, cluster_gap: usize) -> Self {
+        Self {
+            truth: truth.peekable(),
+            query: query.peekable(),
+            pending: None,
+            cluster_gap,
+        }
+    }
+
+    fn next_entry(&mut self) -> Result<Option<Entry>> {
+        if self.truth.peek().is_some_and(Result::is_err) {
+            return self.truth.next().transpose().map(|variant| {
+                variant.map(|variant| Entry {
+                    side: Side::Truth,
+                    variant,
+                })
+            });
+        }
+        if self.query.peek().is_some_and(Result::is_err) {
+            return self.query.next().transpose().map(|variant| {
+                variant.map(|variant| Entry {
+                    side: Side::Query,
+                    variant,
+                })
+            });
+        }
+        let take_truth = match (self.truth.peek(), self.query.peek()) {
+            (Some(Ok(truth)), Some(Ok(query))) => {
+                variant_stream_key(truth) <= variant_stream_key(query)
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return Ok(None),
+            (Some(_), Some(_)) => unreachable!("errors handled before ordering"),
+        };
+        if take_truth {
+            self.truth.next().transpose().map(|variant| {
+                variant.map(|variant| Entry {
+                    side: Side::Truth,
+                    variant,
+                })
+            })
+        } else {
+            self.query.next().transpose().map(|variant| {
+                variant.map(|variant| Entry {
+                    side: Side::Query,
+                    variant,
+                })
+            })
+        }
+    }
+}
+
+impl<T, Q> Iterator for StreamingClusters<T, Q>
+where
+    T: Iterator<Item = Result<Variant>>,
+    Q: Iterator<Item = Result<Variant>>,
+{
+    type Item = Result<Cluster>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = match self.pending.take() {
+            Some(entry) => entry,
+            None => match self.next_entry() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
+            },
+        };
+        let mut cluster = Cluster {
+            chrom: first.variant.key.chrom.clone(),
+            start: first.variant.key.pos,
+            end: first.variant.end_pos(),
+            truth: Vec::new(),
+            query: Vec::new(),
+        };
+        push_cluster_entry(&mut cluster, first);
+        loop {
+            let entry = match self.next_entry() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return Some(Ok(cluster)),
+                Err(error) => return Some(Err(error)),
+            };
+            let start = entry.variant.key.pos;
+            if cluster.chrom == entry.variant.key.chrom
+                && start <= cluster.end.saturating_add(self.cluster_gap)
+            {
+                if cluster.truth.len() + cluster.query.len() >= MAX_CLUSTER_VARIANTS {
+                    return Some(Err(anyhow::anyhow!(
+                        "connected comparison cluster {}:{}-{} exceeds the {} variant active-window limit",
+                        cluster.chrom,
+                        cluster.start,
+                        cluster.end.max(entry.variant.end_pos()),
+                        MAX_CLUSTER_VARIANTS
+                    )));
+                }
+                cluster.end = cluster.end.max(entry.variant.end_pos());
+                push_cluster_entry(&mut cluster, entry);
+            } else {
+                self.pending = Some(entry);
+                return Some(Ok(cluster));
+            }
+        }
+    }
+}
+
+fn variant_stream_key(variant: &Variant) -> (&str, usize, usize) {
+    (&variant.key.chrom, variant.key.pos, variant.end_pos())
+}
+
+fn push_cluster_entry(cluster: &mut Cluster, entry: Entry) {
+    match entry.side {
+        Side::Truth => cluster.truth.push(entry.variant),
+        Side::Query => cluster.query.push(entry.variant),
+    }
 }
 
 pub(super) fn process_cluster(
@@ -3180,10 +3314,23 @@ pub(super) fn effective_refrange(variant: &Variant) -> Option<(usize, usize, boo
 /// the raw CONF bed (standard overlap/touching merge) before
 /// `variant_is_conf` consumes them, but the **un-merged sum** is what
 /// feeds `Subset.IS_CONF.Size`.
+#[cfg(test)]
 pub(super) fn gvcf2bed_padding(
     truth: &[Variant],
     target_bed: Option<&[Interval]>,
 ) -> Vec<Interval> {
+    gvcf2bed_padding_iter(truth.iter().map(Ok::<_, anyhow::Error>), target_bed)
+        .expect("in-memory variants are infallible")
+}
+
+pub(super) fn gvcf2bed_padding_iter<I, V>(
+    truth: I,
+    target_bed: Option<&[Interval]>,
+) -> Result<Vec<Interval>>
+where
+    I: IntoIterator<Item = Result<V>>,
+    V: Borrow<Variant>,
+{
     struct ActiveInterval {
         chrom: String,
         start: i64,
@@ -3226,18 +3373,12 @@ pub(super) fn gvcf2bed_padding(
         s <= p && p < e
     };
 
-    let mut sorted: Vec<&Variant> = truth.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.key
-            .chrom
-            .cmp(&b.key.chrom)
-            .then(a.key.pos.cmp(&b.key.pos))
-    });
-
     let mut out = Vec::new();
     let mut active: Option<ActiveInterval> = None;
 
-    for variant in sorted {
+    for variant in truth {
+        let variant = variant?;
+        let variant = variant.borrow();
         let ref_bytes = variant.key.ref_allele.as_bytes();
         if ref_bytes.is_empty() {
             continue;
@@ -3356,7 +3497,7 @@ pub(super) fn gvcf2bed_padding(
             end: (iv.end + 1) as usize,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Merge overlapping or touching half-open bed intervals. Matches

@@ -7,10 +7,11 @@ use crate::domain::RawVcfRecord;
 use crate::engines::roc;
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -323,40 +324,48 @@ pub(super) fn ensure_ga4gh_headers(headers: &mut Vec<String>) {
     }
 }
 
+#[cfg(test)]
 pub(super) fn validate_ga4gh_qq_fields(headers: &[String], records: &[RawVcfRecord]) -> Result<()> {
-    let qq_is_string = headers.iter().any(|header| {
+    if !ga4gh_qq_is_string(headers) {
+        return Ok(());
+    }
+    for record in records {
+        validate_ga4gh_qq_record(record)?;
+    }
+    Ok(())
+}
+
+pub(super) fn ga4gh_qq_is_string(headers: &[String]) -> bool {
+    headers.iter().any(|header| {
         let Some(body) = header.strip_prefix("##FORMAT=<") else {
             return false;
         };
         let fields = body.split(',').collect::<Vec<_>>();
         fields.contains(&"ID=QQ") && fields.contains(&"Type=String")
-    });
-    if !qq_is_string {
-        return Ok(());
-    }
+    })
+}
 
+pub(super) fn validate_ga4gh_qq_record(record: &RawVcfRecord) -> Result<()> {
     // Legacy's numeric FORMAT reader sizes its result from the encoded BCF
     // string width. A one-character String QQ is accepted as a missing numeric
     // value, while a wider cell yields multiple values and aborts before any
     // report is published (`BCFHelpers.cpp::getFormatFloat`).
-    for record in records {
-        let Some(qq_index) = record.format_keys().iter().position(|field| *field == "QQ") else {
-            continue;
-        };
-        let encoded_width = record
-            .samples
-            .iter()
-            .filter_map(|sample| sample.split(':').nth(qq_index))
-            .map(str::len)
-            .max()
-            .unwrap_or(0);
-        if encoded_width > 1 {
-            bail!(
-                "too many QQ fields at {}:{}",
-                record.chrom,
-                record.pos.saturating_sub(1)
-            );
-        }
+    let Some(qq_index) = record.format_keys().iter().position(|field| *field == "QQ") else {
+        return Ok(());
+    };
+    let encoded_width = record
+        .samples
+        .iter()
+        .filter_map(|sample| sample.split(':').nth(qq_index))
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    if encoded_width > 1 {
+        bail!(
+            "too many QQ fields at {}:{}",
+            record.chrom,
+            record.pos.saturating_sub(1)
+        );
     }
     Ok(())
 }
@@ -1057,20 +1066,29 @@ pub(super) fn merge_region_tags(info: &mut String, additions: &[String]) {
 
 pub(super) fn compact_no_roc_outputs(prefix: &Path) -> Result<()> {
     let all_path = suffixed_report_path(prefix, "roc.all.csv.gz");
-    let text = vcf::read_text(&all_path)?;
-    let rows = text
-        .lines()
-        .enumerate()
-        .filter(|(index, line)| *index == 0 || line.split(',').nth(6).is_some_and(|qq| qq == "*"))
-        .map(|(_, line)| line)
-        .collect::<Vec<_>>();
-    let file = fs::File::create(&all_path)
-        .with_context(|| format!("failed to create {}", all_path.display()))?;
-    let mut encoder = GzEncoder::new(file, Compression::default());
-    writeln!(encoder, "{}", rows.join("\n"))?;
-    encoder
-        .finish()
-        .with_context(|| format!("failed to finish ROC artifact {}", all_path.display()))?;
+    let parent = all_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to stage {}", all_path.display()))?;
+    {
+        let input = fs::File::open(&all_path)
+            .with_context(|| format!("failed to open {}", all_path.display()))?;
+        let reader = BufReader::new(MultiGzDecoder::new(input));
+        let mut encoder = GzEncoder::new(staged.as_file_mut(), Compression::default());
+        for (index, line) in reader.lines().enumerate() {
+            let line = line?;
+            if index == 0 || line.split(',').nth(6).is_some_and(|qq| qq == "*") {
+                writeln!(encoder, "{line}")?;
+            }
+        }
+        encoder.finish()?;
+    }
+    staged
+        .persist(&all_path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to publish {}", all_path.display()))?;
 
     for suffix in [
         "roc.Locations.SNP.csv.gz",

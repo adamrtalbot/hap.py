@@ -4,10 +4,6 @@ use super::{ClassifiedVariant, INDEL_SUBTYPES, QuantifyCountMaps, QuantifyTypeCo
 use crate::domain::{CountsBucket, RawVcfRecord, TypeCounts};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn contigs_in_input(records: &[RawVcfRecord]) -> BTreeSet<String> {
-    records.iter().map(|record| record.chrom.clone()).collect()
-}
-
 pub(super) fn classify_side(
     record: &RawVcfRecord,
     sample_index: usize,

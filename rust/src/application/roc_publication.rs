@@ -5,9 +5,8 @@ use crate::domain::AnnotatedRow;
 use crate::engines::roc::{self, MetricIndices, RocOptions};
 use crate::output::{FailureOperation, fail_operation};
 use anyhow::{Context, Result};
-use flate2::Compression;
-use flate2::write::GzEncoder;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
 pub(crate) fn write_roc_files(
@@ -32,39 +31,55 @@ pub(crate) fn write_roc_files_with_options(
     )
 }
 
+pub(crate) fn write_roc_files_with_options_iter<I, R>(
+    prefix: &Path,
+    rows: I,
+    subset_size: usize,
+    conf_size: usize,
+    options: &RocOptions,
+) -> Result<MetricIndices>
+where
+    I: IntoIterator<Item = Result<R>>,
+    R: std::borrow::Borrow<AnnotatedRow>,
+{
+    publish(
+        prefix,
+        roc::calculate_with_options_iter(rows, subset_size, conf_size, options)?,
+    )
+}
+
 fn publish(prefix: &Path, artifacts: roc::Artifacts) -> Result<MetricIndices> {
     for artifact in artifacts.csv {
         let path = suffixed_report_path(prefix, &artifact.suffix);
-        if artifact.optional && artifact.rows.is_empty() {
+        let Some(source) = artifact.source else {
+            debug_assert!(artifact.optional);
             if path.exists() {
                 std::fs::remove_file(&path)
                     .with_context(|| format!("failed to remove stale {}", path.display()))?;
             }
             continue;
-        }
-        write_gzip_csv(&path, &artifact.header, &artifact.rows)?;
+        };
+        publish_file(&source, &path)?;
     }
-    if let Some(table) = artifacts.raw_table {
+    if let Some(source) = artifacts.raw_table {
         let path = suffixed_report_path(prefix, "roc.tsv");
-        std::fs::write(&path, table)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        publish_file(&source, &path)?;
     }
     Ok(artifacts.indices)
 }
 
-fn write_gzip_csv(path: &Path, header: &str, rows: &[String]) -> Result<()> {
+fn publish_file(source: &Path, path: &Path) -> Result<()> {
     fail_operation(FailureOperation::Writer, path)?;
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut writer = GzEncoder::new(file, Compression::default());
-    writeln!(writer, "{header}")?;
-    for row in rows {
-        writeln!(writer, "{row}")?;
-    }
+    let input = File::open(source)
+        .with_context(|| format!("failed to open ROC artifact {}", source.display()))?;
+    let output =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut reader = BufReader::new(input);
+    let mut writer = BufWriter::new(output);
+    std::io::copy(&mut reader, &mut writer)
+        .with_context(|| format!("failed to publish ROC artifact {}", path.display()))?;
     fail_operation(FailureOperation::Encoder, path)?;
-    writer
-        .finish()
-        .with_context(|| format!("failed to finish ROC artifact {}", path.display()))?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -79,13 +94,15 @@ mod tests {
     fn injected_roc_operations_preserve_generation_and_cleanup() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let output = directory.path().join("report.roc.all.csv.gz");
+        let source = directory.path().join("source.roc.all.csv.gz");
+        fs::write(&source, "new-roc")?;
 
         for operation in [FailureOperation::Writer, FailureOperation::Encoder] {
             fs::write(&output, "old-roc")?;
             let transaction = OutputTransaction::files(Vec::<PathBuf>::new(), [&output])?;
             let staged = transaction.staged_file(&output)?.to_path_buf();
             set_failure_operation(Some(operation));
-            let result = write_gzip_csv(&staged, "header", &["row".to_string()])
+            let result = publish_file(&source, &staged)
                 .with_context(|| format!("failed to write ROC table {}", output.display()));
             set_failure_operation(None);
             let error = result.expect_err("injected ROC operation must fail");

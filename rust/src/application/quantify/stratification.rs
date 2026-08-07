@@ -27,10 +27,13 @@ pub(super) fn load_regions(
         let raw_confidence = confidence.as_deref().ok_or_else(|| {
             anyhow::anyhow!("qfy --adjust-conf-regions requires --false-positives")
         })?;
-        let (_, truth_records) = vcf::load_raw_vcf(Path::new(truth_vcf)).with_context(|| {
+        let truth_records = vcf::open_validated_vcf(Path::new(truth_vcf)).with_context(|| {
             format!("failed to load --adjust-conf-regions truth VCF {truth_vcf}")
         })?;
-        let padding = truth_confidence_padding(&truth_records, raw_confidence);
+        let padding = truth_confidence_padding_iter(
+            truth_records.map(|record| record.map(|record| record.raw().clone())),
+            raw_confidence,
+        )?;
         confidence.get_or_insert_default().extend(padding);
     }
     let mut paths = BTreeMap::<String, PathBuf>::new();
@@ -98,22 +101,30 @@ pub(super) fn dynamic_region_label(raw_name: &str) -> (String, bool) {
     }
 }
 
+#[cfg(test)]
 pub(super) fn truth_confidence_padding(
     records: &[RawVcfRecord],
     targets: &[Interval],
 ) -> Vec<Interval> {
-    let mut records = records.iter().collect::<Vec<_>>();
-    records.sort_by(|left, right| left.chrom.cmp(&right.chrom).then(left.pos.cmp(&right.pos)));
+    truth_confidence_padding_iter(records.iter().cloned().map(Ok::<_, anyhow::Error>), targets)
+        .expect("in-memory confidence records are infallible")
+}
+
+fn truth_confidence_padding_iter<I>(records: I, targets: &[Interval]) -> Result<Vec<Interval>>
+where
+    I: IntoIterator<Item = Result<RawVcfRecord>>,
+{
     let mut output = Vec::new();
     let mut active: Option<Interval> = None;
     for record in records {
+        let record = record?;
         if !targets
             .iter()
             .any(|target| target.matches(&record.chrom, record.pos))
         {
             continue;
         }
-        let (start, end) = effective_reference_range(record)
+        let (start, end) = effective_reference_range(&record)
             .map(|(start, end, _)| (start.saturating_sub(1), end))
             .unwrap_or((
                 record.pos.saturating_sub(1),
@@ -143,7 +154,7 @@ pub(super) fn truth_confidence_padding(
     if let Some(interval) = active {
         output.push(interval);
     }
-    output
+    Ok(output)
 }
 
 pub(super) fn resolve_stratification_path(raw_path: &str, tsv_path: &Path) -> PathBuf {

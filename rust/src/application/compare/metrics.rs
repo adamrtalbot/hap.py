@@ -22,6 +22,7 @@ fn comparison_samples(record: &RawVcfRecord) -> Option<ComparisonSamples<'_>> {
     })
 }
 
+#[cfg(test)]
 pub(super) fn collect_contigs(
     truth: &[Variant],
     query: &[Variant],
@@ -218,6 +219,144 @@ pub(super) fn derive_subset_fp_classes(
 /// use).
 pub(super) type SubtypeFpClasses = BTreeMap<String, BTreeMap<String, (usize, usize)>>;
 pub(super) type SubsetSubtypeFpClasses = BTreeMap<String, SubtypeFpClasses>;
+
+#[derive(Default)]
+pub(super) struct FoldedComparisonReports {
+    pub(super) all_counts: BTreeMap<String, TypeCounts>,
+    pub(super) pass_counts: BTreeMap<String, TypeCounts>,
+    pub(super) all_subtype: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pub(super) pass_subtype: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pub(super) all_subset: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pub(super) pass_subset: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pub(super) all_subset_subtype: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+    pub(super) pass_subset_subtype:
+        BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+    pub(super) all_fp: BTreeMap<String, (usize, usize)>,
+    pub(super) pass_fp: BTreeMap<String, (usize, usize)>,
+    pub(super) all_subset_fp: BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    pub(super) pass_subset_fp: BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    pub(super) all_subtype_fp: SubtypeFpClasses,
+    pub(super) pass_subtype_fp: SubtypeFpClasses,
+    pub(super) all_subset_subtype_fp: SubsetSubtypeFpClasses,
+    pub(super) pass_subset_subtype_fp: SubsetSubtypeFpClasses,
+}
+
+impl FoldedComparisonReports {
+    pub(super) fn observe(&mut self, row: &AnnotatedRow) {
+        let rows = std::slice::from_ref(row);
+        merge_type_map(&mut self.all_counts, derive_total_counts(rows, false));
+        merge_type_map(&mut self.pass_counts, derive_total_counts(rows, true));
+        merge_nested_type_map(&mut self.all_subtype, derive_subtype_counts(rows, false));
+        merge_nested_type_map(&mut self.pass_subtype, derive_subtype_counts(rows, true));
+        merge_nested_type_map(&mut self.all_subset, derive_subset_counts(rows, false));
+        merge_nested_type_map(&mut self.pass_subset, derive_subset_counts(rows, true));
+        merge_triple_type_map(
+            &mut self.all_subset_subtype,
+            derive_subset_subtype_counts(rows, false),
+        );
+        merge_triple_type_map(
+            &mut self.pass_subset_subtype,
+            derive_subset_subtype_counts(rows, true),
+        );
+        merge_pair_map(&mut self.all_fp, derive_fp_classes(rows, false));
+        merge_pair_map(&mut self.pass_fp, derive_fp_classes(rows, true));
+        merge_nested_pair_map(
+            &mut self.all_subset_fp,
+            derive_subset_fp_classes(rows, false),
+        );
+        merge_nested_pair_map(
+            &mut self.pass_subset_fp,
+            derive_subset_fp_classes(rows, true),
+        );
+        merge_nested_pair_map(
+            &mut self.all_subtype_fp,
+            derive_subtype_fp_classes(rows, false),
+        );
+        merge_nested_pair_map(
+            &mut self.pass_subtype_fp,
+            derive_subtype_fp_classes(rows, true),
+        );
+        merge_triple_pair_map(
+            &mut self.all_subset_subtype_fp,
+            derive_subset_subtype_fp_classes(rows, false),
+        );
+        merge_triple_pair_map(
+            &mut self.pass_subset_subtype_fp,
+            derive_subset_subtype_fp_classes(rows, true),
+        );
+    }
+}
+
+fn add_bucket(target: &mut CountsBucket, source: CountsBucket) {
+    target.total += source.total;
+    target.ti += source.ti;
+    target.tv += source.tv;
+    target.het += source.het;
+    target.homalt += source.homalt;
+}
+
+fn add_type_counts(target: &mut TypeCounts, source: TypeCounts) {
+    add_bucket(&mut target.truth_total, source.truth_total);
+    add_bucket(&mut target.truth_tp, source.truth_tp);
+    add_bucket(&mut target.truth_fn, source.truth_fn);
+    add_bucket(&mut target.query_total, source.query_total);
+    add_bucket(&mut target.query_tp, source.query_tp);
+    add_bucket(&mut target.query_fp, source.query_fp);
+    add_bucket(&mut target.query_unk, source.query_unk);
+}
+
+fn merge_type_map(target: &mut BTreeMap<String, TypeCounts>, source: BTreeMap<String, TypeCounts>) {
+    for (key, value) in source {
+        add_type_counts(target.entry(key).or_default(), value);
+    }
+}
+
+fn merge_nested_type_map(
+    target: &mut BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    source: BTreeMap<String, BTreeMap<String, TypeCounts>>,
+) {
+    for (key, values) in source {
+        merge_type_map(target.entry(key).or_default(), values);
+    }
+}
+
+fn merge_triple_type_map(
+    target: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+    source: BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+) {
+    for (key, values) in source {
+        merge_nested_type_map(target.entry(key).or_default(), values);
+    }
+}
+
+fn merge_pair_map(
+    target: &mut BTreeMap<String, (usize, usize)>,
+    source: BTreeMap<String, (usize, usize)>,
+) {
+    for (key, (left, right)) in source {
+        let value = target.entry(key).or_default();
+        value.0 += left;
+        value.1 += right;
+    }
+}
+
+fn merge_nested_pair_map(
+    target: &mut BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    source: BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+) {
+    for (key, values) in source {
+        merge_pair_map(target.entry(key).or_default(), values);
+    }
+}
+
+fn merge_triple_pair_map(
+    target: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, (usize, usize)>>>,
+    source: BTreeMap<String, BTreeMap<String, BTreeMap<String, (usize, usize)>>>,
+) {
+    for (key, values) in source {
+        merge_nested_pair_map(target.entry(key).or_default(), values);
+    }
+}
 
 pub(super) fn derive_subtype_fp_classes(
     rows: &[AnnotatedRow],

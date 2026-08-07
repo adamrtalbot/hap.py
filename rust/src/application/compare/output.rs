@@ -78,6 +78,7 @@ pub(super) fn semantic_info_key(record: &RawVcfRecord) -> SemanticInfoKey {
     (record.chrom.clone(), record.pos, reference, alts)
 }
 
+#[cfg(test)]
 pub(super) fn decorate_output_rows(
     rows: &mut [AnnotatedRow],
     truth: &[RawVcfRecord],
@@ -89,35 +90,45 @@ pub(super) fn decorate_output_rows(
     if !preserve_info && !output_vtc && matches!(roc_field, "QUAL" | "QQ") {
         return Ok(());
     }
-    let mut preserved = BTreeMap::<InfoKey, BTreeSet<String>>::new();
-    let mut semantic_preserved = BTreeMap::<SemanticInfoKey, BTreeSet<String>>::new();
-    if preserve_info {
-        for record in truth.iter().chain(query) {
-            let key = (
-                record.chrom.clone(),
-                record.pos,
-                record.ref_allele.clone(),
-                record.alt_allele.clone(),
-            );
+    let mut decorations = DecorationIndex::default();
+    for record in truth.iter().chain(query) {
+        decorations.observe(record, preserve_info, roc_field);
+    }
+    decorate_output_rows_with_index(rows, &decorations, preserve_info, output_vtc, roc_field)
+}
+
+#[derive(Default)]
+pub(super) struct DecorationIndex {
+    preserved: BTreeMap<InfoKey, BTreeSet<String>>,
+    semantic_preserved: BTreeMap<SemanticInfoKey, BTreeSet<String>>,
+    roc_values: BTreeMap<InfoKey, String>,
+}
+
+impl DecorationIndex {
+    pub(super) fn observe(&mut self, record: &RawVcfRecord, preserve_info: bool, roc_field: &str) {
+        let key = (
+            record.chrom.clone(),
+            record.pos,
+            record.ref_allele.clone(),
+            record.alt_allele.clone(),
+        );
+        if preserve_info {
             for field in record
                 .info
                 .split(';')
                 .filter(|field| !matches!(*field, "" | "."))
             {
-                preserved
+                self.preserved
                     .entry(key.clone())
                     .or_default()
                     .insert(field.to_string());
-                semantic_preserved
+                self.semantic_preserved
                     .entry(semantic_info_key(record))
                     .or_default()
                     .insert(field.to_string());
             }
         }
-    }
-    let mut roc_values = BTreeMap::<InfoKey, String>::new();
-    if !matches!(roc_field, "QUAL" | "QQ" | ".") {
-        for record in truth.iter().chain(query) {
+        if !matches!(roc_field, "QUAL" | "QQ" | ".") {
             let value = record
                 .info
                 .split(';')
@@ -131,18 +142,19 @@ pub(super) fn decorate_output_rows(
                 })
                 .or_else(|| record.sample_map(0).get(roc_field).cloned());
             if let Some(value) = value {
-                roc_values.insert(
-                    (
-                        record.chrom.clone(),
-                        record.pos,
-                        record.ref_allele.clone(),
-                        record.alt_allele.clone(),
-                    ),
-                    value,
-                );
+                self.roc_values.insert(key, value);
             }
         }
     }
+}
+
+pub(super) fn decorate_output_rows_with_index(
+    rows: &mut [AnnotatedRow],
+    decorations: &DecorationIndex,
+    preserve_info: bool,
+    output_vtc: bool,
+    roc_field: &str,
+) -> Result<()> {
     for row in rows {
         let mut record = row.record.raw().clone();
         let key = (
@@ -155,10 +167,11 @@ pub(super) fn decorate_output_rows(
         let regions = current.get("Regions").cloned();
         let mut base = BTreeMap::<String, String>::new();
         if preserve_info {
-            let fields = preserved
-                .get(&key)
-                .into_iter()
-                .chain(semantic_preserved.get(&semantic_info_key(&record)));
+            let fields = decorations.preserved.get(&key).into_iter().chain(
+                decorations
+                    .semantic_preserved
+                    .get(&semantic_info_key(&record)),
+            );
             for fields in fields {
                 for field in fields {
                     let field_key = field.split_once('=').map_or(field.as_str(), |(key, _)| key);
@@ -186,14 +199,14 @@ pub(super) fn decorate_output_rows(
             let iqq = if roc_field == "QUAL" {
                 Some(comparison.iqq.as_str())
             } else {
-                roc_values.get(&key).map(String::as_str)
+                decorations.roc_values.get(&key).map(String::as_str)
             };
             if let Some(iqq) = iqq {
                 base.insert("IQQ".to_string(), format!("IQQ={iqq}"));
             }
         }
 
-        if !matches!(roc_field, "QUAL" | "QQ" | ".") && !roc_values.contains_key(&key) {
+        if !matches!(roc_field, "QUAL" | "QQ" | ".") && !decorations.roc_values.contains_key(&key) {
             // When xcmp's literal custom-field lookup misses, quantify reads
             // an absent IQQ: called query samples receive NaN, truth samples
             // remain missing, and no-call queries retain the zero sentinel.
@@ -264,38 +277,40 @@ pub(super) fn info_fields_by_key(info: &str) -> BTreeMap<String, String> {
 /// tags. Legacy hands qfy the pre-quantification stream instead, so remove
 /// those provisional tags from the private re-quantification handoff and let
 /// qfy derive them from the final confidence and stratification inputs.
+#[cfg(test)]
 pub(super) fn sanitize_requantify_handoff_rows(rows: &[AnnotatedRow]) -> Vec<AnnotatedRow> {
     rows.iter()
         .cloned()
-        .map(|mut row| {
-            row.record
-                .try_update(|record| {
-                    let entries = record
-                        .info
-                        .split(';')
-                        .filter_map(|entry| {
-                            let Some(regions) = entry.strip_prefix("Regions=") else {
-                                return Some(entry.to_string());
-                            };
-                            let retained = regions
-                                .split(',')
-                                .filter(|tag| !matches!(*tag, "TS_boundary" | "TS_contained"))
-                                .collect::<Vec<_>>();
-                            (!retained.is_empty())
-                                .then(|| format!("Regions={}", retained.join(",")))
-                        })
-                        .collect::<Vec<_>>();
-                    record.info = if entries.is_empty() {
-                        ".".to_string()
-                    } else {
-                        entries.join(";")
-                    };
-                    Ok(())
-                })
-                .expect("sanitizing INFO preserves checked record invariants");
-            row
-        })
+        .map(sanitize_requantify_handoff_row)
         .collect()
+}
+
+pub(super) fn sanitize_requantify_handoff_row(mut row: AnnotatedRow) -> AnnotatedRow {
+    row.record
+        .try_update(|record| {
+            let entries = record
+                .info
+                .split(';')
+                .filter_map(|entry| {
+                    let Some(regions) = entry.strip_prefix("Regions=") else {
+                        return Some(entry.to_string());
+                    };
+                    let retained = regions
+                        .split(',')
+                        .filter(|tag| !matches!(*tag, "TS_boundary" | "TS_contained"))
+                        .collect::<Vec<_>>();
+                    (!retained.is_empty()).then(|| format!("Regions={}", retained.join(",")))
+                })
+                .collect::<Vec<_>>();
+            record.info = if entries.is_empty() {
+                ".".to_string()
+            } else {
+                entries.join(";")
+            };
+            Ok(())
+        })
+        .expect("sanitizing INFO preserves checked record invariants");
+    row
 }
 
 pub(super) fn set_comparison_format_value(
@@ -557,21 +572,8 @@ pub(super) fn decorate_existing_comparison_vcf(
     preserve_info: bool,
     output_vtc: bool,
 ) -> Result<()> {
-    let (mut headers, records) = vcf::load_raw_vcf(output_path)?;
-    let (_, truth) = vcf::load_raw_vcf(truth_path)?;
-    let (_, query) = vcf::load_raw_vcf(query_path)?;
-    let mut rows = records
-        .into_iter()
-        .map(|record| AnnotatedRow {
-            sort_key: (record.chrom.clone(), record.pos, 0, 0),
-            record,
-            query_pass: true,
-            fp_class: None,
-            xcmp_ctype: None,
-            xcmp_hap_match: false,
-        })
-        .collect::<Vec<_>>();
-    decorate_output_rows(&mut rows, &truth, &query, preserve_info, output_vtc, "QUAL")?;
+    let reader = vcf::open_validated_vcf(output_path)?;
+    let mut headers = reader.headers().to_vec();
     if output_vtc {
         let mut chrom_index = headers
             .iter()
@@ -591,12 +593,34 @@ pub(super) fn decorate_existing_comparison_vcf(
             }
         }
     }
-    let decorated = rows
-        .into_iter()
-        .map(|row| row.record.into_validated())
-        .collect::<Vec<_>>();
-    let validated = vcf::ValidatedVcf::from_parts(headers, decorated);
-    vcf::write_validated_vcf(output_path, &validated)
+    let mut decorations = DecorationIndex::default();
+    for path in [truth_path, query_path] {
+        for record in vcf::open_validated_vcf(path)? {
+            let record = record?;
+            decorations.observe(record.raw(), preserve_info, "QUAL");
+        }
+    }
+    let decorated = reader.map(|record| {
+        let record = record?;
+        let raw = record.raw();
+        let mut row = AnnotatedRow {
+            sort_key: (raw.chrom.clone(), raw.pos, 0, 0),
+            record: raw.clone().into(),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+        };
+        decorate_output_rows_with_index(
+            std::slice::from_mut(&mut row),
+            &decorations,
+            preserve_info,
+            output_vtc,
+            "QUAL",
+        )?;
+        Ok(row.record.into_validated())
+    });
+    vcf::write_validated_vcf_iter(output_path, &headers, decorated)
 }
 
 pub(super) fn resolve_default_reference() -> Result<String> {
