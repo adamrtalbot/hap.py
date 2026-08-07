@@ -1,4 +1,4 @@
-use crate::cli::SomaticArgs;
+use crate::application::ValidatedSomaticArgs as SomaticArgs;
 use crate::compare::suffixed_report_path;
 use crate::{fasta, ftx, strelka, vcf};
 use anyhow::{Context, Result, bail};
@@ -277,10 +277,17 @@ enum QueryClass {
     Ambi,
 }
 
-pub fn run(mut args: SomaticArgs) -> Result<()> {
-    if let Some(config) = args.roc.as_deref().and_then(somatic_roc_config) {
-        args.feature_table = Some(config.feature_table.to_string());
-    }
+pub fn run(args: SomaticArgs) -> Result<()> {
+    let feature_table = args
+        .roc
+        .as_deref()
+        .and_then(somatic_roc_config)
+        .map(|config| config.feature_table.to_string());
+    let args = args.try_update(|values| {
+        if let Some(feature_table) = feature_table {
+            values.feature_table = Some(feature_table);
+        }
+    })?;
     validate_args(&args)?;
     let af_bins = if args.af_strat {
         parse_af_bins(&args.af_strat_binsize)
@@ -3810,7 +3817,7 @@ mod tests {
         let Command::Somatic(args) = cli.command else {
             panic!("somatic command expected");
         };
-        args
+        args.try_into().expect("test arguments should validate")
     }
 
     fn interval(start: usize, end: usize, label: &str) -> AmbiguousInterval {
@@ -4333,7 +4340,8 @@ mod tests {
             args.af_strat_binsize = raw.to_string();
             assert!(validate_args(&args).is_err());
         }
-        let tiny = parsed_somatic(&["--af-binsize", "1e-12"]);
+        let mut tiny = parsed_somatic(&[]);
+        tiny.af_strat_binsize = "1e-12".to_string();
         assert!(
             validate_args(&tiny)
                 .unwrap_err()

@@ -1,10 +1,14 @@
-use crate::cli::{CompareArgs, CompareEngine, PreprocessArgs};
+use crate::application::{
+    CompareArgs as RawCompareArgs, CompareEngine, PreprocessArgs as RawPreprocessArgs,
+    PreprocessGender, QuantifyArgs as RawQuantifyArgs, SomaticGtMode,
+    ValidatedCompareArgs as CompareArgs, ValidatedPreprocessArgs as PreprocessArgs,
+};
 use crate::fasta;
 use crate::metrics_json;
 use crate::partial_credit;
 use crate::preprocess;
 use crate::report::{self, CountsBucket};
-use crate::vcf::{self, RawVcfRecord, Variant, VariantKey};
+use crate::vcf::{self, RawVcfRecord, ValidatedVcfRecord, Variant, VariantKey};
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -95,7 +99,7 @@ pub struct TypeCounts {
 #[derive(Clone, Debug)]
 pub struct AnnotatedRow {
     pub sort_key: (String, usize, usize, usize),
-    pub line: String,
+    pub line: ComparisonRecord,
     /// Whether the originating query variant was PASS-filtered. Truth
     /// variants are always considered PASS (the `--usefiltered-truth=False`
     /// contract is enforced upstream in preprocess). The field drives the
@@ -112,6 +116,81 @@ pub struct AnnotatedRow {
     /// ordinary (clean-INFO) output remains unchanged.
     pub xcmp_ctype: Option<&'static str>,
     pub xcmp_hap_match: bool,
+}
+
+/// A rendered comparison row that retains its checked structured record.
+#[derive(Clone, Debug)]
+pub struct ComparisonRecord {
+    rendered: String,
+    record: ValidatedVcfRecord,
+}
+
+impl ComparisonRecord {
+    fn generated(rendered: String) -> Self {
+        let raw = RawVcfRecord::from_line(&rendered, Path::new("generated-comparison-record"))
+            .expect("comparison rows are generated as valid VCF records");
+        let record =
+            ValidatedVcfRecord::try_from_raw(raw, crate::domain::QueryProvenance::Unavailable)
+                .expect("comparison rows contain checked coordinates, alleles, and genotypes");
+        Self { rendered, record }
+    }
+
+    fn validated(&self) -> &ValidatedVcfRecord {
+        &self.record
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.rendered
+    }
+
+    pub fn replace(&self, from: &str, to: &str) -> Self {
+        Self::generated(self.rendered.replace(from, to))
+    }
+
+    #[cfg(test)]
+    pub fn replacen(&self, from: &str, to: &str, count: usize) -> Self {
+        Self::generated(self.rendered.replacen(from, to, count))
+    }
+}
+
+impl From<String> for ComparisonRecord {
+    fn from(rendered: String) -> Self {
+        Self::generated(rendered)
+    }
+}
+
+impl std::ops::Deref for ComparisonRecord {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rendered
+    }
+}
+
+impl PartialEq for ComparisonRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.rendered == other.rendered
+    }
+}
+
+impl Eq for ComparisonRecord {}
+
+impl PartialOrd for ComparisonRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ComparisonRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rendered.cmp(&other.rendered)
+    }
+}
+
+impl std::fmt::Display for ComparisonRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.rendered)
+    }
 }
 
 /// Append one of the legacy report suffixes without treating a dotted report
@@ -391,23 +470,31 @@ fn validate_regions_bed(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run(mut args: CompareArgs) -> Result<()> {
+pub fn run(args: CompareArgs) -> Result<()> {
     if args.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     validate_report_parent(Path::new(&args.report_prefix))?;
     let explicit_bcf = args.bcf;
-    args.bcf = comparison_requests_bcf(&args);
-    if args.reference.is_empty() {
-        args.reference = resolve_default_reference()?;
-    }
-    ensure_aggregate_roc_region(&mut args.roc_regions);
-    normalize_engine_preprocessing(&mut args);
+    let bcf = comparison_requests_bcf(&args);
+    let reference = args
+        .reference
+        .is_empty()
+        .then(resolve_default_reference)
+        .transpose()?;
+    let args = args.try_update(|values| {
+        values.bcf = bcf;
+        if let Some(reference) = reference {
+            values.reference = reference;
+        }
+        ensure_aggregate_roc_region(&mut values.roc_regions);
+        normalize_engine_preprocessing(values);
+    })?;
     initialize_compare_log(&args)?;
     log_compare_info(&args, "Starting germline comparison")?;
     let reference_path = Path::new(&args.reference);
-    let prefix = Path::new(&args.report_prefix);
+    let prefix = args.output_plan().report_prefix();
     let reference_sequences = fasta::read_sequences(reference_path)?;
     let contig_lengths: BTreeMap<String, usize> = reference_sequences
         .iter()
@@ -475,15 +562,20 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     // flag as-is.
     let scratch_parent = scratch_parent(&args, prefix);
     let scratch = ScratchRun::create(&scratch_parent, args.keep_scratch)?;
-    let mut preprocessing_args = args.clone();
+    let preprocessing_args = args.clone();
     // Legacy keeps vcfeval handoff files as VCF even when `--bcf` requests a
     // BCF report. The built-in xcmp and SCMP engines can consume BCF
     // intermediates directly.
     let bcf_intermediates = args.bcf && args.engine != CompareEngine::Vcfeval;
-    preprocessing_args.bcf = bcf_intermediates;
-    if preprocessing_args.gender == crate::cli::PreprocessGender::Auto {
-        preprocessing_args.gender = preprocess::infer_gender(Path::new(&args.truth))?;
-    }
+    let inferred_gender = (preprocessing_args.gender == PreprocessGender::Auto)
+        .then(|| preprocess::infer_gender(Path::new(&args.truth)))
+        .transpose()?;
+    let preprocessing_args = preprocessing_args.try_update(|values| {
+        values.bcf = bcf_intermediates;
+        if let Some(gender) = inferred_gender {
+            values.gender = gender;
+        }
+    })?;
     let truth_prep = scratch.path().join(if bcf_intermediates {
         "truth.prep.bcf"
     } else {
@@ -501,7 +593,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         &truth_prep,
         !args.usefiltered_truth,
         args.preprocess_truth,
-    ))?;
+    )?)?;
     if args.locations.is_none() {
         let (_, preprocessed_truth) = vcf::load_raw_vcf(&truth_prep)?;
         if !preprocessed_truth
@@ -518,7 +610,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         &query_prep,
         args.pass_only,
         true,
-    ))?;
+    )?)?;
 
     if args.engine == CompareEngine::Vcfeval {
         log_compare_info(&args, "Running vcfeval comparison")?;
@@ -788,6 +880,11 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         suffixed_report_path(prefix, "vcf.gz")
     };
     let requantify_rows = requantify.then(|| sanitize_requantify_handoff_rows(&rows));
+    let requantify_records = requantify_rows.as_deref().map(|rows| {
+        rows.iter()
+            .map(|row| row.line.validated().clone())
+            .collect::<Vec<_>>()
+    });
     report::write_vcf(
         &comparison_vcf,
         &vcf_headers,
@@ -795,7 +892,7 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
     )?;
     let roc_indices = if requantify {
         crate::quantify::run_from_compare(
-            crate::cli::QuantifyArgs {
+            RawQuantifyArgs {
                 input_vcf: comparison_vcf.display().to_string(),
                 report_prefix: args.report_prefix.clone(),
                 reference: args.reference.clone(),
@@ -831,7 +928,10 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
                 roc_delta: args.roc_delta,
                 ci_alpha: args.ci_alpha,
                 no_json: args.no_json,
-            },
+            }
+            .validated_for_records()?,
+            vcf_headers.clone(),
+            requantify_records.expect("records exist when requantification is enabled"),
             crate::quantify::CompareQuantifyMode {
                 preserve_missing_nocall_bd: args.usefiltered_truth,
                 ..Default::default()
@@ -886,10 +986,10 @@ pub fn run(mut args: CompareArgs) -> Result<()> {
         },
         fp_adjust_conf: args.adjust_conf_regions && !args.no_adjust_conf_regions,
         gender: match args.gender {
-            crate::cli::PreprocessGender::Male => "male",
-            crate::cli::PreprocessGender::Female => "female",
-            crate::cli::PreprocessGender::Auto => "auto",
-            crate::cli::PreprocessGender::None => "none",
+            PreprocessGender::Male => "male",
+            PreprocessGender::Female => "female",
+            PreprocessGender::Auto => "auto",
+            PreprocessGender::None => "none",
         },
         hb_expand: args.hb_expand,
         logfile: args.logfile.as_deref(),
@@ -1101,8 +1201,7 @@ fn run_vcfeval(
             "warning: --engine-vcfeval-path and --engine-vcfeval-template are deprecated and ignored; --engine vcfeval is native Rust"
         );
     }
-    let vcfeval_vcf = scratch.path().join("vcfeval.comparison.vcf.gz");
-    crate::vcfeval::compare_files(
+    let vcfeval = crate::vcfeval::compare_files(
         truth_prep,
         query_prep,
         Path::new(&args.reference),
@@ -1110,11 +1209,11 @@ fn run_vcfeval(
             roc_field: &args.roc,
             loose_match_distance: args.engine_scmp_distance,
         },
-        &vcfeval_vcf,
     )?;
+    let (vcfeval_headers, vcfeval_records) = vcfeval.into_parts();
     let roc_indices = crate::quantify::run_from_compare(
-        crate::cli::QuantifyArgs {
-            input_vcf: vcfeval_vcf.display().to_string(),
+        RawQuantifyArgs {
+            input_vcf: String::new(),
             report_prefix: args.report_prefix.clone(),
             reference: args.reference.clone(),
             annotation_type: Some("ga4gh".to_string()),
@@ -1140,7 +1239,10 @@ fn run_vcfeval(
             roc_delta: args.roc_delta,
             ci_alpha: args.ci_alpha,
             no_json: args.no_json,
-        },
+        }
+        .validated_for_records()?,
+        vcfeval_headers,
+        vcfeval_records,
         crate::quantify::CompareQuantifyMode {
             inherit_same_position_tp_qq: true,
             roc_value_from_qq: true,
@@ -1173,7 +1275,6 @@ fn run_scmp(
     prefix: &Path,
     scratch: ScratchRun,
 ) -> Result<()> {
-    let comparison_vcf = scratch.path().join("scmp.comparison.vcf.gz");
     let mut strat_regions = args.strat_regions.clone();
     if args.adjust_conf_regions
         && !args.no_adjust_conf_regions
@@ -1209,18 +1310,18 @@ fn run_scmp(
             bail!("internal error: run_scmp called for a non-SCMP engine")
         }
     };
-    crate::scmp::compare_files(
+    let comparison = crate::scmp::compare_files(
         truth_prep,
         query_prep,
         Path::new(&args.reference),
         mode,
         &args.roc,
-        &comparison_vcf,
     )?;
+    let (comparison_headers, comparison_records) = comparison.into_parts();
     let write_counts = args.write_counts && !args.no_write_counts;
     let roc_indices = crate::quantify::run_from_compare(
-        crate::cli::QuantifyArgs {
-            input_vcf: comparison_vcf.display().to_string(),
+        RawQuantifyArgs {
+            input_vcf: String::new(),
             report_prefix: args.report_prefix.clone(),
             reference: args.reference.clone(),
             annotation_type: Some("ga4gh".to_string()),
@@ -1246,7 +1347,10 @@ fn run_scmp(
             roc_delta: args.roc_delta,
             ci_alpha: args.ci_alpha,
             no_json: args.no_json,
-        },
+        }
+        .validated_for_records()?,
+        comparison_headers,
+        comparison_records,
         crate::quantify::CompareQuantifyMode {
             preserve_missing_query_qq: args.engine == CompareEngine::ScmpSomatic,
             ..Default::default()
@@ -1267,7 +1371,7 @@ fn ensure_aggregate_roc_region(regions: &mut Vec<String>) {
     }
 }
 
-fn normalize_engine_preprocessing(args: &mut CompareArgs) {
+fn normalize_engine_preprocessing(args: &mut RawCompareArgs) {
     match args.engine {
         CompareEngine::ScmpSomatic => {
             if !args.somatic && args.set_gt.is_none() {
@@ -1283,7 +1387,7 @@ fn normalize_engine_preprocessing(args: &mut CompareArgs) {
         }
         CompareEngine::ScmpDistance => {
             if !args.somatic && args.set_gt.is_none() {
-                args.set_gt = Some(crate::cli::SomaticGtMode::First);
+                args.set_gt = Some(SomaticGtMode::First);
             }
             args.decompose = false;
         }
@@ -1291,13 +1395,13 @@ fn normalize_engine_preprocessing(args: &mut CompareArgs) {
     }
 }
 
-fn somatic_mode_name(mode: Option<crate::cli::SomaticGtMode>) -> Option<&'static str> {
+fn somatic_mode_name(mode: Option<SomaticGtMode>) -> Option<&'static str> {
     mode.map(|mode| match mode {
-        crate::cli::SomaticGtMode::Half => "half",
-        crate::cli::SomaticGtMode::Hemi => "hemi",
-        crate::cli::SomaticGtMode::Het => "het",
-        crate::cli::SomaticGtMode::Hom => "hom",
-        crate::cli::SomaticGtMode::First => "first",
+        SomaticGtMode::Half => "half",
+        SomaticGtMode::Hemi => "hemi",
+        SomaticGtMode::Het => "het",
+        SomaticGtMode::Hom => "hom",
+        SomaticGtMode::First => "first",
     })
 }
 
@@ -1381,10 +1485,10 @@ fn write_runinfo_for_args(
         },
         fp_adjust_conf: args.adjust_conf_regions && !args.no_adjust_conf_regions,
         gender: match args.gender {
-            crate::cli::PreprocessGender::Male => "male",
-            crate::cli::PreprocessGender::Female => "female",
-            crate::cli::PreprocessGender::Auto => "auto",
-            crate::cli::PreprocessGender::None => "none",
+            PreprocessGender::Male => "male",
+            PreprocessGender::Female => "female",
+            PreprocessGender::Auto => "auto",
+            PreprocessGender::None => "none",
         },
         hb_expand: args.hb_expand,
         logfile: args.logfile.as_deref(),
@@ -1545,7 +1649,7 @@ fn decorate_output_rows(
         }
     }
     for row in rows {
-        let mut record = RawVcfRecord::from_line(&row.line, Path::new("comparison-output"))?;
+        let mut record = row.line.validated().raw().clone();
         let key = (
             record.chrom.clone(),
             record.pos,
@@ -1646,7 +1750,7 @@ fn decorate_output_rows(
         } else {
             info.join(";")
         };
-        row.line = record.to_line();
+        row.line = record.to_line().into();
     }
     Ok(())
 }
@@ -1689,7 +1793,7 @@ fn sanitize_requantify_handoff_rows(rows: &[AnnotatedRow]) -> Vec<AnnotatedRow> 
                 } else {
                     entries.join(";")
                 };
-                row.line = fields.join("\t");
+                row.line = fields.join("\t").into();
             }
             row
         })
@@ -1962,7 +2066,7 @@ fn decorate_existing_comparison_vcf(
         .into_iter()
         .map(|record| AnnotatedRow {
             sort_key: (record.chrom.clone(), record.pos, 0, 0),
-            line: record.to_line(),
+            line: record.to_line().into(),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -1991,8 +2095,8 @@ fn decorate_existing_comparison_vcf(
     }
     let decorated = rows
         .iter()
-        .map(|row| RawVcfRecord::from_line(&row.line, output_path))
-        .collect::<Result<Vec<_>>>()?;
+        .map(|row| row.line.validated().raw().clone())
+        .collect::<Vec<_>>();
     vcf::write_raw_vcf(output_path, &headers, &decorated)
 }
 
@@ -6204,7 +6308,7 @@ fn tp_combined_row(
             truth_loc = genotype_label(truth),
             query_loc = genotype_label(query),
             qq = query.qual,
-        ),
+        ).into(),
     }
 }
 
@@ -6246,7 +6350,7 @@ fn unk_combined_row(
             truth_loc = genotype_label(truth),
             query_loc = genotype_label(query),
             qq = query.qual,
-        ),
+        ).into(),
     }
 }
 
@@ -6346,7 +6450,7 @@ fn tp_single_side_row(
                 // side sample column. Accept a shared value from the caller
                 // that holds the cluster-level pairing context.
                 qq = shared_qq.unwrap_or(variant.qual.as_str()),
-            ),
+            ).into(),
         },
         Side::Query => AnnotatedRow {
             sort_key: (
@@ -6377,7 +6481,7 @@ fn tp_single_side_row(
                 type_label = variant.primary_type(),
                 loc = genotype_label(variant),
                 qq = variant.qual,
-            ),
+            ).into(),
         },
     }
 }
@@ -6450,7 +6554,7 @@ fn fn_fp_combined_row(
             truth_bd = truth_bd,
             query_bd = query_bd,
             bk = bk,
-        ),
+        ).into(),
     }
 }
 
@@ -6485,7 +6589,7 @@ fn fn_row(
             info = info,
             type_label = truth.primary_type(),
             loc = genotype_label(truth),
-        ),
+        ).into(),
     }
 }
 
@@ -6525,7 +6629,7 @@ fn unk_truth_row(
             info = info,
             type_label = truth.primary_type(),
             loc = genotype_label(truth),
-        ),
+        ).into(),
     }
 }
 
@@ -6929,7 +7033,7 @@ fn fp_like_row(
             type_label = query.primary_type(),
             loc = genotype_label(query),
             qq = query.qual,
-        ),
+        ).into(),
     }
 }
 
@@ -7235,7 +7339,7 @@ fn build_preprocess_args(
     output: &Path,
     pass_only: bool,
     preprocess_enabled: bool,
-) -> PreprocessArgs {
+) -> Result<PreprocessArgs> {
     let truth_side = input == args.truth;
     let convert_gvcf = args.convert_gvcf_to_vcf
         || if truth_side {
@@ -7243,7 +7347,7 @@ fn build_preprocess_args(
         } else {
             args.convert_gvcf_query
         };
-    PreprocessArgs {
+    RawPreprocessArgs {
         input: input.to_string(),
         output: output.to_string_lossy().into_owned(),
         version: false,
@@ -7275,6 +7379,8 @@ fn build_preprocess_args(
         quiet: args.quiet,
         force_interactive: args.force_interactive,
     }
+    .validated()
+    .map_err(Into::into)
 }
 
 /// Legacy hap.py disables decomposition for somatic/set-gt preprocessing
@@ -7343,12 +7449,14 @@ mod scratch_tests {
     }
 
     fn args(report_prefix: PathBuf, scratch_parent: &Path, keep_scratch: bool) -> CompareArgs {
-        let mut args = CompareArgs::with_paths(
+        let mut args = RawCompareArgs::with_paths(
             fixture_path("truth.vcf").display().to_string(),
             fixture_path("query.vcf").display().to_string(),
             fixture_path("ref.fa").display().to_string(),
             report_prefix.display().to_string(),
-        );
+        )
+        .validated()
+        .unwrap();
         args.scratch_prefix = Some(scratch_parent.display().to_string());
         args.keep_scratch = keep_scratch;
         args
@@ -7365,14 +7473,16 @@ mod scratch_tests {
             &root.join("truth.vcf.gz"),
             true,
             options.preprocess_truth,
-        );
+        )
+        .unwrap();
         let query = build_preprocess_args(
             &options,
             &options.query,
             &root.join("query.vcf.gz"),
             false,
             true,
-        );
+        )
+        .unwrap();
 
         assert!(!truth.leftshift);
         assert!(!truth.decompose);
@@ -7409,7 +7519,7 @@ mod scratch_tests {
         let mut distance = args(root.join("distance"), &root, false);
         distance.engine = CompareEngine::ScmpDistance;
         normalize_engine_preprocessing(&mut distance);
-        assert_eq!(distance.set_gt, Some(crate::cli::SomaticGtMode::First));
+        assert_eq!(distance.set_gt, Some(SomaticGtMode::First));
         assert!(!effective_decomposition(&distance));
         fs::remove_dir_all(root).unwrap();
     }
@@ -7446,7 +7556,8 @@ mod scratch_tests {
             &root.join("truth-enabled.vcf.gz"),
             true,
             options.preprocess_truth,
-        );
+        )
+        .unwrap();
         assert!(truth.leftshift);
         assert!(truth.decompose);
 
@@ -7458,14 +7569,16 @@ mod scratch_tests {
             &root.join("truth-disabled.vcf.gz"),
             true,
             options.preprocess_truth,
-        );
+        )
+        .unwrap();
         let query_disabled = build_preprocess_args(
             &options,
             &options.query,
             &root.join("query-disabled.vcf.gz"),
             false,
             true,
-        );
+        )
+        .unwrap();
         assert!(!truth_disabled.leftshift);
         assert!(!truth_disabled.decompose);
         assert!(!query_disabled.leftshift);
@@ -7485,7 +7598,7 @@ mod scratch_tests {
         options.preprocess_truth = true;
         options.bcftools_norm = true;
         options.fixchr = Some(true);
-        options.gender = crate::cli::PreprocessGender::Male;
+        options.gender = PreprocessGender::Male;
         options.preprocess_window = 4096;
 
         let truth = build_preprocess_args(
@@ -7494,14 +7607,16 @@ mod scratch_tests {
             &root.join("truth.bcf"),
             !options.usefiltered_truth,
             options.preprocess_truth,
-        );
+        )
+        .unwrap();
         let query = build_preprocess_args(
             &options,
             &options.query,
             &root.join("query.bcf"),
             options.pass_only,
             true,
-        );
+        )
+        .unwrap();
         assert!(!truth.pass_only);
         assert_eq!(truth.filters_only, None);
         assert!(truth.convert_gvcf_to_vcf);
@@ -7512,7 +7627,7 @@ mod scratch_tests {
         for side in [&truth, &query] {
             assert!(side.bcftools_norm);
             assert_eq!(side.fixchr, Some(true));
-            assert_eq!(side.gender, crate::cli::PreprocessGender::Male);
+            assert_eq!(side.gender, PreprocessGender::Male);
             assert_eq!(side.window_size, 4096);
         }
         fs::remove_dir_all(root).unwrap();
@@ -7788,7 +7903,8 @@ mod scratch_tests {
                 "GT:BD:BK:BVT:BLT:BI\t",
                 "0/1:TP:gm:SNP:het:ti\t0/1:TP:gm:SNP:het:ti"
             )
-            .to_string(),
+            .to_string()
+            .into(),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -7816,7 +7932,8 @@ mod scratch_tests {
                 "BS=7;Regions=CONF,TS_boundary,EXTRA,TS_contained;RegionsExtent=7-7\t",
                 "GT:BD\t0/1:TP\t0/1:TP"
             )
-            .to_string(),
+            .to_string()
+            .into(),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -7842,12 +7959,14 @@ mod scratch_tests {
     #[test]
     fn vcfeval_ignores_deprecated_external_runtime_flags() {
         let root = test_root("vcfeval-deprecated-flags");
-        let mut options = CompareArgs::with_paths(
+        let mut options = RawCompareArgs::with_paths(
             fixture_path("truth.vcf").display().to_string(),
             fixture_path("query.vcf").display().to_string(),
             fixture_path("ref.fa").display().to_string(),
             root.join("result").display().to_string(),
-        );
+        )
+        .validated()
+        .unwrap();
         options.scratch_prefix = Some(root.join("scratch").display().to_string());
         options.engine = CompareEngine::Vcfeval;
         options.engine_vcfeval = Some("definitely-absent-rtg-for-test".to_string());
@@ -7919,12 +8038,14 @@ mod scratch_tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/synth-homopolymer-insertion");
         let engine_args = |prefix: PathBuf| {
-            let mut options = CompareArgs::with_paths(
+            let mut options = RawCompareArgs::with_paths(
                 fixture.join("truth.vcf").display().to_string(),
                 fixture.join("query.vcf").display().to_string(),
                 fixture.join("ref.fa").display().to_string(),
                 prefix.display().to_string(),
-            );
+            )
+            .validated()
+            .unwrap();
             options.scratch_prefix = Some(root.join("scratch").display().to_string());
             options
         };
@@ -7965,7 +8086,8 @@ mod scratch_tests {
                 "GT:BD:BK:BVT:BLT:QQ\t",
                 "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
             )
-            .to_string(),
+            .to_string()
+            .into(),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -8023,7 +8145,8 @@ mod scratch_tests {
                 "GT:BD:BK:BVT:BLT:QQ\t",
                 "0/1:TP:gm:SNP:het:30\t0/1:TP:gm:SNP:het:30"
             )
-            .to_string(),
+            .to_string()
+            .into(),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -8556,7 +8679,7 @@ mod memory_guards {
     fn filtered_truth_counterpart_sorts_first_at_shared_locus() {
         let row = |alt: &str, side_rank| AnnotatedRow {
             sort_key: ("chr21".to_string(), 15576177, side_rank, 0),
-            line: format!("chr21\t15576177\t.\tG\t{alt}\t0\t.\tBS=15576177\tGT\t./.\t0/1"),
+            line: format!("chr21\t15576177\t.\tG\t{alt}\t0\t.\tBS=15576177\tGT\t./.\t0/1").into(),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,

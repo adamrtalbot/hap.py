@@ -1,6 +1,6 @@
 //! Pure-Rust implementation of the legacy two-sample `scmp` comparison.
 
-use crate::vcf::{self, RawVcfRecord};
+use crate::vcf::{self, RawVcfRecord, ValidatedVcf};
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -36,8 +36,7 @@ pub fn compare_files(
     reference: &Path,
     mode: ScmpMode,
     qq_field: &str,
-    output: &Path,
-) -> Result<()> {
+) -> Result<ValidatedVcf> {
     let (truth_headers, truth_records) = vcf::load_raw_vcf(truth)?;
     let (query_headers, query_records) = vcf::load_raw_vcf(query)?;
     let mut merged = merge_two_sample_records(
@@ -54,7 +53,7 @@ pub fn compare_files(
         mode,
         qq_field,
     )?;
-    vcf::write_raw_vcf(output, &merged.headers, &merged.records)
+    ValidatedVcf::try_from_raw(merged.headers, merged.records)
 }
 
 pub fn merge_two_sample_records(

@@ -8,10 +8,12 @@
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
 mod align;
+mod application;
 mod bcf;
 mod cephes;
 mod cli;
 mod compare;
+mod domain;
 mod fasta;
 mod ftx;
 mod metrics_json;
@@ -89,19 +91,19 @@ pub fn run() -> Result<()> {
         Err(error) => error.exit(),
     };
     match cli.command {
-        Command::Germline(args) => compare::run(args),
-        Command::Somatic(args) => somatic::run(args),
+        Command::Germline(args) => compare::run(args.try_into()?),
+        Command::Somatic(args) => somatic::run(args.try_into()?),
         Command::Preprocess(args) if args.version => {
             println!("pre.py ");
             Ok(())
         }
-        Command::Preprocess(args) => preprocess::run(args),
-        Command::Ftx(args) => ftx::run(args),
+        Command::Preprocess(args) => preprocess::run(args.try_into()?),
+        Command::Ftx(args) => ftx::run(args.try_into()?),
         Command::Quantify(_) if quantify_version => {
             println!("qfy.py ");
             Ok(())
         }
-        Command::Quantify(args) => quantify::run(args),
-        Command::Validate(args) => validate::run(args),
+        Command::Quantify(args) => quantify::run(args.try_into()?),
+        Command::Validate(args) => validate::run(args.try_into()?),
     }
 }

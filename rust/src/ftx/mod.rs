@@ -6,7 +6,8 @@
 //! `preprocessVCF` helper did not run hap.py's primitive decomposition or
 //! genotype rewriting stages.
 
-use crate::cli::{FtxArgs, resolve_legacy_reference};
+use crate::application::ValidatedFtxArgs as FtxArgs;
+use crate::cli::resolve_legacy_reference;
 use crate::partial_credit::RefVar;
 use crate::{fasta, partial_credit, vcf};
 use anyhow::{Context, Result, bail};
@@ -484,7 +485,7 @@ mod tests {
     use std::thread;
 
     fn args(input: &Path, reference: &Path) -> FtxArgs {
-        FtxArgs {
+        crate::application::FtxArgs {
             input: input.display().to_string(),
             output: "unused".to_string(),
             location: None,
@@ -498,6 +499,8 @@ mod tests {
             normalize: false,
             fixchr: false,
         }
+        .validated()
+        .unwrap()
     }
 
     fn fixture(contents: &str, reference: &str) -> (ScratchRun, PathBuf, PathBuf) {

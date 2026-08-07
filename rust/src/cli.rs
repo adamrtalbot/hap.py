@@ -283,96 +283,6 @@ pub enum CompareEngine {
     ScmpDistance,
 }
 
-impl CompareEngine {
-    pub fn legacy_name(self) -> &'static str {
-        match self {
-            Self::Xcmp => "xcmp",
-            Self::Vcfeval => "vcfeval",
-            Self::ScmpSomatic => "scmp-somatic",
-            Self::ScmpDistance => "scmp-distance",
-        }
-    }
-}
-
-impl CompareArgs {
-    /// Construct the legacy-default germline option set for internal callers.
-    /// CLI parsing supplies the same defaults through clap; keeping fixture
-    /// runners on this constructor prevents newly ported switches from
-    /// silently acquiring test-only values.
-    #[cfg(test)]
-    pub fn with_paths(
-        truth: String,
-        query: String,
-        reference: String,
-        report_prefix: String,
-    ) -> Self {
-        Self {
-            truth,
-            query,
-            reference,
-            report_prefix,
-            version: false,
-            annotation_type: None,
-            pass_only: false,
-            preprocess_truth: false,
-            convert_gvcf_truth: false,
-            convert_gvcf_query: false,
-            convert_gvcf_to_vcf: false,
-            usefiltered_truth: false,
-            filters_only: None,
-            preprocess_window: 10_000,
-            adjust_conf_regions: true,
-            no_adjust_conf_regions: false,
-            leftshift: false,
-            no_leftshift: false,
-            decompose: false,
-            no_decompose: false,
-            bcftools_norm: false,
-            fixchr: None,
-            no_fixchr: false,
-            filter_nonref: false,
-            somatic: false,
-            set_gt: None,
-            gender: PreprocessGender::Auto,
-            bcf: false,
-            regions_bedfile: None,
-            targets_bedfile: None,
-            fp_bedfile: None,
-            locations: None,
-            threads: None,
-            strat_tsv: None,
-            strat_regions: Vec::new(),
-            strat_fixchr: false,
-            write_vcf: false,
-            write_counts: true,
-            no_write_counts: false,
-            output_vtc: false,
-            preserve_info: false,
-            roc: "QUAL".to_string(),
-            no_roc: false,
-            roc_regions: Vec::new(),
-            roc_filter: None,
-            roc_delta: 0.5,
-            ci_alpha: 0.0,
-            no_json: false,
-            no_hc: false,
-            window: 50,
-            max_enum: 16_768,
-            hb_expand: 30,
-            engine: CompareEngine::Xcmp,
-            engine_vcfeval: None,
-            engine_vcfeval_template: None,
-            engine_scmp_distance: 30,
-            force_interactive: false,
-            scratch_prefix: None,
-            keep_scratch: false,
-            logfile: None,
-            verbose: false,
-            quiet: false,
-        }
-    }
-}
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SomaticGtMode {
     Half,
@@ -1369,6 +1279,283 @@ fn augment_validate_args(command: ClapCommand, required: bool) -> ClapCommand {
         )
 }
 
+impl From<CompareEngine> for crate::application::CompareEngine {
+    fn from(value: CompareEngine) -> Self {
+        match value {
+            CompareEngine::Xcmp => Self::Xcmp,
+            CompareEngine::Vcfeval => Self::Vcfeval,
+            CompareEngine::ScmpSomatic => Self::ScmpSomatic,
+            CompareEngine::ScmpDistance => Self::ScmpDistance,
+        }
+    }
+}
+
+impl From<SomaticGtMode> for crate::application::SomaticGtMode {
+    fn from(value: SomaticGtMode) -> Self {
+        match value {
+            SomaticGtMode::Half => Self::Half,
+            SomaticGtMode::Hemi => Self::Hemi,
+            SomaticGtMode::Het => Self::Het,
+            SomaticGtMode::Hom => Self::Hom,
+            SomaticGtMode::First => Self::First,
+        }
+    }
+}
+
+impl From<PreprocessGender> for crate::application::PreprocessGender {
+    fn from(value: PreprocessGender) -> Self {
+        match value {
+            PreprocessGender::Male => Self::Male,
+            PreprocessGender::Female => Self::Female,
+            PreprocessGender::Auto => Self::Auto,
+            PreprocessGender::None => Self::None,
+        }
+    }
+}
+
+impl TryFrom<CompareArgs> for crate::application::ValidatedCompareArgs {
+    type Error = crate::application::RequestValidationError;
+
+    fn try_from(args: CompareArgs) -> Result<Self, Self::Error> {
+        crate::application::CompareArgs {
+            truth: args.truth,
+            query: args.query,
+            reference: args.reference,
+            report_prefix: args.report_prefix,
+            version: args.version,
+            annotation_type: args.annotation_type,
+            pass_only: args.pass_only,
+            preprocess_truth: args.preprocess_truth,
+            convert_gvcf_truth: args.convert_gvcf_truth,
+            convert_gvcf_query: args.convert_gvcf_query,
+            convert_gvcf_to_vcf: args.convert_gvcf_to_vcf,
+            usefiltered_truth: args.usefiltered_truth,
+            filters_only: args.filters_only,
+            preprocess_window: args.preprocess_window,
+            adjust_conf_regions: args.adjust_conf_regions,
+            no_adjust_conf_regions: args.no_adjust_conf_regions,
+            leftshift: args.leftshift,
+            no_leftshift: args.no_leftshift,
+            decompose: args.decompose,
+            no_decompose: args.no_decompose,
+            bcftools_norm: args.bcftools_norm,
+            fixchr: args.fixchr,
+            no_fixchr: args.no_fixchr,
+            filter_nonref: args.filter_nonref,
+            somatic: args.somatic,
+            set_gt: args.set_gt.map(Into::into),
+            gender: args.gender.into(),
+            bcf: args.bcf,
+            regions_bedfile: args.regions_bedfile,
+            targets_bedfile: args.targets_bedfile,
+            fp_bedfile: args.fp_bedfile,
+            locations: args.locations,
+            threads: args.threads,
+            strat_tsv: args.strat_tsv,
+            strat_regions: args.strat_regions,
+            strat_fixchr: args.strat_fixchr,
+            write_vcf: args.write_vcf,
+            write_counts: args.write_counts,
+            no_write_counts: args.no_write_counts,
+            output_vtc: args.output_vtc,
+            preserve_info: args.preserve_info,
+            roc: args.roc,
+            no_roc: args.no_roc,
+            roc_regions: args.roc_regions,
+            roc_filter: args.roc_filter,
+            roc_delta: args.roc_delta,
+            ci_alpha: args.ci_alpha,
+            no_json: args.no_json,
+            no_hc: args.no_hc,
+            window: args.window,
+            max_enum: args.max_enum,
+            hb_expand: args.hb_expand,
+            engine: args.engine.into(),
+            engine_vcfeval: args.engine_vcfeval,
+            engine_vcfeval_template: args.engine_vcfeval_template,
+            engine_scmp_distance: args.engine_scmp_distance,
+            force_interactive: args.force_interactive,
+            scratch_prefix: args.scratch_prefix,
+            keep_scratch: args.keep_scratch,
+            logfile: args.logfile,
+            verbose: args.verbose,
+            quiet: args.quiet,
+        }
+        .validated()
+    }
+}
+
+impl TryFrom<PreprocessArgs> for crate::application::ValidatedPreprocessArgs {
+    type Error = crate::application::RequestValidationError;
+
+    fn try_from(args: PreprocessArgs) -> Result<Self, Self::Error> {
+        crate::application::PreprocessArgs {
+            input: args.input,
+            output: args.output,
+            version: args.version,
+            reference: args.reference,
+            locations: args.locations,
+            pass_only: args.pass_only,
+            filters_only: args.filters_only,
+            regions_bedfile: args.regions_bedfile,
+            targets_bedfile: args.targets_bedfile,
+            fixchr: args.fixchr,
+            no_fixchr: args.no_fixchr,
+            somatic: args.somatic,
+            set_gt: args.set_gt.map(Into::into),
+            filter_nonref: args.filter_nonref,
+            convert_gvcf_to_vcf: args.convert_gvcf_to_vcf,
+            bcf: args.bcf,
+            bcftools_norm: args.bcftools_norm,
+            leftshift: args.leftshift,
+            no_leftshift: args.no_leftshift,
+            decompose: args.decompose,
+            no_decompose: args.no_decompose,
+            gender: args.gender.into(),
+            window_size: args.window_size,
+            threads: args.threads,
+            logfile: args.logfile,
+            verbose: args.verbose,
+            quiet: args.quiet,
+            force_interactive: args.force_interactive,
+        }
+        .validated()
+    }
+}
+
+impl TryFrom<QuantifyArgs> for crate::application::ValidatedQuantifyArgs {
+    type Error = crate::application::RequestValidationError;
+
+    fn try_from(args: QuantifyArgs) -> Result<Self, Self::Error> {
+        crate::application::QuantifyArgs {
+            input_vcf: args.input_vcf,
+            report_prefix: args.report_prefix,
+            reference: args.reference,
+            annotation_type: args.annotation_type,
+            fp_bedfile: args.fp_bedfile,
+            strat_tsv: args.strat_tsv,
+            strat_regions: args.strat_regions,
+            strat_fixchr: args.strat_fixchr,
+            write_vcf: args.write_vcf,
+            write_counts: args.write_counts,
+            output_vtc: args.output_vtc,
+            preserve_info: args.preserve_info,
+            adjust_conf_regions: args.adjust_conf_regions,
+            threads: args.threads,
+            bcf: args.bcf,
+            logfile: args.logfile,
+            verbose: args.verbose,
+            quiet: args.quiet,
+            force_interactive: args.force_interactive,
+            roc: args.roc,
+            do_roc: args.do_roc,
+            roc_regions: args.roc_regions,
+            roc_filter: args.roc_filter,
+            roc_delta: args.roc_delta,
+            ci_alpha: args.ci_alpha,
+            no_json: args.no_json,
+        }
+        .validated()
+    }
+}
+
+impl TryFrom<SomaticArgs> for crate::application::ValidatedSomaticArgs {
+    type Error = crate::application::RequestValidationError;
+
+    fn try_from(args: SomaticArgs) -> Result<Self, Self::Error> {
+        crate::application::SomaticArgs {
+            truth: args.truth,
+            query: args.query,
+            output: args.output,
+            reference: args.reference,
+            location: args.location,
+            regions_bedfile: args.regions_bedfile,
+            targets_bedfile: args.targets_bedfile,
+            fp_bedfile: args.fp_bedfile,
+            ambiguous_beds: args.ambiguous_beds,
+            ambi_fp: args.ambi_fp,
+            no_ambi_fp: args.no_ambi_fp,
+            count_unk: args.count_unk,
+            no_count_unk: args.no_count_unk,
+            explain_ambiguous: args.explain_ambiguous,
+            include_nonpass: args.include_nonpass,
+            fp_region_size: args.fp_region_size,
+            feature_table: args.feature_table,
+            happy_stats: args.happy_stats,
+            bams: args.bams,
+            normalize_truth: args.normalize_truth,
+            normalize_query: args.normalize_query,
+            normalize_all: args.normalize_all,
+            fixchr_truth: args.fixchr_truth,
+            fixchr_query: args.fixchr_query,
+            fix_chr_truth: args.fix_chr_truth,
+            fix_chr_query: args.fix_chr_query,
+            no_fixchr_truth: args.no_fixchr_truth,
+            no_fixchr_query: args.no_fixchr_query,
+            no_order_check: args.no_order_check,
+            roc: args.roc,
+            af_strat: args.af_strat,
+            af_strat_binsize: args.af_strat_binsize,
+            af_strat_truth: args.af_strat_truth,
+            af_strat_query: args.af_strat_query,
+            count_filtered_fn: args.count_filtered_fn,
+            ci_level: args.ci_level,
+            scratch_prefix: args.scratch_prefix,
+            keep_scratch: args.keep_scratch,
+            cont: args.cont,
+            logfile: args.logfile,
+            verbose: args.verbose,
+            quiet: args.quiet,
+        }
+        .validated()
+    }
+}
+
+impl TryFrom<FtxArgs> for crate::application::ValidatedFtxArgs {
+    type Error = crate::application::RequestValidationError;
+
+    fn try_from(args: FtxArgs) -> Result<Self, Self::Error> {
+        crate::application::FtxArgs {
+            input: args.input,
+            output: args.output,
+            location: args.location,
+            regions_bedfile: args.regions_bedfile,
+            targets_bedfile: args.targets_bedfile,
+            include_nonpass: args.include_nonpass,
+            features: args.features,
+            label: args.label,
+            bams: args.bams,
+            reference: args.reference,
+            normalize: args.normalize,
+            fixchr: args.fixchr,
+        }
+        .validated()
+    }
+}
+
+impl TryFrom<ValidateArgs> for crate::application::ValidatedValidateArgs {
+    type Error = crate::application::RequestValidationError;
+
+    fn try_from(args: ValidateArgs) -> Result<Self, Self::Error> {
+        crate::application::ValidateArgs {
+            input: args.input,
+            reference: args.reference,
+            output_json: args.output_json,
+            errors_bed: args.errors_bed,
+            locations: args.locations,
+            regions_bedfile: args.regions_bedfile,
+            targets_bedfile: args.targets_bedfile,
+            apply_filters: args.apply_filters,
+            limit_records: args.limit_records,
+            message_every: args.message_every,
+            strict_homref: args.strict_homref,
+            check_bcf_errors: args.check_bcf_errors,
+            all_warnings: args.all_warnings,
+        }
+        .validated()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,6 +1568,103 @@ mod tests {
         assert!(help.contains("qfy"));
         assert!(help.contains("validate"));
         assert!(help.contains("vcfcheck"));
+    }
+
+    #[test]
+    fn adapter_rejects_zero_threads() {
+        let cli = Cli::try_parse_from([
+            "hap",
+            "compare",
+            "truth.vcf.gz",
+            "query.vcf.gz",
+            "-o",
+            "report",
+            "--threads",
+            "0",
+        ])
+        .expect("clap should accept the syntactic thread value");
+        let Command::Germline(args) = cli.command else {
+            panic!("compare alias should resolve to germline");
+        };
+
+        let error = crate::application::ValidatedCompareArgs::try_from(args).unwrap_err();
+        assert_eq!(error.field(), "threads");
+    }
+
+    #[test]
+    fn adapter_rejects_invalid_quantify_ci_and_roc_values() {
+        let cli = Cli::try_parse_from([
+            "hap",
+            "qfy",
+            "annotated.vcf.gz",
+            "-o",
+            "report",
+            "-r",
+            "ref.fa",
+        ])
+        .expect("legacy qfy alias should parse");
+        let Command::Quantify(mut args) = cli.command else {
+            panic!("qfy alias should resolve to quantify");
+        };
+
+        args.ci_alpha = 1.0;
+        let error = crate::application::ValidatedQuantifyArgs::try_from(args.clone()).unwrap_err();
+        assert_eq!(error.field(), "ci_alpha");
+
+        args.ci_alpha = 0.0;
+        args.roc_delta = f64::NAN;
+        let error = crate::application::ValidatedQuantifyArgs::try_from(args).unwrap_err();
+        assert_eq!(error.field(), "roc_delta");
+    }
+
+    #[test]
+    fn adapter_preserves_negative_validate_controls() {
+        let cli = Cli::try_parse_from(["hap", "vcfcheck", "input.vcf.gz"])
+            .expect("legacy vcfcheck alias should parse");
+        let Command::Validate(mut args) = cli.command else {
+            panic!("vcfcheck alias should resolve to validate");
+        };
+
+        args.limit_records = Some(-2);
+        args.message_every = Some(-1);
+        let request = crate::application::ValidatedValidateArgs::try_from(args)
+            .expect("legacy negative controls should reach the use case");
+        assert_eq!(request.limit_records, Some(-2));
+        assert_eq!(request.message_every, Some(-1));
+    }
+
+    #[test]
+    fn legacy_alias_parses_into_validated_application_request() {
+        let cli = Cli::try_parse_from([
+            "hap",
+            "compare",
+            "truth.vcf.gz",
+            "query.vcf.gz",
+            "-o",
+            "report",
+            "--engine",
+            "scmp-distance",
+            "--set-gt",
+            "first",
+            "--gender",
+            "female",
+        ])
+        .expect("legacy compare spelling should parse");
+        let Command::Germline(args) = cli.command else {
+            panic!("compare alias should resolve to germline");
+        };
+
+        let request = crate::application::ValidatedCompareArgs::try_from(args)
+            .expect("valid CLI values should produce an application request");
+        assert_eq!(
+            request.engine,
+            crate::application::CompareEngine::ScmpDistance
+        );
+        assert_eq!(
+            request.set_gt,
+            Some(crate::application::SomaticGtMode::First)
+        );
+        assert_eq!(request.gender, crate::application::PreprocessGender::Female);
     }
 
     #[test]

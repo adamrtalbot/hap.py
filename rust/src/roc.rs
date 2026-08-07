@@ -3119,7 +3119,7 @@ mod tests {
         );
         AnnotatedRow {
             sort_key: (chrom.to_string(), pos, 1, 0),
-            line,
+            line: line.into(),
             query_pass,
             fp_class,
             xcmp_ctype: None,

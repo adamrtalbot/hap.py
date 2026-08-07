@@ -1,4 +1,6 @@
-use crate::cli::{PreprocessArgs, PreprocessGender, SomaticGtMode};
+use crate::application::{
+    PreprocessGender, SomaticGtMode, ValidatedPreprocessArgs as PreprocessArgs,
+};
 use crate::{fasta, partial_credit, variant_pipeline, vcf};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeSet, HashSet};
@@ -3131,7 +3133,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_vcf_output_failure_leaves_unindexed_output() -> Result<()> {
+    fn plain_vcf_output_is_rejected_before_output_creation() -> Result<()> {
         let directory = tempdir()?;
         let input = directory.path().join("input.vcf");
         let output = directory.path().join("output.vcf");
@@ -3149,17 +3151,13 @@ mod tests {
             ),
         )?;
 
-        let mut args = interval_args(&input, &output, &reference, None, None);
-        args.leftshift = false;
-        args.no_leftshift = true;
-        args.decompose = false;
-        args.no_decompose = true;
-        args.gender = PreprocessGender::None;
-        args.threads = Some(1);
-        let error = run(args).unwrap_err();
+        let compressed_output = directory.path().join("output.vcf.gz");
+        let args = interval_args(&input, &compressed_output, &reference, None, None);
+        let mut raw = (*args).clone();
+        raw.output = output.display().to_string();
+        let error = raw.validated().unwrap_err();
         assert!(error.to_string().contains("plain VCF output"));
-        assert!(output.is_file());
-        assert_eq!(vcf::load_raw_vcf(&output)?.1.len(), 1);
+        assert!(!output.exists());
         assert!(!PathBuf::from(format!("{}.tbi", output.display())).exists());
         assert!(!PathBuf::from(format!("{}.csi", output.display())).exists());
         Ok(())
@@ -3331,7 +3329,7 @@ mod tests {
         if !Path::new(&index).is_file() {
             write_test_fai(reference).expect("test reference index should be writable");
         }
-        PreprocessArgs {
+        crate::application::PreprocessArgs {
             input: input.display().to_string(),
             output: output.display().to_string(),
             version: false,
@@ -3361,6 +3359,8 @@ mod tests {
             quiet: false,
             force_interactive: false,
         }
+        .validated()
+        .unwrap()
     }
 
     fn write_test_fai(reference: &Path) -> Result<()> {

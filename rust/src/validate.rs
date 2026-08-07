@@ -1,4 +1,4 @@
-use crate::cli::ValidateArgs;
+use crate::application::ValidatedValidateArgs as ValidateArgs;
 use crate::{fasta, vcf};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
@@ -859,7 +859,7 @@ mod tests {
     }
 
     fn args(input: &Path, output: &Path) -> ValidateArgs {
-        ValidateArgs {
+        crate::application::ValidateArgs {
             input: input.display().to_string(),
             reference: None,
             output_json: Some(output.display().to_string()),
@@ -874,6 +874,8 @@ mod tests {
             check_bcf_errors: false,
             all_warnings: false,
         }
+        .validated()
+        .unwrap()
     }
 
     #[test]

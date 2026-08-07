@@ -1,9 +1,10 @@
-use crate::cli::QuantifyArgs;
+use crate::application::ValidatedQuantifyArgs as QuantifyArgs;
 use crate::compare::{AnnotatedRow, TypeCounts, suffixed_report_path};
+use crate::domain::SampleDecision;
 use crate::metrics_json;
 use crate::report::{self, CountsBucket};
 use crate::roc;
-use crate::vcf::{self, RawVcfRecord};
+use crate::vcf::{self, RawVcfRecord, ValidatedVcf, ValidatedVcfRecord};
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -48,7 +49,7 @@ struct ClassifiedVariant {
     tv: usize,
     het: bool,
     homalt: bool,
-    status: String,
+    status: SampleDecision,
     passes_filter: bool,
     subsets: Vec<String>,
     fp_class: Option<&'static str>,
@@ -117,14 +118,37 @@ pub(crate) struct CompareQuantifyMode {
 
 pub(crate) fn run_from_compare(
     args: QuantifyArgs,
+    headers: Vec<String>,
+    records: Vec<ValidatedVcfRecord>,
     mode: CompareQuantifyMode,
 ) -> Result<roc::MetricIndices> {
-    run_with_metric_indices_mode(args, mode)
+    run_with_metric_indices_source(
+        args,
+        mode,
+        QuantifySource::Records(ValidatedVcf::from_parts(headers, records)),
+    )
 }
 
 fn run_with_metric_indices_mode(
     args: QuantifyArgs,
     mode: CompareQuantifyMode,
+) -> Result<roc::MetricIndices> {
+    let path = args
+        .input_path()
+        .expect("CLI quantification requests always carry a file source")
+        .to_path_buf();
+    run_with_metric_indices_source(args, mode, QuantifySource::File(path))
+}
+
+enum QuantifySource {
+    File(PathBuf),
+    Records(ValidatedVcf),
+}
+
+fn run_with_metric_indices_source(
+    args: QuantifyArgs,
+    mode: CompareQuantifyMode,
+    source: QuantifySource,
 ) -> Result<roc::MetricIndices> {
     validate_options(&args)?;
     if let Some(logfile) = args.logfile.as_deref() {
@@ -135,71 +159,121 @@ fn run_with_metric_indices_mode(
             .with_context(|| format!("failed to open qfy logfile {logfile}"))?;
     }
     let annotation_type = args.annotation_type.as_deref().unwrap_or("xcmp");
-    let prefix = Path::new(&args.report_prefix);
-    let output_vcf = suffixed_report_path(prefix, if args.bcf { "bcf" } else { "vcf.gz" });
-    if args.write_vcf && paths_refer_to_same_file(Path::new(&args.input_vcf), &output_vcf) {
-        bail!(
-            "cannot overwrite input VCF: {} would be overwritten by output {}",
-            args.input_vcf,
-            output_vcf.display()
-        );
-    }
-    require_quantifier_index(Path::new(&args.input_vcf))?;
-    let (mut headers, mut records) = vcf::load_raw_vcf(Path::new(&args.input_vcf))?;
+    let output_plan = args.output_plan();
+    let prefix = output_plan.report_prefix();
+    let output_vcf = suffixed_report_path(
+        prefix,
+        output_plan
+            .variant_output()
+            .map_or("vcf.gz", crate::domain::VariantOutputFormat::suffix),
+    );
+    let mut input = match source {
+        QuantifySource::File(path) => {
+            if args.write_vcf && paths_refer_to_same_file(&path, &output_vcf) {
+                bail!(
+                    "cannot overwrite input VCF: {} would be overwritten by output {}",
+                    path.display(),
+                    output_vcf.display()
+                );
+            }
+            require_quantifier_index(&path)?;
+            vcf::load_validated_vcf(&path)?
+        }
+        QuantifySource::Records(records) => records,
+    };
     if annotation_type == "ga4gh" {
-        validate_ga4gh_qq_fields(&headers, &records)?;
+        validate_ga4gh_qq_fields(input.headers(), input.records())?;
     }
-    let benchmark_samples = benchmark_sample_indices(&headers);
+    let benchmark_samples = benchmark_sample_indices(input.headers());
     let do_roc = args.do_roc && benchmark_samples.has_both();
     let reference = crate::fasta::read_sequences(Path::new(&args.reference))?;
     let reference_contigs = reference.keys().cloned().collect::<BTreeSet<_>>();
     let (confidence, stratifications, stratification_levels) =
         load_regions(&args, &reference_contigs)?;
-    for record in &mut records {
-        if args.preserve_info {
-            let extent = legacy_regions_extent(record);
-            set_info_value(&mut record.info, "RegionsExtent", &extent);
-        }
-        annotate_regions_for_samples(
-            record,
-            confidence.as_deref(),
-            &stratifications,
-            annotation_type == "ga4gh",
-            benchmark_samples,
-            mode.preserve_missing_nocall_bd,
-        );
-        if annotation_type == "xcmp" {
-            reannotate_xcmp_record_for_samples(
+    input.try_edit_records(|_, records| {
+        for record in records.iter_mut() {
+            if args.preserve_info {
+                let extent = legacy_regions_extent(record);
+                set_info_value(&mut record.info, "RegionsExtent", &extent);
+            }
+            annotate_regions_for_samples(
                 record,
+                confidence.as_deref(),
+                &stratifications,
+                annotation_type == "ga4gh",
+                benchmark_samples,
+                mode.preserve_missing_nocall_bd,
+            );
+            if annotation_type == "xcmp" {
+                reannotate_xcmp_record_for_samples(
+                    record,
+                    confidence.is_some(),
+                    &args.roc,
+                    benchmark_samples,
+                );
+            } else {
+                reannotate_ga4gh_record(record);
+            }
+        }
+        propagate_superlocus_annotations_for_samples(
+            records,
+            annotation_type,
+            benchmark_samples,
+            mode.preserve_missing_query_qq,
+            mode.inherit_same_position_tp_qq,
+        );
+        for record in records.iter_mut() {
+            decorate_quantified_record_for_samples(
+                record,
+                annotation_type,
+                args.preserve_info,
+                args.output_vtc,
                 confidence.is_some(),
-                &args.roc,
                 benchmark_samples,
             );
-        } else {
-            reannotate_ga4gh_record(record);
+            if annotation_type == "ga4gh" {
+                normalize_integer_like_format_values(record, "QQ");
+            }
         }
-    }
-    propagate_superlocus_annotations_for_samples(
-        &mut records,
-        annotation_type,
-        benchmark_samples,
-        mode.preserve_missing_query_qq,
-        mode.inherit_same_position_tp_qq,
-    );
-    for record in &mut records {
-        decorate_quantified_record_for_samples(
-            record,
-            annotation_type,
-            args.preserve_info,
-            args.output_vtc,
-            confidence.is_some(),
-            benchmark_samples,
-        );
-        if annotation_type == "ga4gh" {
-            normalize_integer_like_format_values(record, "QQ");
+        Ok(())
+    })?;
+    input.try_edit_records(|headers, _| {
+        if args.write_vcf {
+            ensure_info_header(
+                headers,
+                "Regions",
+                "##INFO=<ID=Regions,Number=.,Type=String,Description=\"Tags for regions.\">",
+            );
+            if args.preserve_info {
+                ensure_info_header(
+                    headers,
+                    "RegionsExtent",
+                    "##INFO=<ID=RegionsExtent,Number=.,Type=String,Description=\"Trimmed reference coordinates matched to regions for this record.\">",
+                );
+            }
+            if annotation_type == "ga4gh" {
+                ensure_ga4gh_headers(headers);
+                canonicalize_ga4gh_header_order(headers);
+            }
+            if args.output_vtc {
+                ensure_info_header(
+                    headers,
+                    "VTC",
+                    "##INFO=<ID=VTC,Number=.,Type=String,Description=\"Variant types used for counting.\">",
+                );
+                if annotation_type == "xcmp" {
+                    ensure_info_header(
+                        headers,
+                        "XCMP",
+                        "##INFO=<ID=XCMP,Number=.,Type=String,Description=\"XCMP extra information.\">",
+                    );
+                }
+            }
         }
-    }
-    let subset_size = contigs_in_input(&records)
+        Ok(())
+    })?;
+    let records = input.records();
+    let subset_size = contigs_in_input(records)
         .into_iter()
         .filter_map(|contig| {
             reference
@@ -235,7 +309,7 @@ fn run_with_metric_indices_mode(
         })
         .unwrap_or_default();
 
-    for record in &records {
+    for record in records {
         let truth = benchmark_samples
             .truth
             .and_then(|sample_index| classify_side(record, sample_index));
@@ -292,7 +366,7 @@ fn run_with_metric_indices_mode(
         &all_counts.by_type,
         &pass_counts.by_type,
     )?;
-    if args.write_counts {
+    if output_plan.writes_counts() {
         write_quantify_extended(
             &suffixed_report_path(prefix, "extended.csv"),
             &all_counts,
@@ -311,37 +385,7 @@ fn run_with_metric_indices_mode(
         )?;
     }
     if args.write_vcf {
-        ensure_info_header(
-            &mut headers,
-            "Regions",
-            "##INFO=<ID=Regions,Number=.,Type=String,Description=\"Tags for regions.\">",
-        );
-        if args.preserve_info {
-            ensure_info_header(
-                &mut headers,
-                "RegionsExtent",
-                "##INFO=<ID=RegionsExtent,Number=.,Type=String,Description=\"Trimmed reference coordinates matched to regions for this record.\">",
-            );
-        }
-        if annotation_type == "ga4gh" {
-            ensure_ga4gh_headers(&mut headers);
-            canonicalize_ga4gh_header_order(&mut headers);
-        }
-        if args.output_vtc {
-            ensure_info_header(
-                &mut headers,
-                "VTC",
-                "##INFO=<ID=VTC,Number=.,Type=String,Description=\"Variant types used for counting.\">",
-            );
-            if annotation_type == "xcmp" {
-                ensure_info_header(
-                    &mut headers,
-                    "XCMP",
-                    "##INFO=<ID=XCMP,Number=.,Type=String,Description=\"XCMP extra information.\">",
-                );
-            }
-        }
-        vcf::write_raw_vcf(&output_vcf, &headers, &records)?;
+        vcf::write_validated_vcf(&output_vcf, &input)?;
     }
     let mut rows = records
         .iter()
@@ -349,7 +393,7 @@ fn run_with_metric_indices_mode(
         .filter_map(|(index, record)| {
             Some(AnnotatedRow {
                 sort_key: (record.chrom.clone(), record.pos, index, 0),
-                line: roc_record_line(record, benchmark_samples)?,
+                line: roc_record_line(record, benchmark_samples)?.into(),
                 query_pass: record.is_pass(),
                 fp_class: benchmark_samples
                     .query
@@ -391,8 +435,8 @@ fn run_with_metric_indices_mode(
     if !do_roc {
         compact_no_roc_outputs(prefix)?;
     }
-    if !args.no_json {
-        write_metrics_json(prefix, args.write_counts, &roc_indices)?;
+    if output_plan.writes_metrics() {
+        write_metrics_json(prefix, output_plan.writes_counts(), &roc_indices)?;
     }
     Ok(roc_indices)
 }
@@ -2139,8 +2183,8 @@ fn contigs_in_input(records: &[RawVcfRecord]) -> BTreeSet<String> {
 
 fn classify_side(record: &RawVcfRecord, sample_index: usize) -> Option<ClassifiedVariant> {
     let fields = record.sample_map(sample_index);
-    let bd = fields.get("BD")?.to_string();
-    if bd == "." || bd == "N" {
+    let bd = fields.get("BD")?.parse::<SampleDecision>().ok()?;
+    if matches!(bd, SampleDecision::Missing | SampleDecision::NoCall) {
         return None;
     }
     // XCMP/GA4GH quantification classifies the active genotype alleles, not
@@ -2173,7 +2217,7 @@ fn classify_side(record: &RawVcfRecord, sample_index: usize) -> Option<Classifie
     };
     let location_type = fields.get("BLT").map(String::as_str).unwrap_or(".");
     let subsets = parse_subsets(&record.info);
-    let fp_class = fp_class(&bd, fields.get("BK").map(String::as_str));
+    let fp_class = fp_class(bd, fields.get("BK").map(String::as_str));
     Some(ClassifiedVariant {
         variant_type,
         subtypes,
@@ -2188,8 +2232,8 @@ fn classify_side(record: &RawVcfRecord, sample_index: usize) -> Option<Classifie
     })
 }
 
-fn fp_class(decision: &str, match_kind: Option<&str>) -> Option<&'static str> {
-    if decision != "FP" {
+fn fp_class(decision: SampleDecision, match_kind: Option<&str>) -> Option<&'static str> {
+    if decision != SampleDecision::FalsePositive {
         return None;
     }
     match match_kind {
@@ -2206,10 +2250,8 @@ fn query_fp_class(record: &RawVcfRecord) -> Option<&'static str> {
 
 fn query_fp_class_for_sample(record: &RawVcfRecord, sample_index: usize) -> Option<&'static str> {
     let fields = record.sample_map(sample_index);
-    fp_class(
-        fields.get("BD").map(String::as_str).unwrap_or("."),
-        fields.get("BK").map(String::as_str),
-    )
+    let decision = fields.get("BD")?.parse().ok()?;
+    fp_class(decision, fields.get("BK").map(String::as_str))
 }
 
 fn parse_subsets(info: &str) -> Vec<String> {
@@ -2238,7 +2280,10 @@ fn register_subsets(
 }
 
 fn record_truth(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) {
-    if !matches!(classified.status.as_str(), "TP" | "FN") {
+    if !matches!(
+        classified.status,
+        SampleDecision::TruePositive | SampleDecision::FalseNegative
+    ) {
         return;
     }
     add_variant_stats(
@@ -2294,7 +2339,7 @@ fn record_truth(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) 
                 .by_type
                 .entry(classified.variant_type.clone())
                 .or_default(),
-            &classified.status,
+            classified.status,
         ),
         classified,
     );
@@ -2307,7 +2352,7 @@ fn record_truth(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) 
                     .or_default()
                     .entry(subtype.clone())
                     .or_default(),
-                &classified.status,
+                classified.status,
             ),
             classified,
         );
@@ -2321,7 +2366,7 @@ fn record_truth(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) 
                     .or_default()
                     .entry(classified.variant_type.clone())
                     .or_default(),
-                &classified.status,
+                classified.status,
             ),
             classified,
         );
@@ -2336,7 +2381,7 @@ fn record_truth(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) 
                         .or_default()
                         .entry(subtype.clone())
                         .or_default(),
-                    &classified.status,
+                    classified.status,
                 ),
                 classified,
             );
@@ -2345,7 +2390,10 @@ fn record_truth(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) 
 }
 
 fn record_truth_total_only(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) {
-    if !matches!(classified.status.as_str(), "TP" | "FN") {
+    if !matches!(
+        classified.status,
+        SampleDecision::TruePositive | SampleDecision::FalseNegative
+    ) {
         return;
     }
     add_variant_stats(
@@ -2398,7 +2446,10 @@ fn record_truth_total_only(counts: &mut QuantifyCountMaps, classified: &Classifi
 
 fn record_truth_filtered(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) {
     record_truth_total_only(counts, classified);
-    if !matches!(classified.status.as_str(), "TP" | "FN") {
+    if !matches!(
+        classified.status,
+        SampleDecision::TruePositive | SampleDecision::FalseNegative
+    ) {
         return;
     }
     add_variant_stats(
@@ -2407,7 +2458,7 @@ fn record_truth_filtered(counts: &mut QuantifyCountMaps, classified: &Classified
                 .by_type
                 .entry(classified.variant_type.clone())
                 .or_default(),
-            &classified.status,
+            classified.status,
         ),
         classified,
     );
@@ -2420,7 +2471,7 @@ fn record_truth_filtered(counts: &mut QuantifyCountMaps, classified: &Classified
                     .or_default()
                     .entry(subtype.clone())
                     .or_default(),
-                &classified.status,
+                classified.status,
             ),
             classified,
         );
@@ -2434,7 +2485,7 @@ fn record_truth_filtered(counts: &mut QuantifyCountMaps, classified: &Classified
                     .or_default()
                     .entry(classified.variant_type.clone())
                     .or_default(),
-                &classified.status,
+                classified.status,
             ),
             classified,
         );
@@ -2449,7 +2500,7 @@ fn record_truth_filtered(counts: &mut QuantifyCountMaps, classified: &Classified
                         .or_default()
                         .entry(subtype.clone())
                         .or_default(),
-                    &classified.status,
+                    classified.status,
                 ),
                 classified,
             );
@@ -2458,7 +2509,13 @@ fn record_truth_filtered(counts: &mut QuantifyCountMaps, classified: &Classified
 }
 
 fn record_query(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) {
-    if !matches!(classified.status.as_str(), "TP" | "FP" | "UNK" | "AMBI") {
+    if !matches!(
+        classified.status,
+        SampleDecision::TruePositive
+            | SampleDecision::FalsePositive
+            | SampleDecision::Unknown
+            | SampleDecision::Ambiguous
+    ) {
         return;
     }
     record_query_stats(
@@ -2507,7 +2564,7 @@ fn record_query(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) 
 
 fn record_query_stats(stats: &mut QuantifyTypeCounts, classified: &ClassifiedVariant) {
     add_variant_stats(&mut stats.query_total, classified);
-    add_variant_stats(query_bucket(stats, &classified.status), classified);
+    add_variant_stats(query_bucket(stats, classified.status), classified);
     match classified.fp_class {
         Some("gt") => stats.fp_gt += 1,
         Some("al") => stats.fp_al += 1,
@@ -2515,19 +2572,19 @@ fn record_query_stats(stats: &mut QuantifyTypeCounts, classified: &ClassifiedVar
     }
 }
 
-fn truth_bucket<'a>(stats: &'a mut TypeCounts, status: &str) -> &'a mut CountsBucket {
+fn truth_bucket(stats: &mut TypeCounts, status: SampleDecision) -> &mut CountsBucket {
     match status {
-        "TP" => &mut stats.truth_tp,
-        "FN" => &mut stats.truth_fn,
+        SampleDecision::TruePositive => &mut stats.truth_tp,
+        SampleDecision::FalseNegative => &mut stats.truth_fn,
         _ => &mut stats.truth_total,
     }
 }
 
-fn query_bucket<'a>(stats: &'a mut TypeCounts, status: &str) -> &'a mut CountsBucket {
+fn query_bucket(stats: &mut TypeCounts, status: SampleDecision) -> &mut CountsBucket {
     match status {
-        "TP" => &mut stats.query_tp,
-        "FP" => &mut stats.query_fp,
-        "UNK" | "AMBI" => &mut stats.query_unk,
+        SampleDecision::TruePositive => &mut stats.query_tp,
+        SampleDecision::FalsePositive => &mut stats.query_fp,
+        SampleDecision::Unknown | SampleDecision::Ambiguous => &mut stats.query_unk,
         _ => &mut stats.query_total,
     }
 }
@@ -3166,7 +3223,7 @@ mod tests {
     }
 
     fn args(root: &Path) -> QuantifyArgs {
-        QuantifyArgs {
+        crate::application::QuantifyArgs {
             input_vcf: indexed_fixture(root).display().to_string(),
             report_prefix: root.join("result").display().to_string(),
             reference: fixture("ref.fa").display().to_string(),
@@ -3194,6 +3251,26 @@ mod tests {
             ci_alpha: 0.0,
             no_json: true,
         }
+        .validated()
+        .unwrap()
+    }
+
+    #[test]
+    fn compare_handoff_quantifies_typed_records_without_reloading_an_input_file() -> Result<()> {
+        let root = test_root("typed-handoff");
+        let mut request = args(&root);
+        let input = PathBuf::from(&request.input_vcf);
+        let (headers, records) = vcf::load_validated_vcf(&input)?.into_parts();
+        fs::remove_file(&input)?;
+        let _ = fs::remove_file(format!("{}.tbi", input.display()));
+        request.input_vcf = root.join("missing-comparison.vcf.gz").display().to_string();
+
+        run_from_compare(request, headers, records, CompareQuantifyMode::default())?;
+
+        assert!(root.join("result.summary.csv").is_file());
+        assert!(!root.join("missing-comparison.vcf.gz").exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     fn raw_record(pos: usize, bs: usize, regions: &str, query: &str) -> RawVcfRecord {
