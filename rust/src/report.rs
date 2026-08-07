@@ -440,7 +440,11 @@ pub(crate) fn empty_comparison_extended_lines(subset_size: usize) -> Vec<String>
 }
 
 pub fn write_vcf(path: &Path, headers: &[String], rows: &[AnnotatedRow]) -> Result<()> {
-    vcf::write_indexed_vcf(path, headers, rows.iter().map(|row| row.line.as_str()))
+    let lines = rows
+        .iter()
+        .map(|row| row.line.raw().to_line())
+        .collect::<Vec<_>>();
+    vcf::write_indexed_vcf(path, headers, lines.iter().map(String::as_str))
 }
 
 fn append_extended_stats(
