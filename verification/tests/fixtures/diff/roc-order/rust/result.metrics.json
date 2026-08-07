@@ -1,0 +1,16 @@
+{
+  "metrics": [
+    {
+      "id": "roc.all",
+      "label": "roc.all",
+      "type": "Table",
+      "properties": [],
+      "data": [
+        {"id": "types", "label": "types", "type": "string", "values": [8, 9, 10]},
+        {"id": "Type", "label": "Type", "type": "string", "values": ["SNP", "SNP", "INDEL"]},
+        {"id": "QQ", "label": "QQ", "type": "string", "values": ["10.000000", "10.000000", "20.000000"]},
+        {"id": "QUERY.TP", "label": "QUERY.TP", "type": "int64", "values": [2, 2, 1]}
+      ]
+    }
+  ]
+}

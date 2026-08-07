@@ -80,7 +80,10 @@ workflow {
     if (cases.contains('happy')) {
         happy_rows = samples(params.happy_samplesheet) { row ->
             def meta = [id: row.sample_id, case_name: 'happy']
-            def stratificationFiles = [row.stratification_tsv, row.stratification_bed]
+            def additionalStratificationBeds = (row.stratification_beds ?: '')
+                .toString()
+                .tokenize(';')
+            def stratificationFiles = ([row.stratification_tsv, row.stratification_bed] + additionalStratificationBeds)
                 .findAll { path -> path }
                 .collect { path -> fixture(path) }
             tuple(

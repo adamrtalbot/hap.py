@@ -14,10 +14,12 @@ process DIFF_OUTPUTS {
     """
     python3 - '${case_name}' '${meta.id}' '${prefix}' <<'PY'
     import csv
+    from collections import Counter
     import gzip
     import hashlib
     import io
     import json
+    import math
     import pathlib
     import re
     import subprocess
@@ -58,6 +60,27 @@ process DIFF_OUTPUTS {
     volatile_vcf_header = re.compile(
         r'^(?:##bcftools_[^=]*(?:Command|Version)=|##fileDate=|##source=)'
     )
+    roc_key_columns = ('Type', 'Subtype', 'Subset', 'Filter', 'Genotype', 'QQ.Field', 'QQ')
+    roc_series_columns = roc_key_columns[:-1]
+    roc_count_column = re.compile(
+        r'(?:FP[.](?:gt|al)|(?:TRUTH|QUERY)[.](?:TOTAL|TP|FN|FP|UNK)(?:[.](?:ti|tv|het|homalt))?)'
+    )
+
+    def normalize_metrics_table(value):
+        if value.get('type') != 'Table' or not isinstance(value.get('data'), list):
+            return value
+        columns = [column for column in value['data'] if isinstance(column, dict) and isinstance(column.get('values'), list)]
+        if not columns:
+            return value
+        if str(value.get('id', '')).startswith('roc.'):
+            for column in columns:
+                column['values'] = []
+            return value
+        row_count = len(columns[0]['values'])
+        synthetic_index = next((column for column in columns if column.get('id') == 'types'), None)
+        if synthetic_index is not None and all(len(column['values']) == row_count for column in columns):
+            synthetic_index['values'] = list(range(row_count))
+        return value
 
     def normalize_json(value, pointer=''):
         if isinstance(value, dict):
@@ -66,7 +89,7 @@ process DIFF_OUTPUTS {
                 child_pointer = pointer + '/' + key.replace('~', '~0').replace('/', '~1')
                 if child_pointer not in volatile_json_pointers:
                     normalized[key] = normalize_json(child, child_pointer)
-            return normalized
+            return normalize_metrics_table(normalized)
         if isinstance(value, list):
             return [normalize_json(child, pointer + '/' + str(index)) for index, child in enumerate(value)]
         return value
@@ -103,20 +126,131 @@ process DIFF_OUTPUTS {
             return '/line/%s' % index, legacy_lines[index - 1] if index <= len(legacy_lines) else None, rust_lines[index - 1] if index <= len(rust_lines) else None
         return None
 
-    def normalize_csv(value):
+    def normalized_csv_table(value):
         rows = list(csv.reader(value.decode('utf-8').splitlines()))
         if not rows:
-            return value
+            return (), []
         indexes = [index for index, header in enumerate(rows[0]) if header not in volatile_csv_columns]
-        normalized = []
-        for row in rows:
-            normalized.append([row[index] if index < len(row) else '' for index in indexes])
-        output = []
-        for row in normalized:
-            stream = io.StringIO()
-            csv.writer(stream, lineterminator='').writerow(row)
-            output.append(stream.getvalue())
-        return ('\\n'.join(output) + '\\n').encode('utf-8')
+        normalized = [
+            tuple(row[index] if index < len(row) else '' for index in indexes)
+            for row in rows
+        ]
+        return normalized[0], normalized[1:]
+
+    def normalize_csv(value):
+        header, rows = normalized_csv_table(value)
+        stream = io.StringIO()
+        csv.writer(stream, lineterminator='\\n').writerows([header] + rows if header else [])
+        return stream.getvalue().encode('utf-8')
+
+    def count_record(row, counts):
+        return {
+            'row': list(row) if row is not None else None,
+            'count': counts[row] if row is not None else 0,
+        }
+
+    def multiplicity_difference(expected_row, actual_row, expected_counts, actual_counts):
+        return '/rows', count_record(expected_row, expected_counts), count_record(actual_row, actual_counts), 'CSV row multiplicities differ'
+
+    def row_multiplicity_difference(expected_rows, actual_rows):
+        expected_counts = Counter(expected_rows)
+        actual_counts = Counter(actual_rows)
+        row = next((
+            row for row in sorted(set(expected_counts).union(actual_counts))
+            if expected_counts[row] != actual_counts[row]
+        ), None)
+        return multiplicity_difference(row, row, expected_counts, actual_counts) if row is not None else None
+
+    def finite_number(value):
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    def nearest_thresholds(extra, legacy_rows, indexes):
+        qq_index = indexes['QQ']
+        series_indexes = [indexes[name] for name in roc_series_columns]
+        series = tuple(extra[index] for index in series_indexes)
+        candidates = [
+            row for row in legacy_rows
+            if tuple(row[index] for index in series_indexes) == series
+        ]
+        threshold = float(extra[qq_index])
+        lower = max(
+            (row for row in candidates if float(row[qq_index]) < threshold),
+            key=lambda row: float(row[qq_index]),
+            default=None,
+        )
+        upper = min(
+            (row for row in candidates if float(row[qq_index]) > threshold),
+            key=lambda row: float(row[qq_index]),
+            default=None,
+        )
+        return lower, upper
+
+    def additional_threshold_difference(extra, rust_counts, legacy_rows, indexes):
+        actual = count_record(extra, rust_counts)
+        type_index = indexes['Type']
+        qq_index = indexes['QQ']
+        if extra[type_index] not in {'SNP', 'INDEL'} or not finite_number(extra[qq_index]):
+            return '/rows', None, actual, 'unexpected non-threshold CSV row'
+        lower_row, upper_row = nearest_thresholds(extra, legacy_rows, indexes)
+        if lower_row is None or upper_row is None:
+            return '/rows', None, actual, 'additional threshold is not bounded by legacy ROC points'
+        count_indexes = [index for name, index in indexes.items() if roc_count_column.fullmatch(name)]
+        for index in count_indexes:
+            neighbours = (lower_row[index], extra[index], upper_row[index])
+            if not all(finite_number(value) for value in neighbours):
+                continue
+            lower_value, value, upper_value = map(float, neighbours)
+            if not min(lower_value, upper_value) <= value <= max(lower_value, upper_value):
+                return '/rows', {
+                    'lower': list(lower_row),
+                    'upper': list(upper_row),
+                }, actual, 'additional threshold breaks ROC count monotonicity'
+        return None
+
+    def csv_multiset_difference(legacy, rust):
+        legacy_header, legacy_rows = normalized_csv_table(legacy)
+        rust_header, rust_rows = normalized_csv_table(rust)
+        if legacy_header != rust_header:
+            return '/header', list(legacy_header), list(rust_header), 'CSV headers differ'
+        indexes = {name: index for index, name in enumerate(legacy_header)}
+        if not set(roc_key_columns).issubset(indexes):
+            return row_multiplicity_difference(legacy_rows, rust_rows)
+
+        type_index = indexes['Type']
+        qq_index = indexes['QQ']
+        comparable_legacy = [row for row in legacy_rows if row[type_index]]
+        legacy_counts = Counter(comparable_legacy)
+        rust_counts = Counter(rust_rows)
+        differing_row = next((
+            row for row in sorted(legacy_counts)
+            if legacy_counts[row] != rust_counts[row]
+        ), None)
+        if differing_row is not None:
+            semantic_indexes = [indexes[name] for name in roc_key_columns]
+            replacement = next((
+                row for row in rust_rows
+                if all(row[index] == differing_row[index] for index in semantic_indexes)
+            ), None)
+            return multiplicity_difference(differing_row, replacement, legacy_counts, rust_counts)
+
+        additional_rows = sorted(set(rust_counts) - set(legacy_counts))
+        legacy_thresholds = [
+            row for row in comparable_legacy
+            if row[type_index] in {'SNP', 'INDEL'} and finite_number(row[qq_index])
+        ]
+        for extra in additional_rows:
+            if rust_counts[extra] != 1:
+                return multiplicity_difference(extra, extra, legacy_counts, rust_counts)
+            difference = additional_threshold_difference(extra, rust_counts, legacy_thresholds, indexes)
+            if difference:
+                return difference
+        return None
+
+    def is_roc_csv(artifact):
+        return artifact.startswith(prefix + '.roc.') and artifact.endswith(('.csv', '.csv.gz'))
 
     def normalize_vcf(value):
         lines = value.decode('utf-8').splitlines()
@@ -216,6 +350,12 @@ process DIFF_OUTPUTS {
                     continue
                 location, expected_value, actual_value = text_diff
                 difference.update(kind='bcf', location=location, expected=expected_value, actual=actual_value, reason='ordered BCF content differs')
+            elif is_roc_csv(artifact):
+                csv_diff = csv_multiset_difference(legacy_content, rust_content)
+                if csv_diff is None:
+                    continue
+                location, expected_value, actual_value, reason = csv_diff
+                difference.update(kind='csv', location=location, expected=expected_value, actual=actual_value, reason=reason)
             elif artifact.endswith(('.csv', '.csv.gz', '.txt', '.vcf', '.vcf.gz', '.bed', '.bed.gz', '.fai')):
                 if artifact.endswith(('.csv', '.csv.gz')):
                     legacy_content = normalize_csv(legacy_content)

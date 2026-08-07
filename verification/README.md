@@ -52,13 +52,17 @@ records the bundle checksum and provenance.
 ## Comparison rules
 
 `modules/diff.nf` contains the comparator. It requires equal artifact sets,
-compares ordered text and CSV content, compares typed JSON trees, and records
-the lane, case, artifact, and location for each difference. It ignores these
-runtime and provenance fields:
+compares ordered text and non-ROC CSV content, compares ROC CSV rows as
+multisets with duplicate counts, and compares typed JSON trees while validating
+duplicated ROC table values through their CSV artifacts. Additional Rust ROC
+thresholds are accepted only when bounded by matching legacy points with
+monotonic raw counts. The comparator records the lane, case, artifact, and
+location for each difference. It ignores these runtime and provenance fields:
 
 - JSON version, timestamp, command-line, generated description fields, and the
   deprecated vcfeval template argument that the Rust engine ignores.
 - CSV columns named `sompyversion` and `sompycmd`.
+- Invalid legacy ROC rows with no variant type.
 - VCF runtime headers such as source, date, and bcftools command/version.
 
 Each exclusion applies to all cases. All remaining content must match.

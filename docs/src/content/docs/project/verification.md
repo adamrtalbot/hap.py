@@ -52,8 +52,12 @@ Valid values are `happy`, `sompy`, `prepy`, `ftxpy`, `qfy`, and `vcfcheck`.
 The comparator requires:
 
 - identical artifact sets;
-- exact ordered text and CSV content after global exclusions;
-- equal typed JSON trees;
+- exact ordered text and non-ROC CSV content after global exclusions;
+- equal ROC CSV headers and row multisets, including duplicate counts;
+- additional Rust ROC thresholds only when bounded by matching legacy points
+  with monotonic raw counts;
+- equal typed JSON trees while validating duplicated ROC values through their
+  CSV artifacts;
 - equal VCF records after the comparator removes runtime headers.
 
 A missing or extra file fails the case. `comparison.json` records the lane,
