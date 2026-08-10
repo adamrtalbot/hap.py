@@ -7,6 +7,7 @@ use super::alleles::{
 use super::canonical::validate_record_reference;
 use super::normalization::{normalize_bcftools_record, record_reference_matches};
 use super::options::{add_legacy_chr_prefix, has_non_reference_genotype, passes_filters_only};
+use super::streaming::{PreparedRecordSpool, PreparedRecordSpoolWriter};
 use super::{
     BlocksplitContigState, BlocksplitJob, BlocksplitObservation, BlocksplitSelection,
     LEGACY_MIN_BLOCK_VARIANTS,
@@ -33,7 +34,7 @@ pub(super) struct BlocksplitObservationParams<'a> {
 pub(super) fn collect_blocksplit_observations<I>(
     records: I,
     params: BlocksplitObservationParams<'_>,
-) -> Result<Vec<BlocksplitObservation>>
+) -> Result<(Vec<BlocksplitObservation>, PreparedRecordSpool)>
 where
     I: IntoIterator<Item = Result<ValidatedVcfRecord>>,
 {
@@ -51,6 +52,7 @@ where
     let input_path = Path::new(&args.input);
     let mut observations = Vec::new();
     let mut normalized_seen = HashSet::new();
+    let mut prepared_records = PreparedRecordSpoolWriter::new()?;
 
     for record in records {
         let mut record = record?.into_raw();
@@ -92,13 +94,18 @@ where
         let blocksplit_pos = record.pos;
         let blocksplit_end = effective_end;
         let symbolic_deletion =
-            normalization_enabled && record.alt_allele.split(',').any(|alt| alt == "<DEL>");
-        if symbolic_deletion {
-            let reference = reference_sequences
-                .get(&record.chrom)
-                .ok_or_else(|| anyhow::anyhow!("reference contig {} not found", record.chrom))?;
-            materialize_symbolic_deletion(&mut record, effective_end, reference.as_bytes())?;
-        }
+            if normalization_enabled && record.alt_allele.split(',').any(|alt| alt == "<DEL>") {
+                let reference = reference_sequences.get(&record.chrom).ok_or_else(|| {
+                    anyhow::anyhow!("reference contig {} not found", record.chrom)
+                })?;
+                Some(materialize_symbolic_deletion(
+                    &mut record,
+                    effective_end,
+                    reference.as_bytes(),
+                )?)
+            } else {
+                None
+            };
 
         if args.bcftools_norm {
             let Some(reference) = reference_sequences.get(&record.chrom) else {
@@ -138,7 +145,7 @@ where
                     continue;
                 }
             }
-            let (pos, end) = if args.bcftools_norm && !symbolic_deletion {
+            let (pos, end) = if args.bcftools_norm && symbolic_deletion.is_none() {
                 (record.pos, record.end_pos())
             } else {
                 (blocksplit_pos, blocksplit_end)
@@ -156,15 +163,16 @@ where
                 },
             );
             observations.push(BlocksplitObservation {
-                chrom: record.chrom,
+                chrom: record.chrom.clone(),
                 pos,
                 end,
                 called,
                 location_groups,
             });
+            prepared_records.push(&record, symbolic_deletion)?;
         }
     }
-    Ok(observations)
+    Ok((observations, prepared_records.finish()?))
 }
 
 pub(super) fn select_blocksplit_resets(

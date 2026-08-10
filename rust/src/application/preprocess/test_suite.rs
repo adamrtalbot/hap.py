@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn preprocess_stream_tie_break_state_respects_left_shift_window() -> Result<()> {
-        let mut spool = PreprocessSpool::new(true, 1)?;
+        let mut spool = PreprocessSpool::new(true, 1, &[])?;
         for pos in 1..=4_096 {
             let mut record = make_record(".");
             record.pos = pos;
@@ -1374,6 +1374,27 @@ mod tests {
         }
 
         assert!(spool.retained_position_count() <= LEFT_SHIFT_WINDOW + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn preprocess_spool_sorts_numeric_contigs_by_declared_header_order() -> Result<()> {
+        let declared = ["1".to_string(), "2".to_string(), "10".to_string()];
+        let mut spool = PreprocessSpool::new(true, 1, &declared)?;
+        for chrom in ["10", "2", "1"] {
+            let mut record = make_record(".");
+            record.chrom = chrom.to_string();
+            spool.push(
+                vcf::ValidatedVcfRecord::try_from_raw(record, QueryProvenance::Unavailable)?,
+                0,
+            )?;
+        }
+
+        let observed = spool
+            .finish()?
+            .map(|record| record.map(|record| record.raw().chrom.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(observed, ["1", "2", "10"]);
         Ok(())
     }
 

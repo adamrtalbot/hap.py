@@ -24,7 +24,9 @@ use blocksplit::*;
 use canonical::*;
 use normalization::*;
 use options::*;
-use streaming::PreprocessSpool;
+use streaming::{
+    LocationAggregatedRecords, PreparedRecordSpool, PreparedRecordSpoolWriter, PreprocessSpool,
+};
 
 pub(crate) use canonical::{canonicalize_legacy_headers, structured_header_identity};
 pub(crate) use options::infer_gender;
@@ -178,6 +180,7 @@ fn preprocess_inputs(args: &PreprocessArgs) -> Vec<PathBuf> {
 }
 
 fn run_inner(args: PreprocessArgs) -> Result<()> {
+    let phase_started = std::time::Instant::now();
     let mut logger = PreprocessLogger::new(&args)?;
     logger.info(&format!("Preprocessing {}", args.input))?;
     let output_path = preprocess_output_path(&args);
@@ -228,6 +231,7 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
             observe_gender(&record, &mut haploid_x, &mut diploid_x);
         }
     }
+    report_phase("input_header_inspection", phase_started);
     let requested_fixchr = if args.no_fixchr {
         Some(false)
     } else {
@@ -247,8 +251,10 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
     let decompose = args.decompose && !args.no_decompose;
     let normalization_enabled = leftshift || decompose || gender == PreprocessGender::Male;
     let effective_threads = effective_thread_count(args.threads);
-    let blocksplit_selection = if normalization_enabled && effective_threads > 1 {
-        let observations = collect_blocksplit_observations(
+    let phase_started = std::time::Instant::now();
+    let (blocksplit_selection, prepared_records) = if normalization_enabled && effective_threads > 1
+    {
+        let (observations, prepared_records) = collect_blocksplit_observations(
             vcf::open_validated_vcf(input_path)?,
             BlocksplitObservationParams {
                 args: &args,
@@ -262,341 +268,365 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
                 locations: locations.as_deref(),
             },
         )?;
-        select_blocksplit_resets(
-            &observations,
-            args.window_size,
-            LEGACY_MAX_BLOCKS.min(effective_threads.saturating_mul(4)),
-            locations.as_deref(),
+        (
+            select_blocksplit_resets(
+                &observations,
+                args.window_size,
+                LEGACY_MAX_BLOCKS.min(effective_threads.saturating_mul(4)),
+                locations.as_deref(),
+            ),
+            Some(prepared_records),
         )
     } else {
-        BlocksplitSelection::default()
+        (BlocksplitSelection::default(), None)
     };
+    report_phase("block_selection", phase_started);
 
     let job_count = blocksplit_selection.jobs.as_ref().map_or(1, Vec::len);
-    let mut output = PreprocessSpool::new(normalization_enabled, job_count)?;
-    for job_index in 0..job_count {
-        let job = blocksplit_selection
-            .jobs
-            .as_ref()
-            .map(|jobs| &jobs[job_index]);
-        let mut normalized_seen = HashSet::new();
-        // Each legacy partial-credit job owns an independent left-shift
-        // boundary, so overlapping jobs must process their copies separately.
-        let mut prev_end_by_chrom: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut prepared_record_index = 0usize;
-        for record in vcf::open_validated_vcf(input_path)? {
-            let mut record = record?.into_raw();
-            if fixchr {
-                record.chrom = add_legacy_chr_prefix(&record.chrom);
-            }
-            if (args.pass_only && !record.is_pass())
-                || (!args.pass_only
-                    && !passes_filters_only(&record.filter, args.filters_only.as_deref()))
-            {
-                continue;
-            }
-            let effective_end = record.effective_end_pos(Path::new(&args.input))?;
-            if !vcf::matches_interval_filters(
-                &record.chrom,
-                record.pos,
-                effective_end,
-                regions.as_deref(),
-                targets.as_deref(),
-                locations.as_deref(),
-            ) {
-                continue;
-            }
-
-            // Standalone pre defaults this field to true because legacy pre.py
-            // accidentally leaves preprocess()'s default in force. hap.py,
-            // however, explicitly forwards its own default=false. Honor the
-            // resolved value here so germline keeps called <NON_REF> alleles unless
-            // the user requests filtering, without changing standalone pre parity.
-            if args.convert_gvcf_to_vcf {
-                if !convert_gvcf_record(&mut record) {
+    let phase_started = std::time::Instant::now();
+    let declared_contigs = declared_contig_order(&headers, fixchr);
+    let mut output = PreprocessSpool::new(normalization_enabled, job_count, &declared_contigs)?;
+    if let Some(prepared_records) = prepared_records {
+        process_blocksplit_jobs(
+            prepared_records,
+            &blocksplit_selection,
+            effective_threads,
+            &args,
+            gender,
+            leftshift,
+            decompose,
+            somatic_mode,
+            &string_format_fields,
+            &reference_sequences,
+            &mut output,
+        )?;
+    } else {
+        for job_index in 0..job_count {
+            let job = blocksplit_selection
+                .jobs
+                .as_ref()
+                .map(|jobs| &jobs[job_index]);
+            let mut normalized_seen = HashSet::new();
+            // Each legacy partial-credit job owns an independent left-shift
+            // boundary, so overlapping jobs must process their copies separately.
+            let mut prev_end_by_chrom: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let mut prepared_record_index = 0usize;
+            for record in vcf::open_validated_vcf(input_path)? {
+                let mut record = record?.into_raw();
+                if fixchr {
+                    record.chrom = add_legacy_chr_prefix(&record.chrom);
+                }
+                if (args.pass_only && !record.is_pass())
+                    || (!args.pass_only
+                        && !passes_filters_only(&record.filter, args.filters_only.as_deref()))
+                {
                     continue;
                 }
-            } else {
-                let drop_record = args.filter_nonref
-                    && (calls_non_ref_allele(&record)
-                        || (normalization_enabled
-                            && somatic_mode.is_none()
-                            && !trim_uncalled_non_ref(&mut record)));
-                if drop_record {
-                    continue;
-                }
-            }
-
-            // VariantReader.cpp treats a symbolic deletion as an empty ALT over
-            // the complete INFO/END span. VariantWriter then adds the preceding
-            // reference base so the emitted VCF contains an ordinary, anchored
-            // deletion. Do this before REF validation: when END is present the
-            // legacy reader intentionally ignores the input REF and rebuilds it
-            // from the reference sequence.
-            let symbolic_deletion = if normalization_enabled
-                && record.alt_allele.split(',').any(|alt| alt == "<DEL>")
-            {
-                let reference = reference_sequences.get(&record.chrom).ok_or_else(|| {
-                    anyhow::anyhow!("reference contig {} not found", record.chrom)
-                })?;
-                Some(materialize_symbolic_deletion(
-                    &mut record,
+                let effective_end = record.effective_end_pos(Path::new(&args.input))?;
+                if !vcf::matches_interval_filters(
+                    &record.chrom,
+                    record.pos,
                     effective_end,
-                    reference.as_bytes(),
-                )?)
-            } else {
-                None
-            };
-
-            if args.bcftools_norm {
-                let Some(reference) = reference_sequences.get(&record.chrom) else {
-                    continue;
-                };
-                if !record_reference_matches(&record, reference.as_bytes()) {
+                    regions.as_deref(),
+                    targets.as_deref(),
+                    locations.as_deref(),
+                ) {
                     continue;
                 }
-            } else if normalization_enabled {
-                validate_record_reference(&record, &reference_sequences)?;
-            }
 
-            let converted = if let (Some(mode), Some(sample_names)) =
-                (somatic_mode, somatic_sample_names.as_deref())
-            {
-                finalize_somatic_for_pipeline(
-                    convert_somatic_record(&record, mode, sample_names),
-                    mode,
-                    normalization_enabled,
-                )
-            } else {
-                vec![record]
-            };
+                // Standalone pre defaults this field to true because legacy pre.py
+                // accidentally leaves preprocess()'s default in force. hap.py,
+                // however, explicitly forwards its own default=false. Honor the
+                // resolved value here so germline keeps called <NON_REF> alleles unless
+                // the user requests filtering, without changing standalone pre parity.
+                if args.convert_gvcf_to_vcf {
+                    if !convert_gvcf_record(&mut record) {
+                        continue;
+                    }
+                } else {
+                    let drop_record = args.filter_nonref
+                        && (calls_non_ref_allele(&record)
+                            || (normalization_enabled
+                                && somatic_mode.is_none()
+                                && !trim_uncalled_non_ref(&mut record)));
+                    if drop_record {
+                        continue;
+                    }
+                }
 
-            for mut record in converted {
+                // VariantReader.cpp treats a symbolic deletion as an empty ALT over
+                // the complete INFO/END span. VariantWriter then adds the preceding
+                // reference base so the emitted VCF contains an ordinary, anchored
+                // deletion. Do this before REF validation: when END is present the
+                // legacy reader intentionally ignores the input REF and rebuilds it
+                // from the reference sequence.
+                let symbolic_deletion = if normalization_enabled
+                    && record.alt_allele.split(',').any(|alt| alt == "<DEL>")
+                {
+                    let reference = reference_sequences.get(&record.chrom).ok_or_else(|| {
+                        anyhow::anyhow!("reference contig {} not found", record.chrom)
+                    })?;
+                    Some(materialize_symbolic_deletion(
+                        &mut record,
+                        effective_end,
+                        reference.as_bytes(),
+                    )?)
+                } else {
+                    None
+                };
+
                 if args.bcftools_norm {
                     let Some(reference) = reference_sequences.get(&record.chrom) else {
                         continue;
                     };
-                    normalize_bcftools_record(&mut record, reference.as_bytes());
-                    let key = (
-                        record.chrom.clone(),
-                        record.pos,
-                        record.ref_allele.clone(),
-                        record.alt_allele.clone(),
-                    );
-                    if !normalized_seen.insert(key) {
+                    if !record_reference_matches(&record, reference.as_bytes()) {
                         continue;
                     }
-                }
-                let record_index = prepared_record_index;
-                prepared_record_index += 1;
-                if job.is_some_and(|job| !job.included_indices.contains(&record_index)) {
-                    continue;
-                }
-                if job.is_some_and(|job| job.reset_before_indices.contains(&record_index)) {
-                    prev_end_by_chrom.remove(&record.chrom);
-                }
-                if !normalization_enabled {
-                    output.push(
-                        vcf::ValidatedVcfRecord::try_from_raw(
-                            record,
-                            QueryProvenance::Unavailable,
-                        )?,
-                        job_index,
-                    )?;
-                    continue;
-                }
-                if args.convert_gvcf_to_vcf {
-                    ensure_missing_ad(&mut record);
-                }
-                // Allele-count INFO fields become stale after preprocessing splits
-                // multi-allelics or decomposes complex variants. Legacy hap.py's C++
-                // preprocess binary (via `VariantAlleleRemover` → `VariantCallsOnly`)
-                // drops them so downstream tools recompute. We mirror that here on the
-                // main code path so output stays deterministic for every caller, not
-                // just the parity reference.
-                strip_stale_info_keys(&mut record);
-
-                // Legacy `VariantReader`/`VariantWriter` drops variant IDs (rsIDs) on
-                // output — `preprocess` rebuilds records from CHROM/POS/REF/ALT only,
-                // so the ID column always becomes `.`.
-                record.id = ".".to_string();
-
-                // Upper-case REF/ALT so soft-masked lowercase bases from the reference
-                // come out as the canonical uppercase form legacy emits. We already
-                // tolerate case when validating; now we normalise on output.
-                record.ref_allele = record.ref_allele.to_ascii_uppercase();
-                record.alt_allele = uppercase_alleles_preserving_breakends(&record.alt_allele);
-                let import_failed = materialize_unsupported_import_failure(&mut record);
-
-                // Legacy `VariantWriter` emits FILTER=`.` for PASS records (htslib's
-                // `bcf_update_filter` treats an empty filter vector as `.`). Normalise
-                // PASS to `.` so downstream byte-diff matches.
-                if record.filter == "PASS" {
-                    record.filter = ".".to_string();
+                } else if normalization_enabled {
+                    validate_record_reference(&record, &reference_sequences)?;
                 }
 
-                // Legacy stores INFO as an ordered map keyed alphabetically by tag
-                // (std::map<std::string,...>) before serialising — htslib then writes
-                // entries in that order. Sort our INFO tags the same way so output
-                // byte-matches.
-                sort_info_keys(&mut record);
-
-                // Legacy represents PL internally as a single integer per sample (the
-                // `v.asInt()` path in `VariantWriter.cpp` line 563). When bcftools
-                // emits the record the array is truncated to the last stored value,
-                // which for biallelic diploid sites is the HOM_ALT likelihood. We
-                // reproduce that truncation here so SAMPLE cells byte-match.
-                collapse_pl_to_last_value(&mut record);
-
-                // Multi-allelic indel decomposition + primitive splitting.
-                //
-                // Replaces the previous `should_split_multi_allelic_indel +
-                // split_multi_allelic` branch: `variant_pipeline::primitive_split`
-                // implements the legacy `VariantPrimitiveSplitter` (stage 5 of
-                // `VariantInput.cpp`) plus the `aggregate_hetalt` re-merge that
-                // brings same-position primitives back to a multi-allelic shape.
-                // Same-direction insertions (`T → TG,TTG`) re-merge into a single
-                // record; mixed-direction or different-length deletions fan out
-                // into per-primitive records anchored at their canonical position.
-                // Insert the ADO field BEFORE primitive_split *and* before any GT
-                // normalisation. Legacy computes `ad_other` (= ADO) from the
-                // *original* GT+AD inside VariantReader, then preserves that value
-                // across both the half-call AlleleSplitter and the per-allele
-                // PrimitiveSplitter. Computing ADO after splitting OR after the
-                // haploid → homalt expansion below would widen the "called" set
-                // if computed after expansion (input `GT=1` ad=[1,23] becomes
-                // `1/1` ad=[1,23] → ADO=AD[0]=1, the unused ref depth, which
-                // matches legacy). Computing ADO from the original GT=1 first
-                // preserves that ref-depth signal correctly.
-                ensure_missing_ad(&mut record);
-                insert_ado_format(&mut record);
-                ensure_missing_dp(&mut record);
-
-                // The legacy C++ Variant representation has MAX_GT=2. During
-                // active preprocessing, wider calls are converted to no-calls
-                // before VariantCallsOnly removes their now-uncalled record.
-                // This is observable in hap.py's vcfeval handoff for triploid
-                // and tetraploid query records.
-                if somatic_mode.is_none() {
-                    mask_genotypes_wider_than_diploid(&mut record);
-                }
-
-                // VariantCallsOnly removes ALT alleles that no sample calls before
-                // primitive decomposition. Besides reducing ordinary multi-allelic
-                // records, this prevents the primitive splitter from emitting a
-                // hom-ref sibling for every uncalled component of a complex allele.
-                // Capture ADO first: legacy derives it from the original GT/AD and
-                // then projects GT and AD onto the retained alleles.
-                if somatic_mode.is_none()
-                    && !args.convert_gvcf_to_vcf
-                    && !import_failed
-                    && !retain_called_alternates(&mut record)
+                let converted = if let (Some(mode), Some(sample_names)) =
+                    (somatic_mode, somatic_sample_names.as_deref())
                 {
-                    continue;
-                }
-
-                // Normalise haploid GTs to the legacy het / hom shape. The C++
-                // VariantAlleleSplitter treats a single haploid alt call (ngt == 1
-                // with gt[0] > 0) as a het half-call and emits `0/1` after the
-                // half-call merge — see `VariantAlleleSplitter.cpp:180-227`. Mirror
-                // that here so that haploid input lines (`GT=1` on autosomes) come
-                // out byte-identical to legacy without a chrX/Y-specific shim.
-                if somatic_mode.is_none() {
-                    normalise_haploid_genotypes(&mut record, gender == PreprocessGender::Male);
-                }
-
-                // Capture before record is potentially consumed by vec![record].
-                let record_chrom = record.chrom.clone();
-                let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
-                let previous_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
-                let prev_end = previous_end;
-
-                let source_records = if matches!(
-                    symbolic_deletion,
-                    Some(SymbolicDeletionMaterialization::LeadingAnchor)
-                ) {
-                    split_called_alleles(&record)
+                    finalize_somatic_for_pipeline(
+                        convert_somatic_record(&record, mode, sample_names),
+                        mode,
+                        normalization_enabled,
+                    )
                 } else {
-                    vec![MaterializedAlleleRecord {
-                        record,
-                        reverse_hetalt_samples: Vec::new(),
-                    }]
+                    vec![record]
                 };
-                let mut emitted_groups = Vec::with_capacity(source_records.len());
-                for source in source_records {
-                    let reverse_hetalt_samples = source.reverse_hetalt_samples;
-                    let source = source.record;
-                    let mut emitted =
-                        if decompose && !source.alt_allele.split(',').any(is_symbolic_allele) {
-                            if let Some(reference) = reference_sequences.get(&source.chrom) {
-                                variant_pipeline::primitive_split_with_floor(
-                                    &source,
-                                    reference.as_bytes(),
-                                    prev_end,
-                                )
-                            } else {
-                                vec![source]
-                            }
-                        } else {
-                            vec![source]
+
+                for mut record in converted {
+                    if args.bcftools_norm {
+                        let Some(reference) = reference_sequences.get(&record.chrom) else {
+                            continue;
                         };
-                    if decompose {
-                        for record in &mut emitted {
-                            restore_legacy_hetalt_orientation(record, &reverse_hetalt_samples);
+                        normalize_bcftools_record(&mut record, reference.as_bytes());
+                        let key = (
+                            record.chrom.clone(),
+                            record.pos,
+                            record.ref_allele.clone(),
+                            record.alt_allele.clone(),
+                        );
+                        if !normalized_seen.insert(key) {
+                            continue;
                         }
                     }
-                    emitted_groups.push(emitted);
-                }
-                for emitted in emitted_groups {
-                    // Only leftshift records that came through primitive_split
-                    // unchanged. Fanned-out primitives are already canonical.
-                    let leftshift_eligible = emitted.len() == 1;
-                    for mut split in emitted {
-                        if leftshift
-                            && leftshift_eligible
-                            && !split.alt_allele.contains(',')
-                            && split.alt_allele != "."
-                            && !split.alt_allele.is_empty()
-                            && !is_symbolic_allele(&split.alt_allele)
-                            && let Some(reference) = reference_sequences.get(&split.chrom)
-                        {
-                            apply_left_shift(&mut split, reference.as_bytes(), prev_end);
-                        }
-                        canonicalize_multi_allelic_order(&mut split);
-                        canonicalize_legacy_genotypes(&mut split);
-                        if split.qual.is_empty() || split.qual == "." {
-                            split.qual = "0".to_string();
-                        }
-                        blank_secondary_sample_annotations(
-                            &mut split,
-                            args.bcf,
-                            &string_format_fields,
-                        );
-                        // Canonical FORMAT ordering: GT → AD/ADO/DP (fixed) → other
-                        // integer-typed fields alphabetical → float-typed alphabetical →
-                        // string-typed alphabetical. Mirrors the `int_fmts/float_fmts/
-                        // string_fmts` loop order in `VariantWriter.cpp` combined with
-                        // dynamic per-value type detection.
-                        reorder_format_fields(&mut split);
+                    let record_index = prepared_record_index;
+                    prepared_record_index += 1;
+                    if job.is_some_and(|job| !job.included_indices.contains(&record_index)) {
+                        continue;
+                    }
+                    if job.is_some_and(|job| job.reset_before_indices.contains(&record_index)) {
+                        prev_end_by_chrom.remove(&record.chrom);
+                    }
+                    if !normalization_enabled {
                         output.push(
                             vcf::ValidatedVcfRecord::try_from_raw(
-                                split,
+                                record,
                                 QueryProvenance::Unavailable,
                             )?,
                             job_index,
                         )?;
+                        continue;
                     }
+                    if args.convert_gvcf_to_vcf {
+                        ensure_missing_ad(&mut record);
+                    }
+                    // Allele-count INFO fields become stale after preprocessing splits
+                    // multi-allelics or decomposes complex variants. Legacy hap.py's C++
+                    // preprocess binary (via `VariantAlleleRemover` → `VariantCallsOnly`)
+                    // drops them so downstream tools recompute. We mirror that here on the
+                    // main code path so output stays deterministic for every caller, not
+                    // just the parity reference.
+                    strip_stale_info_keys(&mut record);
+
+                    // Legacy `VariantReader`/`VariantWriter` drops variant IDs (rsIDs) on
+                    // output — `preprocess` rebuilds records from CHROM/POS/REF/ALT only,
+                    // so the ID column always becomes `.`.
+                    record.id = ".".to_string();
+
+                    // Upper-case REF/ALT so soft-masked lowercase bases from the reference
+                    // come out as the canonical uppercase form legacy emits. We already
+                    // tolerate case when validating; now we normalise on output.
+                    record.ref_allele = record.ref_allele.to_ascii_uppercase();
+                    record.alt_allele = uppercase_alleles_preserving_breakends(&record.alt_allele);
+                    let import_failed = materialize_unsupported_import_failure(&mut record);
+
+                    // Legacy `VariantWriter` emits FILTER=`.` for PASS records (htslib's
+                    // `bcf_update_filter` treats an empty filter vector as `.`). Normalise
+                    // PASS to `.` so downstream byte-diff matches.
+                    if record.filter == "PASS" {
+                        record.filter = ".".to_string();
+                    }
+
+                    // Legacy stores INFO as an ordered map keyed alphabetically by tag
+                    // (std::map<std::string,...>) before serialising — htslib then writes
+                    // entries in that order. Sort our INFO tags the same way so output
+                    // byte-matches.
+                    sort_info_keys(&mut record);
+
+                    // Legacy represents PL internally as a single integer per sample (the
+                    // `v.asInt()` path in `VariantWriter.cpp` line 563). When bcftools
+                    // emits the record the array is truncated to the last stored value,
+                    // which for biallelic diploid sites is the HOM_ALT likelihood. We
+                    // reproduce that truncation here so SAMPLE cells byte-match.
+                    collapse_pl_to_last_value(&mut record);
+
+                    // Multi-allelic indel decomposition + primitive splitting.
+                    //
+                    // Replaces the previous `should_split_multi_allelic_indel +
+                    // split_multi_allelic` branch: `variant_pipeline::primitive_split`
+                    // implements the legacy `VariantPrimitiveSplitter` (stage 5 of
+                    // `VariantInput.cpp`) plus the `aggregate_hetalt` re-merge that
+                    // brings same-position primitives back to a multi-allelic shape.
+                    // Same-direction insertions (`T → TG,TTG`) re-merge into a single
+                    // record; mixed-direction or different-length deletions fan out
+                    // into per-primitive records anchored at their canonical position.
+                    // Insert the ADO field BEFORE primitive_split *and* before any GT
+                    // normalisation. Legacy computes `ad_other` (= ADO) from the
+                    // *original* GT+AD inside VariantReader, then preserves that value
+                    // across both the half-call AlleleSplitter and the per-allele
+                    // PrimitiveSplitter. Computing ADO after splitting OR after the
+                    // haploid → homalt expansion below would widen the "called" set
+                    // if computed after expansion (input `GT=1` ad=[1,23] becomes
+                    // `1/1` ad=[1,23] → ADO=AD[0]=1, the unused ref depth, which
+                    // matches legacy). Computing ADO from the original GT=1 first
+                    // preserves that ref-depth signal correctly.
+                    ensure_missing_ad(&mut record);
+                    insert_ado_format(&mut record);
+                    ensure_missing_dp(&mut record);
+
+                    // The legacy C++ Variant representation has MAX_GT=2. During
+                    // active preprocessing, wider calls are converted to no-calls
+                    // before VariantCallsOnly removes their now-uncalled record.
+                    // This is observable in hap.py's vcfeval handoff for triploid
+                    // and tetraploid query records.
+                    if somatic_mode.is_none() {
+                        mask_genotypes_wider_than_diploid(&mut record);
+                    }
+
+                    // VariantCallsOnly removes ALT alleles that no sample calls before
+                    // primitive decomposition. Besides reducing ordinary multi-allelic
+                    // records, this prevents the primitive splitter from emitting a
+                    // hom-ref sibling for every uncalled component of a complex allele.
+                    // Capture ADO first: legacy derives it from the original GT/AD and
+                    // then projects GT and AD onto the retained alleles.
+                    if somatic_mode.is_none()
+                        && !args.convert_gvcf_to_vcf
+                        && !import_failed
+                        && !retain_called_alternates(&mut record)
+                    {
+                        continue;
+                    }
+
+                    // Normalise haploid GTs to the legacy het / hom shape. The C++
+                    // VariantAlleleSplitter treats a single haploid alt call (ngt == 1
+                    // with gt[0] > 0) as a het half-call and emits `0/1` after the
+                    // half-call merge — see `VariantAlleleSplitter.cpp:180-227`. Mirror
+                    // that here so that haploid input lines (`GT=1` on autosomes) come
+                    // out byte-identical to legacy without a chrX/Y-specific shim.
+                    if somatic_mode.is_none() {
+                        normalise_haploid_genotypes(&mut record, gender == PreprocessGender::Male);
+                    }
+
+                    // Capture before record is potentially consumed by vec![record].
+                    let record_chrom = record.chrom.clone();
+                    let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
+                    let previous_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
+                    let prev_end = previous_end;
+
+                    let source_records = if matches!(
+                        symbolic_deletion,
+                        Some(SymbolicDeletionMaterialization::LeadingAnchor)
+                    ) {
+                        split_called_alleles(&record)
+                    } else {
+                        vec![MaterializedAlleleRecord {
+                            record,
+                            reverse_hetalt_samples: Vec::new(),
+                        }]
+                    };
+                    let mut emitted_groups = Vec::with_capacity(source_records.len());
+                    for source in source_records {
+                        let reverse_hetalt_samples = source.reverse_hetalt_samples;
+                        let source = source.record;
+                        let mut emitted =
+                            if decompose && !source.alt_allele.split(',').any(is_symbolic_allele) {
+                                if let Some(reference) = reference_sequences.get(&source.chrom) {
+                                    variant_pipeline::primitive_split_with_floor(
+                                        &source,
+                                        reference.as_bytes(),
+                                        prev_end,
+                                    )
+                                } else {
+                                    vec![source]
+                                }
+                            } else {
+                                vec![source]
+                            };
+                        if decompose {
+                            for record in &mut emitted {
+                                restore_legacy_hetalt_orientation(record, &reverse_hetalt_samples);
+                            }
+                        }
+                        emitted_groups.push(emitted);
+                    }
+                    for emitted in emitted_groups {
+                        // Only leftshift records that came through primitive_split
+                        // unchanged. Fanned-out primitives are already canonical.
+                        let leftshift_eligible = emitted.len() == 1;
+                        for mut split in emitted {
+                            if leftshift
+                                && leftshift_eligible
+                                && !split.alt_allele.contains(',')
+                                && split.alt_allele != "."
+                                && !split.alt_allele.is_empty()
+                                && !is_symbolic_allele(&split.alt_allele)
+                                && let Some(reference) = reference_sequences.get(&split.chrom)
+                            {
+                                apply_left_shift(&mut split, reference.as_bytes(), prev_end);
+                            }
+                            canonicalize_multi_allelic_order(&mut split);
+                            canonicalize_legacy_genotypes(&mut split);
+                            if split.qual.is_empty() || split.qual == "." {
+                                split.qual = "0".to_string();
+                            }
+                            blank_secondary_sample_annotations(
+                                &mut split,
+                                args.bcf,
+                                &string_format_fields,
+                            );
+                            // Canonical FORMAT ordering: GT → AD/ADO/DP (fixed) → other
+                            // integer-typed fields alphabetical → float-typed alphabetical →
+                            // string-typed alphabetical. Mirrors the `int_fmts/float_fmts/
+                            // string_fmts` loop order in `VariantWriter.cpp` combined with
+                            // dynamic per-value type detection.
+                            reorder_format_fields(&mut split);
+                            output.push(
+                                vcf::ValidatedVcfRecord::try_from_raw(
+                                    split,
+                                    QueryProvenance::Unavailable,
+                                )?,
+                                job_index,
+                            )?;
+                        }
+                    }
+                    // Advance the per-chromosome boundary so the next variant cannot
+                    // left-shift into this record's reference span.
+                    prev_end_by_chrom
+                        .entry(record_chrom)
+                        .and_modify(|e| *e = (*e).max(orig_end))
+                        .or_insert(orig_end);
                 }
-                // Advance the per-chromosome boundary so the next variant cannot
-                // left-shift into this record's reference span.
-                prev_end_by_chrom
-                    .entry(record_chrom)
-                    .and_modify(|e| *e = (*e).max(orig_end))
-                    .or_insert(orig_end);
             }
         }
     }
+    report_phase("normalization", phase_started);
+    output.sort_emitted_contigs();
 
     if somatic_mode.is_some() {
         rewrite_header_for_single_sample(&mut headers);
@@ -613,7 +643,10 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
     }
 
     let output_count = output.serial;
-    vcf::write_validated_vcf_iter(&output_path, &headers, output.finish()?)?;
+    let phase_started = std::time::Instant::now();
+    let records = LocationAggregatedRecords::new(output.finish()?, normalization_enabled);
+    vcf::write_validated_vcf_iter(&output_path, &headers, records)?;
+    report_phase("external_sort_and_output_publication", phase_started);
     if output_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -629,6 +662,267 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
         output_count,
         output_path.display()
     ))?;
+    Ok(())
+}
+
+fn report_phase(name: &str, started: std::time::Instant) {
+    if std::env::var_os("HAP_RS_PROFILE").is_some() {
+        eprintln!(
+            "HAP_RS_PHASE name={name} elapsed_seconds={:.3}",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_blocksplit_jobs(
+    prepared_records: PreparedRecordSpool,
+    selection: &BlocksplitSelection,
+    threads: usize,
+    args: &PreprocessArgs,
+    gender: PreprocessGender,
+    leftshift: bool,
+    decompose: bool,
+    somatic_mode: Option<crate::application::SomaticGtMode>,
+    string_format_fields: &BTreeSet<String>,
+    reference_sequences: &std::collections::BTreeMap<String, String>,
+    output: &mut PreprocessSpool,
+) -> Result<()> {
+    let job_count = selection.jobs.as_ref().map_or(1, Vec::len);
+    let prepared_spool_bytes = prepared_records.len()?;
+    let mut writers = (0..job_count)
+        .map(|_| PreparedRecordSpoolWriter::new())
+        .collect::<Result<Vec<_>>>()?;
+    for (record_index, prepared) in prepared_records.reader()?.enumerate() {
+        let (record, symbolic_deletion, _) = prepared?;
+        let mut included = false;
+        if let Some(jobs) = selection.jobs.as_ref() {
+            for (job_index, job) in jobs.iter().enumerate() {
+                if job.included_indices.contains(&record_index) {
+                    included = true;
+                    writers[job_index].push_with_reset(
+                        &record,
+                        symbolic_deletion,
+                        job.reset_before_indices.contains(&record_index),
+                    )?;
+                }
+            }
+        } else {
+            included = true;
+            writers[0].push(&record, symbolic_deletion)?;
+        }
+        if included {
+            output.seed_contig_rank(&record.chrom);
+        }
+    }
+    let job_spools = writers
+        .into_iter()
+        .map(PreparedRecordSpoolWriter::finish)
+        .collect::<Result<Vec<_>>>()?;
+
+    let worker_count = threads.max(1).min(job_count);
+    if std::env::var_os("HAP_RS_PROFILE").is_some() {
+        let job_spool_bytes = job_spools
+            .iter()
+            .map(PreparedRecordSpool::len)
+            .sum::<Result<u64>>()?;
+        eprintln!(
+            "HAP_RS_PROFILE input_decodes=2 block_jobs={job_count} workers={worker_count} \
+             prepared_spool_bytes={prepared_spool_bytes} job_spool_bytes={job_spool_bytes}"
+        );
+    }
+    let next_job = std::sync::atomic::AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
+    let mut first_error = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let next_job = &next_job;
+            let job_spools = &job_spools;
+            handles.push(scope.spawn(move || {
+                loop {
+                    let job_index = next_job.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(job_spool) = job_spools.get(job_index) else {
+                        break;
+                    };
+                    let mut previous_ends = std::collections::HashMap::new();
+                    let mut reader = match job_spool.reader() {
+                        Ok(reader) => reader,
+                        Err(error) => {
+                            let _ = sender.send((job_index, Err(error)));
+                            break;
+                        }
+                    };
+                    for prepared in &mut reader {
+                        let result = (|| {
+                            let (record, symbolic_deletion, reset_before) = prepared?;
+                            if reset_before {
+                                previous_ends.remove(&record.chrom);
+                            }
+                            process_normalized_record(
+                                record,
+                                symbolic_deletion,
+                                &mut previous_ends,
+                                args,
+                                gender,
+                                leftshift,
+                                decompose,
+                                somatic_mode,
+                                string_format_fields,
+                                reference_sequences,
+                                |record| {
+                                    sender.send((job_index, Ok(record))).map_err(|_| {
+                                        anyhow::anyhow!("preprocess output receiver closed")
+                                    })
+                                },
+                            )
+                        })();
+                        if let Err(error) = result {
+                            let _ = sender.send((job_index, Err(error)));
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+        drop(sender);
+        while let Ok((job_index, record)) = receiver.recv() {
+            match record {
+                Ok(record) if first_error.is_none() => {
+                    if let Err(error) = output.push(record, job_index) {
+                        first_error = Some(error);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        for handle in handles {
+            if handle.join().is_err() && first_error.is_none() {
+                first_error = Some(anyhow::anyhow!("preprocess worker panicked"));
+            }
+        }
+    });
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_normalized_record(
+    mut record: crate::domain::RawVcfRecord,
+    symbolic_deletion: Option<SymbolicDeletionMaterialization>,
+    prev_end_by_chrom: &mut std::collections::HashMap<String, usize>,
+    args: &PreprocessArgs,
+    gender: PreprocessGender,
+    leftshift: bool,
+    decompose: bool,
+    somatic_mode: Option<crate::application::SomaticGtMode>,
+    string_format_fields: &BTreeSet<String>,
+    reference_sequences: &std::collections::BTreeMap<String, String>,
+    mut emit: impl FnMut(vcf::ValidatedVcfRecord) -> Result<()>,
+) -> Result<()> {
+    if args.convert_gvcf_to_vcf {
+        ensure_missing_ad(&mut record);
+    }
+    strip_stale_info_keys(&mut record);
+    record.id = ".".to_string();
+    record.ref_allele = record.ref_allele.to_ascii_uppercase();
+    record.alt_allele = uppercase_alleles_preserving_breakends(&record.alt_allele);
+    let import_failed = materialize_unsupported_import_failure(&mut record);
+    if record.filter == "PASS" {
+        record.filter = ".".to_string();
+    }
+    sort_info_keys(&mut record);
+    collapse_pl_to_last_value(&mut record);
+    ensure_missing_ad(&mut record);
+    insert_ado_format(&mut record);
+    ensure_missing_dp(&mut record);
+    if somatic_mode.is_none() {
+        mask_genotypes_wider_than_diploid(&mut record);
+    }
+    if somatic_mode.is_none()
+        && !args.convert_gvcf_to_vcf
+        && !import_failed
+        && !retain_called_alternates(&mut record)
+    {
+        return Ok(());
+    }
+    if somatic_mode.is_none() {
+        normalise_haploid_genotypes(&mut record, gender == PreprocessGender::Male);
+    }
+
+    let record_chrom = record.chrom.clone();
+    let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
+    let prev_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
+    let source_records = if matches!(
+        symbolic_deletion,
+        Some(SymbolicDeletionMaterialization::LeadingAnchor)
+    ) {
+        split_called_alleles(&record)
+    } else {
+        vec![MaterializedAlleleRecord {
+            record,
+            reverse_hetalt_samples: Vec::new(),
+        }]
+    };
+    let mut emitted_groups = Vec::with_capacity(source_records.len());
+    for source in source_records {
+        let reverse_hetalt_samples = source.reverse_hetalt_samples;
+        let source = source.record;
+        let mut emitted = if decompose && !source.alt_allele.split(',').any(is_symbolic_allele) {
+            if let Some(reference) = reference_sequences.get(&source.chrom) {
+                variant_pipeline::primitive_split_with_floor(
+                    &source,
+                    reference.as_bytes(),
+                    prev_end,
+                )
+            } else {
+                vec![source]
+            }
+        } else {
+            vec![source]
+        };
+        if decompose {
+            for record in &mut emitted {
+                restore_legacy_hetalt_orientation(record, &reverse_hetalt_samples);
+            }
+        }
+        emitted_groups.push(emitted);
+    }
+    for emitted in emitted_groups {
+        let leftshift_eligible = emitted.len() == 1;
+        for mut split in emitted {
+            if leftshift
+                && leftshift_eligible
+                && !split.alt_allele.contains(',')
+                && split.alt_allele != "."
+                && !split.alt_allele.is_empty()
+                && !is_symbolic_allele(&split.alt_allele)
+                && let Some(reference) = reference_sequences.get(&split.chrom)
+            {
+                apply_left_shift(&mut split, reference.as_bytes(), prev_end);
+            }
+            canonicalize_multi_allelic_order(&mut split);
+            canonicalize_legacy_genotypes(&mut split);
+            if split.qual.is_empty() || split.qual == "." {
+                split.qual = "0".to_string();
+            }
+            blank_secondary_sample_annotations(&mut split, args.bcf, string_format_fields);
+            reorder_format_fields(&mut split);
+            emit(vcf::ValidatedVcfRecord::try_from_raw(
+                split,
+                QueryProvenance::Unavailable,
+            )?)?;
+        }
+    }
+    prev_end_by_chrom
+        .entry(record_chrom)
+        .and_modify(|end| *end = (*end).max(orig_end))
+        .or_insert(orig_end);
     Ok(())
 }
 

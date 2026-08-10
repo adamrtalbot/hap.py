@@ -144,6 +144,31 @@ pub(super) fn ensure_pass_filter_header(headers: &mut Vec<String>) {
     );
 }
 
+/// Returns contig IDs in their declared VCF header order.
+///
+/// Normalization may process independent blocksplit jobs in an order that is
+/// unrelated to the input sequence dictionary. Seeding the external sorter
+/// from the dictionary keeps records in VCF/reference order even when numeric
+/// contig names such as `10` are encountered before `2` by a worker job.
+pub(super) fn declared_contig_order(headers: &[String], fixchr: bool) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    headers
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix("##contig=<ID=")
+                .and_then(|body| body.split([',', '>']).next())
+        })
+        .map(|contig| {
+            if fixchr {
+                add_legacy_chr_prefix(contig)
+            } else {
+                contig.to_string()
+            }
+        })
+        .filter(|contig| seen.insert(contig.clone()))
+        .collect()
+}
+
 pub(super) fn resolve_reference(explicit: Option<&str>) -> Result<PathBuf> {
     let hg19 = std::env::var_os("HG19").map(PathBuf::from);
     let hgref = std::env::var_os("HGREF").map(PathBuf::from);
