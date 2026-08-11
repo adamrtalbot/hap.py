@@ -61,7 +61,7 @@ jobs:
 
       - name: Run complete parity gate
         working-directory: verification
-        run: PATH="../target/release:${RUNNER_TEMP}/hap-tools:${PATH}" nf-test test --ci tests/main.nf.test
+        run: PATH="${GITHUB_WORKSPACE}/target/release:${RUNNER_TEMP}/hap-tools:${PATH}" nf-test test --ci tests/main.nf.test
 
       - name: Upload independent parity evidence
         if: always()
