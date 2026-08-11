@@ -211,25 +211,31 @@ where
     // Locations tables are an exact row subset of roc.all. Re-filter the
     // already-rendered ordered stream instead of re-running the same four
     // libstdc++-compatible sorts for each public table.
-    let snp = filter_locations_rows(&all, "SNP", "ALL")?;
+    // The public Locations tables are all projections of the same ordered
+    // `roc.all` stream.  Classify a line once while it is warm in the page
+    // cache instead of rescanning the (potentially multi-gigabyte) rendered
+    // spool once per table.  This preserves both the source order and the
+    // bounded on-disk representation used by metric-index publication.
+    let locations = filter_locations_rows(&all, !options.ignored_filters.is_empty())?;
+    let snp = locations.snp;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.SNP.csv.gz"),
         &header,
         &snp,
     )?;
-    let snp_pass = filter_locations_rows(&all, "SNP", "PASS")?;
+    let snp_pass = locations.snp_pass;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.SNP.PASS.csv.gz"),
         &header,
         &snp_pass,
     )?;
-    let indel = filter_locations_rows(&all, "INDEL", "ALL")?;
+    let indel = locations.indel;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.INDEL.csv.gz"),
         &header,
         &indel,
     )?;
-    let indel_pass = filter_locations_rows(&all, "INDEL", "PASS")?;
+    let indel_pass = locations.indel_pass;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.INDEL.PASS.csv.gz"),
         &header,
@@ -237,17 +243,20 @@ where
     )?;
 
     let mut selective = Vec::new();
-    if !options.ignored_filters.is_empty() {
-        for ty in ["SNP", "INDEL"] {
-            let lines = filter_locations_rows(&all, ty, "SEL")?;
-            let id = format!("roc.Locations.{ty}.SEL");
-            write_optional_gzip_csv(
-                &suffixed_report_path(prefix, &format!("roc.Locations.{ty}.SEL.csv.gz")),
-                &header,
-                &lines,
-            )?;
-            selective.push((id, lines, ty));
-        }
+    if let Some(snp_sel) = locations.snp_sel {
+        write_optional_gzip_csv(
+            &suffixed_report_path(prefix, "roc.Locations.SNP.SEL.csv.gz"),
+            &header,
+            &snp_sel,
+        )?;
+        selective.push(("roc.Locations.SNP.SEL".to_string(), snp_sel, "SNP"));
+        let indel_sel = locations.indel_sel.expect("SEL location spools are paired");
+        write_optional_gzip_csv(
+            &suffixed_report_path(prefix, "roc.Locations.INDEL.SEL.csv.gz"),
+            &header,
+            &indel_sel,
+        )?;
+        selective.push(("roc.Locations.INDEL.SEL".to_string(), indel_sel, "INDEL"));
     }
 
     build_metric_indices(
@@ -271,32 +280,76 @@ struct RenderedRows {
     len: usize,
 }
 
-fn filter_locations_rows(all: &RenderedRows, ty: &str, filter: &str) -> Result<RenderedRows> {
-    let mut output =
-        tempfile::NamedTempFile::new().context("failed to create Locations ROC report spool")?;
-    let mut len = 0usize;
-    {
-        let mut writer = BufWriter::new(output.as_file_mut());
-        for line in all.lines()? {
-            let line = line?;
-            let mut fields = line.splitn(8, ',');
-            if fields.next() == Some(ty)
-                && fields.next() == Some("*")
-                && fields.next() == Some("*")
-                && fields.next() == Some(filter)
-                && fields.next() == Some("*")
-                && fields.next().is_some()
-                && fields.next().is_some_and(|qq| qq != "*")
-            {
-                writeln!(writer, "{line}")?;
-                len += 1;
-            }
+struct LocationRows {
+    snp: RenderedRows,
+    snp_pass: RenderedRows,
+    indel: RenderedRows,
+    indel_pass: RenderedRows,
+    snp_sel: Option<RenderedRows>,
+    indel_sel: Option<RenderedRows>,
+}
+
+fn filter_locations_rows(all: &RenderedRows, include_selective: bool) -> Result<LocationRows> {
+    let mut outputs = (0..if include_selective { 6 } else { 4 })
+        .map(|_| {
+            tempfile::NamedTempFile::new().context("failed to create Locations ROC report spool")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut lengths = vec![0usize; outputs.len()];
+    let mut writers = outputs
+        .iter_mut()
+        .map(|output| BufWriter::new(output.as_file_mut()))
+        .collect::<Vec<_>>();
+    for line in all.lines()? {
+        let line = line?;
+        let mut fields = line.splitn(8, ',');
+        let ty = fields.next();
+        let subtype = fields.next();
+        let subset = fields.next();
+        let filter = fields.next();
+        let genotype = fields.next();
+        let _qq_field = fields.next();
+        let qq = fields.next();
+        if subtype != Some("*")
+            || subset != Some("*")
+            || genotype != Some("*")
+            || qq == Some("*")
+            || qq.is_none()
+        {
+            continue;
         }
+        let index = match (ty, filter) {
+            (Some("SNP"), Some("ALL")) => Some(0),
+            (Some("SNP"), Some("PASS")) => Some(1),
+            (Some("INDEL"), Some("ALL")) => Some(2),
+            (Some("INDEL"), Some("PASS")) => Some(3),
+            (Some("SNP"), Some("SEL")) if include_selective => Some(4),
+            (Some("INDEL"), Some("SEL")) if include_selective => Some(5),
+            _ => None,
+        };
+        if let Some(index) = index {
+            writeln!(writers[index], "{line}")?;
+            lengths[index] += 1;
+        }
+    }
+    for writer in &mut writers {
         writer.flush()?;
     }
-    Ok(RenderedRows {
-        path: output.into_temp_path(),
-        len,
+    drop(writers);
+    let mut rows = outputs
+        .into_iter()
+        .zip(lengths)
+        .map(|(output, len)| RenderedRows {
+            path: output.into_temp_path(),
+            len,
+        });
+    Ok(LocationRows {
+        snp: rows.next().expect("SNP spool exists"),
+        snp_pass: rows.next().expect("SNP PASS spool exists"),
+        indel: rows.next().expect("INDEL spool exists"),
+        indel_pass: rows.next().expect("INDEL PASS spool exists"),
+        snp_sel: include_selective.then(|| rows.next().expect("SNP SEL spool exists")),
+        indel_sel: include_selective.then(|| rows.next().expect("INDEL SEL spool exists")),
     })
 }
 
