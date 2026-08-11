@@ -562,8 +562,17 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
                 };
             }
             Ok(_) => {
-                return fs::canonicalize(&candidate)
-                    .with_context(|| format!("failed to canonicalize {}", candidate.display()));
+                // A concurrent output transaction can move an existing file
+                // to its backup between `symlink_metadata` and this call.
+                // Treat that narrow race as an absent destination; the later
+                // publication lock and destination validation serialize the
+                // actual replacement.
+                return match fs::canonicalize(&candidate) {
+                    Ok(resolved) => Ok(resolved),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(candidate),
+                    Err(error) => Err(error)
+                        .with_context(|| format!("failed to canonicalize {}", candidate.display())),
+                };
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
             Err(e) => {
