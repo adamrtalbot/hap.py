@@ -1,0 +1,75 @@
+name: benchmark-parity
+
+on:
+  push:
+    branches:
+      - benchmark-parity-d93991e
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    name: parity-run-${{ matrix.run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2]
+
+    env:
+      BCFTOOLS_APT_VERSION: 1.19-1build2
+      NXF_HOME: ${{ runner.temp }}/nextflow-home
+      NXF_SYNTAX_PARSER: v2
+      NXF_DISABLE_CHECK_LATEST: 'true'
+      TABIX_APT_VERSION: 1.19+ds-1.1build3
+
+    steps:
+      - name: Checkout exact source lineage
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify source commit
+        run: |
+          test "$(git rev-parse HEAD^)" = d93991e131e3c55028a5064bdf11a46990e1437a
+          test "$(git diff --name-only HEAD^)" = .github/workflows/benchmark-parity.yml
+
+      - name: Set up Rust 1.89.0
+        uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05 # 1.89.0
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install indexed-VCF query tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            "bcftools=${BCFTOOLS_APT_VERSION}" \
+            "tabix=${TABIX_APT_VERSION}"
+
+      - name: Install pinned verification tools
+        run: scripts/install-verification-tools.sh "${RUNNER_TEMP}/hap-tools"
+
+      - name: Build locked release binary
+        run: cargo build --locked --release --bin hap
+
+      - name: Run complete parity gate
+        working-directory: verification
+        run: PATH="../target/release:${RUNNER_TEMP}/hap-tools:${PATH}" nf-test test --ci tests/main.nf.test
+
+      - name: Upload independent parity evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: parity-run-${{ matrix.run }}
+          path: |
+            verification/.nf-test.log
+            verification/.nf-test/tests/*/meta
+            verification/.nf-test/tests/*/output
+          if-no-files-found: warn
