@@ -637,6 +637,48 @@ mod tests {
     }
 
     #[test]
+    fn regular_af_bins_omit_empty_legacy_type_and_bin_rows() {
+        let root = unique_test_dir("af-complete-rows");
+        let truth = root.join("truth.vcf");
+        let query = root.join("query.vcf");
+        fs::create_dir_all(&root).expect("create AF row test root");
+        write_test_vcf(&truth, 7);
+        write_test_vcf(&query, 8);
+
+        let mut args = parsed_somatic(&[]);
+        args.truth = truth.display().to_string();
+        args.query = query.display().to_string();
+        args.output = root.join("result").display().to_string();
+        args.reference = root.join("missing.fa").display().to_string();
+        args.feature_table = Some("generic".to_string());
+        args.af_strat = true;
+        args.af_strat_binsize = "0.2".to_string();
+        args.af_strat_truth = "QUAL.truth".to_string();
+        args.af_strat_query = "QUAL".to_string();
+        args.fp_region_size = Some("10".to_string());
+        args.quiet = true;
+        run_args(args).expect("run AF row compatibility fixture");
+
+        let stats =
+            fs::read_to_string(root.join("result.stats.csv")).expect("read complete AF stats");
+        let lines = stats.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "header + records + observed SNV type");
+        assert!(lines.iter().any(|line| line.contains(",records,")));
+        assert!(lines.iter().any(|line| line.contains(",SNVs,")));
+        for prefix in ["records", "SNVs", "indels"] {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&format!(",{prefix}.")))
+                    .count(),
+                0
+            );
+        }
+
+        fs::remove_dir_all(&root).expect("remove AF row test root");
+    }
+
+    #[test]
     fn ambiguous_fp_toggle_matches_legacy_label_semantics() {
         let ambiguous = vec![
             interval(10, 20, "fp"),
@@ -990,6 +1032,26 @@ mod tests {
     }
 
     #[test]
+    fn pass_token_in_composite_filter_survives_raw_filtering() {
+        let record = raw_record("chr1\t10\t.\tGAAGGCC\tG\t.\tPASS;Tier1B;HighConf\t.\tGT\t0/1");
+        let filtered = filter_raw_records(
+            vec![record],
+            Path::new("test.vcf"),
+            &RawFilterOptions {
+                reference_contigs: &BTreeSet::from(["chr1".to_string()]),
+                fixchr: true,
+                pass_only: true,
+                regions: None,
+                targets: None,
+                locations: None,
+            },
+        )
+        .expect("filter composite PASS VCF record");
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].record.is_pass());
+    }
+
+    #[test]
     fn exact_pairing_preserves_duplicate_occurrences() {
         let first = raw_record("chr1\t10\t.\tA\tC\t.\tPASS\t.");
         let second = raw_record("chr1\t20\t.\tG\tT\t.\tPASS\t.");
@@ -1003,6 +1065,29 @@ mod tests {
         let (truth_matches, query_matches) = pair_exact_records(&truth, &query);
         assert_eq!(truth_matches, vec![Some(1), Some(0), Some(2)]);
         assert_eq!(query_matches, vec![Some(1), Some(0), Some(2)]);
+    }
+
+    #[test]
+    fn tp_feature_rows_sort_lexically_while_other_groups_keep_input_order() {
+        let mut rows = FeatureRowSpools::new().expect("create feature spools");
+        rows.push(0, "0,chr2,20,TP,A,A,C,C").unwrap();
+        rows.push(0, "0,chr10,30,TP,A,A,C,C").unwrap();
+        rows.push(0, "0,chr10,10,TP,A,A,C,C").unwrap();
+        rows.push(1, "0,chr2,20,FP,A,,C,").unwrap();
+        rows.push(1, "0,chr10,10,FP,A,,C,").unwrap();
+
+        let ordered = rows.renumber().expect("renumber feature rows");
+        let output = fs::read_to_string(ordered.path()).expect("read ordered feature rows");
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            vec![
+                "0,chr10,10,TP,A,A,C,C",
+                "1,chr10,30,TP,A,A,C,C",
+                "2,chr2,20,TP,A,A,C,C",
+                "0,chr2,20,FP,A,,C,",
+                "1,chr10,10,FP,A,,C,",
+            ]
+        );
     }
 
     #[test]
@@ -1128,6 +1213,14 @@ mod tests {
         assert_eq!(
             raw_type_label(&raw_record("chr1\t1\t.\tA\tAC\t.\tPASS\t.")),
             Some("indels")
+        );
+        assert_eq!(
+            raw_type_label(&raw_record("chr1\t1\t.\tG\tCC\t.\tPASS\t.")),
+            Some("others")
+        );
+        assert_eq!(
+            raw_type_label(&raw_record("chr1\t1\t.\tAA\tT\t.\tPASS\t.")),
+            Some("others")
         );
         assert_eq!(
             raw_type_label(&raw_record("chr1\t1\t.\tAC\tGT\t.\tPASS\t.")),

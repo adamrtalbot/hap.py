@@ -24,9 +24,7 @@ use blocksplit::*;
 use canonical::*;
 use normalization::*;
 use options::*;
-use streaming::{
-    LocationAggregatedRecords, PreparedRecordSpool, PreparedRecordSpoolWriter, PreprocessSpool,
-};
+use streaming::{LocationAggregatedRecords, PreparedRecordSpool, PreprocessSpool};
 
 pub(crate) use canonical::{canonicalize_legacy_headers, structured_header_identity};
 pub(crate) use options::infer_gender;
@@ -67,11 +65,11 @@ struct BlocksplitSelection {
 }
 
 struct BlocksplitJob {
-    included_indices: HashSet<usize>,
+    included_indices: Vec<usize>,
     /// Resets can land on records discarded later by VariantCallsOnly. They
     /// must therefore be applied immediately after selecting the prepared
     /// input record, before genotype-based filtering.
-    reset_before_indices: HashSet<usize>,
+    reset_before_indices: Vec<usize>,
 }
 
 #[cfg(test)]
@@ -94,6 +92,20 @@ impl BlocksplitSelection {
 }
 
 pub(crate) fn run(args: ValidatedPreprocessArgs) -> Result<()> {
+    run_with_optional_reference(args, None)
+}
+
+pub(crate) fn run_with_reference(
+    args: ValidatedPreprocessArgs,
+    reference_sequences: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    run_with_optional_reference(args, Some(reference_sequences))
+}
+
+fn run_with_optional_reference(
+    args: ValidatedPreprocessArgs,
+    reference_sequences: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<()> {
     let mut args = args.into_inner();
     if args.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
@@ -124,7 +136,7 @@ pub(crate) fn run(args: ValidatedPreprocessArgs) -> Result<()> {
             .to_string_lossy()
             .into_owned();
     }
-    let outcome = run_inner(args).map_err(|error| {
+    let outcome = run_inner(args, reference_sequences).map_err(|error| {
         anyhow::anyhow!(
             "failed to produce preprocess output {}: {error:#}",
             output_path.display()
@@ -179,7 +191,10 @@ fn preprocess_inputs(args: &PreprocessArgs) -> Vec<PathBuf> {
         .collect()
 }
 
-fn run_inner(args: PreprocessArgs) -> Result<()> {
+fn run_inner(
+    args: PreprocessArgs,
+    shared_reference_sequences: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<()> {
     let phase_started = std::time::Instant::now();
     let mut logger = PreprocessLogger::new(&args)?;
     logger.info(&format!("Preprocessing {}", args.input))?;
@@ -190,8 +205,16 @@ fn run_inner(args: PreprocessArgs) -> Result<()> {
     let input = vcf::open_validated_vcf(input_path)?;
     let mut headers = input.headers().to_vec();
     require_vcf_sample(&headers)?;
+    // The index is part of the legacy reference contract even when an outer
+    // comparison has already loaded and shared the sequence bodies.
     let reference_index = fasta::read_index(&reference_path)?;
-    let reference_sequences = fasta::read_sequences(&reference_path)?;
+    let owned_reference_sequences;
+    let reference_sequences = if let Some(reference_sequences) = shared_reference_sequences {
+        reference_sequences
+    } else {
+        owned_reference_sequences = fasta::read_sequences(&reference_path)?;
+        &owned_reference_sequences
+    };
     let reference_contigs: BTreeSet<String> = reference_index.keys().cloned().collect();
     // Legacy passes selectors to bcftools after its optional CHROM rewrite;
     // selector names themselves are never normalized against the reference.
@@ -690,45 +713,23 @@ fn process_blocksplit_jobs(
 ) -> Result<()> {
     let job_count = selection.jobs.as_ref().map_or(1, Vec::len);
     let prepared_spool_bytes = prepared_records.len()?;
-    let mut writers = (0..job_count)
-        .map(|_| PreparedRecordSpoolWriter::new())
-        .collect::<Result<Vec<_>>>()?;
-    for (record_index, prepared) in prepared_records.reader()?.enumerate() {
-        let (record, symbolic_deletion, _) = prepared?;
-        let mut included = false;
-        if let Some(jobs) = selection.jobs.as_ref() {
-            for (job_index, job) in jobs.iter().enumerate() {
-                if job.included_indices.contains(&record_index) {
-                    included = true;
-                    writers[job_index].push_with_reset(
-                        &record,
-                        symbolic_deletion,
-                        job.reset_before_indices.contains(&record_index),
-                    )?;
-                }
-            }
-        } else {
-            included = true;
-            writers[0].push(&record, symbolic_deletion)?;
-        }
-        if included {
-            output.seed_contig_rank(&record.chrom);
-        }
+    let prepared_record_count = prepared_records.record_count();
+    for contig in prepared_records.contigs() {
+        output.seed_contig_rank(contig);
     }
-    let job_spools = writers
-        .into_iter()
-        .map(PreparedRecordSpoolWriter::finish)
-        .collect::<Result<Vec<_>>>()?;
+    let dispatched_record_reads = selection
+        .jobs
+        .as_ref()
+        .map_or(prepared_record_count, |jobs| {
+            jobs.iter().map(|job| job.included_indices.len()).sum()
+        });
 
     let worker_count = threads.max(1).min(job_count);
     if std::env::var_os("HAP_RS_PROFILE").is_some() {
-        let job_spool_bytes = job_spools
-            .iter()
-            .map(PreparedRecordSpool::len)
-            .sum::<Result<u64>>()?;
         eprintln!(
             "HAP_RS_PROFILE input_decodes=2 block_jobs={job_count} workers={worker_count} \
-             prepared_spool_bytes={prepared_spool_bytes} job_spool_bytes={job_spool_bytes}"
+             prepared_records={prepared_record_count} prepared_spool_bytes={prepared_spool_bytes} \
+             dispatched_record_reads={dispatched_record_reads} job_spool_bytes=0"
         );
     }
     let next_job = std::sync::atomic::AtomicUsize::new(0);
@@ -739,25 +740,32 @@ fn process_blocksplit_jobs(
         for _ in 0..worker_count {
             let sender = sender.clone();
             let next_job = &next_job;
-            let job_spools = &job_spools;
+            let prepared_records = &prepared_records;
+            let jobs = selection.jobs.as_deref();
             handles.push(scope.spawn(move || {
                 loop {
                     let job_index = next_job.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(job_spool) = job_spools.get(job_index) else {
+                    if job_index >= job_count {
                         break;
-                    };
+                    }
                     let mut previous_ends = std::collections::HashMap::new();
-                    let mut reader = match job_spool.reader() {
+                    let mut reader = match prepared_records.reader() {
                         Ok(reader) => reader,
                         Err(error) => {
                             let _ = sender.send((job_index, Err(error)));
                             break;
                         }
                     };
-                    for prepared in &mut reader {
+                    let indices: Box<dyn Iterator<Item = usize>> = match jobs {
+                        Some(jobs) => Box::new(jobs[job_index].included_indices.iter().copied()),
+                        None => Box::new(0..prepared_record_count),
+                    };
+                    for record_index in indices {
                         let result = (|| {
-                            let (record, symbolic_deletion, reset_before) = prepared?;
-                            if reset_before {
+                            let (record, symbolic_deletion) = reader.read_at(record_index)?;
+                            if jobs.is_some_and(|jobs| {
+                                jobs[job_index].reset_before_indices.contains(&record_index)
+                            }) {
                                 previous_ends.remove(&record.chrom);
                             }
                             process_normalized_record(

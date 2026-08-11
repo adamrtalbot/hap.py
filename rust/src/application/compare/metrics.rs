@@ -286,13 +286,16 @@ fn add_type_counts(target: &mut TypeCounts, source: TypeCounts) {
     add_bucket(&mut target.query_unk, source.query_unk);
 }
 
-fn merge_type_map(target: &mut BTreeMap<String, TypeCounts>, source: BTreeMap<String, TypeCounts>) {
+pub(super) fn merge_type_map(
+    target: &mut BTreeMap<String, TypeCounts>,
+    source: BTreeMap<String, TypeCounts>,
+) {
     for (key, value) in source {
         add_type_counts(target.entry(key).or_default(), value);
     }
 }
 
-fn merge_nested_type_map(
+pub(super) fn merge_nested_type_map(
     target: &mut BTreeMap<String, BTreeMap<String, TypeCounts>>,
     source: BTreeMap<String, BTreeMap<String, TypeCounts>>,
 ) {
@@ -559,7 +562,10 @@ impl<'a> SampleView<'a> {
     }
 
     fn variant_type(&self) -> Option<&'a str> {
-        self.bvt.filter(|value| *value != "NOCALL")
+        // Legacy qfy excludes half-calls (`BVT=UNK`) from every summary
+        // axis even when the comparison decision is TP. Only scored small
+        // variant classes form report types.
+        self.bvt.filter(|value| matches!(*value, "INDEL" | "SNP"))
     }
 
     /// Per-row subtypes for INDEL aggregation. Multi-allelic INDELs emit

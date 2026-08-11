@@ -203,11 +203,10 @@ pub(super) fn tp_combined_row(
 }
 
 /// Combined UNK+UNK row for a same-key truth+query pair where the locus
-/// falls outside the confident region. Legacy emits BD=UNK on both
-/// samples with BK=lm — the locus-match heuristic fires because the two
-/// sides share the variant exactly, and the unconditional non-CONF →
-/// UNK rewrite trumps the gm verdict from xcmp. Truth-side QQ stays `.`
-/// (truth's input qual is always "0") while query-side carries the
+/// falls outside the confident region. Exact equality alone does not make
+/// this a local mismatch: legacy leaves BK missing unless a residual allele
+/// elsewhere in the block establishes a true locus mismatch. Truth-side QQ
+/// stays `.` (truth's input qual is always "0") while query-side carries the
 /// query's own qual.
 pub(super) fn unk_combined_row(
     truth: &Variant,
@@ -232,13 +231,13 @@ pub(super) fn unk_combined_row(
                 filter: filter_for_output(&query.filter).to_string(),
                 info: format!("BS={block_start}{regions}"),
                 truth_sample: format!(
-                    "{}:UNK:lm:{info}:{}:{}:.",
+                    "{}:UNK:.:{info}:{}:{}:.",
                     truth.gt,
                     truth.primary_type(),
                     genotype_label(truth)
                 ),
                 query_sample: format!(
-                    "{}:UNK:lm:{info}:{}:{}:{}",
+                    "{}:UNK:.:{info}:{}:{}:{}",
                     query.gt,
                     truth.primary_type(),
                     genotype_label(query),
@@ -312,6 +311,38 @@ pub(super) fn tp_single_side_row(
     shared_qq: Option<&str>,
     truth_filter: &str,
 ) -> AnnotatedRow {
+    if side == Side::Truth && variant.primary_type() == "UNK" {
+        let end = variant.end_pos();
+        return AnnotatedRow {
+            sort_key: (variant.key.chrom.clone(), variant.key.pos, 1, 0),
+            query_pass: filter_is_pass(truth_filter),
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+            record: comparison_record(
+                variant,
+                ComparisonRecordFields {
+                    reference: variant
+                        .key
+                        .ref_allele
+                        .chars()
+                        .next()
+                        .unwrap_or('N')
+                        .to_string(),
+                    alternate: ".".to_string(),
+                    quality: variant.qual.clone(),
+                    filter: truth_filter.to_string(),
+                    info: format!("END={end};BS={block_start}{regions}"),
+                    truth_sample: format!(
+                        "{}:TP:gm:.:UNK:halfcall:{}",
+                        variant.gt,
+                        shared_qq.unwrap_or(variant.qual.as_str())
+                    ),
+                    query_sample: "./.:.:.:.:NOCALL:nocall:0".to_string(),
+                },
+            ),
+        };
+    }
     let info = comparison_info(variant, reference);
     match side {
         Side::Truth => AnnotatedRow {
@@ -461,6 +492,34 @@ pub(super) fn fn_row(
     regions: &str,
     bk: &'static str,
 ) -> AnnotatedRow {
+    if truth.primary_type() == "UNK" {
+        let end = truth.end_pos();
+        return AnnotatedRow {
+            sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+            record: comparison_record(
+                truth,
+                ComparisonRecordFields {
+                    reference: truth
+                        .key
+                        .ref_allele
+                        .chars()
+                        .next()
+                        .unwrap_or('N')
+                        .to_string(),
+                    alternate: ".".to_string(),
+                    quality: truth.qual.clone(),
+                    filter: ".".to_string(),
+                    info: format!("END={end};BS={block_start}{regions}"),
+                    truth_sample: format!("{}:N:.:.:UNK:halfcall:.", truth.gt),
+                    query_sample: "./.:.:.:.:NOCALL:nocall:0".to_string(),
+                },
+            ),
+        };
+    }
     let info = comparison_info(truth, reference);
     AnnotatedRow {
         sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
@@ -504,6 +563,34 @@ pub(super) fn unk_truth_row(
     regions: &str,
     bk: &'static str,
 ) -> AnnotatedRow {
+    if truth.primary_type() == "UNK" {
+        let end = truth.end_pos();
+        return AnnotatedRow {
+            sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+            record: comparison_record(
+                truth,
+                ComparisonRecordFields {
+                    reference: truth
+                        .key
+                        .ref_allele
+                        .chars()
+                        .next()
+                        .unwrap_or('N')
+                        .to_string(),
+                    alternate: ".".to_string(),
+                    quality: truth.qual.clone(),
+                    filter: ".".to_string(),
+                    info: format!("END={end};BS={block_start}{regions}"),
+                    truth_sample: format!("{}:UNK:.:.:UNK:halfcall:.", truth.gt),
+                    query_sample: "./.:.:.:.:NOCALL:nocall:0".to_string(),
+                },
+            ),
+        };
+    }
     let info = comparison_info(truth, reference);
     AnnotatedRow {
         sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
@@ -562,6 +649,12 @@ pub(super) fn split_query_primitives_with_neighbors(
     cluster_truth: &[Variant],
 ) -> Vec<Variant> {
     if !variant.key.alt_allele.contains(',') {
+        return vec![variant.clone()];
+    }
+    // Preprocessing has already applied VariantPrimitiveSplitter and
+    // VariantLocationAggregator. Splitting the persisted query a second
+    // time changes legacy row grain and double-counts real indels.
+    if persisted_query_representation_is_final(variant) {
         return vec![variant.clone()];
     }
     let alleles = parse_gt_alleles(&variant.gt);
@@ -664,14 +757,13 @@ pub(super) fn split_query_primitives_with_neighbors(
             },
             qual: variant.qual.clone(),
             filter: variant.filter.clone(),
-            // Canonical hetalt GT for the sorted multi-allelic. Legacy
-            // emits the reversed form `<later>/<earlier>` (e.g. `2/1`)
-            // because `VariantLocationAggregator::addAlleleToVariant`
-            // with `MAX_GT=2` writes the second allele into the first
-            // zero slot, producing reversed-index GTs. Mirror that
-            // ordering so downstream byte output matches.
+            // Preprocessing has already assigned the aggregate's legacy
+            // haplotype slots. Preserve them here: most aggregates are 2/1,
+            // while independently phased complex siblings can legitimately
+            // be 1/2 (GIAB chr2:111776288). Reconstructing the GT solely
+            // from ALT count erases that distinction.
             gt: if alt_list.len() > 1 {
-                "2/1".to_string()
+                variant.gt.clone()
             } else {
                 "0/1".to_string()
             },
@@ -746,6 +838,10 @@ pub(super) fn split_query_primitives_with_neighbors(
             }
         })
         .collect()
+}
+
+fn persisted_query_representation_is_final(variant: &Variant) -> bool {
+    variant.gt == "2/1" && variant.key.alt_allele.contains(',')
 }
 
 /// Trim common prefix and suffix from (ref, alt) and re-anchor the
@@ -836,6 +932,16 @@ pub(super) fn bk_for_row(
 ) -> &'static str {
     if almismatch_same_locus(row, counterparts) {
         return "lm";
+    }
+    // Legacy's graph reconciles the two long insertion paths represented by
+    // a persisted GT=2/1 aggregate where the linear event signature reports
+    // a mismatch. Keep BK missing for this narrow aggregate shape; ordinary
+    // long single-ALT rows still use the block-level verdict below.
+    let long_aggregate_match = row.gt == "2/1"
+        && row.key.alt_allele.contains(',')
+        && row.key.alt_allele.split(',').all(|alt| alt.len() > 512);
+    if long_aggregate_match {
+        return ".";
     }
     if hap_mismatch {
         return "lm";
@@ -972,6 +1078,9 @@ pub(super) fn query_type_rank(variant: &Variant) -> usize {
 }
 
 pub(super) fn genotype_label(variant: &Variant) -> &'static str {
+    if variant.gt.contains('.') && variant.gt.split(['/', '|']).any(|allele| allele == "0") {
+        return "halfcall";
+    }
     // BLT / location label follows the active-allele view of the GT, not the
     // literal string: two distinct non-REF alleles are hetalt; two equal
     // non-REF alleles are homalt (covers 1|1, 2|2, 3|3 …); one REF + one
@@ -994,6 +1103,9 @@ pub(super) fn genotype_label(variant: &Variant) -> &'static str {
 }
 
 pub(super) fn comparison_info(variant: &Variant, reference: &str) -> String {
+    if variant.primary_type() == "UNK" {
+        return ".".to_string();
+    }
     // Multi-allelic records — SNP or INDEL — go through subtype_label so
     // mixed ti/tv or mixed indel sizes emit the legacy comma-joined BI
     // (e.g. `A → G,T` GT=2/1 must be `ti,tv`, not a single ti/tv token).
@@ -1003,6 +1115,9 @@ pub(super) fn comparison_info(variant: &Variant, reference: &str) -> String {
         return subtype.to_lowercase();
     }
     if variant.primary_type() == "SNP" {
+        if !variant_has_only_canonical_bases(variant) {
+            return ".".to_string();
+        }
         return snp_bucket_label(variant).unwrap_or("tv").to_string();
     }
     if let Some(subtype) = subtype_label(variant) {
@@ -1013,7 +1128,7 @@ pub(super) fn comparison_info(variant: &Variant, reference: &str) -> String {
 }
 
 pub(super) fn snp_bucket_label(variant: &Variant) -> Option<&'static str> {
-    if variant.primary_type() != "SNP" {
+    if variant.primary_type() != "SNP" || !variant_has_only_canonical_bases(variant) {
         return None;
     }
     if variant.is_single_base_snp() {
@@ -1047,6 +1162,15 @@ pub(super) fn snp_bucket_label(variant: &Variant) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn variant_has_only_canonical_bases(variant: &Variant) -> bool {
+    variant
+        .key
+        .ref_allele
+        .chars()
+        .chain(variant.key.alt_allele.chars().filter(|base| *base != ','))
+        .all(|base| matches!(base.to_ascii_uppercase(), 'A' | 'C' | 'G' | 'T'))
 }
 
 pub(super) fn subtype_label(variant: &Variant) -> Option<String> {

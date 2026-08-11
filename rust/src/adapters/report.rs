@@ -105,7 +105,13 @@ pub(crate) fn write_summary(
             .flush()
             .with_context(|| format!("failed to flush {}", path.display()));
     }
-    let mut variant_types: Vec<&String> = all_counts.keys().chain(pass_counts.keys()).collect();
+    let mut variant_types: Vec<&String> = all_counts
+        .keys()
+        .chain(pass_counts.keys())
+        .filter(|variant_type| {
+            summary_type_has_observations(variant_type, all_counts, pass_counts, all_fp, pass_fp)
+        })
+        .collect();
     variant_types.sort();
     variant_types.dedup();
     let empty = TypeCounts::default();
@@ -165,6 +171,7 @@ pub(crate) fn write_extended(
     all_subtype: &BTreeMap<String, BTreeMap<String, TypeCounts>>,
     pass_subtype: &BTreeMap<String, BTreeMap<String, TypeCounts>>,
     subset_size: usize,
+    whole_reference_size: usize,
     conf_size: usize,
     has_conf_regions: bool,
     all_subset: &BTreeMap<String, BTreeMap<String, TypeCounts>>,
@@ -341,11 +348,12 @@ pub(crate) fn write_extended(
                     //                              (formatted as integer
                     //                              when subtype="*",
                     //                              else still raw integer)
-                    //   subset="TS_boundary"   → format_count(subset_size)
+                    //   subset="TS_boundary"   → format_count(whole_reference_size)
                     //   subset="TS_contained"  → format_count(conf_size)
                     let size_cell = match subset {
                         "*" => subset_size.to_string(),
                         "TS_contained" => format_count(conf_size),
+                        "TS_boundary" => format_count(whole_reference_size),
                         _ => format_count(subset_size),
                     };
                     // Subset.IS_CONF.Size cell:
@@ -414,6 +422,32 @@ pub(crate) fn write_extended(
     writer
         .flush()
         .with_context(|| format!("failed to flush {}", path.display()))
+}
+
+fn summary_type_has_observations(
+    variant_type: &str,
+    all_counts: &BTreeMap<String, TypeCounts>,
+    pass_counts: &BTreeMap<String, TypeCounts>,
+    all_fp: &BTreeMap<String, (usize, usize)>,
+    pass_fp: &BTreeMap<String, (usize, usize)>,
+) -> bool {
+    let counted = |counts: &BTreeMap<String, TypeCounts>| {
+        counts.get(variant_type).is_some_and(|stats| {
+            stats.truth_total.total > 0
+                || stats.query_total.total > 0
+                || stats.truth_tp.total > 0
+                || stats.truth_fn.total > 0
+                || stats.query_tp.total > 0
+                || stats.query_fp.total > 0
+                || stats.query_unk.total > 0
+        })
+    };
+    let classified_fp = |counts: &BTreeMap<String, (usize, usize)>| {
+        counts
+            .get(variant_type)
+            .is_some_and(|(gt, allele)| *gt > 0 || *allele > 0)
+    };
+    counted(all_counts) || counted(pass_counts) || classified_fp(all_fp) || classified_fp(pass_fp)
 }
 
 pub(crate) fn empty_comparison_extended_lines(subset_size: usize) -> Vec<String> {
@@ -683,7 +717,7 @@ pub(crate) fn append_ci_cells(
 
 #[cfg(test)]
 mod format_tests {
-    use super::{SubsetSubtypeFpCounts, python_repr_float, write_extended};
+    use super::{SubsetSubtypeFpCounts, python_repr_float, write_extended, write_summary};
     use crate::domain::TypeCounts;
     use std::collections::BTreeMap;
 
@@ -757,6 +791,28 @@ mod format_tests {
     }
 
     #[test]
+    fn summary_omits_zero_observation_unknown_type() {
+        let output = tempfile::NamedTempFile::new().expect("temporary summary output");
+        let mut indel = TypeCounts::default();
+        indel.truth_total.total = 1;
+        let counts = BTreeMap::from([
+            ("INDEL".to_string(), indel),
+            ("UNK".to_string(), TypeCounts::default()),
+        ]);
+        write_summary(
+            output.path(),
+            &counts,
+            &counts,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("write summary");
+        let summary = std::fs::read_to_string(output.path()).expect("read summary");
+        assert!(summary.lines().any(|line| line.starts_with("INDEL,ALL,")));
+        assert!(!summary.lines().any(|line| line.starts_with("UNK,")));
+    }
+
+    #[test]
     fn extended_omits_indel_subtype_rows_for_subsets_without_indels() {
         let output = tempfile::NamedTempFile::new().expect("temporary extended output");
         let counts = BTreeMap::from([
@@ -786,6 +842,7 @@ mod format_tests {
             &counts,
             &nested_counts,
             &nested_counts,
+            100,
             100,
             80,
             true,

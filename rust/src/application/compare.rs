@@ -11,7 +11,7 @@ use crate::output::{OutputTransaction, benchmark_artifacts, stratification_input
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -34,6 +34,15 @@ use rows::*;
 use spool::*;
 
 static SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
+
+fn report_phase(name: &str, started: std::time::Instant) {
+    if std::env::var_os("HAP_RS_PROFILE").is_some() {
+        eprintln!(
+            "HAP_RS_PHASE name={name} elapsed_seconds={:.3}",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
 
 struct ScratchRun {
     path: PathBuf,
@@ -123,6 +132,207 @@ struct Cluster {
     query: Vec<Variant>,
 }
 
+struct ProcessedCluster {
+    cluster: Cluster,
+    rows: Vec<AnnotatedRow>,
+}
+
+fn process_cluster_work(
+    cluster: Cluster,
+    reference_sequences: &BTreeMap<String, String>,
+    conf_bed: Option<&[Interval]>,
+    config: ComparisonConfig,
+) -> Result<ProcessedCluster> {
+    let mut counts: BTreeMap<String, TypeCounts> = BTreeMap::new();
+    let mut subtype_counts: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
+    for variant in &cluster.truth {
+        add_variant_stats(
+            &mut counts
+                .entry(variant.primary_type().to_string())
+                .or_default()
+                .truth_total,
+            variant,
+        );
+        add_variant_stats_subtype(
+            &mut subtype_counts,
+            variant.primary_type(),
+            variant,
+            |stats| &mut stats.truth_total,
+        );
+    }
+    for variant in &cluster.query {
+        add_variant_stats(
+            &mut counts
+                .entry(variant.primary_type().to_string())
+                .or_default()
+                .query_total,
+            variant,
+        );
+        add_variant_stats_subtype(
+            &mut subtype_counts,
+            variant.primary_type(),
+            variant,
+            |stats| &mut stats.query_total,
+        );
+    }
+    let mut rows = Vec::new();
+    process_cluster(
+        &cluster,
+        reference_sequences,
+        conf_bed,
+        config,
+        &mut counts,
+        &mut subtype_counts,
+        &mut rows,
+    )?;
+    Ok(ProcessedCluster { cluster, rows })
+}
+
+fn process_clusters_parallel<I, F>(
+    mut clusters: I,
+    threads: usize,
+    reference_sequences: &BTreeMap<String, String>,
+    conf_bed: Option<&[Interval]>,
+    config: ComparisonConfig,
+    mut consume: F,
+) -> Result<()>
+where
+    I: Iterator<Item = Result<Cluster>>,
+    F: FnMut(ProcessedCluster) -> Result<()>,
+{
+    let worker_count = threads.max(1);
+    // Keep enough ordered work in flight that one expensive cluster cannot
+    // starve the remaining workers.  The old two-jobs-per-worker window
+    // counted completed, out-of-order results against its limit; a slow
+    // cluster at the front therefore stopped dispatch after only a handful
+    // of later clusters completed.  A fixed per-worker window remains
+    // bounded (and clusters themselves are capped at MAX_CLUSTER_VARIANTS)
+    // while amortising those head-of-line stalls on real GIAB inputs.
+    const CLUSTERS_INFLIGHT_PER_WORKER: usize = 64;
+    let maximum_inflight = worker_count
+        .saturating_mul(CLUSTERS_INFLIGHT_PER_WORKER)
+        .max(1);
+    if std::env::var_os("HAP_RS_PROFILE").is_some() {
+        eprintln!(
+            "HAP_RS_PROFILE comparison_workers={worker_count} comparison_max_inflight={maximum_inflight}"
+        );
+    }
+    let queue = (
+        std::sync::Mutex::new((VecDeque::<(usize, Cluster)>::new(), false)),
+        std::sync::Condvar::new(),
+    );
+    let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(maximum_inflight);
+    let mut first_error = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let queue = &queue;
+            let result_sender = result_sender.clone();
+            handles.push(scope.spawn(move || {
+                loop {
+                    let work = {
+                        let mut state = queue.0.lock().unwrap_or_else(|error| error.into_inner());
+                        while state.0.is_empty() && !state.1 {
+                            state = queue
+                                .1
+                                .wait(state)
+                                .unwrap_or_else(|error| error.into_inner());
+                        }
+                        state.0.pop_front()
+                    };
+                    let Some((index, cluster)) = work else {
+                        break;
+                    };
+                    let result =
+                        process_cluster_work(cluster, reference_sequences, conf_bed, config);
+                    if result_sender.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(result_sender);
+
+        let mut source_finished = false;
+        let mut next_index = 0usize;
+        let mut next_to_consume = 0usize;
+        let mut inflight = 0usize;
+        let mut pending = BTreeMap::new();
+        while !source_finished || inflight > 0 {
+            while first_error.is_none() && !source_finished && inflight < maximum_inflight {
+                match clusters.next() {
+                    Some(Ok(cluster)) => {
+                        let mut state = queue.0.lock().unwrap_or_else(|error| error.into_inner());
+                        state.0.push_back((next_index, cluster));
+                        next_index += 1;
+                        inflight += 1;
+                        drop(state);
+                        queue.1.notify_one();
+                    }
+                    Some(Err(error)) => {
+                        first_error = Some(error);
+                        source_finished = true;
+                    }
+                    None => source_finished = true,
+                }
+            }
+            if (source_finished || first_error.is_some())
+                && !queue.0.lock().unwrap_or_else(|error| error.into_inner()).1
+            {
+                let mut state = queue.0.lock().unwrap_or_else(|error| error.into_inner());
+                state.1 = true;
+                drop(state);
+                queue.1.notify_all();
+                source_finished = true;
+            }
+            if inflight == 0 {
+                break;
+            }
+            match result_receiver.recv() {
+                Ok((index, result)) => {
+                    inflight -= 1;
+                    pending.insert(index, result);
+                    while let Some(result) = pending.remove(&next_to_consume) {
+                        if first_error.is_none() {
+                            match result {
+                                Ok(result) => {
+                                    if let Err(error) = consume(result) {
+                                        first_error = Some(error);
+                                    }
+                                }
+                                Err(error) => first_error = Some(error),
+                            }
+                        }
+                        next_to_consume += 1;
+                    }
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!(
+                            "comparison worker result channel closed: {error}"
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+        {
+            let mut state = queue.0.lock().unwrap_or_else(|error| error.into_inner());
+            state.1 = true;
+        }
+        queue.1.notify_all();
+        for handle in handles {
+            if handle.join().is_err() && first_error.is_none() {
+                first_error = Some(anyhow::anyhow!("comparison worker panicked"));
+            }
+        }
+    });
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Side {
     Truth,
@@ -181,14 +391,24 @@ struct RegionState {
 
 impl RegionState {
     fn from_cluster(cluster: &Cluster, reference: &str, conf_bed: Option<&[Interval]>) -> Self {
+        // `merge_bed_intervals` orders the effective CONF lane by chromosome
+        // and coordinate. Retain only the tiny slice that can affect this
+        // cluster. The previous implementation cloned the complete BED and
+        // linearly searched every interval for every record in every cluster;
+        // on a whole-genome query that made confidence annotation quadratic
+        // in the number of variants and BED intervals.
+        let conf_intervals = conf_bed
+            .map(|intervals| cluster_conf_intervals(intervals, cluster))
+            .unwrap_or_default();
         let mut state = Self {
             conf_enabled: conf_bed.is_some(),
-            conf_intervals: conf_bed.unwrap_or(&[]).to_vec(),
+            conf_intervals,
             ..Self::default()
         };
-        let Some(conf_bed) = conf_bed else {
+        if conf_bed.is_none() {
             return state;
-        };
+        }
+        let conf_bed = state.conf_intervals.as_slice();
 
         for truth in &cluster.truth {
             let covered = variant_is_conf(truth, reference, cluster.start, cluster.end, conf_bed);
@@ -300,6 +520,21 @@ impl RegionState {
     }
 }
 
+fn cluster_conf_intervals(intervals: &[Interval], cluster: &Cluster) -> Vec<Interval> {
+    let chrom_start =
+        intervals.partition_point(|interval| interval.chrom.as_str() < cluster.chrom.as_str());
+    let chrom_end =
+        intervals.partition_point(|interval| interval.chrom.as_str() <= cluster.chrom.as_str());
+    let chrom_intervals = &intervals[chrom_start..chrom_end];
+
+    // BED is zero-based half-open while cluster coordinates are one-based
+    // inclusive. Include an interval starting at cluster.end so insertion
+    // coverage at the base immediately after the anchor remains visible.
+    let range_start = chrom_intervals.partition_point(|interval| interval.end < cluster.start);
+    let range_end = chrom_intervals.partition_point(|interval| interval.start <= cluster.end);
+    chrom_intervals[range_start.min(range_end)..range_end].to_vec()
+}
+
 fn validate_report_parent(prefix: &Path) -> Result<()> {
     let parent = prefix
         .parent()
@@ -401,6 +636,7 @@ pub(crate) fn run(args: ValidatedCompareArgs) -> Result<()> {
         );
     }
     let staged_prefix = transaction.staged_prefix()?.to_path_buf();
+    let comparison_started = std::time::Instant::now();
     run_inner(
         args,
         explicit_bcf,
@@ -413,7 +649,11 @@ pub(crate) fn run(args: ValidatedCompareArgs) -> Result<()> {
             destination_prefix.display()
         )
     })?;
-    transaction.commit()
+    report_phase("comparison_pipeline", comparison_started);
+    let publication_started = std::time::Instant::now();
+    transaction.commit()?;
+    report_phase("output_publication", publication_started);
+    Ok(())
 }
 
 fn compare_inputs(args: &CompareArgs) -> Result<(Vec<PathBuf>, Vec<String>)> {
@@ -440,7 +680,9 @@ fn run_inner(
     log_compare_info(&args, "Starting germline comparison")?;
     let reference_path = Path::new(&args.reference);
     let prefix = output_prefix;
+    let reference_started = std::time::Instant::now();
     let reference_sequences = fasta::read_sequences(reference_path)?;
+    report_phase("reference_loading", reference_started);
     let contig_lengths: BTreeMap<String, usize> = reference_sequences
         .iter()
         .map(|(name, sequence)| (name.clone(), sequence.len()))
@@ -527,7 +769,8 @@ fn run_inner(
         "query.prep.vcf.gz"
     });
     log_compare_info(&args, "Preprocessing truth")?;
-    preprocess::run(
+    let truth_preprocess_started = std::time::Instant::now();
+    preprocess::run_with_reference(
         build_preprocess_args(
             &preprocessing_args,
             &args.truth,
@@ -536,7 +779,9 @@ fn run_inner(
             args.preprocess_truth,
         )
         .validated()?,
+        &reference_sequences,
     )?;
+    report_phase("truth_preprocessing", truth_preprocess_started);
     if args.locations.is_none() {
         let mut preprocessed_truth = vcf::open_validated_vcf(&truth_prep)?;
         let mut common_contig = false;
@@ -551,7 +796,8 @@ fn run_inner(
         }
     }
     log_compare_info(&args, "Preprocessing query")?;
-    preprocess::run(
+    let query_preprocess_started = std::time::Instant::now();
+    preprocess::run_with_reference(
         build_preprocess_args(
             &preprocessing_args,
             &args.query,
@@ -560,7 +806,9 @@ fn run_inner(
             true,
         )
         .validated()?,
+        &reference_sequences,
     )?;
+    report_phase("query_preprocessing", query_preprocess_started);
 
     if args.engine == CompareEngine::Vcfeval {
         log_compare_info(&args, "Running vcfeval comparison")?;
@@ -682,7 +930,8 @@ fn run_inner(
         targets.as_deref(),
         locations.as_deref(),
     )?;
-    let clusters = StreamingClusters::new(truth, query, cluster_gap);
+    let contig_ranks = comparison_contig_ranks(&truth_headers, &query_headers);
+    let clusters = StreamingClusters::new(truth, query, cluster_gap, contig_ranks);
     let mut contigs_in_play = locations
         .as_deref()
         .map(|locations| {
@@ -695,8 +944,6 @@ fn run_inner(
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
-    let mut counts: BTreeMap<String, TypeCounts> = BTreeMap::new();
-    let mut subtype_counts: BTreeMap<String, BTreeMap<String, TypeCounts>> = BTreeMap::new();
     let mut row_spool = ComparisonRowSpool::new();
     let needs_decoration =
         args.preserve_info || args.output_vtc || !matches!(args.roc.as_str(), "QUAL" | "QQ");
@@ -707,129 +954,108 @@ fn run_inner(
         BTreeMap::new()
     };
     let mut active_metadata: Option<ActiveComparisonMetadata> = None;
-    for cluster in clusters {
-        let cluster = cluster?;
-        if active_metadata
-            .as_ref()
-            .is_none_or(|metadata| metadata.chrom != cluster.chrom)
-        {
-            let truth_cursor = truth_metadata
-                .get(&cluster.chrom)
-                .map(ComparisonMetadataCursor::open)
-                .transpose()?;
-            let query_cursor = query_metadata
-                .get(&cluster.chrom)
-                .map(ComparisonMetadataCursor::open)
-                .transpose()?;
-            active_metadata = Some(ActiveComparisonMetadata {
-                chrom: cluster.chrom.clone(),
-                truth: truth_cursor,
-                query: query_cursor,
-            });
-        }
-        contigs_in_play.insert(cluster.chrom.clone());
-        for variant in &cluster.truth {
-            add_variant_stats(
-                &mut counts
-                    .entry(variant.primary_type().to_string())
-                    .or_default()
-                    .truth_total,
-                variant,
-            );
-            add_variant_stats_subtype(
-                &mut subtype_counts,
-                variant.primary_type(),
-                variant,
-                |stats| &mut stats.truth_total,
-            );
-        }
-        for variant in &cluster.query {
-            add_variant_stats(
-                &mut counts
-                    .entry(variant.primary_type().to_string())
-                    .or_default()
-                    .query_total,
-                variant,
-            );
-            add_variant_stats_subtype(
-                &mut subtype_counts,
-                variant.primary_type(),
-                variant,
-                |stats| &mut stats.query_total,
-            );
-        }
-        let mut cluster_rows = Vec::new();
-        process_cluster(
-            &cluster,
-            &reference_sequences,
-            adjusted_conf_bed.as_deref(),
-            ComparisonConfig {
-                no_hc: args.no_hc || args.engine != CompareEngine::Xcmp,
-                max_enum: args.max_enum,
-                hb_expand: args.hb_expand,
-            },
-            &mut counts,
-            &mut subtype_counts,
-            &mut cluster_rows,
-        )?;
-        let mut emitted_start = cluster.start;
-        let mut emitted_end = cluster.end;
-        for row in &cluster_rows {
-            let record = row.record.raw();
-            emitted_start = emitted_start.min(record.pos);
-            emitted_end = emitted_end.max(record.end_pos());
-        }
-        let mut filtered_truth_keys = BTreeSet::new();
-        let mut decorations = DecorationIndex::default();
-        let metadata = active_metadata
-            .as_mut()
-            .expect("comparison metadata cursor was initialized");
-        if let Some(truth_cursor) = &mut metadata.truth {
-            truth_cursor.collect(
-                &cluster.chrom,
-                emitted_start,
-                emitted_end,
-                &mut filtered_truth_keys,
-                &mut decorations,
-                args.preserve_info,
-                &args.roc,
-                true,
-            )?;
-        }
-        if needs_decoration && let Some(query_cursor) = &mut metadata.query {
-            query_cursor.collect(
-                &cluster.chrom,
-                emitted_start,
-                emitted_end,
-                &mut filtered_truth_keys,
-                &mut decorations,
-                args.preserve_info,
-                &args.roc,
-                false,
-            )?;
-        }
-        for mut row in cluster_rows {
-            let sort_line = row.record.raw().to_line();
-            let filtered_match = row_matches_variant_key(&row, &filtered_truth_keys);
-            if needs_decoration {
-                decorate_output_rows_with_index(
-                    std::slice::from_mut(&mut row),
-                    &decorations,
+    let matching_started = std::time::Instant::now();
+    let comparison_threads = args.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    });
+    process_clusters_parallel(
+        clusters,
+        comparison_threads,
+        &reference_sequences,
+        adjusted_conf_bed.as_deref(),
+        ComparisonConfig {
+            no_hc: args.no_hc || args.engine != CompareEngine::Xcmp,
+            max_enum: args.max_enum,
+            hb_expand: args.hb_expand,
+        },
+        |processed| {
+            let cluster = processed.cluster;
+            if active_metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.chrom != cluster.chrom)
+            {
+                let truth_cursor = truth_metadata
+                    .get(&cluster.chrom)
+                    .map(ComparisonMetadataCursor::open)
+                    .transpose()?;
+                let query_cursor = query_metadata
+                    .get(&cluster.chrom)
+                    .map(ComparisonMetadataCursor::open)
+                    .transpose()?;
+                active_metadata = Some(ActiveComparisonMetadata {
+                    chrom: cluster.chrom.clone(),
+                    truth: truth_cursor,
+                    query: query_cursor,
+                });
+            }
+            contigs_in_play.insert(cluster.chrom.clone());
+            let cluster_rows = processed.rows;
+            let mut emitted_start = cluster.start;
+            let mut emitted_end = cluster.end;
+            for row in &cluster_rows {
+                let record = row.record.raw();
+                emitted_start = emitted_start.min(record.pos);
+                emitted_end = emitted_end.max(record.end_pos());
+            }
+            let mut filtered_truth_keys = BTreeSet::new();
+            let mut decorations = DecorationIndex::default();
+            let metadata = active_metadata
+                .as_mut()
+                .expect("comparison metadata cursor was initialized");
+            if let Some(truth_cursor) = &mut metadata.truth {
+                truth_cursor.collect(
+                    &cluster.chrom,
+                    emitted_start,
+                    emitted_end,
+                    &mut filtered_truth_keys,
+                    &mut decorations,
                     args.preserve_info,
-                    args.output_vtc,
                     &args.roc,
+                    true,
                 )?;
             }
-            row_spool.push(row, filtered_match, sort_line)?;
-        }
-    }
+            if needs_decoration && let Some(query_cursor) = &mut metadata.query {
+                query_cursor.collect(
+                    &cluster.chrom,
+                    emitted_start,
+                    emitted_end,
+                    &mut filtered_truth_keys,
+                    &mut decorations,
+                    args.preserve_info,
+                    &args.roc,
+                    false,
+                )?;
+            }
+            for mut row in cluster_rows {
+                let sort_line = row.record.raw().to_line();
+                let filtered_match = row_matches_variant_key(&row, &filtered_truth_keys);
+                if needs_decoration {
+                    decorate_output_rows_with_index(
+                        std::slice::from_mut(&mut row),
+                        &decorations,
+                        args.preserve_info,
+                        args.output_vtc,
+                        &args.roc,
+                    )?;
+                }
+                row_spool.push(row, filtered_match, sort_line)?;
+            }
+            Ok(())
+        },
+    )?;
+    report_phase("matching", matching_started);
+    let sorting_started = std::time::Instant::now();
     let row_file = row_spool.finish()?;
+    report_phase("external_sorting", sorting_started);
     let subset_size = report_subset_size(
         &contig_non_n_lengths,
         &contigs_in_play,
         explicit_bcf,
         args.bcf && !explicit_bcf,
     );
+    let whole_reference_size = contig_non_n_lengths.values().sum();
     if subset_size == 0 {
         bail!("no reference contigs selected for analysis");
     }
@@ -854,6 +1080,7 @@ fn run_inner(
             &tallies.all_subtype,
             &tallies.pass_subtype,
             subset_size,
+            whole_reference_size,
             conf_size,
             conf_bed.is_some(),
             &tallies.all_subset,
@@ -906,6 +1133,7 @@ fn run_inner(
             })
         }),
     )?;
+    let roc_started = std::time::Instant::now();
     let roc_indices = if requantify {
         crate::application::quantify::run_from_compare_path(
             QuantifyArgs {
@@ -956,7 +1184,10 @@ fn run_inner(
         )?
     } else {
         let roc_options = crate::engines::roc::RocOptions {
+            threads: comparison_threads,
             output_rocs: !args.no_roc,
+            whole_reference_size: Some(whole_reference_size),
+            preserve_raw_table: args.verbose,
             ..Default::default()
         };
         let indices = roc_publication::write_roc_files_with_options_iter(
@@ -971,6 +1202,7 @@ fn run_inner(
         }
         indices
     };
+    report_phase("roc_generation", roc_started);
     let commandline = std::env::args().collect::<Vec<_>>().join(" ");
     let run_args = metrics_json::CompareRunArgs {
         truth: &args.truth,

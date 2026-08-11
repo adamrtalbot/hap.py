@@ -981,6 +981,38 @@ mod memory_guards {
     }
 
     #[test]
+    fn streaming_clusters_follow_sequence_dictionary_across_9_to_10() -> Result<()> {
+        let at = |chrom: &str, pos: usize| {
+            let mut variant = het("0/1");
+            variant.key.chrom = chrom.to_string();
+            variant.key.pos = pos;
+            variant
+        };
+        let truth = vec![at("9", 100), at("10", 1)];
+        let query = vec![at("9", 200), at("10", 1)];
+        let headers = [
+            "##contig=<ID=9,length=1000>".to_string(),
+            "##contig=<ID=10,length=1000>".to_string(),
+        ];
+        let ranks = comparison_contig_ranks(&headers, &[]);
+
+        let clusters = StreamingClusters::new(
+            truth.into_iter().map(Ok),
+            query.into_iter().map(Ok),
+            200,
+            ranks,
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].chrom, "9");
+        assert_eq!((clusters[0].truth.len(), clusters[0].query.len()), (1, 1));
+        assert_eq!(clusters[1].chrom, "10");
+        assert_eq!((clusters[1].truth.len(), clusters[1].query.len()), (1, 1));
+        Ok(())
+    }
+
+    #[test]
     fn estimated_state_count_doubles_per_unphased_het() {
         let variants = vec![het("0/1"), het("0/1"), het("0/1")];
         assert_eq!(estimated_state_count(&variants), 8);
@@ -1159,6 +1191,43 @@ mod memory_guards {
     }
 
     #[test]
+    fn truth_halfcalls_render_with_legacy_unknown_allele_contract() {
+        let truth = variant(984495, "C", ".", "0|.").with_qual("30");
+
+        let n_row = fn_row(&truth, "C", 984494, ";Regions=CONF,TS_contained", ".");
+        assert_eq!(n_row.record.ref_allele, "C");
+        assert_eq!(n_row.record.alt_allele, ".");
+        assert_eq!(
+            n_row.record.info,
+            "END=984495;BS=984494;Regions=CONF,TS_contained"
+        );
+        assert_eq!(n_row.record.samples[0], "0|.:N:.:.:UNK:halfcall:.");
+
+        let tp_row = tp_single_side_row(
+            &truth,
+            "C",
+            984494,
+            ";Regions=CONF,TS_contained",
+            Side::Truth,
+            Some("30"),
+            ".",
+        );
+        assert_eq!(
+            tp_row.record.info,
+            "END=984495;BS=984494;Regions=CONF,TS_contained"
+        );
+        assert_eq!(tp_row.record.samples[0], "0|.:TP:gm:.:UNK:halfcall:30");
+        let mut tallies = FoldedComparisonReports::default();
+        tallies.observe(&tp_row);
+        assert!(tallies.all_counts.is_empty());
+        assert!(tallies.pass_counts.is_empty());
+
+        let unk_row = unk_truth_row(&truth, "C", 984494, "", "lm");
+        assert_eq!(unk_row.record.info, "END=984495;BS=984494");
+        assert_eq!(unk_row.record.samples[0], "0|.:UNK:.:.:UNK:halfcall:.");
+    }
+
+    #[test]
     fn exact_only_unphased_indel_block_reaches_legacy_hap_match_verdict() {
         let identical = Cluster {
             chrom: "chr21".to_string(),
@@ -1177,6 +1246,51 @@ mod memory_guards {
         assert!(
             identical_gt_exact_indel_keys(&phased_truth).is_empty(),
             "the standard phased-truth fixture must retain its legacy lm verdict"
+        );
+    }
+
+    #[test]
+    fn outside_conf_exact_indel_keeps_local_mismatch_with_residual_allele() {
+        let reference = BTreeMap::from([("chr21".to_string(), "A".repeat(256))]);
+        let exact_truth = variant(100, "A", "AT", "1|1");
+        let exact_query = variant(100, "A", "AT", "1/1");
+        let residual_truth = variant(105, "A", "AT,AG", "1|1");
+        let residual_query = variant(105, "A", "AT,AG", "2/2");
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 100,
+            end: 105,
+            truth: vec![exact_truth, residual_truth],
+            query: vec![exact_query, residual_query],
+        };
+        let mut counts = BTreeMap::new();
+        let mut subtype_counts = BTreeMap::new();
+        let mut rows = Vec::new();
+        process_cluster(
+            &cluster,
+            &reference,
+            Some(&[]),
+            ComparisonConfig {
+                no_hc: false,
+                max_enum: 100_000,
+                hb_expand: 0,
+            },
+            &mut counts,
+            &mut subtype_counts,
+            &mut rows,
+        )
+        .unwrap();
+
+        let exact = rows
+            .iter()
+            .find(|row| row.record.raw().pos == 100)
+            .expect("exact pair is emitted");
+        assert!(
+            exact.record.samples_contain(":UNK:lm:"),
+            "rows={:?}",
+            rows.iter()
+                .map(|row| row.record.raw().to_line())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1209,12 +1323,29 @@ mod memory_guards {
 
         assert_eq!(
             legacy_repetitive_indel_hap_promotions(&cluster, &region_state),
-            BTreeSet::from([paired_truth.key])
+            BTreeSet::from([paired_truth.key.clone()])
         );
         assert_eq!(
             legacy_preprocessed_snp_first_positions(&cluster),
             BTreeSet::from([15181526])
         );
+
+        let reference = "A".repeat(4);
+        let mut rows = vec![
+            tp_combined_row(&paired_truth, &paired_query, &reference, cluster.start, ""),
+            tp_combined_row(
+                &shared_truth_snp,
+                &shared_query_snp,
+                &reference,
+                cluster.start,
+                "",
+            ),
+        ];
+        apply_legacy_combined_before_truth_only_order(&mut rows);
+        apply_legacy_preprocessed_snp_first_order(&mut rows, &cluster);
+        rows.sort_by_key(|row| row.sort_key.clone());
+        assert_eq!(rows[0].record.raw().alt_allele, "T");
+        assert_eq!(rows[1].record.raw().alt_allele, "AT");
 
         let all_conf = RegionState {
             covered_truth: cluster.truth.iter().map(|v| v.key.clone()).collect(),
@@ -1283,6 +1414,25 @@ mod memory_guards {
 
         assert!(has_nonconf_split_sibling(&deletion, &cluster, &regions));
         assert!(has_nonconf_split_sibling(&insertion, &cluster, &regions));
+    }
+
+    #[test]
+    fn truth_edits_across_adjacent_indels_prevent_split_sibling_label() {
+        let deletion = variant(390, "TAAA", "T", "0/1").with_qual("50");
+        let insertion = variant(393, "A", "ATT", "0/1").with_qual("50");
+        let cluster = Cluster {
+            chrom: "chr19".to_string(),
+            start: deletion.key.pos,
+            end: insertion.end_pos(),
+            truth: vec![
+                variant(390, "TA", "T", "0|1"),
+                variant(392, "A", "T", "0|1"),
+            ],
+            query: vec![deletion.clone(), insertion],
+        };
+        let regions = RegionState::from_cluster(&cluster, "TAAA", Some(&[]));
+
+        assert!(!has_nonconf_split_sibling(&deletion, &cluster, &regions));
     }
 
     #[test]
@@ -1439,6 +1589,17 @@ mod memory_guards {
     }
 
     #[test]
+    fn bk_path_long_persisted_aggregate_keeps_missing_kind() {
+        let long = variant(
+            1533412,
+            "C",
+            &format!("C{},C{}", "A".repeat(600), "A".repeat(700)),
+            "2/1",
+        );
+        assert_eq!(bk_for_row(&long, &[], true), ".");
+    }
+
+    #[test]
     fn bk_path_fallthrough_emits_dot_on_snp_only_mismatch() {
         // chr21:15200371 pattern: truth FN at pos P; cluster's only
         // query is a SNP 7bp away at a different locus. No same-locus
@@ -1579,6 +1740,26 @@ mod memory_guards {
         ));
     }
 
+    #[test]
+    fn truth_subset_match_preserves_persisted_location_aggregate() {
+        // test_full chr1:963700: preprocessing has already combined the
+        // query's two deletion calls into one canonical `2/1` record.
+        // Legacy hap.py emits both truth rows plus this one query row; it
+        // does not consume one query allele into a combined truth row.
+        let truth_short = variant(963700, "GC", "G", "1|0");
+        let truth_long = variant(963700, "GCC", "G", "0|1");
+        let query = variant(963700, "GCC", "GC,G", "2/1");
+        let reference = "N".repeat(963710);
+        assert!(!truth_subset_match(
+            &truth_long,
+            &query,
+            &reference,
+            963700,
+            &[truth_short, truth_long.clone()],
+            std::slice::from_ref(&query),
+        ));
+    }
+
     // Residual #50 — chr21:15671076 cluster had a truth `T→TATATA` at
     // pos 15671094 plus a truth `T→TA` at pos 15671095. Both are
     // insertions. The previous homopolymer anchor slide pushed both
@@ -1674,6 +1855,248 @@ mod memory_guards {
     }
 
     #[test]
+    fn ambiguous_reference_snp_has_no_titv_subtype() {
+        let variant = variant(121965037, "N", "T", "1/1");
+        assert_eq!(comparison_info(&variant, "N"), ".");
+        assert_eq!(snp_bucket_label(&variant), None);
+    }
+
+    #[test]
+    fn spanning_deletion_halfcall_uses_anchor_for_confidence() {
+        let halfcall = variant(100, "ACGT", ".", "0|.");
+        let conf = [Interval {
+            chrom: "chr21".to_string(),
+            start: 99,
+            end: 100,
+        }];
+        assert!(variant_is_conf(&halfcall, "N", 100, 103, &conf));
+    }
+
+    #[test]
+    fn halfcall_is_tp_only_inside_a_matched_deletion() {
+        let deletion = variant(100, "ACGT", "A", "0|1");
+        let query = variant(100, "ACGT", "A", "0/1");
+        let mut cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 100,
+            end: 103,
+            truth: vec![deletion, variant(102, "G", ".", "0|.")],
+            query: vec![query],
+        };
+        assert!(!halfcall_is_covered_by_matched_deletion(
+            &cluster.truth[1],
+            &cluster
+        ));
+        cluster.query.push(variant(103, "T", "TA,TAA", "2/1"));
+        assert!(halfcall_is_covered_by_matched_deletion(
+            &cluster.truth[1],
+            &cluster
+        ));
+        let outside = variant(104, "T", ".", "0|.");
+        assert!(!halfcall_is_covered_by_matched_deletion(&outside, &cluster));
+    }
+
+    #[test]
+    fn unmatched_covering_deletion_promotes_halfcall_in_hap_match() {
+        let deletion = variant(100, "ACGT", "A", "0|1");
+        let halfcall = variant(102, "G", ".", "0|.");
+        let cluster = Cluster {
+            chrom: "chr10".to_string(),
+            start: 100,
+            end: 103,
+            truth: vec![deletion, halfcall.clone()],
+            query: vec![variant(102, "G", "T", "1/1")],
+        };
+
+        assert!(halfcall_is_covered_by_matched_deletion(&halfcall, &cluster));
+    }
+
+    #[test]
+    fn overlapping_truth_deletion_makes_gt_discordance_local() {
+        let paired_truth = variant(127, "ACGT", "A", "1|0");
+        let paired_query = variant(127, "ACGT", "A", "1/1");
+        let overlapping_truth = variant(100, "A".repeat(50).as_str(), "A", "0|1");
+        let cluster = Cluster {
+            chrom: "chr20".to_string(),
+            start: 100,
+            end: 149,
+            truth: vec![overlapping_truth, paired_truth],
+            query: vec![paired_query],
+        };
+
+        assert!(legacy_overlapping_deletion_mismatch(&cluster));
+    }
+
+    #[test]
+    fn halfcall_order_follows_legacy_companion_kind() {
+        let reference = "A".repeat(256);
+        let halfcall = variant(102, "A", ".", "0|.");
+        let truth = variant(102, "A", "G", "0|1");
+        let query = variant(102, "A", "G", "0/1");
+
+        let mut matched = vec![
+            fn_row(&halfcall, &reference, 100, "", "."),
+            tp_combined_row(&truth, &query, &reference, 100, ""),
+        ];
+        apply_legacy_halfcall_order(&mut matched);
+        assert_eq!(matched[0].sort_key.2, 2);
+        assert_eq!(matched[1].sort_key.2, 1);
+
+        let mut truth_only = vec![
+            fn_row(&halfcall, &reference, 100, "", "."),
+            fn_row(&truth, &reference, 100, "", "."),
+        ];
+        apply_legacy_halfcall_order(&mut truth_only);
+        assert_eq!(truth_only[0].sort_key.2, 2);
+        assert_eq!(truth_only[1].sort_key.2, 3);
+
+        let residual_query = variant(102, "A", "AG", "0/1");
+        let mut three_grains = vec![
+            fn_row(&halfcall, &reference, 100, "", "."),
+            fn_row(&truth, &reference, 100, "", "."),
+            fp_like_row(&residual_query, &reference, 100, "", "UNK", None, "lm"),
+        ];
+        apply_legacy_halfcall_order(&mut three_grains);
+        assert_eq!(three_grains[0].sort_key.2, 2);
+        assert_eq!(three_grains[1].sort_key.2, 3);
+        assert_eq!(three_grains[2].sort_key.2, 4);
+    }
+
+    #[test]
+    fn combined_allele_sorts_before_truth_only_allele_at_same_position() {
+        let reference = "A".repeat(256);
+        let paired_truth = variant(102, "AAAA", "A", "1|0");
+        let paired_query = variant(102, "AAAA", "A", "0/1");
+        let truth_only = variant(102, "AAA", "A", "0|1");
+        let mut rows = vec![
+            fn_row(&truth_only, &reference, 100, "", "lm"),
+            tp_combined_row(&paired_truth, &paired_query, &reference, 100, ""),
+        ];
+
+        apply_legacy_combined_before_truth_only_order(&mut rows);
+
+        assert_eq!(rows[0].sort_key.2, 1);
+        assert_eq!(rows[1].sort_key.2, 0);
+    }
+
+    #[test]
+    fn halfcall_inherits_same_position_truth_local_mismatch_kind() {
+        let reference = "A".repeat(256);
+        let halfcall = variant(102, "A", ".", "0|.");
+        let unmatched_snp = variant(102, "A", "T", "0|1");
+        let matched_snp = variant(103, "A", "G", "0|1");
+        let matched_query = variant(103, "A", "G", "0/1");
+
+        let mut rows = vec![
+            fn_row(&halfcall, &reference, 100, "", "."),
+            fn_row(&unmatched_snp, &reference, 100, "", "lm"),
+            tp_combined_row(&matched_snp, &matched_query, &reference, 100, ""),
+        ];
+        apply_legacy_halfcall_block_kind(&mut rows);
+
+        assert!(rows[0].record.samples[0].contains(":N:lm:.:UNK:halfcall:"));
+        assert!(rows[1].record.samples[0].contains(":FN:lm:"));
+        assert!(rows[2].record.samples[0].contains(":TP:gm:"));
+    }
+
+    #[test]
+    fn outside_conf_aggregate_mismatch_marks_the_whole_block_local() {
+        let cluster = Cluster {
+            chrom: "chr9".to_string(),
+            start: 113463932,
+            end: 113463970,
+            truth: vec![
+                variant(113463934, "T", "TATTTTTTTTATTGTATTGTATTG", "1|0"),
+                variant(113463959, "T", "TA", "1|0"),
+                variant(113463959, "T", "TATTTT", "0|1"),
+            ],
+            query: vec![
+                variant(113463934, "T", "TATTTTTTTTATTGTATTGTATTG", "0/1"),
+                variant(113463959, "T", "TA,TATTTT", "2/1"),
+            ],
+        };
+        assert_eq!(
+            legacy_unknown_aggregate_local_mismatch(&cluster, &RegionState::default(), false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn matched_outside_conf_reaching_insertion_aggregate_marks_whole_block_local() {
+        // Reduced form of test_full chr9:113463932. The first insertion is
+        // byte-equal across truth/query and reaches the later two-allele
+        // aggregate. The remaining truth primitives and query aggregate
+        // reconstruct the same haplotypes, but legacy's graph still stamps
+        // the entire outside-CONF block BK=lm.
+        let reaching = "TATTTTTTTTATTGTATTGTATTG";
+        let aggregate = "TATTTTATTTTATTTTATTTTATTTTATTTTATTTT";
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 3,
+            end: 28,
+            truth: vec![
+                variant(3, "T", reaching, "1|0"),
+                variant(28, "T", "TA", "1|0"),
+                variant(28, "T", aggregate, "0|1"),
+            ],
+            query: vec![
+                variant(3, "T", reaching, "0/1"),
+                variant(28, "T", &format!("TA,{aggregate}"), "2/1"),
+            ],
+        };
+        let reference = BTreeMap::from([("chr21".to_string(), "T".repeat(96))]);
+        let mut counts = BTreeMap::new();
+        let mut subtype_counts = BTreeMap::new();
+        let mut rows = Vec::new();
+        process_cluster(
+            &cluster,
+            &reference,
+            Some(&[]),
+            ComparisonConfig {
+                no_hc: false,
+                max_enum: 100_000,
+                hb_expand: 0,
+            },
+            &mut counts,
+            &mut subtype_counts,
+            &mut rows,
+        )
+        .unwrap();
+
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|row| !row.record.samples_contain(":UNK:.:")
+                && row.record.samples_contain(":UNK:lm:")),
+            "rows={:?}",
+            rows.iter()
+                .map(|row| row.record.raw().to_line())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn outside_conf_aggregate_with_matching_phases_keeps_block_kind_missing() {
+        let cluster = Cluster {
+            chrom: "chr2".to_string(),
+            start: 1533412,
+            end: 1534186,
+            truth: vec![
+                variant(1533412, "C", "CAAA", "0|1"),
+                variant(1533412, "C", "CAAAAA", "1|0"),
+                variant(1533413, "CAAAAAA", "C", "1|1"),
+            ],
+            query: vec![
+                variant(1533412, "C", "CAAA,CAAAAA", "2/1"),
+                variant(1533413, "CAAAAAA", "C", "1/1"),
+            ],
+        };
+        assert_eq!(
+            legacy_unknown_aggregate_local_mismatch(&cluster, &RegionState::default(), true),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn symbolic_output_ref_uses_the_reference_base() {
         let variant = Variant {
             key: VariantKey {
@@ -1690,10 +2113,11 @@ mod memory_guards {
     }
 
     #[test]
-    fn fully_nonconf_matched_fanout_uses_local_match_bk() {
-        assert_eq!(matched_query_unk_bk(true, false, "."), "lm");
+    fn fully_nonconf_matched_fanout_keeps_fallback_bk() {
+        assert_eq!(matched_query_unk_bk(true, false, "."), ".");
         assert_eq!(matched_query_unk_bk(true, true, "."), ".");
         assert_eq!(matched_query_unk_bk(false, false, "."), ".");
+        assert_eq!(matched_query_unk_bk(true, false, "lm"), "lm");
     }
 
     // Class 3 pin: `variant_is_conf` must apply legacy's

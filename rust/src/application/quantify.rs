@@ -448,6 +448,7 @@ fn run_with_metric_indices_inner(
             },
         });
     let roc_options = roc::RocOptions {
+        threads: args.threads.unwrap_or(1).max(1),
         qq_field: args.roc.clone(),
         score_field: mode.roc_value_from_qq.then(|| "QQ".to_string()),
         ignored_filters: args

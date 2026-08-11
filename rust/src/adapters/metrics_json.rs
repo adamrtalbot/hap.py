@@ -269,6 +269,11 @@ fn metrics_json_for_module_with_indices(
     indices: Option<&BTreeMap<String, Vec<usize>>>,
 ) -> Result<String> {
     let ci_alpha = commandline_ci_alpha(commandline);
+    let ratio_overrides = tables
+        .iter()
+        .find(|(id, _, _)| *id == "all.metrics")
+        .map(|(_, _, path)| ratio_overrides_from_extended(path))
+        .transpose()?;
     let rendered_tables = tables
         .iter()
         .map(|(id, label, path)| {
@@ -280,6 +285,7 @@ fn metrics_json_for_module_with_indices(
                     .and_then(|tables| tables.get(*id))
                     .map(Vec::as_slice),
                 ci_alpha,
+                ratio_overrides.as_ref(),
             )
         })
         .collect::<Result<Vec<_>>>()?
@@ -304,8 +310,11 @@ fn create_parent(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 fn table_json(id: &str, label: &str, path: &Path) -> Result<String> {
-    table_json_with_indices(id, label, path, None, None)
+    table_json_with_indices(id, label, path, None, None, None)
 }
+
+type RatioOverrideKey = (String, String, String, String, String);
+type RatioOverrides = BTreeMap<RatioOverrideKey, String>;
 
 fn table_json_with_indices(
     id: &str,
@@ -313,6 +322,7 @@ fn table_json_with_indices(
     path: &Path,
     indices: Option<&[usize]>,
     ci_alpha: Option<f64>,
+    ratio_overrides: Option<&RatioOverrides>,
 ) -> Result<String> {
     let text = crate::adapters::vcf::read_text(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -339,7 +349,14 @@ fn table_json_with_indices(
             .collect::<Vec<_>>();
         let kind = legacy_column_type(id, name, &values);
         out.push_str(&column_json(
-            name, name, kind, &values, &header, &rows, ci_alpha,
+            name,
+            name,
+            kind,
+            &values,
+            &header,
+            &rows,
+            ci_alpha,
+            ratio_overrides,
         ));
     }
     out.push_str("],\"properties\":[],\"type\":\"Table\",\"id\":");
@@ -403,6 +420,7 @@ fn column_json(
     header: &[String],
     rows: &[Vec<String>],
     ci_alpha: Option<f64>,
+    ratio_overrides: Option<&RatioOverrides>,
 ) -> String {
     let rendered = values
         .iter()
@@ -414,7 +432,7 @@ fn column_json(
             }
             "double" if id.starts_with("METRIC.") => render_legacy_metric(value),
             "double" if is_ratio_column(id) => {
-                render_legacy_ratio(id, value, header, &rows[row_index])
+                render_legacy_ratio(id, value, header, &rows[row_index], ratio_overrides)
             }
             "double" => render_double(value),
             _ => json_string(value),
@@ -540,10 +558,28 @@ fn is_ratio_column(column: &str) -> bool {
     column.ends_with(".TiTv_ratio") || column.ends_with(".het_hom_ratio")
 }
 
-fn render_legacy_ratio(column: &str, displayed: &str, header: &[String], row: &[String]) -> String {
+fn render_legacy_ratio(
+    column: &str,
+    displayed: &str,
+    header: &[String],
+    row: &[String],
+    ratio_overrides: Option<&RatioOverrides>,
+) -> String {
     let Some((base, numerator_suffix, denominator_suffix)) = ratio_parts(column) else {
         return render_double(displayed);
     };
+    if let Some(overrides) = ratio_overrides {
+        let key = (
+            column.to_string(),
+            displayed.to_string(),
+            row_value(header, row, base).unwrap_or("").to_string(),
+            row_value(header, row, "Type").unwrap_or("").to_string(),
+            row_value(header, row, "Filter").unwrap_or("").to_string(),
+        );
+        if let Some(value) = overrides.get(&key) {
+            return value.clone();
+        }
+    }
     let numerator_column = format!("{base}.{numerator_suffix}");
     let denominator_column = format!("{base}.{denominator_suffix}");
     if header.iter().any(|name| name == &numerator_column)
@@ -577,6 +613,79 @@ fn render_legacy_ratio(column: &str, displayed: &str, header: &[String], row: &[
         return json_repr_float(numerator as f64 / denominator as f64);
     }
     json_repr_float(value)
+}
+
+/// Recover the unrounded integer ratios retained by legacy pandas from the
+/// extended table. The summary CSV prints only 12 significant digits, which
+/// is insufficient to reconstruct a unique fraction for multi-million-call
+/// GIAB rows; the sibling extended table carries the exact ti/tv and
+/// het/homalt counts used to create the JSON value.
+fn ratio_overrides_from_extended(path: &Path) -> Result<RatioOverrides> {
+    let text = crate::adapters::vcf::read_text(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing CSV header in {}", path.display()))?
+        .split(',')
+        .collect::<Vec<_>>();
+    let rows = lines
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.split(',').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let index = |name: &str| header.iter().position(|column| *column == name);
+    let type_index = index("Type");
+    let filter_index = index("Filter");
+    let mut overrides = BTreeMap::new();
+    for (ratio_index, ratio_column) in header.iter().enumerate() {
+        let Some((base, numerator_suffix, denominator_suffix)) = ratio_parts(ratio_column) else {
+            continue;
+        };
+        let Some(base_index) = index(base) else {
+            continue;
+        };
+        let Some(numerator_index) = index(&format!("{base}.{numerator_suffix}")) else {
+            continue;
+        };
+        let Some(denominator_index) = index(&format!("{base}.{denominator_suffix}")) else {
+            continue;
+        };
+        for row in &rows {
+            let displayed = row.get(ratio_index).copied().unwrap_or("");
+            let Some(numerator) = row
+                .get(numerator_index)
+                .and_then(|value| parse_finite(value))
+            else {
+                continue;
+            };
+            let Some(denominator) = row
+                .get(denominator_index)
+                .and_then(|value| parse_finite(value))
+                .filter(|value| *value != 0.0)
+            else {
+                continue;
+            };
+            overrides.insert(
+                (
+                    (*ratio_column).to_string(),
+                    displayed.to_string(),
+                    row.get(base_index).copied().unwrap_or("").to_string(),
+                    type_index
+                        .and_then(|index| row.get(index))
+                        .copied()
+                        .unwrap_or("")
+                        .to_string(),
+                    filter_index
+                        .and_then(|index| row.get(index))
+                        .copied()
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                json_repr_float(numerator / denominator),
+            );
+        }
+    }
+    Ok(overrides)
 }
 
 fn ratio_parts(column: &str) -> Option<(&str, &str, &str)> {
@@ -770,9 +879,15 @@ mod tests {
             "\"values\":[\"21.000000\",\"\"],\"type\":\"string\",\"id\":\"Subset.IS_CONF.Size\""
         ));
 
-        let indexed =
-            table_json_with_indices("all.metrics", "all.metrics", &csv, Some(&[9, 3]), None)
-                .unwrap();
+        let indexed = table_json_with_indices(
+            "all.metrics",
+            "all.metrics",
+            &csv,
+            Some(&[9, 3]),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(indexed.contains("\"values\":[9,3],\"type\":\"string\",\"id\":\"types\""));
     }
 

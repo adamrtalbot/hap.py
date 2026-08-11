@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const PREPROCESS_SORT_CHUNK_RECORDS: usize = 65_536;
@@ -16,22 +16,39 @@ const PREPROCESS_SORT_MERGE_FAN_IN: usize = 32;
 
 pub(super) struct PreparedRecordSpool {
     path: tempfile::TempPath,
+    offsets: Vec<u64>,
+    contigs: Vec<String>,
 }
 
 impl PreparedRecordSpool {
-    pub(super) fn reader(&self) -> Result<PreparedRecordReader> {
+    pub(super) fn reader(&self) -> Result<PreparedRecordReader<'_>> {
         Ok(PreparedRecordReader {
             reader: BufReader::new(File::open(&self.path)?),
+            offsets: &self.offsets,
+            next_index: None,
         })
     }
 
     pub(super) fn len(&self) -> Result<u64> {
         Ok(std::fs::metadata(&self.path)?.len())
     }
+
+    pub(super) fn record_count(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub(super) fn contigs(&self) -> &[String] {
+        &self.contigs
+    }
 }
 
 pub(super) struct PreparedRecordSpoolWriter {
     writer: BufWriter<tempfile::NamedTempFile>,
+    offsets: Vec<u64>,
+    encoded: Vec<u8>,
+    bytes_written: u64,
+    contig_set: HashSet<String>,
+    contigs: Vec<String>,
 }
 
 impl PreparedRecordSpoolWriter {
@@ -40,6 +57,11 @@ impl PreparedRecordSpoolWriter {
             writer: BufWriter::new(
                 tempfile::NamedTempFile::new().context("failed to create prepared-record spool")?,
             ),
+            offsets: Vec::new(),
+            encoded: Vec::new(),
+            bytes_written: 0,
+            contig_set: HashSet::new(),
+            contigs: Vec::new(),
         })
     }
 
@@ -48,26 +70,23 @@ impl PreparedRecordSpoolWriter {
         record: &RawVcfRecord,
         symbolic_deletion: Option<SymbolicDeletionMaterialization>,
     ) -> Result<()> {
-        self.push_with_reset(record, symbolic_deletion, false)
-    }
-
-    pub(super) fn push_with_reset(
-        &mut self,
-        record: &RawVcfRecord,
-        symbolic_deletion: Option<SymbolicDeletionMaterialization>,
-        reset_before: bool,
-    ) -> Result<()> {
+        if self.contig_set.insert(record.chrom.clone()) {
+            self.contigs.push(record.chrom.clone());
+        }
         let marker = match symbolic_deletion {
             None => 0,
             Some(SymbolicDeletionMaterialization::LeadingAnchor) => 1,
             Some(SymbolicDeletionMaterialization::ContigStart) => 2,
         };
-        writeln!(
-            self.writer,
-            "{marker}\t{}\t{}",
-            usize::from(reset_before),
-            record.to_line()
-        )?;
+        self.encoded.clear();
+        self.encoded.push(marker);
+        encode_raw_record(&mut self.encoded, record)?;
+        self.offsets.push(self.bytes_written);
+        self.writer.write_all(&self.encoded)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(u64::try_from(self.encoded.len())?)
+            .context("prepared-record spool size overflow")?;
         Ok(())
     }
 
@@ -79,45 +98,129 @@ impl PreparedRecordSpoolWriter {
             .map_err(|error| error.into_error())?;
         Ok(PreparedRecordSpool {
             path: file.into_temp_path(),
+            offsets: self.offsets,
+            contigs: self.contigs,
         })
     }
 }
 
-pub(super) struct PreparedRecordReader {
+pub(super) struct PreparedRecordReader<'a> {
     reader: BufReader<File>,
+    offsets: &'a [u64],
+    next_index: Option<usize>,
 }
 
-impl Iterator for PreparedRecordReader {
-    type Item = Result<(RawVcfRecord, Option<SymbolicDeletionMaterialization>, bool)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => return None,
-            Ok(_) => {}
-            Err(error) => return Some(Err(error.into())),
+impl PreparedRecordReader<'_> {
+    pub(super) fn read_at(
+        &mut self,
+        index: usize,
+    ) -> Result<(RawVcfRecord, Option<SymbolicDeletionMaterialization>)> {
+        let offset = self
+            .offsets
+            .get(index)
+            .copied()
+            .context("prepared-record spool index is out of bounds")?;
+        if self.next_index != Some(index) {
+            self.reader.seek(SeekFrom::Start(offset))?;
         }
-        Some((|| {
-            let line = line.trim_end_matches(['\r', '\n']);
-            let (marker, remainder) = line
-                .split_once('\t')
-                .context("prepared-record spool entry lacks marker")?;
-            let (reset_before, record) = remainder
-                .split_once('\t')
-                .context("prepared-record spool entry lacks reset marker")?;
-            let symbolic_deletion = match marker {
-                "0" => None,
-                "1" => Some(SymbolicDeletionMaterialization::LeadingAnchor),
-                "2" => Some(SymbolicDeletionMaterialization::ContigStart),
-                _ => anyhow::bail!("invalid prepared-record spool marker {marker}"),
-            };
-            Ok((
-                RawVcfRecord::from_line(record, Path::new("prepared-record-spool"))?,
-                symbolic_deletion,
-                reset_before == "1",
-            ))
-        })())
+        let marker = read_u8(&mut self.reader)?;
+        let symbolic_deletion = match marker {
+            0 => None,
+            1 => Some(SymbolicDeletionMaterialization::LeadingAnchor),
+            2 => Some(SymbolicDeletionMaterialization::ContigStart),
+            _ => anyhow::bail!("invalid prepared-record spool marker {marker}"),
+        };
+        let record = decode_raw_record(&mut self.reader)?;
+        self.next_index = index.checked_add(1);
+        Ok((record, symbolic_deletion))
     }
+}
+
+fn encode_raw_record(output: &mut Vec<u8>, record: &RawVcfRecord) -> Result<()> {
+    encode_string(output, &record.chrom)?;
+    output.extend_from_slice(&u64::try_from(record.pos)?.to_le_bytes());
+    encode_string(output, &record.id)?;
+    encode_string(output, &record.ref_allele)?;
+    encode_string(output, &record.alt_allele)?;
+    encode_string(output, &record.qual)?;
+    encode_string(output, &record.filter)?;
+    encode_string(output, &record.info)?;
+    match &record.format {
+        Some(format) => {
+            output.push(1);
+            encode_string(output, format)?;
+        }
+        None => output.push(0),
+    }
+    output.extend_from_slice(&u32::try_from(record.samples.len())?.to_le_bytes());
+    for sample in &record.samples {
+        encode_string(output, sample)?;
+    }
+    Ok(())
+}
+
+fn encode_string(output: &mut Vec<u8>, value: &str) -> Result<()> {
+    output.extend_from_slice(&u32::try_from(value.len())?.to_le_bytes());
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn decode_raw_record(reader: &mut impl Read) -> Result<RawVcfRecord> {
+    let chrom = decode_string(reader)?;
+    let pos = usize::try_from(read_u64(reader)?)?;
+    let id = decode_string(reader)?;
+    let ref_allele = decode_string(reader)?;
+    let alt_allele = decode_string(reader)?;
+    let qual = decode_string(reader)?;
+    let filter = decode_string(reader)?;
+    let info = decode_string(reader)?;
+    let format = match read_u8(reader)? {
+        0 => None,
+        1 => Some(decode_string(reader)?),
+        marker => anyhow::bail!("invalid prepared-record FORMAT marker {marker}"),
+    };
+    let sample_count = usize::try_from(read_u32(reader)?)?;
+    let mut samples = Vec::with_capacity(sample_count);
+    for _ in 0..sample_count {
+        samples.push(decode_string(reader)?);
+    }
+    Ok(RawVcfRecord {
+        chrom,
+        pos,
+        id,
+        ref_allele,
+        alt_allele,
+        qual,
+        filter,
+        info,
+        format,
+        samples,
+    })
+}
+
+fn decode_string(reader: &mut impl Read) -> Result<String> {
+    let len = usize::try_from(read_u32(reader)?)?;
+    let mut value = vec![0; len];
+    reader.read_exact(&mut value)?;
+    String::from_utf8(value).context("prepared-record spool field is not UTF-8")
+}
+
+fn read_u8(reader: &mut impl Read) -> Result<u8> {
+    let mut bytes = [0; 1];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes[0])
+}
+
+fn read_u32(reader: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[derive(Default)]
@@ -277,6 +380,7 @@ impl PreprocessSpool {
         self.flush_chunk()?;
         Ok(PreprocessRecords::Sorted(ExternalRecordMerge::new(
             self.chunks,
+            self.stream_count,
         )?))
     }
 }
@@ -324,11 +428,11 @@ impl Iterator for LocationAggregatedRecords {
         };
         let chrom = first.raw().chrom.clone();
         let pos = first.raw().pos;
-        let mut group = vec![first.into_raw()];
+        let mut group = vec![(first.provenance().source_index(), first.into_raw())];
         loop {
             match self.inner.next() {
                 Some(Ok(record)) if record.raw().chrom == chrom && record.raw().pos == pos => {
-                    group.push(record.into_raw());
+                    group.push((record.provenance().source_index(), record.into_raw()));
                 }
                 Some(record) => {
                     self.pending = Some(record);
@@ -338,13 +442,30 @@ impl Iterator for LocationAggregatedRecords {
             }
         }
 
-        self.ready.extend(
-            crate::engines::variant_pipeline::aggregate_location_records(group)
-                .into_iter()
-                .map(|record| {
-                    ValidatedVcfRecord::try_from_raw(record, QueryProvenance::Unavailable)
-                }),
-        );
+        let mut streams = BTreeMap::<usize, Vec<RawVcfRecord>>::new();
+        for (stream, record) in group {
+            streams.entry(stream.unwrap_or(0)).or_default().push(record);
+        }
+        let streams = streams
+            .into_values()
+            .map(crate::engines::variant_pipeline::aggregate_location_records)
+            .collect::<Vec<_>>();
+        // Legacy merges independent block/location streams round-wise at an
+        // equal normalized position: first record from every stream, then
+        // the second from every stream. Keeping stream provenance through
+        // the indexed spool prevents duplicate location copies from being
+        // mistaken for two alleles of one diploid call.
+        let maximum_stream_records = streams.iter().map(Vec::len).max().unwrap_or(0);
+        for record_index in 0..maximum_stream_records {
+            for stream in &streams {
+                if let Some(record) = stream.get(record_index) {
+                    self.ready.push_back(ValidatedVcfRecord::try_from_raw(
+                        record.clone(),
+                        QueryProvenance::Unavailable,
+                    ));
+                }
+            }
+        }
         self.ready.pop_front()
     }
 }
@@ -368,14 +489,18 @@ pub(super) struct ExternalRecordMerge {
     readers: Vec<BufReader<File>>,
     current: Vec<Option<KeyedRecord>>,
     heap: BinaryHeap<Reverse<SortKey>>,
+    stream_count: usize,
 }
 
 impl ExternalRecordMerge {
-    fn new(chunks: Vec<tempfile::TempPath>) -> Result<Self> {
-        Self::open(collapse_preprocess_chunks(chunks)?)
+    fn new(chunks: Vec<tempfile::TempPath>, stream_count: usize) -> Result<Self> {
+        Self::open(
+            collapse_preprocess_chunks(chunks, stream_count)?,
+            stream_count,
+        )
     }
 
-    fn open(chunks: Vec<tempfile::TempPath>) -> Result<Self> {
+    fn open(chunks: Vec<tempfile::TempPath>, stream_count: usize) -> Result<Self> {
         let readers = chunks
             .iter()
             .map(File::open)
@@ -387,6 +512,7 @@ impl ExternalRecordMerge {
             readers,
             current,
             heap: BinaryHeap::new(),
+            stream_count: stream_count.max(1),
         };
         for index in 0..merge.readers.len() {
             merge.read_next(index)?;
@@ -420,7 +546,8 @@ impl ExternalRecordMerge {
                 .context("preprocess sort chunk lacks record")?,
             Path::new("preprocess-sort-chunk"),
         )?;
-        let record = ValidatedVcfRecord::try_from_raw(raw, QueryProvenance::Unavailable)?;
+        let provenance = QueryProvenance::source(serial % self.stream_count, self.stream_count)?;
+        let record = ValidatedVcfRecord::try_from_raw(raw, provenance)?;
         self.current[index] = Some(((rank, pos, serial), record));
         self.heap.push(Reverse((rank, pos, serial, index)));
         Ok(())
@@ -451,6 +578,7 @@ impl Iterator for ExternalRecordMerge {
 
 fn collapse_preprocess_chunks(
     mut chunks: Vec<tempfile::TempPath>,
+    stream_count: usize,
 ) -> Result<Vec<tempfile::TempPath>> {
     while chunks.len() > PREPROCESS_SORT_MERGE_FAN_IN {
         let mut merged = Vec::with_capacity(chunks.len().div_ceil(PREPROCESS_SORT_MERGE_FAN_IN));
@@ -467,7 +595,7 @@ fn collapse_preprocess_chunks(
                 .context("failed to create preprocess merge chunk")?;
             {
                 let mut writer = BufWriter::new(output.as_file_mut());
-                let mut merge = ExternalRecordMerge::open(batch)?;
+                let mut merge = ExternalRecordMerge::open(batch, stream_count)?;
                 while let Some(entry) = merge.next_keyed() {
                     let ((rank, pos, serial), record) = entry?;
                     writeln!(

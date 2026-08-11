@@ -813,8 +813,21 @@ pub(super) fn raw_type_label(record: &RawVcfRecord) -> Option<&'static str> {
             .all(|alternate| alternate.len() == reference_len)
     {
         Some("MNPs")
-    } else {
+    } else if alternates.iter().all(|alternate| {
+        record
+            .ref_allele
+            .as_bytes()
+            .first()
+            .zip(alternate.as_bytes().first())
+            .is_some_and(|(reference, alternate)| reference == alternate)
+    }) {
         Some("indels")
+    } else {
+        // `som.py` obtains these totals from `bcftools stats`. A
+        // length-changing replacement is only an indel when the VCF alleles
+        // retain their shared anchor base; otherwise bcftools calls it
+        // "other" (for example `G -> CC` or `AA -> T`).
+        Some("others")
     }
 }
 

@@ -82,9 +82,13 @@ pub(crate) fn primitive_split_with_floor(
     }
 
     // Per-allele decomposition into primitive RefVars.
-    let mut primitives: Vec<(usize, Vec<RefVar>)> = Vec::with_capacity(alts.len());
+    let mut primitives: Vec<(usize, bool, Vec<RefVar>)> = Vec::with_capacity(alts.len());
     for (idx, alt) in alts.iter().enumerate() {
-        primitives.push((idx, allele_primitives(record, alt, reference)));
+        primitives.push((
+            idx,
+            allele_has_mixed_edit(&record.ref_allele, alt),
+            allele_primitives(record, alt, reference),
+        ));
     }
 
     // Build per-primitive RawVcfRecord values, projecting AD and remapping GT
@@ -105,8 +109,8 @@ pub(crate) fn primitive_split_with_floor(
         })
     });
 
-    let mut output: Vec<RawVcfRecord> = Vec::new();
-    for (allele_idx, prims) in primitives {
+    let mut output: Vec<(RawVcfRecord, bool)> = Vec::new();
+    for (allele_idx, preserve_mixed_anchor, prims) in primitives {
         let target = (allele_idx + 1) as u32;
         for prim in prims {
             if let Some(rec) = primitive_to_record(
@@ -117,8 +121,9 @@ pub(crate) fn primitive_split_with_floor(
                 gt_index,
                 &format_keys,
                 reference,
+                preserve_mixed_anchor,
             ) {
-                output.push(rec);
+                output.push((rec, preserve_mixed_anchor));
             }
         }
     }
@@ -130,7 +135,7 @@ pub(crate) fn primitive_split_with_floor(
     // processed; the second primitive at the same input anchor sees the
     // first primitive's end as its leftshift floor and stays put — matching
     // legacy's `VariantAlleleNormalizer.cpp:209-238` behaviour.
-    output.sort_by(|a, b| {
+    output.sort_by(|(a, _), (b, _)| {
         a.pos.cmp(&b.pos).then_with(|| {
             b.ref_allele
                 .len()
@@ -139,8 +144,15 @@ pub(crate) fn primitive_split_with_floor(
         })
     });
     let mut current_maxpos = previous_end;
-    for rec in &mut output {
-        shift_primitive_record(rec, reference, current_maxpos);
+    for (rec, preserve_mixed_anchor) in &mut output {
+        // The legacy primitive splitter emits the substitution and indel
+        // pieces of a mixed edit at their shared source anchor. Passing
+        // those pieces through the generic left shifter moves the indel to
+        // its trailing edge and changes both VCF identity and sibling
+        // aggregation (for example CAG>A must become C>A plus CAG>C).
+        if !*preserve_mixed_anchor {
+            shift_primitive_record(rec, reference, current_maxpos);
+        }
         // Legacy advances from `nv.pos + nv.len - 1` of the emitted record,
         // not from the wider source span that produced the primitive.
         let new_end = rec.pos + rec.ref_allele.len().saturating_sub(1);
@@ -152,7 +164,27 @@ pub(crate) fn primitive_split_with_floor(
     // merge when the leading REF span matches; if positions differ even by
     // one base the records stay separate (matching legacy's per-position
     // primitive emission for mixed-length deletions).
-    aggregate_same_position(output, &format_keys, phased)
+    let mut aggregated = aggregate_same_position(
+        output.into_iter().map(|(record, _)| record).collect(),
+        &format_keys,
+        phased,
+    );
+    if alts
+        .iter()
+        .any(|alt| allele_has_mixed_edit(&record.ref_allele, alt))
+    {
+        aggregated.sort_by(|left, right| {
+            left.pos.cmp(&right.pos).then_with(|| {
+                let left_indel = left.ref_allele.len() != left.alt_allele.len();
+                let right_indel = right.ref_allele.len() != right.alt_allele.len();
+                left_indel
+                    .cmp(&right_indel)
+                    .then(left.ref_allele.len().cmp(&right.ref_allele.len()))
+                    .then(left.alt_allele.cmp(&right.alt_allele))
+            })
+        });
+    }
+    aggregated
 }
 
 /// Run partial-credit left-shift + trim on a single-ALT primitive emitted
@@ -259,10 +291,38 @@ fn needs_primitive_split(record: &RawVcfRecord, alts: &[&str]) -> bool {
     }
     let ref_len = record.ref_allele.len();
     // Trigger when (a) we're multi-allelic with ≥1 indel allele OR (b) any
-    // allele is a real MNP/complex variant (both reflen>1 and altlen>1).
+    // allele retains both REF and ALT bases after common prefix/suffix trim.
+    // The latter includes asymmetric complex alleles such as AT→G and T→CGT;
+    // checking only raw lengths >1 misses exactly those shapes.
     let has_multi_indel = alts.len() > 1 && alts.iter().any(|a| a.len() != ref_len);
-    let has_complex = alts.iter().any(|a| ref_len > 1 && a.len() > 1);
+    let has_complex = alts
+        .iter()
+        .any(|alt| allele_has_mixed_edit(&record.ref_allele, alt));
     has_multi_indel || has_complex
+}
+
+fn allele_has_mixed_edit(reference: &str, alternate: &str) -> bool {
+    if reference.len() <= 1 && alternate.len() <= 1 {
+        return false;
+    }
+    let reference = reference.as_bytes();
+    let alternate = alternate.as_bytes();
+    let mut prefix = 0usize;
+    while prefix < reference.len()
+        && prefix < alternate.len()
+        && reference[prefix].eq_ignore_ascii_case(&alternate[prefix])
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < reference.len().saturating_sub(prefix)
+        && suffix < alternate.len().saturating_sub(prefix)
+        && reference[reference.len() - suffix - 1]
+            .eq_ignore_ascii_case(&alternate[alternate.len() - suffix - 1])
+    {
+        suffix += 1;
+    }
+    prefix + suffix < reference.len() && prefix + suffix < alternate.len()
 }
 
 /// Split an allele's REF/ALT pair into its primitive RefVars in the legacy
@@ -315,6 +375,7 @@ fn primitive_to_record(
     gt_index: Option<usize>,
     format_keys: &[String],
     reference: &[u8],
+    preserve_mixed_anchor: bool,
 ) -> Option<RawVcfRecord> {
     let mut out = record.clone();
     let reflen_i = (prim.end as i64) - (prim.start as i64) + 1;
@@ -329,25 +390,53 @@ fn primitive_to_record(
             .collect();
         out.alt_allele = prim.alt.to_ascii_uppercase();
     } else if reflen_i > 0 && altlen == 0 {
-        // Pure deletion — right-anchor convention (legacy trailing-edge):
-        // pos -> prim.start; REF = deleted_bases + right_anchor; ALT = right_anchor.
-        let anchor_pos = prim.end + 1;
-        let anchor = ref_slice(reference, anchor_pos, anchor_pos)?[0].to_ascii_uppercase() as char;
-        let deleted: String = ref_slice(reference, prim.start, prim.end)?
-            .iter()
-            .map(|b| b.to_ascii_uppercase() as char)
-            .collect();
-        out.pos = prim.start;
-        out.ref_allele = format!("{deleted}{anchor}");
-        out.alt_allele = anchor.to_string();
+        if preserve_mixed_anchor && prim.start > 1 {
+            // A deletion following a substitution uses their common left
+            // anchor: CAG>A => C>A plus CAG>C.
+            let anchor_pos = prim.start - 1;
+            let anchor =
+                ref_slice(reference, anchor_pos, anchor_pos)?[0].to_ascii_uppercase() as char;
+            let deleted: String = ref_slice(reference, prim.start, prim.end)?
+                .iter()
+                .map(|b| b.to_ascii_uppercase() as char)
+                .collect();
+            out.pos = anchor_pos;
+            out.ref_allele = format!("{anchor}{deleted}");
+            out.alt_allele = anchor.to_string();
+        } else {
+            // Standalone deletion — right-anchor convention (legacy
+            // trailing-edge).
+            let anchor_pos = prim.end + 1;
+            let anchor =
+                ref_slice(reference, anchor_pos, anchor_pos)?[0].to_ascii_uppercase() as char;
+            let deleted: String = ref_slice(reference, prim.start, prim.end)?
+                .iter()
+                .map(|b| b.to_ascii_uppercase() as char)
+                .collect();
+            out.pos = prim.start;
+            out.ref_allele = format!("{deleted}{anchor}");
+            out.alt_allele = anchor.to_string();
+        }
     } else if reflen_i <= 0 && altlen > 0 {
-        // Pure insertion — right-anchor convention (legacy trailing-edge):
-        // pos -> prim.start; REF = right_anchor; ALT = inserted_seq + right_anchor.
-        let anchor_pos = prim.start;
-        let anchor = ref_slice(reference, anchor_pos, anchor_pos)?[0].to_ascii_uppercase() as char;
-        out.pos = anchor_pos;
-        out.ref_allele = anchor.to_string();
-        out.alt_allele = format!("{}{anchor}", prim.alt.to_ascii_uppercase());
+        if preserve_mixed_anchor && prim.start > 1 {
+            // An insertion following a substitution uses their common left
+            // anchor: A>TT becomes A>T plus A>AT.
+            let anchor_pos = prim.start - 1;
+            let anchor =
+                ref_slice(reference, anchor_pos, anchor_pos)?[0].to_ascii_uppercase() as char;
+            out.pos = anchor_pos;
+            out.ref_allele = anchor.to_string();
+            out.alt_allele = format!("{anchor}{}", prim.alt.to_ascii_uppercase());
+        } else {
+            // Standalone insertion — right-anchor convention (legacy
+            // trailing-edge).
+            let anchor_pos = prim.start;
+            let anchor =
+                ref_slice(reference, anchor_pos, anchor_pos)?[0].to_ascii_uppercase() as char;
+            out.pos = anchor_pos;
+            out.ref_allele = anchor.to_string();
+            out.alt_allele = format!("{}{anchor}", prim.alt.to_ascii_uppercase());
+        }
     } else if reflen_i > 0 && altlen > 0 {
         // Generic mixed-length primitive (e.g. the original untrimmed
         // RefVar passed through by the legacy splitter when no allele was
@@ -374,6 +463,7 @@ fn primitive_to_record(
             ad_index,
             gt_index,
             format_keys.len(),
+            preserve_mixed_anchor,
         ));
     }
     out.samples = new_samples;
@@ -398,6 +488,7 @@ fn project_sample(
     ad_index: Option<usize>,
     gt_index: Option<usize>,
     expected_len: usize,
+    reverse_unphased_het: bool,
 ) -> String {
     let mut new_cells: Vec<String> = (0..expected_len)
         .map(|i| cells.get(i).cloned().unwrap_or_else(|| ".".to_string()))
@@ -407,6 +498,9 @@ fn project_sample(
         && let Some(cell) = new_cells.get_mut(gi)
     {
         *cell = canonical_split_gt(cell, target);
+        if reverse_unphased_het && *cell == "0/1" {
+            *cell = "1/0".to_string();
+        }
     }
     if let Some(ai) = ad_index
         && let Some(cell) = new_cells.get_mut(ai)
@@ -475,7 +569,7 @@ fn canonical_split_gt(gt: &str, target: u32) -> String {
 fn aggregate_same_position(
     records: Vec<RawVcfRecord>,
     format_keys: &[String],
-    phased: bool,
+    _phased: bool,
 ) -> Vec<RawVcfRecord> {
     if records.len() <= 1 {
         return records;
@@ -507,7 +601,13 @@ fn aggregate_same_position(
         let has_indel = group
             .iter()
             .any(|record| record.ref_allele.len() != record.alt_allele.len());
-        if phased && has_substitution && has_indel {
+        // A complex allele such as AT→G decomposes into A→G plus AT→A at
+        // the same anchor. Legacy's primitive splitter keeps those as two
+        // records for both phased and unphased genotypes; only compatible
+        // same-kind primitives are eligible for re-aggregation. Restricting
+        // this guard to phased input collapsed 37 real GIAB SNP primitives
+        // back into complex INDEL rows.
+        if has_substitution && has_indel {
             let mut split = group;
             split.sort_by(|left, right| {
                 let left_indel = left.ref_allele.len() != left.alt_allele.len();
@@ -611,6 +711,109 @@ fn merge_records(
     base
 }
 
+/// Aggregate two compatible biallelic calls emitted at the same VCF location.
+///
+/// Legacy's `VariantLocationAggregator` operates across input-record
+/// boundaries, not only across primitives produced from one parent record.
+/// It pads shorter REF alleles to the longest sibling span, extends each ALT
+/// by the same suffix, and emits one het-alt record. Records that cannot fit
+/// that diploid shape pass through unchanged.
+pub(crate) fn aggregate_location_records(mut records: Vec<RawVcfRecord>) -> Vec<RawVcfRecord> {
+    if records.len() > 2 {
+        let (substitutions, indels): (Vec<_>, Vec<_>) = records
+            .into_iter()
+            .partition(|record| record.ref_allele.len() == record.alt_allele.len());
+        if !substitutions.is_empty() && !indels.is_empty() {
+            // LocationAggregator combines compatible alleles within their
+            // variant class even when a decomposed complex call contributes
+            // both classes at the same position. Treating the whole location
+            // as one indivisible group leaves duplicate SNPs and insertions
+            // unmerged at real GIAB sites with three or four output rows.
+            let mut aggregated = aggregate_location_records(substitutions);
+            aggregated.extend(aggregate_location_records(indels));
+            return aggregated;
+        }
+        records = substitutions;
+        records.extend(indels);
+    }
+    if records.len() != 2
+        || records[0].chrom != records[1].chrom
+        || records[0].pos != records[1].pos
+        || records.iter().any(|record| record.alt_allele.contains(','))
+        || records[0].format != records[1].format
+        || records[0].samples.len() != records[1].samples.len()
+    {
+        return records;
+    }
+    let first_is_snp = records[0].ref_allele.len() == 1 && records[0].alt_allele.len() == 1;
+    let second_is_snp = records[1].ref_allele.len() == 1 && records[1].alt_allele.len() == 1;
+    if first_is_snp != second_is_snp {
+        return records;
+    }
+    let format_keys = records[0]
+        .format
+        .as_deref()
+        .map(|format| format.split(':').collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some(gt_index) = format_keys.iter().position(|key| *key == "GT") else {
+        return records;
+    };
+    let ad_index = format_keys.iter().position(|key| *key == "AD");
+    let compatible_calls = records.iter().all(|record| {
+        record.samples.iter().all(|sample| {
+            sample
+                .split(':')
+                .nth(gt_index)
+                .is_some_and(|gt| matches!(gt, "0/1" | "1/0"))
+        })
+    });
+    if !compatible_calls {
+        return records;
+    }
+
+    // VariantAlleleSplitter orders cross-record half-calls before padding.
+    // Preserve the source spans here: sorting the final padded alleles would
+    // invert overlapping deletions such as GC>G plus GCC>G.
+    records.sort_by(|left, right| {
+        left.ref_allele
+            .len()
+            .cmp(&right.ref_allele.len())
+            .then(left.alt_allele.len().cmp(&right.alt_allele.len()))
+            .then(left.alt_allele.cmp(&right.alt_allele))
+    });
+
+    let longest_ref = records
+        .iter()
+        .map(|record| record.ref_allele.as_str())
+        .max_by_key(|reference| reference.len())
+        .unwrap_or_default()
+        .to_string();
+    for record in &mut records {
+        let Some(suffix) = longest_ref.strip_prefix(&record.ref_allele) else {
+            return records;
+        };
+        record.ref_allele = longest_ref.clone();
+        record.alt_allele.push_str(suffix);
+    }
+    if records[0].alt_allele == records[1].alt_allele {
+        // Two independently emitted heterozygous copies of the same allele
+        // occupy both genotype slots in VariantLocationAggregator. This
+        // occurs when a complex allele contributes the same SNP as an
+        // adjacent biallelic record (C>A plus CAG>A => C>A 1/1 and CAG>C).
+        let mut merged = records.remove(0);
+        for sample in &mut merged.samples {
+            let mut cells = sample.split(':').map(str::to_string).collect::<Vec<_>>();
+            if let Some(gt) = cells.get_mut(gt_index) {
+                *gt = "1/1".to_string();
+            }
+            *sample = cells.join(":");
+        }
+        return vec![merged];
+    }
+
+    vec![merge_records(records, ad_index, Some(gt_index))]
+}
+
 fn merge_phased_genotypes(genotypes: &[&str]) -> String {
     let ploidy = genotypes
         .iter()
@@ -649,6 +852,13 @@ fn merge_unphased_genotypes(genotypes: &[&str]) -> String {
     } else if alt_calls.len() == 1 {
         format!("0/{}", alt_calls[0])
     } else {
+        if genotypes.len() == 2 && genotypes.iter().all(|genotype| *genotype == "1/0") {
+            // Two complex primitives already carry the legacy reversed
+            // single-call orientation. Their distinct alleles nevertheless
+            // occupy source haplotypes in forward order (1/2), as at the
+            // GIAB A>GG plus A>GGG location.
+            return "1/2".to_string();
+        }
         // `VariantLocationAggregator` fills the last zero slot first,
         // yielding the later alternate before the earlier one.
         alt_calls.sort_unstable();
@@ -701,6 +911,53 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].alt_allele, "G");
         assert_eq!(out[0].samples[0], "0/1");
+    }
+
+    #[test]
+    fn location_aggregator_merges_adjacent_real_world_indels() {
+        let shorter = make_record("chr1", 963_700, "GC", "G", "GT:AD:ADO:DP", "0/1:0,1:0:0");
+        let longer = make_record("chr1", 963_700, "GCC", "G", "GT:AD:ADO:DP", "0/1:0,1:0:0");
+
+        let out = aggregate_location_records(vec![shorter, longer]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ref_allele, "GCC");
+        assert_eq!(out[0].alt_allele, "GC,G");
+        assert_eq!(out[0].samples[0], "2/1:0,1,1:0:0");
+    }
+
+    #[test]
+    fn location_aggregator_preserves_incompatible_calls() {
+        let first = make_record("chr1", 100, "A", "G", "GT", "1/1");
+        let second = make_record("chr1", 100, "A", "T", "GT", "0/1");
+
+        let out = aggregate_location_records(vec![first, second]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alt_allele, "G");
+        assert_eq!(out[1].alt_allele, "T");
+    }
+
+    #[test]
+    fn location_aggregator_preserves_mixed_snp_and_indel_calls() {
+        let first = make_record("chr1", 100, "A", "G", "GT", "0/1");
+        let second = make_record("chr1", 100, "A", "AT", "GT", "0/1");
+
+        let out = aggregate_location_records(vec![first, second]);
+
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn location_aggregator_orders_source_alleles_before_padding() {
+        let longer_alt = make_record("chr10", 18_102_686, "A", "ATAT", "GT:AD", "0/1:0,1");
+        let shorter_alt = make_record("chr10", 18_102_686, "A", "ATT", "GT:AD", "0/1:0,1");
+
+        let out = aggregate_location_records(vec![longer_alt, shorter_alt]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alt_allele, "ATT,ATAT");
+        assert_eq!(out[0].samples[0], "2/1:0,1,1");
     }
 
     #[test]
@@ -882,6 +1139,84 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].alt_allele, "T");
         assert_eq!(out[1].alt_allele, "AT");
+    }
+
+    #[test]
+    fn unphased_complex_substitution_and_deletion_remain_separate() {
+        // The following reference base is A, so the one-base deletion
+        // left-shifts back onto the source anchor exactly as at the GIAB
+        // AT→G loci that exposed the re-aggregation bug.
+        let reference = windowed_ref(100, b"NNNNNATANNN");
+        let rec = make_record("chr1", 105, "AT", "G", "GT:AD", "0/1:5,9");
+        let out = primitive_split(&rec, &reference);
+
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|record| {
+            record.pos == 105
+                && record.ref_allele == "A"
+                && record.alt_allele == "G"
+                && record.samples[0] == "1/0:5,9"
+        }));
+        assert!(out.iter().any(|record| {
+            record.pos == 105
+                && record.ref_allele == "AT"
+                && record.alt_allele == "A"
+                && record.samples[0] == "1/0:5,9"
+        }));
+    }
+
+    #[test]
+    fn unphased_complex_substitution_and_insertion_share_the_source_anchor() {
+        let reference = windowed_ref(100, b"NNNNNANNNNN");
+        let rec = make_record("chr1", 105, "A", "TT", "GT:AD", "0/1:5,9");
+        let out = primitive_split(&rec, &reference);
+
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|record| {
+            record.pos == 105
+                && record.ref_allele == "A"
+                && record.alt_allele == "T"
+                && record.samples[0] == "1/0:5,9"
+        }));
+        assert!(out.iter().any(|record| {
+            record.pos == 105
+                && record.ref_allele == "A"
+                && record.alt_allele == "AT"
+                && record.samples[0] == "1/0:5,9"
+        }));
+    }
+
+    #[test]
+    fn duplicate_snp_primitives_fill_both_genotype_slots() {
+        let first = make_record("chr1", 105, "C", "A", "GT:AD", "1/0:5,9");
+        let second = make_record("chr1", 105, "C", "A", "GT:AD", "1/0:5,9");
+
+        let out = aggregate_location_records(vec![first, second]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alt_allele, "A");
+        assert_eq!(out[0].samples[0], "1/1:5,9");
+    }
+
+    #[test]
+    fn mixed_four_record_location_aggregates_each_variant_class() {
+        let first_snp = make_record("chr2", 105, "A", "G", "GT:AD", "1/0:5,9");
+        let first_insertion = make_record("chr2", 105, "A", "AG", "GT:AD", "1/0:5,9");
+        let second_snp = make_record("chr2", 105, "A", "G", "GT:AD", "1/0:5,9");
+        let second_insertion = make_record("chr2", 105, "A", "AGG", "GT:AD", "1/0:5,9");
+
+        let out = aggregate_location_records(vec![
+            first_snp,
+            first_insertion,
+            second_snp,
+            second_insertion,
+        ]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alt_allele, "G");
+        assert_eq!(out[0].samples[0], "1/1:5,9");
+        assert_eq!(out[1].alt_allele, "AG,AGG");
+        assert_eq!(out[1].samples[0], "1/2:5,9,9");
     }
 
     #[test]

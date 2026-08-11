@@ -24,18 +24,24 @@ use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::borrow::Borrow;
-use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 const INDEL_SUBTYPES: [&str; 9] = [
     "C16_PLUS", "C1_5", "C6_15", "D16_PLUS", "D1_5", "D6_15", "I16_PLUS", "I1_5", "I6_15",
 ];
 const ROC_OBSERVATION_CHUNK: usize = 16_384;
-const ROC_INDEX_ENTRY_BYTES: u64 = 24;
+const ROC_INDEX_ENTRY_BYTES: u64 = 16;
+// The full GIAB profile produces roughly 62 million observations: a 1 GiB
+// fixed-width index. Keeping that index in memory avoids billions of tiny
+// random writes to the temporary filesystem while leaving the much larger
+// variable-width observation payload disk-backed. The production pipeline
+// gives hap.py 24 GiB, so a 2 GiB bound remains conservative.
+const ROC_IN_MEMORY_INDEX_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RENDERED_ROC_THRESHOLDS: usize = 2_500_000;
 const MAX_ROC_METRIC_INDEX_KEYS: usize = 500_000;
 
@@ -53,6 +59,7 @@ pub(crate) struct MetricIndices {
 /// remains identical to the historical hap.py invocation.
 #[derive(Clone, Debug)]
 pub(crate) struct RocOptions {
+    pub(crate) threads: usize,
     pub(crate) qq_field: String,
     /// Optional FORMAT/INFO field used for thresholds while `qq_field`
     /// remains the user-facing label in metrics and ROC tables.
@@ -80,6 +87,7 @@ pub(crate) struct RocOptions {
 impl Default for RocOptions {
     fn default() -> Self {
         Self {
+            threads: 1,
             qq_field: "QUAL".to_string(),
             score_field: None,
             ignored_filters: HashSet::new(),
@@ -169,6 +177,7 @@ where
 
     if options.preserve_raw_table {
         write_legacy_roc_table(prefix, &groups, subset_size, conf_size, options)?;
+        clear_all_sorted_indices(&groups);
     }
 
     // Compute per-subtype star_sorted snapshots ONCE (heavy operation: up to
@@ -188,7 +197,7 @@ where
         filter_counts_only: options.roc_regions.contains("*"),
     };
     // `roc.all`: every row from every group, no filtering.
-    let all = render_rows(&groups, &star_sorted, RowFilter::All, render_config)?;
+    let all = render_rows_parallel(&groups, &star_sorted, render_config, options.threads)?;
     write_gzip_csv(
         &suffixed_report_path(prefix, "roc.all.csv.gz"),
         &header,
@@ -199,57 +208,28 @@ where
     // filter — keeps only `(Type, Subtype=*, Subset=*, Genotype=*, Filter,
     // QQ != *)` rows. Each file is the per-QQ cumulative threshold sweep
     // for the corresponding Type under a single Filter.
-    let snp = render_rows(
-        &groups,
-        &star_sorted,
-        RowFilter::Locations {
-            ty: "SNP",
-            filter: "ALL",
-        },
-        render_config,
-    )?;
+    // Locations tables are an exact row subset of roc.all. Re-filter the
+    // already-rendered ordered stream instead of re-running the same four
+    // libstdc++-compatible sorts for each public table.
+    let snp = filter_locations_rows(&all, "SNP", "ALL")?;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.SNP.csv.gz"),
         &header,
         &snp,
     )?;
-    let snp_pass = render_rows(
-        &groups,
-        &star_sorted,
-        RowFilter::Locations {
-            ty: "SNP",
-            filter: "PASS",
-        },
-        render_config,
-    )?;
+    let snp_pass = filter_locations_rows(&all, "SNP", "PASS")?;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.SNP.PASS.csv.gz"),
         &header,
         &snp_pass,
     )?;
-    let indel = render_rows(
-        &groups,
-        &star_sorted,
-        RowFilter::Locations {
-            ty: "INDEL",
-            filter: "ALL",
-        },
-        render_config,
-    )?;
+    let indel = filter_locations_rows(&all, "INDEL", "ALL")?;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.INDEL.csv.gz"),
         &header,
         &indel,
     )?;
-    let indel_pass = render_rows(
-        &groups,
-        &star_sorted,
-        RowFilter::Locations {
-            ty: "INDEL",
-            filter: "PASS",
-        },
-        render_config,
-    )?;
+    let indel_pass = filter_locations_rows(&all, "INDEL", "PASS")?;
     write_optional_gzip_csv(
         &suffixed_report_path(prefix, "roc.Locations.INDEL.PASS.csv.gz"),
         &header,
@@ -259,12 +239,7 @@ where
     let mut selective = Vec::new();
     if !options.ignored_filters.is_empty() {
         for ty in ["SNP", "INDEL"] {
-            let lines = render_rows(
-                &groups,
-                &star_sorted,
-                RowFilter::Locations { ty, filter: "SEL" },
-                render_config,
-            )?;
+            let lines = filter_locations_rows(&all, ty, "SEL")?;
             let id = format!("roc.Locations.{ty}.SEL");
             write_optional_gzip_csv(
                 &suffixed_report_path(prefix, &format!("roc.Locations.{ty}.SEL.csv.gz")),
@@ -287,12 +262,42 @@ where
         },
         options.delta,
         options.output_rocs,
+        options.threads,
     )
 }
 
 struct RenderedRows {
     path: tempfile::TempPath,
     len: usize,
+}
+
+fn filter_locations_rows(all: &RenderedRows, ty: &str, filter: &str) -> Result<RenderedRows> {
+    let mut output =
+        tempfile::NamedTempFile::new().context("failed to create Locations ROC report spool")?;
+    let mut len = 0usize;
+    {
+        let mut writer = BufWriter::new(output.as_file_mut());
+        for line in all.lines()? {
+            let line = line?;
+            let mut fields = line.splitn(8, ',');
+            if fields.next() == Some(ty)
+                && fields.next() == Some("*")
+                && fields.next() == Some("*")
+                && fields.next() == Some(filter)
+                && fields.next() == Some("*")
+                && fields.next().is_some()
+                && fields.next().is_some_and(|qq| qq != "*")
+            {
+                writeln!(writer, "{line}")?;
+                len += 1;
+            }
+        }
+        writer.flush()?;
+    }
+    Ok(RenderedRows {
+        path: output.into_temp_path(),
+        len,
+    })
 }
 
 impl RenderedRows {
@@ -325,11 +330,114 @@ struct MetricRows<'a> {
     selective: &'a [(String, RenderedRows, &'a str)],
 }
 
+type MaskedMetricLevels = BTreeMap<(String, String), Vec<f64>>;
+
+fn metric_subtype_flags(ty: &str) -> &'static [(&'static str, Option<&'static str>)] {
+    if ty == "SNP" {
+        &[("*", None), ("ti", Some("ti")), ("tv", Some("tv"))]
+    } else {
+        &[
+            ("*", None),
+            ("I1_5", Some("I1_5")),
+            ("I6_15", Some("I6_15")),
+            ("I16_PLUS", Some("I16_PLUS")),
+            ("D1_5", Some("D1_5")),
+            ("D6_15", Some("D6_15")),
+            ("D16_PLUS", Some("D16_PLUS")),
+            ("C1_5", Some("C1_5")),
+            ("C6_15", Some("C6_15")),
+            ("C16_PLUS", Some("C16_PLUS")),
+        ]
+    }
+}
+
+fn build_metric_level_sets(
+    groups: &[(&RowKey, &BoundedGroupAccum)],
+    delta: f64,
+    output_rocs: bool,
+    threads: usize,
+) -> Result<Vec<MaskedMetricLevels>> {
+    if groups.len() <= 1 || threads <= 1 {
+        return groups
+            .iter()
+            .map(|(key, accum)| {
+                if !output_rocs || !is_aggregate_filter(&key.filter) {
+                    Ok(BTreeMap::new())
+                } else {
+                    legacy_masked_level_sets(
+                        &accum.observations,
+                        metric_subtype_flags(&key.ty),
+                        delta,
+                    )
+                }
+            })
+            .collect();
+    }
+
+    // Two simultaneous compact level vectors keep peak RSS close to the
+    // existing bounded profile while overlapping the independent ALL/PASS
+    // and SNP/INDEL metric walks.
+    let worker_count = threads.max(1).min(2).min(groups.len());
+    let next_group = std::sync::atomic::AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(worker_count);
+    let mut results = (0..groups.len()).map(|_| None).collect::<Vec<_>>();
+    let mut first_error = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let next_group = &next_group;
+            handles.push(scope.spawn(move || {
+                loop {
+                    let index = next_group.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((key, accum)) = groups.get(index).copied() else {
+                        break;
+                    };
+                    let result = if !output_rocs || !is_aggregate_filter(&key.filter) {
+                        Ok(BTreeMap::new())
+                    } else {
+                        legacy_masked_level_sets(
+                            &accum.observations,
+                            metric_subtype_flags(&key.ty),
+                            delta,
+                        )
+                    };
+                    if sender.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(sender);
+        for (index, result) in receiver {
+            match result {
+                Ok(levels) if first_error.is_none() => results[index] = Some(levels),
+                Ok(_) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        for handle in handles {
+            if handle.join().is_err() && first_error.is_none() {
+                first_error = Some(anyhow::anyhow!("ROC metric worker panicked"));
+            }
+        }
+    });
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(results
+        .into_iter()
+        .map(|result| result.expect("each ROC metric group returned a result"))
+        .collect())
+}
+
 fn build_metric_indices(
     groups: &BTreeMap<RowKey, BoundedGroupAccum>,
     rows: MetricRows<'_>,
     delta: f64,
     output_rocs: bool,
+    threads: usize,
 ) -> Result<MetricIndices> {
     let mut rocs = BTreeMap::<String, (&RowKey, &BoundedGroupAccum)>::new();
     let active_types = groups
@@ -351,28 +459,14 @@ fn build_metric_indices(
         rocs.insert(name, (key, accum));
     }
 
+    let roc_groups = rocs.into_values().collect::<Vec<_>>();
+    let masked_level_sets = build_metric_level_sets(&roc_groups, delta, output_rocs, threads)?;
     let mut table = LegacyUnorderedRows::default();
-    for (_, (key, accum)) in rocs {
-        let subtype_flags: &[(&str, Option<&str>)] = if key.ty == "SNP" {
-            &[("*", None), ("ti", Some("ti")), ("tv", Some("tv"))]
-        } else {
-            &[
-                ("*", None),
-                ("I1_5", Some("I1_5")),
-                ("I6_15", Some("I6_15")),
-                ("I16_PLUS", Some("I16_PLUS")),
-                ("D1_5", Some("D1_5")),
-                ("D6_15", Some("D6_15")),
-                ("D16_PLUS", Some("D16_PLUS")),
-                ("C1_5", Some("C1_5")),
-                ("C6_15", Some("C6_15")),
-                ("C16_PLUS", Some("C16_PLUS")),
-            ]
-        };
+    for ((key, _accum), masked_levels) in roc_groups.into_iter().zip(masked_level_sets) {
+        let subtype_flags = metric_subtype_flags(&key.ty);
         let counts_only = !output_rocs || !is_aggregate_filter(&key.filter);
-        let mut sort_passes = 0usize;
-        for (subtype, subtype_flag) in subtype_flags {
-            for (genotype, genotype_flag) in [
+        for (subtype, _) in subtype_flags {
+            for (genotype, _) in [
                 ("het", Some("het")),
                 ("hetalt", Some("hetalt")),
                 ("homalt", Some("homalt")),
@@ -390,14 +484,8 @@ fn build_metric_indices(
                 if counts_only {
                     continue;
                 }
-                sort_passes += 1;
-                for level in legacy_masked_levels_store(
-                    &accum.observations,
-                    *subtype_flag,
-                    genotype_flag,
-                    delta,
-                    sort_passes,
-                )? {
+                let mask_key = ((*subtype).to_string(), genotype.to_string());
+                for level in masked_levels.get(&mask_key).into_iter().flatten().copied() {
                     let qq = format!("{level:.6}");
                     if !matches!(*subtype, "ti" | "tv") && genotype == "*" {
                         table.set(
@@ -678,75 +766,75 @@ fn indices_for_lines(
         .collect()
 }
 
-fn legacy_masked_levels(
-    obs: &[ObsRecord],
-    subtype: Option<&str>,
-    genotype: Option<&str>,
+/// Build every subtype/genotype level set for one legacy ROC group in a
+/// single sequential pass. Metric-index construction only needs the ordered
+/// threshold values; it does not consume cumulative counts, so repeatedly
+/// introsorting and randomly rereading the full observation payload (up to
+/// forty times for INDEL) cannot affect its result.
+fn legacy_masked_level_sets(
+    observations: &ObservationStore,
+    subtype_flags: &[(&str, Option<&str>)],
     delta: f64,
-) -> Vec<f64> {
-    let mut levels = obs
-        .iter()
-        .filter(|record| {
-            let subtype_matches = match subtype {
-                None => true,
-                Some("ti") => record.ti_flag,
-                Some("tv") => record.tv_flag,
-                Some(value) => record.subtypes.iter().any(|candidate| candidate == value),
-            };
-            subtype_matches && genotype.is_none_or(|value| record.blt.as_deref() == Some(value))
-        })
-        .map(|record| record.level)
-        .collect::<Vec<_>>();
-    levels.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-    let mut kept = Vec::new();
-    let mut previous = None;
-    for level in levels {
-        if previous.is_none_or(|value: f64| (level - value).abs() > delta) {
-            kept.push(level);
-            previous = Some(level);
+) -> Result<BTreeMap<(String, String), Vec<f64>>> {
+    let genotypes = [
+        ("het", Some("het")),
+        ("hetalt", Some("hetalt")),
+        ("homalt", Some("homalt")),
+        ("*", None),
+    ];
+    let mut kept = BTreeMap::<(String, String), Vec<f64>>::new();
+    for (subtype, _) in subtype_flags {
+        for (genotype, _) in genotypes {
+            kept.insert(((*subtype).to_string(), genotype.to_string()), Vec::new());
         }
     }
-    kept
-}
 
-fn legacy_masked_levels_store(
-    observations: &ObservationStore,
-    subtype: Option<&str>,
-    genotype: Option<&str>,
-    delta: f64,
-    sort_passes: usize,
-) -> Result<Vec<f64>> {
-    if !observations.is_disk_backed() {
-        return Ok(legacy_masked_levels(
-            &observations.small_records(),
-            subtype,
-            genotype,
-            delta,
-        ));
-    }
-    let mut kept = Vec::new();
-    let mut previous = None;
-    for observation in observations.sorted_with_passes(sort_passes)? {
+    // Retain only the fields needed by the metric-index threshold walk and
+    // sort them once. The former implementation built and sorted up to forty
+    // multi-million-element f64 vectors for one INDEL group.
+    let mut observations_by_level = Vec::<(f64, u16, u8)>::new();
+    for observation in observations.unsorted()? {
         let observation = observation?;
-        let subtype_matches = match subtype {
-            None => true,
-            Some("ti") => observation.ti_flag,
-            Some("tv") => observation.tv_flag,
-            Some(value) => observation
-                .subtypes
-                .iter()
-                .any(|candidate| candidate == value),
-        };
-        if subtype_matches
-            && genotype.is_none_or(|value| observation.blt.as_deref() == Some(value))
-            && previous.is_none_or(|value: f64| (observation.level - value).abs() > delta)
-        {
-            previous = Some(observation.level);
-            kept.push(observation.level);
-            if kept.len() > MAX_RENDERED_ROC_THRESHOLDS {
-                bail!(
-                    "ROC output exceeds the {MAX_RENDERED_ROC_THRESHOLDS} rendered-threshold resource limit"
-                );
+        let mut subtype_mask = 0u16;
+        for (index, (_, subtype_flag)) in subtype_flags.iter().enumerate() {
+            let subtype_matches = match subtype_flag {
+                None => true,
+                Some("ti") => observation.ti_flag,
+                Some("tv") => observation.tv_flag,
+                Some(value) => observation.has_subtype(value),
+            };
+            if subtype_matches {
+                subtype_mask |= 1u16 << index;
+            }
+        }
+        observations_by_level.push((observation.level, subtype_mask, observation.blt));
+    }
+    observations_by_level
+        .sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+
+    for (level, subtype_mask, observation_genotype) in observations_by_level {
+        for (subtype_index, (subtype, _)) in subtype_flags.iter().enumerate() {
+            if subtype_mask & (1u16 << subtype_index) == 0 {
+                continue;
+            }
+            for (genotype_index, (genotype, _)) in genotypes.iter().enumerate() {
+                if genotype_index != 3 && observation_genotype != genotype_index as u8 + 1 {
+                    continue;
+                }
+                let levels = kept
+                    .get_mut(&((**subtype).to_string(), (*genotype).to_string()))
+                    .expect("legacy metric level mask was preseeded");
+                if levels
+                    .last()
+                    .is_none_or(|previous| (level - previous).abs() > delta)
+                {
+                    levels.push(level);
+                    if levels.len() > MAX_RENDERED_ROC_THRESHOLDS {
+                        bail!(
+                            "ROC output exceeds the {MAX_RENDERED_ROC_THRESHOLDS} rendered-threshold resource limit"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1019,9 +1107,9 @@ fn legacy_obs_matches(record: &ObsRecord, subtype: &str, genotype: &str) -> bool
         "*" => true,
         "ti" => record.ti_flag,
         "tv" => record.tv_flag,
-        value => record.subtypes.iter().any(|candidate| candidate == value),
+        value => record.has_subtype(value),
     };
-    subtype_matches && (genotype == "*" || record.blt.as_deref() == Some(genotype))
+    subtype_matches && (genotype == "*" || record.blt_is(genotype))
 }
 
 fn legacy_totals(obs: &[ObsRecord], subtype: &str, genotype: &str) -> Cumul {
@@ -1384,14 +1472,67 @@ struct Cumul {
 struct ObsRecord {
     level: f64,
     counts: Cumul,
-    subtypes: Vec<String>,
+    subtype_bits: u16,
     /// True if the original BI tag included `ti` — needed to mirror
     /// legacy's `OBS_FLAG_TI` mask which is set per-record from the BI
     /// string, *not* from non-zero count fields. Filter-failed query
     /// phantoms have all-zero counts but still carry their flag bits.
     ti_flag: bool,
     tv_flag: bool,
-    blt: Option<String>,
+    blt: u8,
+}
+
+impl ObsRecord {
+    fn has_subtype(&self, subtype: &str) -> bool {
+        subtype_bit(subtype).is_some_and(|bit| self.subtype_bits & bit != 0)
+    }
+
+    fn blt_is(&self, value: &str) -> bool {
+        self.blt == encode_blt(Some(value))
+    }
+}
+
+fn subtype_bit(subtype: &str) -> Option<u16> {
+    if subtype == "*" {
+        Some(1)
+    } else {
+        INDEL_SUBTYPES
+            .iter()
+            .position(|candidate| *candidate == subtype)
+            .map(|index| 1u16 << (index + 1))
+    }
+}
+
+fn encode_subtypes(subtypes: &[String]) -> u16 {
+    subtypes
+        .iter()
+        .filter_map(|subtype| subtype_bit(subtype))
+        .fold(0, |bits, bit| bits | bit)
+}
+
+fn subtype_names(bits: u16) -> impl Iterator<Item = &'static str> {
+    std::iter::once("*")
+        .chain(INDEL_SUBTYPES)
+        .enumerate()
+        .filter_map(move |(index, subtype)| (bits & (1u16 << index) != 0).then_some(subtype))
+}
+
+fn encode_blt(blt: Option<&str>) -> u8 {
+    match blt {
+        Some("het") => 1,
+        Some("hetalt") => 2,
+        Some("homalt") => 3,
+        _ => 0,
+    }
+}
+
+fn decode_blt(blt: u8) -> &'static str {
+    match blt {
+        1 => "het",
+        2 => "hetalt",
+        3 => "homalt",
+        _ => ".",
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1405,7 +1546,8 @@ struct ObservationStore {
     buffer: Vec<StoredObs>,
     chunks: Vec<tempfile::TempPath>,
     disk: Option<DiskObservationStore>,
-    sorted_indices: RefCell<BTreeMap<usize, tempfile::TempPath>>,
+    sorted_indices: std::sync::Mutex<BTreeMap<usize, Arc<Vec<DiskIndexEntry>>>>,
+    disk_sorted_indices: std::sync::Mutex<BTreeMap<usize, tempfile::TempPath>>,
     next_serial: u64,
     error: Option<String>,
 }
@@ -1457,7 +1599,6 @@ impl ObservationStore {
                 .context("failed to create ROC observation data spool")?;
             let mut index = tempfile::NamedTempFile::new()
                 .context("failed to create ROC observation index spool")?;
-            let mut offset = 0u64;
             let mut len = 0usize;
             for chunk in std::mem::take(&mut self.chunks) {
                 for line in BufReader::new(File::open(&chunk)?).lines() {
@@ -1468,12 +1609,10 @@ impl ObservationStore {
                     write_disk_index_entry(
                         index.as_file_mut(),
                         DiskIndexEntry {
-                            offset,
-                            len: encoded.len() as u64,
+                            observation_bits: encode_compact_observation(&observation.record)?,
                             level_bits: observation.record.level.to_bits(),
                         },
                     )?;
-                    offset += encoded.len() as u64;
                     len += 1;
                 }
             }
@@ -1499,6 +1638,20 @@ impl ObservationStore {
             .collect()
     }
 
+    fn unsorted(&self) -> Result<Box<dyn Iterator<Item = Result<ObsRecord>> + '_>> {
+        if let Some(disk) = &self.disk {
+            let lines = BufReader::new(File::open(&disk.data)?).lines();
+            return Ok(Box::new(lines.map(|line| {
+                parse_observation(&line?).map(|observation| observation.record)
+            })));
+        }
+        Ok(Box::new(
+            self.buffer
+                .iter()
+                .map(|observation| Ok(observation.record.clone())),
+        ))
+    }
+
     fn sorted(&self) -> Result<Box<dyn Iterator<Item = Result<ObsRecord>>>> {
         self.sorted_with_passes(4)
     }
@@ -1508,9 +1661,49 @@ impl ObservationStore {
         passes: usize,
     ) -> Result<Box<dyn Iterator<Item = Result<ObsRecord>>>> {
         if let Some(disk) = &self.disk {
+            let index_bytes = (disk.len as u64).saturating_mul(ROC_INDEX_ENTRY_BYTES);
+            if index_bytes <= ROC_IN_MEMORY_INDEX_LIMIT_BYTES {
+                let cached = self
+                    .sorted_indices
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .range(..=passes)
+                    .next_back()
+                    .map(|(completed, entries)| (*completed, Arc::clone(entries)));
+                let (completed_passes, mut entries) = if let Some((completed, entries)) = cached {
+                    (completed, entries.as_ref().clone())
+                } else {
+                    let mut index_file = File::open(&disk.index)?;
+                    (0, read_disk_index_entries(&mut index_file, disk.len)?)
+                };
+                for _ in completed_passes..passes {
+                    introsort_libstdcpp_by(&mut entries, |left, right| {
+                        f64::from_bits(left.level_bits) < f64::from_bits(right.level_bits)
+                    });
+                }
+                let entries = Arc::new(entries);
+                let mut sorted_indices = self
+                    .sorted_indices
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                sorted_indices
+                    .entry(passes)
+                    .or_insert_with(|| Arc::clone(&entries));
+                // Passes 4/8/12 feed the main, ti, and tv sweeps. Later
+                // subtype passes are requested monotonically, so retaining
+                // only the newest one bounds each worker to four snapshots.
+                sorted_indices.retain(|completed, _| *completed <= 12 || *completed == passes);
+                drop(sorted_indices);
+                return Ok(Box::new(MemoryObservationIter {
+                    entries,
+                    position: 0,
+                }));
+            }
+
             let (completed_passes, source) = self
-                .sorted_indices
-                .borrow()
+                .disk_sorted_indices
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
                 .range(..=passes)
                 .next_back()
                 .map(|(completed, path)| (*completed, path.to_path_buf()))
@@ -1520,15 +1713,16 @@ impl ObservationStore {
             for _ in completed_passes..passes {
                 disk_introsort_libstdcpp(&mut index_file, disk.len)?;
             }
-            if !self.sorted_indices.borrow().contains_key(&passes) {
-                self.sorted_indices
-                    .borrow_mut()
-                    .insert(passes, copy_temp_path(&index)?);
+            let mut sorted_indices = self
+                .disk_sorted_indices
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !sorted_indices.contains_key(&passes) {
+                sorted_indices.insert(passes, copy_temp_path(&index)?);
             }
             return Ok(Box::new(DiskObservationIter {
                 _index_path: index,
                 sorted_index: index_file,
-                data: File::open(&disk.data)?,
                 position: 0,
                 len: disk.len,
             }));
@@ -1539,6 +1733,17 @@ impl ObservationStore {
         }
         Ok(Box::new(observations.into_iter().map(Ok)))
     }
+
+    fn clear_sorted_indices(&self) {
+        self.sorted_indices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.disk_sorted_indices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
 }
 
 fn copy_temp_path(path: &Path) -> Result<tempfile::TempPath> {
@@ -1548,17 +1753,138 @@ fn copy_temp_path(path: &Path) -> Result<tempfile::TempPath> {
     Ok(copy.into_temp_path())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DiskIndexEntry {
-    offset: u64,
-    len: u64,
+    observation_bits: u64,
     level_bits: u64,
 }
 
+fn encode_compact_observation(observation: &ObsRecord) -> Result<u64> {
+    let mut encoded = 0u64;
+    let mut shift = 0u32;
+    let mut push_count = |value: usize| -> Result<()> {
+        if value > 1 {
+            bail!("single ROC observation count {value} cannot be compacted");
+        }
+        encoded |= (value as u64) << shift;
+        shift += 1;
+        Ok(())
+    };
+    for bucket in [
+        &observation.counts.truth_tp,
+        &observation.counts.truth_fn,
+        &observation.counts.query_tp,
+        &observation.counts.query_fp,
+        &observation.counts.query_unk,
+    ] {
+        for value in [
+            bucket.total,
+            bucket.ti,
+            bucket.tv,
+            bucket.het,
+            bucket.homalt,
+        ] {
+            push_count(value)?;
+        }
+    }
+    push_count(observation.counts.fp_gt)?;
+    push_count(observation.counts.fp_al)?;
+    drop(push_count);
+
+    encoded |= u64::from(observation.subtype_bits) << shift;
+    shift += 10;
+    if observation.ti_flag {
+        encoded |= 1u64 << shift;
+    }
+    shift += 1;
+    if observation.tv_flag {
+        encoded |= 1u64 << shift;
+    }
+    shift += 1;
+    encoded |= u64::from(observation.blt) << shift;
+    Ok(encoded)
+}
+
+fn decode_compact_observation(observation_bits: u64, level_bits: u64) -> Result<ObsRecord> {
+    let mut shift = 0u32;
+    let mut next_count = || {
+        let value = ((observation_bits >> shift) & 1) as usize;
+        shift += 1;
+        value
+    };
+    let mut next_bucket = || CountsBucket {
+        total: next_count(),
+        ti: next_count(),
+        tv: next_count(),
+        het: next_count(),
+        homalt: next_count(),
+    };
+    let truth_tp = next_bucket();
+    let truth_fn = next_bucket();
+    let query_tp = next_bucket();
+    let query_fp = next_bucket();
+    let query_unk = next_bucket();
+    drop(next_bucket);
+    let counts = Cumul {
+        truth_tp,
+        truth_fn,
+        query_tp,
+        query_fp,
+        query_unk,
+        fp_gt: next_count(),
+        fp_al: next_count(),
+    };
+    drop(next_count);
+
+    let subtype_bits = ((observation_bits >> shift) & 0x03ff) as u16;
+    shift += 10;
+    let ti_flag = observation_bits & (1u64 << shift) != 0;
+    shift += 1;
+    let tv_flag = observation_bits & (1u64 << shift) != 0;
+    shift += 1;
+    let blt = ((observation_bits >> shift) & 0b11) as u8;
+    Ok(ObsRecord {
+        level: f64::from_bits(level_bits),
+        counts,
+        subtype_bits,
+        ti_flag,
+        tv_flag,
+        blt,
+    })
+}
+
 fn write_disk_index_entry(file: &mut File, entry: DiskIndexEntry) -> Result<()> {
-    file.write_all(&entry.offset.to_le_bytes())?;
-    file.write_all(&entry.len.to_le_bytes())?;
+    file.write_all(&entry.observation_bits.to_le_bytes())?;
     file.write_all(&entry.level_bits.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_disk_index_entries(file: &mut File, len: usize) -> Result<Vec<DiskIndexEntry>> {
+    file.seek(SeekFrom::Start(0))?;
+    let byte_len = len
+        .checked_mul(ROC_INDEX_ENTRY_BYTES as usize)
+        .context("ROC index is too large to address")?;
+    let mut bytes = vec![0u8; byte_len];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes
+        .chunks_exact(ROC_INDEX_ENTRY_BYTES as usize)
+        .map(|entry| DiskIndexEntry {
+            observation_bits: u64::from_le_bytes(
+                entry[0..8].try_into().expect("observation bytes"),
+            ),
+            level_bits: u64::from_le_bytes(entry[8..16].try_into().expect("level bytes")),
+        })
+        .collect())
+}
+
+#[cfg(test)]
+fn write_disk_index_entries(file: &mut File, entries: &[DiskIndexEntry]) -> Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    for entry in entries {
+        write_disk_index_entry(file, *entry)?;
+    }
+    file.set_len((entries.len() as u64).saturating_mul(ROC_INDEX_ENTRY_BYTES))?;
+    file.flush()?;
     Ok(())
 }
 
@@ -1567,9 +1893,8 @@ fn read_disk_index_entry(file: &mut File, position: usize) -> Result<DiskIndexEn
     let mut bytes = [0u8; ROC_INDEX_ENTRY_BYTES as usize];
     file.read_exact(&mut bytes)?;
     Ok(DiskIndexEntry {
-        offset: u64::from_le_bytes(bytes[0..8].try_into().expect("offset bytes")),
-        len: u64::from_le_bytes(bytes[8..16].try_into().expect("length bytes")),
-        level_bits: u64::from_le_bytes(bytes[16..24].try_into().expect("level bytes")),
+        observation_bits: u64::from_le_bytes(bytes[0..8].try_into().expect("observation bytes")),
+        level_bits: u64::from_le_bytes(bytes[8..16].try_into().expect("level bytes")),
     })
 }
 
@@ -1597,9 +1922,26 @@ fn disk_level(file: &mut File, position: usize) -> Result<f64> {
 struct DiskObservationIter {
     _index_path: tempfile::TempPath,
     sorted_index: File,
-    data: File,
     position: usize,
     len: usize,
+}
+
+struct MemoryObservationIter {
+    entries: Arc<Vec<DiskIndexEntry>>,
+    position: usize,
+}
+
+impl Iterator for MemoryObservationIter {
+    type Item = Result<ObsRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = self.entries.get(self.position).copied()?;
+        self.position += 1;
+        Some(decode_compact_observation(
+            entry.observation_bits,
+            entry.level_bits,
+        ))
+    }
 }
 
 impl Iterator for DiskObservationIter {
@@ -1612,11 +1954,7 @@ impl Iterator for DiskObservationIter {
         let result = (|| {
             let entry = read_disk_index_entry(&mut self.sorted_index, self.position)?;
             self.position += 1;
-            self.data.seek(SeekFrom::Start(entry.offset))?;
-            let mut bytes = vec![0u8; entry.len as usize];
-            self.data.read_exact(&mut bytes)?;
-            let line = std::str::from_utf8(&bytes)?.trim_end_matches(['\r', '\n']);
-            Ok(parse_observation(line)?.record)
+            decode_compact_observation(entry.observation_bits, entry.level_bits)
         })();
         Some(result)
     }
@@ -1633,6 +1971,9 @@ fn sortable_f64(value: f64) -> u64 {
 
 fn write_observation(writer: &mut dyn Write, observation: &StoredObs) -> Result<()> {
     let counts = &observation.record.counts;
+    let subtypes = subtype_names(observation.record.subtype_bits)
+        .collect::<Vec<_>>()
+        .join("|");
     write!(
         writer,
         "{}\t{}\t{}",
@@ -1658,10 +1999,10 @@ fn write_observation(writer: &mut dyn Write, observation: &StoredObs) -> Result<
         "\t{}\t{}\t{}\t{}\t{}\t{}",
         counts.fp_gt,
         counts.fp_al,
-        observation.record.subtypes.join("|"),
+        subtypes,
         u8::from(observation.record.ti_flag),
         u8::from(observation.record.tv_flag),
-        observation.record.blt.as_deref().unwrap_or(".")
+        decode_blt(observation.record.blt)
     )?;
     Ok(())
 }
@@ -1700,16 +2041,19 @@ fn parse_observation(line: &str) -> Result<StoredObs> {
         fp_al: fields[index + 1].parse()?,
     };
     index += 2;
-    let subtypes = fields[index].split('|').map(str::to_string).collect();
+    let subtype_bits = fields[index]
+        .split('|')
+        .filter_map(subtype_bit)
+        .fold(0u16, |bits, bit| bits | bit);
     let ti_flag = fields[index + 1] == "1";
     let tv_flag = fields[index + 2] == "1";
-    let blt = (fields[index + 3] != ".").then(|| fields[index + 3].to_string());
+    let blt = encode_blt(Some(fields[index + 3]));
     Ok(StoredObs {
         serial,
         record: ObsRecord {
             level,
             counts,
-            subtypes,
+            subtype_bits,
             ti_flag,
             tv_flag,
             blt,
@@ -1849,10 +2193,10 @@ impl SubstatSnapshotCursor {
                         record: ObsRecord {
                             level: observation.level,
                             counts: running.clone(),
-                            subtypes: vec!["*".to_string()],
+                            subtype_bits: subtype_bit("*").expect("wildcard subtype is encoded"),
                             ti_flag: false,
                             tv_flag: false,
-                            blt: None,
+                            blt: 0,
                         },
                     },
                 )?;
@@ -2254,10 +2598,10 @@ impl BoundedGroupAccum {
         self.observations.push(ObsRecord {
             level: obs_level,
             counts: counts.clone(),
-            subtypes: subtypes.to_vec(),
+            subtype_bits: encode_subtypes(subtypes),
             ti_flag,
             tv_flag,
-            blt: blt.map(str::to_string),
+            blt: encode_blt(blt),
         });
         if self.observations.is_disk_backed() {
             self.threshold_window.clear();
@@ -2383,7 +2727,7 @@ impl BoundedGroupAccum {
             (Some(sorted), Some(st)) if st != "*" => {
                 let filtered: Vec<ObsRecord> = sorted
                     .iter()
-                    .filter(|o| o.subtypes.iter().any(|x| x == st))
+                    .filter(|o| o.has_subtype(st))
                     .cloned()
                     .collect();
                 (filtered, true)
@@ -2593,12 +2937,7 @@ impl BoundedGroupAccum {
         let mut total_tv = Cumul::default();
         for observation in source.sorted_with_passes(sort_passes)? {
             let observation = observation?;
-            if subtype.is_some_and(|subtype| {
-                !observation
-                    .subtypes
-                    .iter()
-                    .any(|candidate| candidate == subtype)
-            }) {
+            if subtype.is_some_and(|subtype| !observation.has_subtype(subtype)) {
                 continue;
             }
             total.add(&observation.counts);
@@ -2614,14 +2953,10 @@ impl BoundedGroupAccum {
         let mut numeric_rows = EmittedRowSpool::new();
         let mut running = Cumul::default();
         let mut ti_snapshots = SubstatSnapshotCursor::build(source, 8, |row| {
-            row.ti_flag
-                && subtype
-                    .is_none_or(|subtype| row.subtypes.iter().any(|candidate| candidate == subtype))
+            row.ti_flag && subtype.is_none_or(|subtype| row.has_subtype(subtype))
         })?;
         let mut tv_snapshots = SubstatSnapshotCursor::build(source, 12, |row| {
-            row.tv_flag
-                && subtype
-                    .is_none_or(|subtype| row.subtypes.iter().any(|candidate| candidate == subtype))
+            row.tv_flag && subtype.is_none_or(|subtype| row.has_subtype(subtype))
         })?;
         let mut previous_main: Option<f64> = None;
         let mut previous_ti: Option<f64> = None;
@@ -2694,12 +3029,7 @@ impl BoundedGroupAccum {
 
         for observation in source.sorted_with_passes(sort_passes)? {
             let observation = observation?;
-            if subtype.is_some_and(|subtype| {
-                !observation
-                    .subtypes
-                    .iter()
-                    .any(|candidate| candidate == subtype)
-            }) {
+            if subtype.is_some_and(|subtype| !observation.has_subtype(subtype)) {
                 continue;
             }
             if current
@@ -2813,63 +3143,88 @@ fn lg_floor(n: usize) -> usize {
 }
 
 fn introsort_libstdcpp(arr: &mut [ObsRecord]) {
+    introsort_libstdcpp_by(arr, |left, right| left.level < right.level);
+}
+
+fn introsort_libstdcpp_by<T, F>(arr: &mut [T], less: F)
+where
+    F: Fn(&T, &T) -> bool + Copy,
+{
     let n = arr.len();
     if n > 1 {
         let depth_limit = lg_floor(n) * 2;
-        introsort_loop(arr, 0, n, depth_limit);
-        final_insertion_sort(arr);
+        introsort_loop(arr, 0, n, depth_limit, less);
+        final_insertion_sort(arr, less);
     }
 }
 
-fn introsort_loop(arr: &mut [ObsRecord], first: usize, mut last: usize, mut depth_limit: usize) {
+fn introsort_loop<T, F>(
+    arr: &mut [T],
+    first: usize,
+    mut last: usize,
+    mut depth_limit: usize,
+    less: F,
+) where
+    F: Fn(&T, &T) -> bool + Copy,
+{
     while last - first > ROC_SORT_THRESHOLD {
         if depth_limit == 0 {
-            heapsort_range(arr, first, last);
+            heapsort_range(arr, first, last, less);
             return;
         }
         depth_limit -= 1;
-        let cut = unguarded_partition_pivot(arr, first, last);
-        introsort_loop(arr, cut, last, depth_limit);
+        let cut = unguarded_partition_pivot(arr, first, last, less);
+        introsort_loop(arr, cut, last, depth_limit, less);
         last = cut;
     }
 }
 
-fn unguarded_partition_pivot(arr: &mut [ObsRecord], first: usize, last: usize) -> usize {
+fn unguarded_partition_pivot<T, F>(arr: &mut [T], first: usize, last: usize, less: F) -> usize
+where
+    F: Fn(&T, &T) -> bool + Copy,
+{
     let mid = first + (last - first) / 2;
-    move_median_to_first(arr, first, first + 1, mid, last - 1);
-    unguarded_partition(arr, first + 1, last, first)
+    move_median_to_first(arr, first, first + 1, mid, last - 1, less);
+    unguarded_partition(arr, first + 1, last, first, less)
 }
 
-fn move_median_to_first(arr: &mut [ObsRecord], result: usize, a: usize, b: usize, c: usize) {
-    if arr[a].level < arr[b].level {
-        if arr[b].level < arr[c].level {
+fn move_median_to_first<T, F>(arr: &mut [T], result: usize, a: usize, b: usize, c: usize, less: F)
+where
+    F: Fn(&T, &T) -> bool,
+{
+    if less(&arr[a], &arr[b]) {
+        if less(&arr[b], &arr[c]) {
             arr.swap(result, b);
-        } else if arr[a].level < arr[c].level {
+        } else if less(&arr[a], &arr[c]) {
             arr.swap(result, c);
         } else {
             arr.swap(result, a);
         }
-    } else if arr[a].level < arr[c].level {
+    } else if less(&arr[a], &arr[c]) {
         arr.swap(result, a);
-    } else if arr[b].level < arr[c].level {
+    } else if less(&arr[b], &arr[c]) {
         arr.swap(result, c);
     } else {
         arr.swap(result, b);
     }
 }
 
-fn unguarded_partition(
-    arr: &mut [ObsRecord],
+fn unguarded_partition<T, F>(
+    arr: &mut [T],
     mut first: usize,
     mut last: usize,
     pivot: usize,
-) -> usize {
+    less: F,
+) -> usize
+where
+    F: Fn(&T, &T) -> bool,
+{
     loop {
-        while arr[first].level < arr[pivot].level {
+        while less(&arr[first], &arr[pivot]) {
             first += 1;
         }
         last -= 1;
-        while arr[pivot].level < arr[last].level {
+        while less(&arr[pivot], &arr[last]) {
             last -= 1;
         }
         if first >= last {
@@ -2880,26 +3235,32 @@ fn unguarded_partition(
     }
 }
 
-fn final_insertion_sort(arr: &mut [ObsRecord]) {
+fn final_insertion_sort<T, F>(arr: &mut [T], less: F)
+where
+    F: Fn(&T, &T) -> bool + Copy,
+{
     let n = arr.len();
     if n > ROC_SORT_THRESHOLD {
-        insertion_sort_range(arr, 0, ROC_SORT_THRESHOLD);
-        unguarded_insertion_sort_range(arr, ROC_SORT_THRESHOLD, n);
+        insertion_sort_range(arr, 0, ROC_SORT_THRESHOLD, less);
+        unguarded_insertion_sort_range(arr, ROC_SORT_THRESHOLD, n, less);
     } else {
-        insertion_sort_range(arr, 0, n);
+        insertion_sort_range(arr, 0, n, less);
     }
 }
 
-fn insertion_sort_range(arr: &mut [ObsRecord], first: usize, last: usize) {
+fn insertion_sort_range<T, F>(arr: &mut [T], first: usize, last: usize, less: F)
+where
+    F: Fn(&T, &T) -> bool,
+{
     if first == last {
         return;
     }
     for i in (first + 1)..last {
-        if arr[i].level < arr[first].level {
+        if less(&arr[i], &arr[first]) {
             arr[first..=i].rotate_right(1);
         } else {
             let mut j = i;
-            while j > first && arr[j].level < arr[j - 1].level {
+            while j > first && less(&arr[j], &arr[j - 1]) {
                 arr.swap(j, j - 1);
                 j -= 1;
             }
@@ -2907,31 +3268,40 @@ fn insertion_sort_range(arr: &mut [ObsRecord], first: usize, last: usize) {
     }
 }
 
-fn unguarded_insertion_sort_range(arr: &mut [ObsRecord], first: usize, last: usize) {
+fn unguarded_insertion_sort_range<T, F>(arr: &mut [T], first: usize, last: usize, less: F)
+where
+    F: Fn(&T, &T) -> bool,
+{
     for i in first..last {
         let mut j = i;
-        while j > 0 && arr[j].level < arr[j - 1].level {
+        while j > 0 && less(&arr[j], &arr[j - 1]) {
             arr.swap(j, j - 1);
             j -= 1;
         }
     }
 }
 
-fn heapsort_range(arr: &mut [ObsRecord], first: usize, last: usize) {
+fn heapsort_range<T, F>(arr: &mut [T], first: usize, last: usize, less: F)
+where
+    F: Fn(&T, &T) -> bool + Copy,
+{
     let n = last - first;
     if n < 2 {
         return;
     }
     for i in (0..n / 2).rev() {
-        sift_down(arr, first + i, first, last);
+        sift_down(arr, first + i, first, last, less);
     }
     for i in (1..n).rev() {
         arr.swap(first, first + i);
-        sift_down(arr, first, first, first + i);
+        sift_down(arr, first, first, first + i, less);
     }
 }
 
-fn sift_down(arr: &mut [ObsRecord], start: usize, first: usize, last: usize) {
+fn sift_down<T, F>(arr: &mut [T], start: usize, first: usize, last: usize, less: F)
+where
+    F: Fn(&T, &T) -> bool,
+{
     let mut root = start;
     loop {
         let lc = first + 2 * (root - first) + 1;
@@ -2940,10 +3310,10 @@ fn sift_down(arr: &mut [ObsRecord], start: usize, first: usize, last: usize) {
         }
         let rc = lc + 1;
         let mut child = lc;
-        if rc < last && arr[lc].level < arr[rc].level {
+        if rc < last && less(&arr[lc], &arr[rc]) {
             child = rc;
         }
-        if arr[root].level < arr[child].level {
+        if less(&arr[root], &arr[child]) {
             arr.swap(root, child);
             root = child;
         } else {
@@ -3700,10 +4070,13 @@ fn extract_subsets(info: &str) -> Vec<String> {
 enum RowFilter<'a> {
     /// Emit every row from every group — used for `result.roc.all.csv.gz`.
     All,
-    /// Legacy `happyroc.py` Locations filter: keep only rows in the base
-    /// group `(Type=ty, Subtype=*, Subset=*, Genotype=*, Filter=filter)`
-    /// and drop the `QQ="*"` baseline row.
-    Locations { ty: &'a str, filter: &'a str },
+    Bundle {
+        ty: &'a str,
+        subset: &'a str,
+        filter: &'a str,
+        genotype: &'a str,
+        qq_field: &'a str,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3795,6 +4168,190 @@ fn legacy_subtype_sort_passes(ty: &str, subtype: &str) -> usize {
         .map_or(4, |index| (index + 1) * 4)
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RenderBundleKey {
+    ty: String,
+    subset: String,
+    filter: String,
+    genotype: String,
+    qq_field: String,
+}
+
+fn render_rows_parallel(
+    groups: &BTreeMap<RowKey, BoundedGroupAccum>,
+    star_sorted: &BTreeMap<(String, String, String, String), Vec<ObsRecord>>,
+    config: RenderConfig<'_>,
+    threads: usize,
+) -> Result<RenderedRows> {
+    let active_types = groups
+        .iter()
+        .filter(|(_, accum)| accum.records > 0)
+        .map(|(key, _)| key.ty.as_str())
+        .collect::<HashSet<_>>();
+    let bundles = groups
+        .keys()
+        .filter(|key| active_types.contains(key.ty.as_str()))
+        .map(|key| RenderBundleKey {
+            ty: key.ty.clone(),
+            subset: key.subset.clone(),
+            filter: key.filter.clone(),
+            genotype: key.genotype.clone(),
+            qq_field: key.qq_field.clone(),
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if bundles.len() <= 1 || threads <= 1 {
+        let result = render_rows(groups, star_sorted, RowFilter::All, config);
+        clear_all_sorted_indices(groups);
+        return result;
+    }
+
+    let worker_count = threads.max(1).min(bundles.len());
+    let next_bundle = std::sync::atomic::AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(worker_count);
+    let mut rendered = (0..bundles.len()).map(|_| None).collect::<Vec<_>>();
+    let mut first_error = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let next_bundle = &next_bundle;
+            let bundles = &bundles;
+            handles.push(scope.spawn(move || {
+                loop {
+                    let index = next_bundle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(bundle) = bundles.get(index) else {
+                        break;
+                    };
+                    let result = render_rows(
+                        groups,
+                        star_sorted,
+                        RowFilter::Bundle {
+                            ty: &bundle.ty,
+                            subset: &bundle.subset,
+                            filter: &bundle.filter,
+                            genotype: &bundle.genotype,
+                            qq_field: &bundle.qq_field,
+                        },
+                        config,
+                    );
+                    clear_bundle_sorted_indices(groups, bundle);
+                    if sender.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(sender);
+        for (index, result) in receiver {
+            match result {
+                Ok(rows) if first_error.is_none() => rendered[index] = Some(rows),
+                Ok(_) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        for handle in handles {
+            if handle.join().is_err() && first_error.is_none() {
+                first_error = Some(anyhow::anyhow!("ROC render worker panicked"));
+            }
+        }
+    });
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    merge_rendered_rows(
+        rendered
+            .into_iter()
+            .map(|rows| rows.expect("each ROC render bundle returned a result"))
+            .collect(),
+    )
+}
+
+fn clear_bundle_sorted_indices(
+    groups: &BTreeMap<RowKey, BoundedGroupAccum>,
+    bundle: &RenderBundleKey,
+) {
+    for (key, accum) in groups {
+        if key.ty == bundle.ty
+            && key.subtype == "*"
+            && key.subset == bundle.subset
+            && key.filter == bundle.filter
+            && key.genotype == bundle.genotype
+            && key.qq_field == bundle.qq_field
+        {
+            accum.observations.clear_sorted_indices();
+        }
+    }
+}
+
+fn clear_all_sorted_indices(groups: &BTreeMap<RowKey, BoundedGroupAccum>) {
+    for accum in groups.values() {
+        accum.observations.clear_sorted_indices();
+    }
+}
+
+type RenderedSortKey = [String; 7];
+
+fn rendered_sort_key(line: &str) -> Result<RenderedSortKey> {
+    line.split(',')
+        .take(7)
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|fields: Vec<String>| {
+            anyhow::anyhow!(
+                "rendered ROC row has {} key fields, expected 7",
+                fields.len()
+            )
+        })
+}
+
+fn merge_rendered_rows(rows: Vec<RenderedRows>) -> Result<RenderedRows> {
+    let mut readers = rows
+        .iter()
+        .map(|rows| rows.lines())
+        .collect::<Result<Vec<_>>>()?;
+    let mut current = (0..readers.len()).map(|_| None).collect::<Vec<_>>();
+    let mut heap = BinaryHeap::<Reverse<(RenderedSortKey, usize)>>::new();
+    let advance = |index: usize,
+                   readers: &mut Vec<std::io::Lines<BufReader<File>>>,
+                   current: &mut Vec<Option<String>>,
+                   heap: &mut BinaryHeap<Reverse<(RenderedSortKey, usize)>>|
+     -> Result<()> {
+        if let Some(line) = readers[index].next() {
+            let line = line?;
+            heap.push(Reverse((rendered_sort_key(&line)?, index)));
+            current[index] = Some(line);
+        }
+        Ok(())
+    };
+    for index in 0..readers.len() {
+        advance(index, &mut readers, &mut current, &mut heap)?;
+    }
+
+    let mut output = tempfile::NamedTempFile::new()
+        .context("failed to create merged rendered ROC report spool")?;
+    let mut len = 0usize;
+    {
+        let mut writer = BufWriter::new(output.as_file_mut());
+        while let Some(Reverse((_, index))) = heap.pop() {
+            let line = current[index]
+                .take()
+                .expect("rendered ROC merge entry has a current row");
+            writeln!(writer, "{line}")?;
+            len += 1;
+            advance(index, &mut readers, &mut current, &mut heap)?;
+        }
+        writer.flush()?;
+    }
+    Ok(RenderedRows {
+        path: output.into_temp_path(),
+        len,
+    })
+}
+
 fn render_rows(
     groups: &BTreeMap<RowKey, BoundedGroupAccum>,
     star_sorted: &BTreeMap<(String, String, String, String), Vec<ObsRecord>>,
@@ -3821,12 +4378,18 @@ fn render_rows(
         }
         match row_filter {
             RowFilter::All => {}
-            RowFilter::Locations { ty, filter } => {
+            RowFilter::Bundle {
+                ty,
+                subset,
+                filter,
+                genotype,
+                qq_field,
+            } => {
                 if key.ty != ty
-                    || key.subtype != "*"
-                    || key.subset != "*"
-                    || key.genotype != "*"
+                    || key.subset != subset
                     || key.filter != filter
+                    || key.genotype != genotype
+                    || key.qq_field != qq_field
                 {
                     continue;
                 }
@@ -3865,10 +4428,6 @@ fn render_rows(
         };
         for emitted in emitted_rows {
             let emitted = emitted?;
-            if matches!(row_filter, RowFilter::Locations { .. }) && emitted.qq_str == "*" {
-                // Legacy's Locations file drops the baseline row.
-                continue;
-            }
             if is_filter_tier && config.filter_counts_only && emitted.qq_str != "*" {
                 // Per-Filter rows in legacy are baseline-only (QQ='*').
                 // No numeric thresholds — skip the synthetic 0.0 and any
@@ -4265,10 +4824,10 @@ mod tests {
                 },
                 ..Cumul::default()
             },
-            subtypes: vec!["*".to_string()],
+            subtype_bits: subtype_bit("*").expect("wildcard subtype is encoded"),
             ti_flag: false,
             tv_flag: true,
-            blt: None,
+            blt: 0,
         });
 
         let mut cursor = SubstatSnapshotCursor::build(&source, 8, |row| row.tv_flag)?;
@@ -4355,6 +4914,75 @@ mod tests {
         assert_eq!(lg_floor(3), 1);
         assert_eq!(lg_floor(16), 4);
         assert_eq!(lg_floor(usize::MAX), usize::BITS as usize - 1);
+    }
+
+    #[test]
+    fn in_memory_disk_index_sort_matches_random_access_path() -> Result<()> {
+        let original = (0..257usize)
+            .map(|index| DiskIndexEntry {
+                observation_bits: index as u64 * 101,
+                level_bits: (((index * 37) % 13) as f64 - 6.0).to_bits(),
+            })
+            .collect::<Vec<_>>();
+
+        for passes in [1, 4, 12, 40] {
+            let mut expected_file = tempfile::NamedTempFile::new()?;
+            write_disk_index_entries(expected_file.as_file_mut(), &original)?;
+            for _ in 0..passes {
+                disk_introsort_libstdcpp(expected_file.as_file_mut(), original.len())?;
+            }
+            let expected = read_disk_index_entries(expected_file.as_file_mut(), original.len())?;
+
+            let mut actual = original.clone();
+            for _ in 0..passes {
+                introsort_libstdcpp_by(&mut actual, |left, right| {
+                    f64::from_bits(left.level_bits) < f64::from_bits(right.level_bits)
+                });
+            }
+            assert_eq!(actual, expected, "sort order differs after {passes} passes");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_observation_round_trips_every_encoded_axis() -> Result<()> {
+        let observation = ObsRecord {
+            level: 42.25,
+            counts: Cumul {
+                truth_tp: CountsBucket {
+                    total: 1,
+                    ti: 1,
+                    het: 1,
+                    ..CountsBucket::default()
+                },
+                query_fp: CountsBucket {
+                    total: 1,
+                    tv: 1,
+                    homalt: 1,
+                    ..CountsBucket::default()
+                },
+                fp_gt: 1,
+                ..Cumul::default()
+            },
+            subtype_bits: encode_subtypes(&[
+                "*".to_string(),
+                "I1_5".to_string(),
+                "D16_PLUS".to_string(),
+            ]),
+            ti_flag: true,
+            tv_flag: true,
+            blt: encode_blt(Some("homalt")),
+        };
+        let encoded = encode_compact_observation(&observation)?;
+        let decoded = decode_compact_observation(encoded, observation.level.to_bits())?;
+
+        assert_eq!(decoded.level.to_bits(), observation.level.to_bits());
+        assert_eq!(encode_compact_observation(&decoded)?, encoded);
+        assert!(decoded.has_subtype("*"));
+        assert!(decoded.has_subtype("I1_5"));
+        assert!(decoded.has_subtype("D16_PLUS"));
+        assert!(decoded.blt_is("homalt"));
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)] // Keeps row fixtures legible at each call site.
@@ -4743,6 +5371,64 @@ mod tests {
         assert!(unused.iter().all(|fields| fields[6] == "*"));
         assert!(unused.iter().all(|fields| fields[13] == "7.000000"));
         assert!(unused.iter().all(|fields| fields[16] == "0"));
+    }
+
+    #[test]
+    fn threaded_roc_render_is_byte_deterministic() {
+        let rows = vec![
+            annotated(
+                "chr1",
+                100,
+                "42",
+                "0/1:TP:gm:tv:SNP:het:42",
+                "0/1:TP:gm:tv:SNP:het:42",
+                "",
+                true,
+                None,
+            ),
+            annotated(
+                "chr1",
+                200,
+                "41",
+                "0/1:TP:gm:i1_5:INDEL:het:41",
+                "0/1:TP:gm:i1_5:INDEL:het:41",
+                "",
+                true,
+                None,
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let serial_prefix = dir.path().join("serial");
+        let threaded_prefix = dir.path().join("threaded");
+        let serial_options = RocOptions {
+            threads: 1,
+            ..RocOptions::default()
+        };
+        let threaded_options = RocOptions {
+            threads: 6,
+            ..serial_options.clone()
+        };
+        let serial =
+            write_roc_files_with_options(&serial_prefix, &rows, 100, 0, &serial_options).unwrap();
+        let threaded =
+            write_roc_files_with_options(&threaded_prefix, &rows, 100, 0, &threaded_options)
+                .unwrap();
+
+        assert_eq!(serial.tables, threaded.tables);
+        assert_eq!(serial.table_order, threaded.table_order);
+        for suffix in [
+            "roc.all.csv.gz",
+            "roc.Locations.SNP.csv.gz",
+            "roc.Locations.SNP.PASS.csv.gz",
+            "roc.Locations.INDEL.csv.gz",
+            "roc.Locations.INDEL.PASS.csv.gz",
+        ] {
+            assert_eq!(
+                std::fs::read(suffixed_report_path(&serial_prefix, suffix)).unwrap(),
+                std::fs::read(suffixed_report_path(&threaded_prefix, suffix)).unwrap(),
+                "threaded output differs for {suffix}"
+            );
+        }
     }
 
     #[test]

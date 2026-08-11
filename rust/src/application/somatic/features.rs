@@ -71,13 +71,25 @@ impl FeatureRowSpools {
             .context("failed to create ordered somatic feature spool")?;
         {
             let mut writer = BufWriter::new(ordered.as_file_mut());
-            for group in &mut self.groups {
+            for (group_index, group) in self.groups.iter_mut().enumerate() {
                 group.as_file_mut().flush()?;
-                for (index, row) in BufReader::new(File::open(group.path())?)
+                let mut rows = BufReader::new(File::open(group.path())?)
                     .lines()
-                    .enumerate()
-                {
-                    let row = row?;
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                if group_index == 0 {
+                    // Legacy's merged TP DataFrame sorts CHROM as text while
+                    // FP/FN rows retain the source VCF sequence order.
+                    rows.sort_by(|left, right| {
+                        let left = parse_csv_line(left);
+                        let right = parse_csv_line(right);
+                        left.get(1).cmp(&right.get(1)).then_with(|| {
+                            left.get(2)
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .cmp(&right.get(2).and_then(|value| value.parse::<usize>().ok()))
+                        })
+                    });
+                }
+                for (index, row) in rows.into_iter().enumerate() {
                     let tail = row.split_once(',').map(|(_, tail)| tail).unwrap_or(&row);
                     writeln!(writer, "{index},{tail}")?;
                 }

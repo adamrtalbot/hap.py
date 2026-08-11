@@ -19,6 +19,7 @@ const TBI_MAX_POSITION: usize = 1 << 29;
 const TBI_LINEAR_SHIFT: usize = 14;
 const TBI_METADATA_BIN: u32 = 37_450;
 const MAX_VCF_LINE_BYTES: usize = 64 * 1024 * 1024;
+const BGZF_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 #[cfg(test)]
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
@@ -61,6 +62,9 @@ impl Variant {
     }
 
     pub(crate) fn primary_type(&self) -> &'static str {
+        if self.key.alt_allele == "." {
+            return "UNK";
+        }
         // Legacy hap.py classifies the VCF record's BVT by the allele that
         // the GT actually calls, not by scanning every ALT in a multi-allelic
         // record. A `T → C,TATC` truth with `GT=1|0` has only the `T→C` SNP
@@ -295,7 +299,9 @@ impl RawVcfRecord {
     }
 
     pub(crate) fn is_pass(&self) -> bool {
-        self.filter == "PASS" || self.filter == "." || self.filter.is_empty()
+        self.filter == "."
+            || self.filter.is_empty()
+            || self.filter.split(';').any(|token| token == "PASS")
     }
 
     pub(crate) fn end_pos(&self) -> usize {
@@ -447,10 +453,12 @@ impl Iterator for RawVcfReader {
 pub(crate) fn open_raw_vcf(path: &Path) -> Result<RawVcfReader> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut signature = [0; 2];
+    let mut signature = [0; 16];
     let count = file.read(&mut signature)?;
     file.seek(SeekFrom::Start(0))?;
-    let input: Box<dyn Read> = if count == 2 && signature == [0x1f, 0x8b] {
+    let input: Box<dyn Read> = if is_bgzf(&signature[..count]) {
+        Box::new(bgzf::io::Reader::new(file))
+    } else if count >= 2 && signature[..2] == [0x1f, 0x8b] {
         Box::new(MultiGzDecoder::new(file))
     } else {
         Box::new(file)
@@ -696,7 +704,11 @@ where
             .create_new(true)
             .open(&staged_vcf)
             .with_context(|| format!("failed to create VCF destination {}", path.display()))?;
-        let mut writer = bgzf::io::Writer::new(vcf_file);
+        // BGZF emits a frame header through several small writes. Buffer whole
+        // batches before they reach Docker/virtiofs so a shared-filesystem
+        // write cannot leave a torn header followed by a sparse zero run.
+        let mut writer =
+            bgzf::io::Writer::new(BufWriter::with_capacity(BGZF_WRITE_BUFFER_BYTES, vcf_file));
         for header in headers {
             writeln!(writer, "{header}")?;
         }
@@ -714,7 +726,10 @@ where
         }
 
         fail_operation(FailureOperation::Encoder, path)?;
-        let vcf_file = writer.finish()?;
+        let vcf_file = writer
+            .finish()?
+            .into_inner()
+            .map_err(|error| error.into_error())?;
         vcf_file
             .sync_all()
             .with_context(|| format!("failed to sync VCF destination {}", path.display()))?;
@@ -726,9 +741,13 @@ where
             .create_new(true)
             .open(&staged_tbi)
             .with_context(|| format!("failed to create VCF index {}", sidecar_path.display()))?;
-        let mut index_writer = bgzf::io::Writer::new(tbi_file);
+        let mut index_writer =
+            bgzf::io::Writer::new(BufWriter::with_capacity(BGZF_WRITE_BUFFER_BYTES, tbi_file));
         index_writer.write_all(&payload)?;
-        let tbi_file = index_writer.finish()?;
+        let tbi_file = index_writer
+            .finish()?
+            .into_inner()
+            .map_err(|error| error.into_error())?;
         tbi_file
             .sync_all()
             .with_context(|| format!("failed to sync VCF index {}", sidecar_path.display()))?;
@@ -1438,12 +1457,29 @@ impl Iterator for VariantReader<'_> {
                 Err(error) => return Some(Err(error)),
             };
 
+            let spanning_deletion = record.alt_allele == "*";
+            let gt = if spanning_deletion {
+                gt.split_inclusive(['/', '|'])
+                    .map(|token| {
+                        let (allele, separator) = token
+                            .strip_suffix(['/', '|'])
+                            .map_or((token, ""), |allele| (allele, &token[allele.len()..]));
+                        format!("{}{separator}", if allele == "1" { "." } else { allele })
+                    })
+                    .collect::<String>()
+            } else {
+                gt
+            };
             let variant = Variant {
                 key: VariantKey {
                     chrom,
                     pos: record.pos,
                     ref_allele: record.ref_allele.clone(),
-                    alt_allele: record.alt_allele.clone(),
+                    alt_allele: if spanning_deletion {
+                        ".".to_string()
+                    } else {
+                        record.alt_allele.clone()
+                    },
                 },
                 qual: canonical_qual(&record.qual).to_string(),
                 filter: record.filter.clone(),
@@ -1453,7 +1489,7 @@ impl Iterator for VariantReader<'_> {
             if self.pass_only && !variant.is_pass() {
                 continue;
             }
-            if variant.key.alt_allele == "." {
+            if variant.key.alt_allele == "." && !spanning_deletion {
                 continue;
             }
             if !matches_interval_filters(
@@ -1857,6 +1893,31 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn streaming_reader_reopens_large_native_bgzf_output() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("large.vcf.gz");
+        let headers = [
+            "##fileformat=VCFv4.2".to_string(),
+            "##contig=<ID=chr1,length=200000>".to_string(),
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO".to_string(),
+        ];
+        let records = (1usize..=100_000)
+            .map(|position| {
+                format!(
+                    "chr1\t{position}\tcall_{position}\tA\tC\t60\tPASS\tPAD={:016x}",
+                    position.wrapping_mul(0x9e37_79b9usize)
+                )
+            })
+            .collect::<Vec<_>>();
+
+        write_indexed_vcf(&path, &headers, records.iter().map(String::as_str))?;
+        let signature = fs::read(&path)?;
+        assert!(is_bgzf(&signature));
+        assert_eq!(open_raw_vcf(&path)?.count(), records.len());
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct ParsedReferenceIndex {
         bins: BTreeMap<u32, Vec<Chunk>>,
@@ -2082,6 +2143,29 @@ mod tests {
     }
 
     #[test]
+    fn variant_loading_maps_selected_spanning_deletion_to_halfcall() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("spanning-deletion.vcf");
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+                "1\t984495\t.\tC\t*\t30\tPASS\t.\tGT\t0|1\n",
+            ),
+        )?;
+        let contigs = BTreeSet::from(["1".to_string()]);
+
+        let variants = load_variants(&input, &contigs, false, None, None, None)?;
+
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].key.alt_allele, ".");
+        assert_eq!(variants[0].gt, "0|.");
+        assert_eq!(variants[0].primary_type(), "UNK");
+        Ok(())
+    }
+
+    #[test]
     fn concurrent_same_prefix_writers_publish_one_complete_generation() -> Result<()> {
         let directory = tempdir()?;
         let path = Arc::new(directory.path().join("shared.vcf.gz"));
@@ -2151,7 +2235,7 @@ mod tests {
                     .arg("adapters::vcf::tests::concurrent_processes_publish_one_complete_generation")
                     .env("HAP_RS_PUBLICATION_TEST_PATH", &path)
                     .env("HAP_RS_PUBLICATION_TEST_GENERATION", generation.to_string())
-                    .stdout(Stdio::null())
+                    .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()?,
             );
@@ -2160,8 +2244,9 @@ mod tests {
             let output = child.wait_with_output()?;
             assert!(
                 output.status.success(),
-                "publication helper failed with {}: {}",
+                "publication helper failed with {}:\nstdout:\n{}\nstderr:\n{}",
                 output.status,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
         }

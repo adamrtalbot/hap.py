@@ -797,11 +797,17 @@ mod tests {
         run(args)?;
 
         let (_, records) = vcf::load_raw_vcf(&output)?;
-        let repeat = records
-            .iter()
-            .find(|record| record.ref_allele == "AA")
-            .expect("repeat deletion must survive preprocessing");
-        assert_eq!(repeat.pos, 1);
+        // Location aggregation may pad the shifted deletion to a longer REF
+        // when another job emits an allele at the same normalized position.
+        // Match the one-base deletion by allele length instead of requiring
+        // its pre-aggregation `AA>A` spelling.
+        assert!(records.iter().any(|record| {
+            record.pos == 1
+                && record
+                    .alt_allele
+                    .split(',')
+                    .any(|alt| record.ref_allele.len() == alt.len() + 1)
+        }));
         Ok(())
     }
 

@@ -282,9 +282,9 @@ pub(super) fn build_blocksplit_jobs(
         // blocksplit's no-breakpoint fallback returns the complete contig,
         // even when the requested location covers only one part of it.
         if state.candidates.is_empty() || boundaries.is_empty() {
-            let included_indices = chrom_indices.into_iter().collect::<HashSet<_>>();
+            let included_indices = chrom_indices;
             let reset_before_indices = location_start
-                .filter(|index| *index > 0 && included_indices.contains(index))
+                .filter(|index| *index > 0 && included_indices.binary_search(index).is_ok())
                 .into_iter()
                 .collect();
             jobs.push(BlocksplitJob {
@@ -313,12 +313,12 @@ pub(super) fn build_blocksplit_jobs(
                     let pos = observations[index].pos;
                     block_start.is_none_or(|start| pos >= start) && pos < block_end
                 })
-                .collect::<HashSet<_>>();
+                .collect::<Vec<_>>();
             if !included_indices.is_empty() {
                 let reset_before_indices = [block_start_index, location_start]
                     .into_iter()
                     .flatten()
-                    .filter(|index| *index > 0 && included_indices.contains(index))
+                    .filter(|index| *index > 0 && included_indices.binary_search(index).is_ok())
                     .collect();
                 jobs.push(BlocksplitJob {
                     included_indices,
@@ -335,12 +335,12 @@ pub(super) fn build_blocksplit_jobs(
                 block_start.is_none_or(|start| pos >= start)
                     && final_end.is_none_or(|end| pos < end)
             })
-            .collect::<HashSet<_>>();
+            .collect::<Vec<_>>();
         if !included_indices.is_empty() {
             let reset_before_indices = [block_start_index, location_start]
                 .into_iter()
                 .flatten()
-                .filter(|index| *index > 0 && included_indices.contains(index))
+                .filter(|index| *index > 0 && included_indices.binary_search(index).is_ok())
                 .collect();
             jobs.push(BlocksplitJob {
                 included_indices,
