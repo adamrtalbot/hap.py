@@ -20,7 +20,7 @@ jobs:
 
     env:
       BCFTOOLS_APT_VERSION: 1.19-1build2
-      NXF_HOME: ${{ runner.temp }}/nextflow-home
+      NXF_HOME: /tmp/nextflow-home
       NXF_SYNTAX_PARSER: v2
       NXF_DISABLE_CHECK_LATEST: 'true'
       TABIX_APT_VERSION: 1.19+ds-1.1build3
