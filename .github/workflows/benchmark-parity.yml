@@ -29,13 +29,13 @@ jobs:
       - name: Checkout exact source lineage
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
 
       - name: Verify source commit
         run: |
-          test "$(git rev-parse HEAD^)" = d93991e131e3c55028a5064bdf11a46990e1437a
-          test "$(git diff --name-only HEAD^)" = .github/workflows/benchmark-parity.yml
+          test "$(git rev-parse HEAD~2)" = d93991e131e3c55028a5064bdf11a46990e1437a
+          test "$(git diff --name-only HEAD~2)" = .github/workflows/benchmark-parity.yml
 
       - name: Set up Rust 1.89.0
         uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05 # 1.89.0
