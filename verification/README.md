@@ -9,6 +9,20 @@ image and the matching `hap` subcommand from `PATH`, then compares the emitted
 `result*` files. nf-test fails when a comparison contains a difference outside
 the metadata exclusions below.
 
+## Legacy reference image
+
+`containers/happy-0.3.15.yml` defines the legacy hap.py environment. Build it
+with Wave CLI and freeze the result:
+
+```bash
+wave --conda-file verification/containers/happy-0.3.15.yml \
+  --platform linux/amd64 --freeze --await --output json
+```
+
+Set the frozen Wave image name in `nextflow.config`; do not use an expiring
+request-scoped Wave URL as a parity reference. The current reference is
+`community.wave.seqera.io/library/happy-0.3.15:41c2102638513597`.
+
 ## Lanes
 
 | Lane | Legacy command | Rust command |
