@@ -23,6 +23,15 @@ Set the frozen Wave image name in `nextflow.config`; do not use an expiring
 request-scoped Wave URL as a parity reference. The current reference is
 `community.wave.seqera.io/library/happy-0.3.15:41c2102638513597`.
 
+The SOMPY and FTXPY lanes use the digest-pinned hap.py 0.3.15 image from the
+nf-core/variantbenchmarking v1.6.0dev full-size run. Its exact dependency set
+affects legacy CSV float serialization, so it must not be replaced by another
+hap.py 0.3.15 build without first observing and updating the legacy contract.
+The SOMPY legacy process supplies a Python environment shim for pandas' removed
+`display.height` option, which som.py sets only while rendering ambiguity
+explanations. The shim ignores that display-only setting and does not alter
+som.py or its output data.
+
 ## Lanes
 
 | Lane | Legacy command | Rust command |

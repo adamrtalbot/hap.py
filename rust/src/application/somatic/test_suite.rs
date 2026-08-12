@@ -679,6 +679,17 @@ mod tests {
                 5
             );
         }
+        let first_bin = ["records", "SNVs", "indels"].map(|prefix| {
+            let row = lines
+                .iter()
+                .find(|line| line.contains(&format!(",{prefix}.0.000000-0.200000,")))
+                .expect("first AF bin row");
+            let mut fields = parse_csv_line(row);
+            fields.remove(7);
+            fields
+        });
+        assert_eq!(first_bin[0], first_bin[1]);
+        assert_eq!(first_bin[0], first_bin[2]);
 
         fs::remove_dir_all(&root).expect("remove AF row test root");
     }
@@ -1435,7 +1446,7 @@ mod tests {
             "0,chr1,50,AMBI,A,,C,,,,1.0".to_string(),
         ];
         let rows = feature_spool(&rows);
-        let bins = calculate_af_stats(header, rows.path(), "0.5", "TRUTH_AF", "QUERY_AF", None)
+        let bins = calculate_af_stats(header, rows.path(), "0.5", "TRUTH_AF", "QUERY_AF")
             .expect("AF stats");
         assert_eq!(bins.len(), 2);
         assert_eq!(bins[0].2.truth_total, 1);

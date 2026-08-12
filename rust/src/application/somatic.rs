@@ -816,19 +816,13 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
                         continue;
                     };
                     for prefix in ["records", "SNVs", "indels"] {
-                        let type_label = (prefix != "records").then_some(prefix);
-                        let Some(typed_rows) =
-                            feature_rows_for_type(rows.path(), header, type_label)?
-                        else {
-                            continue;
-                        };
                         let path = PathBuf::from(format!(
                             "{}.{}.{}.roc.csv",
                             args.output,
                             prefix,
                             format_af_interval(start, end)
                         ));
-                        write_somatic_roc(&path, header, typed_rows.path(), roc_name)?;
+                        write_somatic_roc(&path, header, rows.path(), roc_name)?;
                     }
                 }
             }
@@ -950,7 +944,6 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         && let Some(header) = feature_header.as_deref()
     {
         for prefix in ["records", "SNVs", "indels"] {
-            let type_label = (prefix != "records").then_some(prefix);
             let af_counts = calculate_af_stats(
                 header,
                 ordered_feature_rows
@@ -960,7 +953,6 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
                 &args.af_strat_binsize,
                 &args.af_strat_truth,
                 &args.af_strat_query,
-                type_label,
             )?;
             for (start, end, counts, filtered) in &af_counts {
                 let label = format!("{prefix}.{}", format_af_interval(*start, *end));

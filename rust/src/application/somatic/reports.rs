@@ -254,7 +254,6 @@ pub(super) fn calculate_af_stats(
     bin_sizes: &str,
     truth_af_field: &str,
     query_af_field: &str,
-    type_label: Option<&str>,
 ) -> Result<Vec<(f64, f64, SomaticCounts, FilteredCounts)>> {
     let headers = parse_csv_line(feature_header);
     let tag_index = csv_column_index(&headers, "tag")?;
@@ -278,10 +277,6 @@ pub(super) fn calculate_af_stats(
         let mut filtered = FilteredCounts::default();
         for row in BufReader::new(File::open(feature_rows)?).lines() {
             let row = parse_csv_line(&row?);
-            if type_label.is_some_and(|expected| feature_row_type(&headers, &row) != Some(expected))
-            {
-                continue;
-            }
             let tag = row.get(tag_index).map(String::as_str).unwrap_or_default();
             let filtered_call = row.get(filter_index).is_some_and(|value| !value.is_empty());
             match tag {
@@ -318,63 +313,6 @@ pub(super) fn calculate_af_stats(
         output.push((start, end, counts, filtered));
     }
     Ok(output)
-}
-
-pub(super) fn feature_rows_for_type(
-    feature_rows: &Path,
-    feature_header: &str,
-    type_label: Option<&str>,
-) -> Result<Option<tempfile::NamedTempFile>> {
-    let headers = parse_csv_line(feature_header);
-    let mut output =
-        tempfile::NamedTempFile::new().context("failed to create feature type spool")?;
-    let mut count = 0usize;
-    for row in BufReader::new(File::open(feature_rows)?).lines() {
-        let row = row?;
-        if type_label.is_none() || feature_row_type(&headers, &parse_csv_line(&row)) == type_label {
-            writeln!(output.as_file_mut(), "{row}")?;
-            count += 1;
-        }
-    }
-    output.as_file_mut().flush()?;
-    Ok((count > 0).then_some(output))
-}
-
-pub(super) fn feature_row_type(headers: &[String], row: &[String]) -> Option<&'static str> {
-    let tag_index = csv_column_index(headers, "tag").ok()?;
-    let tag = row.get(tag_index)?.as_str();
-    let (reference_field, alternate_field) = if matches!(tag, "TP" | "FN") {
-        ("REF.truth", "ALT.truth")
-    } else {
-        ("REF", "ALT")
-    };
-    let reference = row.get(csv_column_index(headers, reference_field).ok()?)?;
-    let alternate = row.get(csv_column_index(headers, alternate_field).ok()?)?;
-    let (reference, alternate) = if reference.is_empty() || alternate.is_empty() {
-        (
-            row.get(csv_column_index(headers, "REF").ok()?)?,
-            row.get(csv_column_index(headers, "ALT").ok()?)?,
-        )
-    } else {
-        (reference, alternate)
-    };
-    feature_allele_type(reference, alternate)
-}
-
-pub(super) fn feature_allele_type(reference: &str, alternate: &str) -> Option<&'static str> {
-    if alternate.is_empty() || alternate == "." {
-        return None;
-    }
-    if alternate == "*" || alternate.starts_with('<') || alternate.contains(['[', ']']) {
-        return Some("others");
-    }
-    if reference.len() == 1 && alternate.len() == 1 {
-        Some("SNVs")
-    } else if reference.len() > 1 && alternate.len() == reference.len() {
-        Some("MNPs")
-    } else {
-        Some("indels")
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
