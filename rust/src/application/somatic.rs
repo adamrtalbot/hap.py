@@ -24,7 +24,7 @@ mod reports;
 #[cfg(test)]
 mod test_suite;
 
-use allele_frequency::{format_af_interval, parse_af_bins, preserves_empty_records_af_bin};
+use allele_frequency::{format_af_interval, parse_af_bins};
 use features::*;
 use metrics::*;
 use normalization::*;
@@ -883,9 +883,6 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             } else {
                 by_type.get(label).copied().unwrap_or_default()
             };
-            if label != "records" && row.truth_total == 0 {
-                continue;
-            }
             let filtered = if label == "records" {
                 args.count_filtered_fn.then_some(filtered_records)
             } else {
@@ -966,12 +963,6 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
                 type_label,
             )?;
             for (start, end, counts, filtered) in &af_counts {
-                if counts.truth_total == 0
-                    && !(prefix == "records"
-                        && preserves_empty_records_af_bin(&args.af_strat_binsize, *end))
-                {
-                    continue;
-                }
                 let label = format!("{prefix}.{}", format_af_interval(*start, *end));
                 lines.push(render_row_af(
                     0,

@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn regular_af_bins_omit_empty_legacy_type_and_bin_rows() {
+    fn regular_af_bins_emit_complete_deployed_legacy_rows() {
         let root = unique_test_dir("af-complete-rows");
         let truth = root.join("truth.vcf");
         let query = root.join("query.vcf");
@@ -662,16 +662,21 @@ mod tests {
         let stats =
             fs::read_to_string(root.join("result.stats.csv")).expect("read complete AF stats");
         let lines = stats.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 3, "header + records + observed SNV type");
-        assert!(lines.iter().any(|line| line.contains(",records,")));
-        assert!(lines.iter().any(|line| line.contains(",SNVs,")));
+        assert_eq!(lines.len(), 22, "header + 21 deployed legacy rows");
+        for label in ["indels", "SNVs", "no-ALTs", "records", "MNPs", "others"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!(",{label},")))
+            );
+        }
         for prefix in ["records", "SNVs", "indels"] {
             assert_eq!(
                 lines
                     .iter()
                     .filter(|line| line.contains(&format!(",{prefix}.")))
                     .count(),
-                0
+                5
             );
         }
 
@@ -1275,6 +1280,35 @@ mod tests {
         assert_eq!(ci_95[9], ci_80[9]);
         assert_ne!(ci_95[10], ci_80[10]);
         assert_ne!(ci_95[11], ci_80[11]);
+    }
+
+    #[test]
+    fn somatic_stats_preserve_full_float_precision() {
+        let counts = SomaticCounts {
+            truth_total: 3,
+            query_total: 2,
+            tp: 1,
+            fp: 1,
+            fn_count: 2,
+            ..SomaticCounts::default()
+        };
+        let row = render_row_af(
+            0,
+            "indels",
+            counts,
+            &StatsRowContext {
+                fp_region_size: 100,
+                ci_alpha: 0.05,
+                filtered: None,
+                include_filtered_columns: false,
+                commandline: "som.py",
+            },
+        );
+        let cells = row.split(',').collect::<Vec<_>>();
+
+        assert_eq!(cells[9], "0.3333333333333333");
+        assert_eq!(cells[11], "0.8232639028687426");
+        assert_eq!(cells[12], "0.3333333333333333");
     }
 
     #[test]

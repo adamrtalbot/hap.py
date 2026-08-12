@@ -15,7 +15,7 @@ pub(super) fn ratio(numerator: usize, denominator: usize) -> f64 {
 }
 
 pub(super) fn py_float(value: f64) -> String {
-    crate::adapters::report::python_repr_float(value)
+    crate::adapters::report::full_repr_float(value)
 }
 
 pub(super) fn write_legacy_metrics_json(

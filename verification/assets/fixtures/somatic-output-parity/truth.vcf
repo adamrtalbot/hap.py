@@ -1,0 +1,9 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100>
+##INFO=<ID=T_ALT_RATE,Number=1,Type=Float,Description="Truth allele fraction">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=VT,Number=1,Type=String,Description="Variant type">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TRUTH
+chr1	5	.	A	AT	60	PASS	T_ALT_RATE=0.1	GT:VT	1/1:INDEL
+chr1	10	.	A	AT	60	PASS	T_ALT_RATE=0.3	GT:VT	1/1:INDEL
+chr1	15	.	A	AT	60	PASS	T_ALT_RATE=0.9	GT:VT	1/1:INDEL

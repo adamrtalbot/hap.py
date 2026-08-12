@@ -659,7 +659,7 @@ pub(crate) fn format_ratio(value: f64) -> String {
     full_repr_float(value)
 }
 
-fn full_repr_float(value: f64) -> String {
+pub(crate) fn full_repr_float(value: f64) -> String {
     if value.is_nan() {
         return "nan".to_string();
     }
