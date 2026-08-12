@@ -579,11 +579,11 @@ pub(crate) fn format_metric(value: f64) -> String {
     // reproduces the exact decimal text legacy emits — which is generally
     // 1 ULP off from a plain `(value * 1e6).round() / 1e6` round-trip.
     if !value.is_finite() {
-        return python_repr_float(value);
+        return full_repr_float(value);
     }
     let formatted = format!("{value:.6}");
     let lossy = pandas_xstrtod(&formatted);
-    python_repr_float(lossy)
+    full_repr_float(lossy)
 }
 
 /// Rust port of pandas 0.24 `xstrtod` (the lossy parser used by
@@ -655,11 +655,43 @@ pub(crate) fn pandas_xstrtod(s: &str) -> f64 {
     number
 }
 
-fn format_ratio(value: f64) -> String {
-    python_repr_float(value)
+pub(crate) fn format_ratio(value: f64) -> String {
+    full_repr_float(value)
 }
 
-// Python 2's str(float), used by pandas 0.19.2 CSV emission, keeps 12
+pub(crate) fn full_repr_float(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-inf".to_string()
+        } else {
+            "inf".to_string()
+        };
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        };
+    }
+    let exponent = value.abs().log10().floor() as i32;
+    if !(-4..12).contains(&exponent) {
+        let scientific = format!("{value:e}");
+        let (mantissa, exponent_text) = scientific.split_once('e').unwrap();
+        let exponent_value = exponent_text.parse::<i32>().unwrap();
+        return format!("{mantissa}e{exponent_value:+03}");
+    }
+    let mut rendered = value.to_string();
+    if !rendered.contains('.') {
+        rendered.push_str(".0");
+    }
+    rendered
+}
+
+// Python 2's str(float), used by the other legacy adapters, keeps 12
 // significant digits. It uses fixed notation for exponents in [-4, 11] and
 // scientific notation otherwise. Integer-valued fixed numbers retain `.0`.
 pub(crate) fn python_repr_float(value: f64) -> String {
@@ -717,7 +749,9 @@ pub(crate) fn append_ci_cells(
 
 #[cfg(test)]
 mod format_tests {
-    use super::{SubsetSubtypeFpCounts, python_repr_float, write_extended, write_summary};
+    use super::{
+        SubsetSubtypeFpCounts, format_ratio, python_repr_float, write_extended, write_summary,
+    };
     use crate::domain::TypeCounts;
     use std::collections::BTreeMap;
 
@@ -735,13 +769,18 @@ mod format_tests {
     }
 
     #[test]
-    fn long_repr_matches_python_two_significant_digits() {
+    fn germline_ratio_preserves_the_shortest_round_trip_value() {
         let v: f64 = 0.9651790000000001;
-        assert_eq!(python_repr_float(v), "0.965179");
+        assert_eq!(format_ratio(v), "0.9651790000000001");
         let w: f64 = 1.58980044345898;
-        assert_eq!(python_repr_float(w), "1.58980044346");
-        assert_eq!(python_repr_float(0.00009499999999999999), "9.5e-05");
-        assert_eq!(python_repr_float(1_234_567_890_123.0), "1.23456789012e+12");
+        assert_eq!(format_ratio(w), "1.58980044345898");
+        assert_eq!(
+            format_ratio(0.00009499999999999999),
+            "9.499999999999999e-05"
+        );
+        assert_eq!(format_ratio(1_234_567_890_123.0), "1.234567890123e+12");
+        assert_eq!(format_ratio(1.713487071977638), "1.713487071977638");
+        assert_eq!(format_ratio(2.1964285714285716), "2.1964285714285716");
     }
 
     #[test]
@@ -777,17 +816,17 @@ mod format_tests {
     #[test]
     fn format_metric_matches_legacy_byte_for_byte() {
         use super::format_metric;
-        // Python 2 str() suppresses the parser's one-ULP representation noise.
-        assert_eq!(format_metric(7839.0 / 8937.0), "0.87714");
+        assert_eq!(format_metric(7839.0 / 8937.0), "0.8771399999999999");
         // Precision = 7949/8292 → "0.958635" → pandas-xstrtod → "0.958635"
         assert_eq!(format_metric(7949.0 / 8292.0), "0.958635");
-        // F1 ≈ 0.916078519... → C++ "0.916079" → Python 2 "0.916079".
+        // F1 ≈ 0.916078519... → C++ "0.916079" → pandas' adjacent double.
         let r = 7839.0 / 8937.0;
         let p = 7949.0 / 8292.0;
         let f1 = 2.0 * r * p / (r + p);
-        assert_eq!(format_metric(f1), "0.916079");
+        assert_eq!(format_metric(f1), "0.9160790000000001");
         // Frac_NA = 3520/11812 → "0.298002" → exact f64 → "0.298002"
         assert_eq!(format_metric(3520.0 / 11812.0), "0.298002");
+        assert_eq!(format_metric(0.976271), "0.9762709999999999");
     }
 
     #[test]

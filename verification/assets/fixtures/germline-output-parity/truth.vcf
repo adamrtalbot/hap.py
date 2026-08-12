@@ -1,0 +1,18 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TRUTH
+chr1	5	truth-snp-1	A	G	60	PASS	.	GT	0/1
+chr1	9	truth-snp-2	A	G	59	PASS	.	GT	0/1
+chr1	13	truth-snp-3	A	G	58	PASS	.	GT	0/1
+chr1	17	truth-snp-4	A	G	57	PASS	.	GT	0/1
+chr1	21	truth-snp-5	A	C	56	PASS	.	GT	1/1
+chr1	25	truth-snp-6	A	C	55	PASS	.	GT	1/1
+chr1	29	truth-snp-7	A	C	54	PASS	.	GT	1/1
+chr1	33	truth-indel-1	A	AT	53	PASS	.	GT	0/1
+chr1	37	truth-indel-2	AC	A	52	PASS	.	GT	0/1
+chr1	41	truth-indel-3	A	AT	51	PASS	.	GT	0/1
+chr1	45	truth-indel-4	A	AT	50	PASS	.	GT	0/1
+chr1	49	truth-indel-5	A	AT	49	PASS	.	GT	0/1
+chr1	53	truth-indel-6	A	AT	48	PASS	.	GT	0/1
+chr1	57	truth-indel-7	A	AT	47	PASS	.	GT	0/1

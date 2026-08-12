@@ -48,17 +48,6 @@ pub(super) fn parse_af_bins(raw: &str) -> Result<Vec<(f64, f64)>> {
     }
 }
 
-pub(super) fn preserves_empty_records_af_bin(raw: &str, end: f64) -> bool {
-    if end.is_nan() {
-        return true;
-    }
-    end >= 1.0
-        && raw
-            .split(',')
-            .filter_map(|part| part.parse::<f64>().ok())
-            .any(|value| value.is_infinite() && value.is_sign_positive())
-}
-
 fn format_af_bound(value: f64) -> String {
     if value.is_nan() {
         "nan".to_string()

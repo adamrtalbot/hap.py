@@ -24,7 +24,7 @@ mod reports;
 #[cfg(test)]
 mod test_suite;
 
-use allele_frequency::{format_af_interval, parse_af_bins, preserves_empty_records_af_bin};
+use allele_frequency::{format_af_interval, parse_af_bins};
 use features::*;
 use metrics::*;
 use normalization::*;
@@ -816,19 +816,13 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
                         continue;
                     };
                     for prefix in ["records", "SNVs", "indels"] {
-                        let type_label = (prefix != "records").then_some(prefix);
-                        let Some(typed_rows) =
-                            feature_rows_for_type(rows.path(), header, type_label)?
-                        else {
-                            continue;
-                        };
                         let path = PathBuf::from(format!(
                             "{}.{}.{}.roc.csv",
                             args.output,
                             prefix,
                             format_af_interval(start, end)
                         ));
-                        write_somatic_roc(&path, header, typed_rows.path(), roc_name)?;
+                        write_somatic_roc(&path, header, rows.path(), roc_name)?;
                     }
                 }
             }
@@ -883,9 +877,6 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             } else {
                 by_type.get(label).copied().unwrap_or_default()
             };
-            if label != "records" && row.truth_total == 0 {
-                continue;
-            }
             let filtered = if label == "records" {
                 args.count_filtered_fn.then_some(filtered_records)
             } else {
@@ -953,7 +944,6 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         && let Some(header) = feature_header.as_deref()
     {
         for prefix in ["records", "SNVs", "indels"] {
-            let type_label = (prefix != "records").then_some(prefix);
             let af_counts = calculate_af_stats(
                 header,
                 ordered_feature_rows
@@ -963,15 +953,8 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
                 &args.af_strat_binsize,
                 &args.af_strat_truth,
                 &args.af_strat_query,
-                type_label,
             )?;
             for (start, end, counts, filtered) in &af_counts {
-                if counts.truth_total == 0
-                    && !(prefix == "records"
-                        && preserves_empty_records_af_bin(&args.af_strat_binsize, *end))
-                {
-                    continue;
-                }
                 let label = format!("{prefix}.{}", format_af_interval(*start, *end));
                 lines.push(render_row_af(
                     0,

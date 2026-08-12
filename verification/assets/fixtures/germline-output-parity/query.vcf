@@ -1,0 +1,18 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	QUERY
+chr1	5	query-match	A	G	60	PASS	.	GT	0/1
+chr1	33	query-indel-match	A	AT	53	PASS	.	GT	0/1
+chr1	42	query-snp-2	C	T	49	PASS	.	GT	0/1
+chr1	46	query-snp-3	C	T	48	PASS	.	GT	0/1
+chr1	50	query-snp-4	C	T	47	PASS	.	GT	0/1
+chr1	54	query-snp-5	C	A	46	PASS	.	GT	1/1
+chr1	58	query-snp-6	C	A	45	PASS	.	GT	1/1
+chr1	62	query-snp-7	C	A	44	PASS	.	GT	1/1
+chr1	65	query-indel-2	A	AT	43	PASS	.	GT	0/1
+chr1	69	query-indel-3	A	AT	42	PASS	.	GT	0/1
+chr1	73	query-indel-4	A	AT	41	PASS	.	GT	0/1
+chr1	77	query-indel-5	A	AT	40	PASS	.	GT	0/1
+chr1	81	query-indel-6	A	AT	39	PASS	.	GT	0/1
+chr1	85	query-indel-7	A	AT	38	PASS	.	GT	0/1

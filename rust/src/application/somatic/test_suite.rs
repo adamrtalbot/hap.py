@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn regular_af_bins_omit_empty_legacy_type_and_bin_rows() {
+    fn regular_af_bins_emit_complete_deployed_legacy_rows() {
         let root = unique_test_dir("af-complete-rows");
         let truth = root.join("truth.vcf");
         let query = root.join("query.vcf");
@@ -662,18 +662,34 @@ mod tests {
         let stats =
             fs::read_to_string(root.join("result.stats.csv")).expect("read complete AF stats");
         let lines = stats.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 3, "header + records + observed SNV type");
-        assert!(lines.iter().any(|line| line.contains(",records,")));
-        assert!(lines.iter().any(|line| line.contains(",SNVs,")));
+        assert_eq!(lines.len(), 22, "header + 21 deployed legacy rows");
+        for label in ["indels", "SNVs", "no-ALTs", "records", "MNPs", "others"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!(",{label},")))
+            );
+        }
         for prefix in ["records", "SNVs", "indels"] {
             assert_eq!(
                 lines
                     .iter()
                     .filter(|line| line.contains(&format!(",{prefix}.")))
                     .count(),
-                0
+                5
             );
         }
+        let first_bin = ["records", "SNVs", "indels"].map(|prefix| {
+            let row = lines
+                .iter()
+                .find(|line| line.contains(&format!(",{prefix}.0.000000-0.200000,")))
+                .expect("first AF bin row");
+            let mut fields = parse_csv_line(row);
+            fields.remove(7);
+            fields
+        });
+        assert_eq!(first_bin[0], first_bin[1]);
+        assert_eq!(first_bin[0], first_bin[2]);
 
         fs::remove_dir_all(&root).expect("remove AF row test root");
     }
@@ -1278,6 +1294,35 @@ mod tests {
     }
 
     #[test]
+    fn somatic_stats_preserve_full_float_precision() {
+        let counts = SomaticCounts {
+            truth_total: 3,
+            query_total: 2,
+            tp: 1,
+            fp: 1,
+            fn_count: 2,
+            ..SomaticCounts::default()
+        };
+        let row = render_row_af(
+            0,
+            "indels",
+            counts,
+            &StatsRowContext {
+                fp_region_size: 100,
+                ci_alpha: 0.05,
+                filtered: None,
+                include_filtered_columns: false,
+                commandline: "som.py",
+            },
+        );
+        let cells = row.split(',').collect::<Vec<_>>();
+
+        assert_eq!(cells[9], "0.3333333333333333");
+        assert_eq!(cells[11], "0.8232639028687426");
+        assert_eq!(cells[12], "0.3333333333333333");
+    }
+
+    #[test]
     fn filtered_fn_columns_align_with_their_header() {
         let counts = SomaticCounts {
             truth_total: 10,
@@ -1401,7 +1446,7 @@ mod tests {
             "0,chr1,50,AMBI,A,,C,,,,1.0".to_string(),
         ];
         let rows = feature_spool(&rows);
-        let bins = calculate_af_stats(header, rows.path(), "0.5", "TRUTH_AF", "QUERY_AF", None)
+        let bins = calculate_af_stats(header, rows.path(), "0.5", "TRUTH_AF", "QUERY_AF")
             .expect("AF stats");
         assert_eq!(bins.len(), 2);
         assert_eq!(bins[0].2.truth_total, 1);

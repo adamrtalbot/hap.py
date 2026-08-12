@@ -1,0 +1,14 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=100>
+##MaxDepth_chr1=100
+##INFO=<ID=NT,Number=1,Type=String,Description="Normal genotype tier">
+##INFO=<ID=QSI_NT,Number=1,Type=Integer,Description="Joint quality score">
+##INFO=<ID=SomaticEVS,Number=1,Type=Float,Description="Somatic empirical variant score">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+##FORMAT=<ID=FDP50,Number=1,Type=Integer,Description="Filtered basecall depth">
+##FORMAT=<ID=BCN50,Number=1,Type=Float,Description="Copy number">
+##FORMAT=<ID=TAR,Number=2,Type=Integer,Description="Reference allele observations">
+##FORMAT=<ID=TIR,Number=2,Type=Integer,Description="Indel allele observations">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NORMAL	TUMOR
+chr1	5	.	A	AT	41	PASS	NT=ref;QSI_NT=41;SomaticEVS=17.22	DP:FDP50:BCN50:TAR:TIR	10:0:2:10,10:0,0	20:0:2:18,18:2,2
+chr1	20	.	A	AT	14.1	PASS	NT=ref;QSI_NT=14;SomaticEVS=14.1	DP:FDP50:BCN50:TAR:TIR	10:0:2:10,10:0,0	20:0:2:16,16:4,4
