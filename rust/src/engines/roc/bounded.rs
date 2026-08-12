@@ -43,7 +43,10 @@ const ROC_INDEX_ENTRY_BYTES: u64 = 16;
 // gives hap.py 24 GiB, so a 2 GiB bound remains conservative.
 const ROC_IN_MEMORY_INDEX_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RENDERED_ROC_THRESHOLDS: usize = 2_500_000;
-const MAX_ROC_METRIC_INDEX_KEYS: usize = 500_000;
+// Metric-index ordering also tracks the four legacy genotype projections for
+// each threshold, including aggregation keys discarded before publication.
+// Keep that internal index bounded without reducing the rendered ROC budget.
+const MAX_ROC_METRIC_INDEX_KEYS: usize = MAX_RENDERED_ROC_THRESHOLDS * 4;
 
 /// Write `roc.all` and each non-empty Locations ROC file alongside `prefix`.
 #[derive(Clone, Debug, Default)]
@@ -4910,6 +4913,16 @@ mod tests {
         let key = "SNP\t*\t*\tPASS\tTS_contained\t379.290009";
         assert_eq!(legacy_string_hash(key), 0x1dac_92aa_2553_6c1f);
         assert_eq!(legacy_string_hash(key) % 10_273, 5_747);
+    }
+
+    #[test]
+    fn legacy_metric_index_accepts_more_than_2500000_keys() -> Result<()> {
+        let mut rows = LegacyUnorderedRows::default();
+        for index in 0..=2_500_000 {
+            rows.set(format!("SNP\t*\t*\tALL\t*\t{index}"), true)?;
+        }
+        assert_eq!(rows.retained_order().len(), 2_500_001);
+        Ok(())
     }
 
     #[test]

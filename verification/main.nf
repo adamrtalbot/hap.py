@@ -17,7 +17,7 @@
 
 nextflow.enable.dsl = 2
 
-include { HAPPY_LEGACY ; HAPPY_RUST ; HAPPY_RUST_CONTRACT } from './modules/happy'
+include { HAPPY_PREPARE ; HAPPY_LEGACY ; HAPPY_RUST ; HAPPY_RUST_CONTRACT } from './modules/happy'
 include { SOMPY_LEGACY ; SOMPY_RUST } from './modules/sompy'
 include { PREPY_LEGACY ; PREPY_RUST } from './modules/prepy'
 include { FTXPY_LEGACY ; FTXPY_RUST } from './modules/ftxpy'
@@ -46,6 +46,9 @@ def fixture(rel) {
     def path = rel.toString()
     if (path.startsWith('local:')) {
         return file("${projectDir}/${path.substring('local:'.length())}")
+    }
+    if (path ==~ /^[a-z][a-z0-9+.-]*:\/\/.*/) {
+        return file(path)
     }
     file("${params.fixture_base}/${path}")
 }
@@ -83,6 +86,7 @@ workflow {
                 id: row.sample_id,
                 case_name: 'happy',
                 strict_roc_order: (row.strict_roc_order ?: 'false').toString().toBoolean(),
+                query_sample: (row.query_sample ?: '').toString(),
             ]
             def additionalStratificationBeds = (row.stratification_beds ?: '')
                 .toString()
@@ -97,7 +101,7 @@ workflow {
                 fixture(row.query_vcf),
                 fixtureIndexes(row.query_vcf),
                 fixture(row.reference),
-                fixture("${row.reference}.fai"),
+                [fixture("${row.reference}.fai")] + (row.reference_gzi ? [fixture(row.reference_gzi)] : []),
                 fixture(row.fp_bed),
                 fixtureIndexes(row.fp_bed),
                 stratificationFiles,
@@ -106,7 +110,15 @@ workflow {
             )
         }
 
-        happy_legacy_in = happy_rows.map { meta, truth, truthIndexes, query, queryIndexes, reference, referenceFai, fpBed, fpIndexes, stratificationFiles, referenceSdf, args ->
+        happy_rows.branch { meta, truth, truthIndexes, query, queryIndexes, reference, referenceIndexes, fpBed, fpIndexes, stratificationFiles, referenceSdf, args ->
+            prepare: meta.query_sample
+            ready: true
+        }.set { happy_branches }
+
+        HAPPY_PREPARE(happy_branches.prepare)
+        happy_ready = happy_branches.ready.mix(HAPPY_PREPARE.out.rows)
+
+        happy_legacy_in = happy_ready.map { meta, truth, truthIndexes, query, queryIndexes, reference, referenceIndexes, fpBed, fpIndexes, stratificationFiles, referenceSdf, args ->
             tuple(
                 meta,
                 truth,
@@ -114,7 +126,7 @@ workflow {
                 query,
                 queryIndexes,
                 reference,
-                referenceFai,
+                referenceIndexes,
                 fpBed,
                 fpIndexes,
                 stratificationFiles,
@@ -122,7 +134,7 @@ workflow {
                 args,
             )
         }
-        happy_rust_in = happy_rows.map { meta, truth, truthIndexes, query, queryIndexes, reference, referenceFai, fpBed, fpIndexes, stratificationFiles, _referenceSdf, args ->
+        happy_rust_in = happy_ready.map { meta, truth, truthIndexes, query, queryIndexes, reference, referenceIndexes, fpBed, fpIndexes, stratificationFiles, _referenceSdf, args ->
             tuple(
                 meta,
                 truth,
@@ -130,7 +142,7 @@ workflow {
                 query,
                 queryIndexes,
                 reference,
-                referenceFai,
+                referenceIndexes,
                 fpBed,
                 fpIndexes,
                 stratificationFiles,
