@@ -13,7 +13,26 @@ use std::path::Path;
 
 const COMPARISON_ROW_CHUNK: usize = 65_536;
 const COMPARISON_MERGE_FAN_IN: usize = 32;
-type ComparisonSortKey = (String, usize, u8, usize, usize, String, usize);
+type ComparisonSortKey = (String, usize, u8, String, String, u8, String, usize);
+
+fn legacy_same_key_rank(samples: &[String]) -> u8 {
+    if samples
+        .first()
+        .is_some_and(|sample| !sample.starts_with("./.") && !sample.contains("NOCALL:nocall"))
+    {
+        return 0;
+    }
+    let query_gt = samples
+        .get(1)
+        .and_then(|sample| sample.split(':').next())
+        .unwrap_or(".");
+    let alleles = query_gt.split(['/', '|']).collect::<Vec<_>>();
+    if alleles.len() == 2 && alleles[0] != "0" && alleles[0] != "." && alleles[0] == alleles[1] {
+        1
+    } else {
+        2
+    }
+}
 
 pub(super) struct ComparisonRowSpool {
     buffer: Vec<(ComparisonSortKey, AnnotatedRow)>,
@@ -36,12 +55,14 @@ impl ComparisonRowSpool {
         filtered_truth_match: bool,
         sort_line: String,
     ) -> Result<()> {
+        let raw = row.record.raw();
         let key = (
             row.sort_key.0.clone(),
             row.sort_key.1,
             u8::from(!filtered_truth_match),
-            row.sort_key.2,
-            row.sort_key.3,
+            raw.ref_allele.clone(),
+            raw.alt_allele.clone(),
+            legacy_same_key_rank(&raw.samples),
             sort_line,
             self.serial,
         );
@@ -175,14 +196,15 @@ fn write_comparison_spool_row(
 ) -> Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         key.0,
         key.1,
         key.2,
         key.3,
         key.4,
-        key.6,
-        hex_encode(key.5.as_bytes()),
+        key.5,
+        key.7,
+        hex_encode(key.6.as_bytes()),
         u8::from(row.query_pass),
         row.fp_class.unwrap_or("."),
         row.xcmp_ctype.unwrap_or("."),
@@ -193,7 +215,7 @@ fn write_comparison_spool_row(
 }
 
 fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, AnnotatedRow)> {
-    let mut fields = line.splitn(12, '\t');
+    let mut fields = line.splitn(13, '\t');
     let chrom = fields
         .next()
         .context("comparison spool lacks chromosome")?
@@ -206,13 +228,17 @@ fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, Annotate
         .next()
         .context("comparison spool lacks filtered rank")?
         .parse()?;
-    let third = fields
+    let reference = fields
         .next()
-        .context("comparison spool lacks tertiary key")?
-        .parse()?;
-    let fourth = fields
+        .context("comparison spool lacks reference sort key")?
+        .to_string();
+    let alternate = fields
         .next()
-        .context("comparison spool lacks quaternary key")?
+        .context("comparison spool lacks alternate sort key")?
+        .to_string();
+    let same_key_rank = fields
+        .next()
+        .context("comparison spool lacks same-key rank")?
         .parse()?;
     let serial = fields
         .next()
@@ -246,15 +272,16 @@ fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, Annotate
         chrom.clone(),
         pos,
         filtered,
-        third,
-        fourth,
+        reference,
+        alternate,
+        same_key_rank,
         sort_line,
         serial,
     );
     Ok((
         key,
         AnnotatedRow {
-            sort_key: (chrom, pos, third, fourth),
+            sort_key: (chrom, pos, 0, 0),
             record: record.into(),
             query_pass,
             fp_class,
@@ -322,6 +349,31 @@ fn collapse_comparison_chunks(
         chunks = merged;
     }
     Ok(chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::legacy_same_key_rank;
+
+    #[test]
+    fn duplicate_keys_order_truth_then_query_homalt_then_query_het() {
+        let truth_only = vec![
+            "0/1:UNK:lm:i6_15:INDEL:het:.".to_string(),
+            "./.:.:.:.:NOCALL:nocall:0".to_string(),
+        ];
+        let query_homalt = vec![
+            "./.:.:.:.:NOCALL:nocall:.".to_string(),
+            "1/1:UNK:lm:i6_15:INDEL:homalt:0".to_string(),
+        ];
+        let query_het = vec![
+            "./.:.:.:.:NOCALL:nocall:.".to_string(),
+            "1/0:UNK:.:ti:SNP:het:0".to_string(),
+        ];
+
+        assert_eq!(legacy_same_key_rank(&truth_only), 0);
+        assert_eq!(legacy_same_key_rank(&query_homalt), 1);
+        assert_eq!(legacy_same_key_rank(&query_het), 2);
+    }
 }
 
 pub(super) struct ComparisonContigSpool {

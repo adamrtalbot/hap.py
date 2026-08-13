@@ -462,6 +462,7 @@ mod tests {
             info: info.to_string(),
             format: Some(format.to_string()),
             samples: samples.iter().map(|v| v.to_string()).collect(),
+            mixed_edit_primitive: false,
         }
     }
 

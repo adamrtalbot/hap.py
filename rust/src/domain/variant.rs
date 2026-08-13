@@ -12,4 +12,8 @@ pub(crate) struct RawVcfRecord {
     pub(crate) info: String,
     pub(crate) format: Option<String>,
     pub(crate) samples: Vec<String>,
+    /// Internal preprocessing provenance. Mixed edits retain their source
+    /// anchor and sort separately from ordinary insertion primitives during
+    /// cross-record location aggregation. This field is never serialized.
+    pub(crate) mixed_edit_primitive: bool,
 }

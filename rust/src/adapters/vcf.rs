@@ -259,6 +259,7 @@ impl RawVcfRecord {
             } else {
                 Vec::new()
             },
+            mixed_edit_primitive: false,
         })
     }
 

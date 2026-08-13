@@ -143,6 +143,7 @@ fn comparison_record(variant: &Variant, fields: ComparisonRecordFields) -> Compa
         info: fields.info,
         format: Some("GT:BD:BK:BI:BVT:BLT:QQ".to_string()),
         samples: vec![fields.truth_sample, fields.query_sample],
+        mixed_edit_primitive: false,
     }
     .into()
 }
@@ -514,7 +515,7 @@ pub(super) fn fn_row(
                     quality: truth.qual.clone(),
                     filter: ".".to_string(),
                     info: format!("END={end};BS={block_start}{regions}"),
-                    truth_sample: format!("{}:N:.:.:UNK:halfcall:.", truth.gt),
+                    truth_sample: format!("{}:N:{bk}:.:UNK:halfcall:.", truth.gt),
                     query_sample: "./.:.:.:.:NOCALL:nocall:0".to_string(),
                 },
             ),
@@ -585,7 +586,7 @@ pub(super) fn unk_truth_row(
                     quality: truth.qual.clone(),
                     filter: ".".to_string(),
                     info: format!("END={end};BS={block_start}{regions}"),
-                    truth_sample: format!("{}:UNK:.:.:UNK:halfcall:.", truth.gt),
+                    truth_sample: format!("{}:UNK:{bk}:.:UNK:halfcall:.", truth.gt),
                     query_sample: "./.:.:.:.:NOCALL:nocall:0".to_string(),
                 },
             ),
@@ -654,7 +655,7 @@ pub(super) fn split_query_primitives_with_neighbors(
     // Preprocessing has already applied VariantPrimitiveSplitter and
     // VariantLocationAggregator. Splitting the persisted query a second
     // time changes legacy row grain and double-counts real indels.
-    if persisted_query_representation_is_final(variant) {
+    if persisted_query_representation_is_final(variant, cluster_neighbors) {
         return vec![variant.clone()];
     }
     let alleles = parse_gt_alleles(&variant.gt);
@@ -840,8 +841,29 @@ pub(super) fn split_query_primitives_with_neighbors(
         .collect()
 }
 
-fn persisted_query_representation_is_final(variant: &Variant) -> bool {
-    variant.gt == "2/1" && variant.key.alt_allele.contains(',')
+fn persisted_query_representation_is_final(
+    variant: &Variant,
+    cluster_neighbors: &[Variant],
+) -> bool {
+    let alts = variant.key.alt_allele.split(',').collect::<Vec<_>>();
+    let variant_end = variant.key.pos + variant.key.ref_allele.len().saturating_sub(1);
+    let has_overlapping_deletion = cluster_neighbors.iter().any(|neighbor| {
+        neighbor.key != variant.key
+            && neighbor
+                .key
+                .alt_allele
+                .split(',')
+                .any(|alt| neighbor.key.ref_allele.len() > alt.len())
+            && neighbor.key.pos <= variant_end
+            && neighbor.key.pos + neighbor.key.ref_allele.len().saturating_sub(1) >= variant.key.pos
+    });
+    variant.key.alt_allele.contains(',')
+        && (variant.gt == "2/1"
+            || (variant.gt == "1/2"
+                && has_overlapping_deletion
+                && alts
+                    .iter()
+                    .all(|alt| variant.key.ref_allele.len() > alt.len())))
 }
 
 /// Trim common prefix and suffix from (ref, alt) and re-anchor the
@@ -1265,11 +1287,15 @@ pub(super) fn subtype_label(variant: &Variant) -> Option<String> {
     } else if ref_rem == 0 && alt_rem > 0 {
         ("I", alt_rem)
     } else {
-        // Complex: size is the larger remnant (matches legacy's
-        // VariantStatistics bucketing on total_ins+total_del after
-        // realignment, which for a substitution-plus-indel takes the
-        // dominant indel length).
-        ("C", ref_rem.max(alt_rem))
+        // Complex edits with unequal remnants are bucketed by their net
+        // inserted/deleted length. Equal-length complex substitutions retain
+        // their remnant length because their net length change is zero.
+        let size = if ref_rem == alt_rem {
+            ref_rem
+        } else {
+            ref_rem.abs_diff(alt_rem)
+        };
+        ("C", size)
     };
     let bucket = bucket_label(size);
     let mut label = format!("{class}{bucket}");

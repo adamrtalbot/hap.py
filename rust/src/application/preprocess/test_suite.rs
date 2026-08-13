@@ -1050,6 +1050,7 @@ mod tests {
             info: info.into(),
             format: None,
             samples: vec![],
+            mixed_edit_primitive: false,
         }
     }
 
@@ -2082,6 +2083,159 @@ mod tests {
         assert_eq!(record.alt_allele, ".");
         assert_eq!(record.info, ".");
         assert_eq!(record.samples, ["0/0:12:40"]);
+    }
+
+    fn observe_anchor_context(
+        records: &[RawVcfRecord],
+    ) -> (
+        HashSet<RecordIdentity>,
+        HashSet<RecordIdentity>,
+        HashSet<RecordIdentity>,
+        HashSet<RecordIdentity>,
+    ) {
+        let mut pending = HashMap::new();
+        let mut deletion_ends = HashMap::new();
+        let mut spanning = HashSet::new();
+        let mut equal_floor = HashSet::new();
+        let mut released_mixed = HashSet::new();
+        let mut released_following = HashSet::new();
+        let mut merge_partners = HashSet::new();
+        for record in records {
+            observe_following_spanning_deletions(
+                record,
+                &mut pending,
+                &mut deletion_ends,
+                &mut spanning,
+                &mut equal_floor,
+                &mut released_mixed,
+                &mut released_following,
+                &mut merge_partners,
+            );
+        }
+        (spanning, equal_floor, released_following, merge_partners)
+    }
+
+    fn record_at(pos: usize, reference: &str, alternate: &str) -> RawVcfRecord {
+        let mut record = make_record(".");
+        record.pos = pos;
+        record.ref_allele = reference.to_string();
+        record.alt_allele = alternate.to_string();
+        record
+    }
+
+    #[test]
+    fn shorter_following_deletion_releases_its_own_floor() {
+        let mixed = record_at(100, "AACTTTTA", "G");
+        let following = record_at(101, "ACT", "A");
+        let mixed_identity = (
+            "chr1".to_string(),
+            100,
+            "AACTTTTA".to_string(),
+            "G".to_string(),
+        );
+        let following_identity = ("chr1".to_string(), 101, "ACT".to_string(), "A".to_string());
+
+        let (spanning, equal_floor, released_following, merge_partners) =
+            observe_anchor_context(&[mixed, following]);
+
+        assert!(!spanning.contains(&mixed_identity));
+        assert!(!equal_floor.contains(&mixed_identity));
+        assert!(released_following.contains(&following_identity));
+        assert!(merge_partners.contains(&following_identity));
+    }
+
+    #[test]
+    fn later_longer_follower_does_not_reblock_a_released_mixed_deletion() {
+        let mixed = record_at(100, "CTCAACTAG", "T");
+        let shorter_following = record_at(101, "TCAACTAG", "T");
+        let longer_following = record_at(101, "TCAACTAGTTAAG", "T");
+        let mixed_identity = (
+            "chr1".to_string(),
+            100,
+            "CTCAACTAG".to_string(),
+            "T".to_string(),
+        );
+
+        let (spanning, _, _, _) =
+            observe_anchor_context(&[mixed, shorter_following, longer_following]);
+
+        assert!(!spanning.contains(&mixed_identity));
+    }
+
+    #[test]
+    fn released_following_deletion_extends_one_base_left() {
+        let mut record = record_at(101, "ACT", "A");
+        let mut reference = vec![b'N'; 110];
+        reference[99] = b'A';
+
+        extend_record_left(&mut record, &reference);
+
+        assert_eq!(record.pos, 100);
+        assert_eq!(record.ref_allele, "AACT");
+        assert_eq!(record.alt_allele, "AA");
+    }
+
+    #[test]
+    fn adjacent_preceding_deletion_blocks_an_equal_floor() {
+        let preceding = record_at(99, "GC", "G");
+        let mixed = record_at(100, "CG", "A");
+        let following = record_at(101, "GGA", "G");
+        let identity = ("chr1".to_string(), 100, "CG".to_string(), "A".to_string());
+
+        let (spanning, equal_floor, released_following, merge_partners) =
+            observe_anchor_context(&[preceding, mixed, following]);
+
+        assert!(spanning.contains(&identity));
+        assert!(equal_floor.contains(&identity));
+        assert!(released_following.is_empty());
+        assert!(merge_partners.contains(&(
+            "chr1".to_string(),
+            101,
+            "GGA".to_string(),
+            "G".to_string(),
+        )));
+    }
+
+    #[test]
+    fn chr19_adjacent_chain_marks_following_deletion_as_partner() {
+        let preceding = record_at(43_502_996, "TA", "T");
+        let mixed = record_at(43_502_997, "AGATCTGT", "G");
+        let intervening_snp = record_at(43_502_998, "G", "C");
+        let following = record_at(43_502_998, "GATCTGT", "G");
+        let following_identity = (
+            "chr1".to_string(),
+            43_502_998,
+            "GATCTGT".to_string(),
+            "G".to_string(),
+        );
+
+        let (spanning, equal_floor, released_following, merge_partners) =
+            observe_anchor_context(&[preceding, mixed, intervening_snp, following]);
+
+        assert!(!spanning.contains(&(
+            "chr1".to_string(),
+            43_502_997,
+            "AGATCTGT".to_string(),
+            "G".to_string(),
+        )));
+        assert!(equal_floor.is_empty());
+        assert!(released_following.contains(&following_identity));
+        assert!(merge_partners.contains(&following_identity));
+    }
+
+    #[test]
+    fn longer_following_deletion_alone_does_not_block_an_equal_floor() {
+        let mixed = record_at(100, "TG", "A");
+        let following = record_at(101, "GGTCAACA", "G");
+        let identity = ("chr1".to_string(), 100, "TG".to_string(), "A".to_string());
+
+        let (spanning, equal_floor, released_following, merge_partners) =
+            observe_anchor_context(&[mixed, following]);
+
+        assert!(spanning.contains(&identity));
+        assert!(!equal_floor.contains(&identity));
+        assert!(released_following.is_empty());
+        assert!(merge_partners.is_empty());
     }
 
     #[test]

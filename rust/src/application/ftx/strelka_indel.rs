@@ -169,6 +169,7 @@ mod tests {
             info: "NT=ref;QSI_NT=42;SomaticEVS=17.5;SGT=ref->het;RC=3;RU=T;IC=2;IHP=4;MQ=55;EVSF=1.5,bad".to_string(),
             format: Some("DP:TAR:TIR:BCN50:FDP50".to_string()),
             samples: vec!["10:8,9:2,3:0.5:1".to_string(), "20:5,6:15,16:0.25:2".to_string()],
+            mixed_edit_primitive: false,
         }
     }
 

@@ -270,6 +270,7 @@ fn simple_two_sample_record(record: &RawVcfRecord, side: Side) -> RawVcfRecord {
             Side::Truth => vec![gt, ".".to_string()],
             Side::Query => vec![".".to_string(), gt],
         },
+        mixed_edit_primitive: false,
     }
 }
 

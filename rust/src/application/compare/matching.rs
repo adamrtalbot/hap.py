@@ -3,6 +3,7 @@
 #[cfg(test)]
 use super::XCMP_ENUMERATION_THRESHOLD;
 use super::genotype::{equivalent_gt, parse_gt_alleles};
+use super::legacy_graph;
 use super::metrics::{add_variant_stats, add_variant_stats_subtype};
 use super::rows::{
     bk_for_row, cluster_query_filter, compute_shift_target, fn_fp_combined_row, fn_row,
@@ -258,6 +259,76 @@ fn push_cluster_entry(cluster: &mut Cluster, entry: Entry) {
     }
 }
 
+/// Order one side's block records the way legacy xcmp sees them.
+///
+/// legacy's `VariantReader` pulls records through htslib's synced reader,
+/// whose `bcf_sr_sort` pass regroups every line sharing a VCF POS before
+/// they reach `GraphReference::makeGraph`. With `COLLAPSE_NONE` the pairing
+/// mode is `BCF_SR_PAIR_EXACT`, so each distinct REF/ALT spelling becomes one
+/// variant set whose count is the number of *files* carrying it, and the
+/// emission loop repeatedly pops the highest-count set (ties keep creation
+/// order). A REF/ALT spelling present in both inputs therefore precedes the
+/// single-file spellings at the same POS, independent of the order the lines
+/// appear in either file.
+///
+/// The pairing is on allele spelling alone — genotypes never enter it — so
+/// the key here is "does the other side of this block carry a record with the
+/// same (pos, ref, alt)", not "did this record survive rust's GT-aware exact
+/// match".
+///
+/// Inside a class the stream keeps each reader's own line order, and the two
+/// readers do not agree on it. hap.py leaves the truth VCF unpreprocessed
+/// (`preprocessing_truth` is off), so truth records reach xcmp in raw input
+/// order. The query goes through pre.py's leftshift/decompose, which re-emits
+/// same-position records by trimmed edit start — the coordinate `makeGraph`
+/// derives after `trimLeft`/`trimRight`, putting a substitution at POS ahead
+/// of an insertion anchored on it. Measured against the legacy result VCF that
+/// holds for every one of its 7,566 multi-record query-only positions, while
+/// truth-only positions keep raw order in the cases where the two disagree.
+pub(super) fn legacy_graph_truth_order(
+    truth: &[Variant],
+    paired_keys: &BTreeSet<VariantKey>,
+) -> Vec<Variant> {
+    let mut ordered = truth.to_vec();
+    ordered.sort_by_key(|variant| {
+        (
+            variant.key.pos,
+            usize::from(!paired_keys.contains(&variant.key)),
+        )
+    });
+    ordered
+}
+
+/// Query-side counterpart of [`legacy_graph_truth_order`]. Paired records take
+/// their position from the truth stream — htslib creates each variant set while
+/// scanning reader 0 (truth) first, so the pairs are emitted in truth's order —
+/// and the query-only remainder follows pre.py's trimmed-start order.
+pub(super) fn legacy_graph_query_order(
+    query: &[Variant],
+    paired_keys: &BTreeSet<VariantKey>,
+    truth_order: &[Variant],
+) -> Vec<Variant> {
+    let truth_rank = truth_order
+        .iter()
+        .enumerate()
+        .map(|(rank, variant)| (variant.key.clone(), rank as isize))
+        .collect::<BTreeMap<_, _>>();
+    let mut ordered = query.to_vec();
+    ordered.sort_by_key(|variant| {
+        let paired = paired_keys.contains(&variant.key);
+        (
+            variant.key.pos,
+            usize::from(!paired),
+            if paired {
+                truth_rank.get(&variant.key).copied().unwrap_or(0)
+            } else {
+                legacy_graph::selected_edit_start(variant)
+            },
+        )
+    });
+    ordered
+}
+
 pub(super) fn process_cluster(
     cluster: &Cluster,
     reference_sequences: &BTreeMap<String, String>,
@@ -400,7 +471,7 @@ pub(super) fn process_cluster(
         truth: cluster.truth.clone(),
         query: cluster.query.clone(),
     };
-    let (truth_sig, query_sig) = if allow_haplotype_match {
+    let (linear_truth_sig, linear_query_sig) = if allow_haplotype_match {
         (
             cluster_signature_with_limit(
                 &signature_cluster,
@@ -422,6 +493,42 @@ pub(super) fn process_cluster(
     } else {
         (None, None)
     };
+    let (mut truth_sig, mut query_sig) = (linear_truth_sig.clone(), linear_query_sig.clone());
+    if allow_haplotype_match {
+        // htslib pairs the two inputs' lines on allele spelling alone, so the
+        // "seen on both sides" class is the intersection of the block's
+        // (pos, ref, alt) keys — genotypes play no part.
+        let truth_keys = cluster
+            .truth
+            .iter()
+            .map(|variant| variant.key.clone())
+            .collect::<BTreeSet<_>>();
+        let query_keys = cluster
+            .query
+            .iter()
+            .map(|variant| variant.key.clone())
+            .collect::<BTreeSet<_>>();
+        let paired_keys = truth_keys
+            .intersection(&query_keys)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let graph_truth = legacy_graph_truth_order(&cluster.truth, &paired_keys);
+        let graph_query = legacy_graph_query_order(&cluster.query, &paired_keys, &graph_truth);
+        truth_sig = legacy_graph::signatures(
+            &graph_truth,
+            reference,
+            signature_cluster.start,
+            signature_cluster.end,
+            config.max_enum,
+        );
+        query_sig = legacy_graph::signatures(
+            &graph_query,
+            reference,
+            signature_cluster.start,
+            signature_cluster.end,
+            config.max_enum,
+        );
+    }
 
     // Legacy's `DiploidCompare::setRegion` flags `hap_match = true` as
     // soon as ANY enumerated (h1, h2) pair from truth's di_haps equals
@@ -432,17 +539,44 @@ pub(super) fn process_cluster(
     // legacy's `hap_fail = true` takes the same `ctype != "hap:mismatch"`
     // branch we want for non-evaluable blocks.
     let overlapping_deletion_mismatch = legacy_overlapping_deletion_mismatch(cluster);
-    let is_match = matches!(
+    let signatures_overlap = matches!(
         (&truth_sig, &query_sig),
         (Some(left), Some(right)) if left.intersection(right).next().is_some()
-    ) && !overlapping_deletion_mismatch;
+    );
+    let graph_failed = allow_haplotype_match && (truth_sig.is_none() || query_sig.is_none());
+    let is_match = signatures_overlap && !overlapping_deletion_mismatch && !graph_failed;
     // Legacy's `ctype == "hap:mismatch"` fires only when the block-level
     // haplotype comparator actually ran (both signatures computed) AND
     // the two sides disagreed. A None signature — hapcmp skipped on the
     // n_nonsnp gate OR state-count cap exceeded — corresponds to
     // legacy's "simple" / "hapfail" ctypes, neither of which promotes to
     // BK=lm.
-    let hap_mismatch = if overlapping_deletion_mismatch {
+    let drain_counterpart = if allow_haplotype_match
+        && truth_sig.is_some()
+        && query_sig.is_none()
+        && estimated_state_count_with_limit(&cluster.query, config.max_enum) <= config.max_enum
+    {
+        query_insert_conflict_has_truth_counterpart(
+            &cluster.query,
+            &cluster.truth,
+            &truth_remaining,
+        )
+    } else {
+        None
+    };
+    let covered_multi_conflict_mismatch = graph_failed
+        && truth_remaining.is_empty()
+        && legacy_covered_multi_conflict_mismatch(&cluster.query);
+    // A failed graph outranks every other signal. Legacy's `finish_block`
+    // arms `hap_fail` before entering the `try` and clears it only when
+    // `DiploidCompare` returns match or mismatch, so any throw out of
+    // `makeGraph`/`enumeratePaths`/`setRegion` leaves the block at
+    // `ctype=hapfail:*`, and quantify only promotes `BK=lm` on
+    // `ctype=hap:mismatch`. A block rust could not enumerate therefore
+    // cannot carry a local mismatch, whatever the shape heuristics say.
+    let hap_mismatch = if graph_failed {
+        false
+    } else if overlapping_deletion_mismatch || covered_multi_conflict_mismatch {
         true
     } else if allow_haplotype_match && truth_sig.is_some() && query_sig.is_some() {
         !is_match
@@ -458,14 +592,7 @@ pub(super) fn process_cluster(
         //   Some(false) — Insert+Subst drain, no truth counterpart  → BK=lm
         //                 OR deletion-covers-insert drain            → BK=lm
         //   None        — other drain (overlapping deletions, etc.)  → BK=.
-        matches!(
-            query_insert_conflict_has_truth_counterpart(
-                &cluster.query,
-                &cluster.truth,
-                &truth_remaining,
-            ),
-            Some(false)
-        )
+        matches!(drain_counterpart, Some(false))
     } else {
         false
     };
@@ -494,6 +621,8 @@ pub(super) fn process_cluster(
     };
     let (mut xcmp_ctype, mut xcmp_hap_match) = if !allow_haplotype_match {
         ("simple:mismatch", false)
+    } else if graph_failed {
+        ("hapfail:mismatch", false)
     } else {
         match (&truth_sig, &query_sig) {
             (Some(_), Some(_)) if is_match => ("hap:match", true),
@@ -533,9 +662,9 @@ pub(super) fn process_cluster(
     // aggregate is one such case: the linear signatures overlap, while
     // legacy xcmp still marks the outside-CONF aggregate block as a local
     // mismatch. Apply the correction on both match and mismatch paths.
-    if let Some(local_mismatch) =
-        legacy_unknown_aggregate_local_mismatch(cluster, &region_state, hap_mismatch)
-    {
+    let unknown_aggregate_local_mismatch =
+        legacy_unknown_aggregate_local_mismatch(cluster, &region_state, hap_mismatch);
+    if let Some(local_mismatch) = unknown_aggregate_local_mismatch {
         for row in &mut rows[output_start..] {
             if local_mismatch && row.record.samples_contain(":UNK:.:") {
                 row.record
@@ -590,7 +719,11 @@ pub(super) fn process_cluster(
     let residual_is_unreconciled = rows[exact_match_post_count..]
         .iter()
         .any(annotated_row_has_unreconciled_allele);
-    if residual_is_unreconciled {
+    if should_propagate_unreconciled_exact_rows(
+        xcmp_ctype,
+        residual_is_unreconciled,
+        covered_multi_conflict_mismatch,
+    ) {
         for row in &mut rows[exact_match_pre_count..exact_match_post_count] {
             if row.record.samples_contain(":UNK:.:") {
                 row.record
@@ -627,6 +760,14 @@ pub(super) fn process_cluster(
     apply_legacy_halfcall_block_kind(&mut rows[output_start..]);
     set_xcmp_context(&mut rows[output_start..], xcmp_ctype, xcmp_hap_match);
     Ok(())
+}
+
+pub(super) fn should_propagate_unreconciled_exact_rows(
+    xcmp_ctype: &str,
+    residual_is_unreconciled: bool,
+    genuine_drain_mismatch: bool,
+) -> bool {
+    residual_is_unreconciled && (xcmp_ctype == "hap:mismatch" || genuine_drain_mismatch)
 }
 
 pub(super) fn apply_legacy_preprocessed_snp_first_order(
@@ -674,35 +815,6 @@ pub(super) fn apply_legacy_combined_before_truth_only_order(rows: &mut [Annotate
         }
     }
 }
-
-/// Legacy hapcmp reports a local mismatch when a genotype-discordant
-/// deletion pair is overlapped by another truth deletion. The linear event
-/// enumerator can drain this shape and surface it as hapfail instead, which
-/// loses both `am` on the paired allele and block-wide `lm` on companions.
-pub(super) fn legacy_overlapping_deletion_mismatch(cluster: &Cluster) -> bool {
-    cluster.truth.iter().any(|paired_truth| {
-        if paired_truth.primary_type() != "INDEL" {
-            return false;
-        }
-        let Some(paired_query) = cluster
-            .query
-            .iter()
-            .find(|query| query.key == paired_truth.key)
-        else {
-            return false;
-        };
-        if equivalent_gt(&paired_truth.gt, &paired_query.gt) {
-            return false;
-        }
-        cluster.truth.iter().any(|overlapping_truth| {
-            overlapping_truth.key != paired_truth.key
-                && overlapping_truth.primary_type() == "INDEL"
-                && overlapping_truth.key.pos <= paired_truth.end_pos()
-                && paired_truth.key.pos <= overlapping_truth.end_pos()
-        })
-    })
-}
-
 pub(super) fn apply_legacy_halfcall_order(rows: &mut [AnnotatedRow]) {
     let halfcall_positions = rows
         .iter()
@@ -744,6 +856,34 @@ pub(super) fn apply_legacy_halfcall_order(rows: &mut [AnnotatedRow]) {
             row.sort_key.2 = 4;
         }
     }
+}
+
+/// Legacy hapcmp reports a local mismatch when a genotype-discordant
+/// deletion pair is overlapped by another truth deletion. The linear event
+/// enumerator can drain this shape and surface it as hapfail instead, which
+/// loses both `am` on the paired allele and block-wide `lm` on companions.
+pub(super) fn legacy_overlapping_deletion_mismatch(cluster: &Cluster) -> bool {
+    cluster.truth.iter().any(|paired_truth| {
+        if paired_truth.primary_type() != "INDEL" {
+            return false;
+        }
+        let Some(paired_query) = cluster
+            .query
+            .iter()
+            .find(|query| query.key == paired_truth.key)
+        else {
+            return false;
+        };
+        if equivalent_gt(&paired_truth.gt, &paired_query.gt) {
+            return false;
+        }
+        cluster.truth.iter().any(|overlapping_truth| {
+            overlapping_truth.key != paired_truth.key
+                && overlapping_truth.primary_type() == "INDEL"
+                && overlapping_truth.key.pos < paired_truth.key.pos
+                && overlapping_truth.end_pos() >= paired_truth.end_pos()
+        })
+    })
 }
 
 /// Legacy's spanning-deletion halfcall keeps the local-mismatch block kind
@@ -1337,7 +1477,9 @@ pub(super) fn query_insert_conflict_has_truth_counterpart(
     truth_remaining: &[Variant],
 ) -> Option<bool> {
     // Classify each query variant position as Insert (any alt longer than ref)
-    // or Subst (all alts same length as ref, i.e. SNP/substitution).
+    // or Subst (all alts no longer than ref). The graph drain path groups a
+    // same-anchor deletion with substitutions; the truth-counterpart check
+    // below distinguishes the reciprocal aggregate that remains hapfail.
     let mut insert_positions: BTreeSet<usize> = BTreeSet::new();
     let mut subst_positions: BTreeSet<usize> = BTreeSet::new();
     for v in query_variants {
@@ -1433,9 +1575,10 @@ pub(super) fn query_insert_conflict_has_truth_counterpart(
             if max_alt_len <= qv.key.ref_allele.len() {
                 continue; // not an insert at this position
             }
-            // Use alt-set equality comparison: "CAA,CA" matches truth "CA,CAA"
-            // (same set, different order), but "TAA" does NOT match "TAA,TA"
-            // (strict subset → genuine mismatch, legacy gives BK=lm).
+            // A truth insertion can be one selected member of the query's
+            // reciprocal insertion/deletion aggregate. Accept that direction
+            // as a counterpart. The reverse remains strict: query "TAA" does
+            // not match truth "TAA,TA" because the query omits a truth allele.
             let q_alts: std::collections::BTreeSet<&str> = qv.key.alt_allele.split(',').collect();
             if truth_variants.iter().any(|tv| {
                 if tv.key.pos != qv.key.pos || tv.key.ref_allele != qv.key.ref_allele {
@@ -1443,13 +1586,59 @@ pub(super) fn query_insert_conflict_has_truth_counterpart(
                 }
                 let t_alts: std::collections::BTreeSet<&str> =
                     tv.key.alt_allele.split(',').collect();
-                q_alts == t_alts
+                !t_alts.is_empty() && t_alts.is_subset(&q_alts)
             }) {
                 return Some(true); // expected hapfail: truth has identical insert allele set
             }
         }
     }
     Some(false) // genuine mismatch: no truth counterpart for any conflict-pos insert
+}
+
+/// Legacy graph comparison can complete a phased query block when one
+/// deletion spans multiple later Insert+Subst conflicts. The simpler Rust
+/// graph can drain that block instead. A single conflict is not sufficient:
+/// the public HG001 corpus contains many such hapfail blocks with BK=`.`.
+pub(super) fn legacy_covered_multi_conflict_mismatch(query_variants: &[Variant]) -> bool {
+    let mut insert_positions = BTreeSet::new();
+    let mut substitution_positions = BTreeSet::new();
+    for variant in query_variants {
+        let ref_len = variant.key.ref_allele.len();
+        let alt_lens = variant
+            .key
+            .alt_allele
+            .split(',')
+            .map(str::len)
+            .collect::<Vec<_>>();
+        if alt_lens.iter().any(|alt_len| *alt_len > ref_len) {
+            insert_positions.insert(variant.key.pos);
+        }
+        if alt_lens.iter().all(|alt_len| *alt_len == ref_len) {
+            substitution_positions.insert(variant.key.pos);
+        }
+    }
+    let conflicts = insert_positions
+        .intersection(&substitution_positions)
+        .copied()
+        .collect::<Vec<_>>();
+    if conflicts.len() < 2 {
+        return false;
+    }
+    query_variants.iter().any(|variant| {
+        let ref_len = variant.key.ref_allele.len();
+        let max_alt_len = variant
+            .key
+            .alt_allele
+            .split(',')
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        ref_len > max_alt_len
+            && !variant.gt.split(['/', '|']).any(|allele| allele == "0")
+            && conflicts.iter().all(|position| {
+                variant.key.pos < *position && *position < variant.key.pos + ref_len
+            })
+    })
 }
 
 /// Upper-bound the number of haplotype assignments the enumeration will
@@ -2853,7 +3042,7 @@ pub(super) fn mark_cluster_match(
             q.qual
                 .parse::<f64>()
                 .ok()
-                .filter(|v| *v > 0.0)
+                .filter(|v| v.is_finite() && *v >= 0.0)
                 .map(|v| (v, q.qual.as_str()))
         })
         .min_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
@@ -2911,12 +3100,6 @@ pub(super) fn mark_cluster_match(
         if paired_query.contains(&query_index) {
             continue;
         }
-        // pre.py decomposes a complex indel into adjacent insertion/deletion
-        // records with the same QUAL. In a hap:match block legacy still
-        // stamps those unmatched sibling primitives BK=lm. Keep this on the
-        // hap-match path only: `--unhappy` skips hapcmp and leaves the same
-        // query-only primitives at BK=`.`.
-        let split_sibling = has_nonconf_split_sibling(query, full_cluster, region_state);
         // Multi-allelic query records emit one VCF row per per-allele
         // primitive, matching legacy's per-primitive output grain. CONF
         // status is evaluated per primitive: a multi-allelic record's
@@ -2950,11 +3133,7 @@ pub(super) fn mark_cluster_match(
                 ));
             } else {
                 let fallback = bk_for_row(&primitive, &full_cluster.truth, false);
-                let bk = if split_sibling {
-                    "lm"
-                } else {
-                    matched_query_unk_bk(fanned_out, any_primitive_in_conf, fallback)
-                };
+                let bk = matched_query_unk_bk(fanned_out, any_primitive_in_conf, fallback);
                 rows.push(fp_like_row(
                     &primitive,
                     reference,
@@ -3006,53 +3185,6 @@ pub(super) fn halfcall_is_covered_by_matched_deletion(
         !has_exact_query_deletion || requires_haplotype_reconciliation
     })
 }
-
-pub(super) fn has_nonconf_split_sibling(
-    query: &Variant,
-    cluster: &Cluster,
-    region_state: &RegionState,
-) -> bool {
-    if query.primary_type() != "INDEL" || region_state.query_is_conf(query) {
-        return false;
-    }
-    let query_is_insertion = query.key.alt_allele.len() > query.key.ref_allele.len();
-    let query_is_deletion = query.key.ref_allele.len() > query.key.alt_allele.len();
-    if !query_is_insertion && !query_is_deletion {
-        return false;
-    }
-
-    cluster.query.iter().any(|sibling| {
-        if sibling.key == query.key
-            || sibling.qual != query.qual
-            || sibling.primary_type() != "INDEL"
-            || region_state.query_is_conf(sibling)
-        {
-            return false;
-        }
-        let sibling_is_insertion = sibling.key.alt_allele.len() > sibling.key.ref_allele.len();
-        let sibling_is_deletion = sibling.key.ref_allele.len() > sibling.key.alt_allele.len();
-        let complementary = (query_is_insertion && sibling_is_deletion)
-            || (query_is_deletion && sibling_is_insertion);
-        let split_span = query
-            .key
-            .ref_allele
-            .len()
-            .max(sibling.key.ref_allele.len())
-            .max(1);
-        let split_start = query.key.pos.min(sibling.key.pos);
-        let split_end = query.end_pos().max(sibling.end_pos());
-        let truth_represents_split_span = cluster.truth.iter().any(|truth| {
-            truth.key.pos <= split_end
-                && truth.end_pos() >= split_start
-                && truth.key != query.key
-                && truth.key != sibling.key
-        });
-        complementary
-            && query.key.pos.abs_diff(sibling.key.pos) < split_span
-            && !truth_represents_split_span
-    })
-}
-
 pub(super) fn matched_query_unk_bk(
     _fanned_out: bool,
     _any_primitive_in_conf: bool,
@@ -3107,6 +3239,7 @@ pub(super) fn mark_cluster_mismatch(
             }
             if query_matches_truth_allele_set(query, truth)
                 && selected_alt_sequences(truth) != selected_alt_sequences(query)
+                && !mixed_type_same_locus_keeps_indel_rows_separate(cluster, truth, query)
             {
                 pairs.push((ti, qi));
                 paired_truth.insert(ti);
@@ -3380,6 +3513,26 @@ pub(super) fn mark_cluster_mismatch(
             ));
         }
     }
+}
+
+pub(super) fn mixed_type_same_locus_keeps_indel_rows_separate(
+    cluster: &Cluster,
+    truth: &Variant,
+    query: &Variant,
+) -> bool {
+    if truth.primary_type() != "INDEL" || query.primary_type() != "INDEL" {
+        return false;
+    }
+    cluster.truth.iter().any(|snp_truth| {
+        snp_truth.key.pos == truth.key.pos
+            && snp_truth.primary_type() == "SNP"
+            && cluster.query.iter().any(|snp_query| {
+                snp_query.key.pos == query.key.pos
+                    && snp_query.primary_type() == "SNP"
+                    && query_matches_truth_allele_set(snp_query, snp_truth)
+                    && selected_alt_sequences(snp_truth) != selected_alt_sequences(snp_query)
+            })
+    })
 }
 
 /// Map the per-row `BK` (block kind) tag to the FP classification used by
