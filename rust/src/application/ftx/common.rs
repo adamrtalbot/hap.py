@@ -134,9 +134,15 @@ mod tests {
 
     #[test]
     fn format_python_float_matches_pandas_notation_threshold_bytes() {
+        let below_upper = f64::from_bits(1e16_f64.to_bits() - 1);
+        let below_lower = f64::from_bits(1e-4_f64.to_bits() - 1);
+
         assert_eq!(format_python_float(1e12), "1000000000000.0");
         assert_eq!(format_python_float(1e15), "1000000000000000.0");
+        assert_eq!(format_python_float(below_upper), "9999999999999998.0");
         assert_eq!(format_python_float(1e16), "1e+16");
+        assert_eq!(format_python_float(below_lower), "9.999999999999999e-05");
+        assert_eq!(format_python_float(1e-4), "0.0001");
     }
 
     #[test]

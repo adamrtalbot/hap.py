@@ -677,8 +677,11 @@ pub(crate) fn full_repr_float(value: f64) -> String {
             "0.0".to_string()
         };
     }
-    let exponent = value.abs().log10().floor() as i32;
-    if !(-4..16).contains(&exponent) {
+    // Python's shortest representation uses fixed notation exactly within
+    // this numeric interval. Direct comparison preserves adjacent f64 values;
+    // `log10` can round them across either boundary.
+    let magnitude = value.abs();
+    if magnitude < 1e-4 || magnitude >= 1e16 {
         let scientific = format!("{value:e}");
         let (mantissa, exponent_text) = scientific.split_once('e').unwrap();
         let exponent_value = exponent_text.parse::<i32>().unwrap();
@@ -750,7 +753,8 @@ pub(crate) fn append_ci_cells(
 #[cfg(test)]
 mod format_tests {
     use super::{
-        SubsetSubtypeFpCounts, format_ratio, python_repr_float, write_extended, write_summary,
+        SubsetSubtypeFpCounts, format_ratio, full_repr_float, python_repr_float, write_extended,
+        write_summary,
     };
     use crate::domain::TypeCounts;
     use std::collections::BTreeMap;
@@ -786,6 +790,17 @@ mod format_tests {
         assert_eq!(format_ratio(100_000_000_000.0), "1e+11");
         assert_eq!(format_ratio(9.99999999999e-5), "9.99999999999e-05");
         assert_eq!(format_ratio(9.999999999999e-5), "0.0001");
+    }
+
+    #[test]
+    fn full_repr_notation_uses_adjacent_numeric_thresholds() {
+        let below_upper = f64::from_bits(1e16_f64.to_bits() - 1);
+        let below_lower = f64::from_bits(1e-4_f64.to_bits() - 1);
+
+        assert_eq!(full_repr_float(below_upper), "9999999999999998.0");
+        assert_eq!(full_repr_float(1e16), "1e+16");
+        assert_eq!(full_repr_float(below_lower), "9.999999999999999e-05");
+        assert_eq!(full_repr_float(1e-4), "0.0001");
     }
 
     #[test]

@@ -968,7 +968,16 @@ mod tests {
 
     #[test]
     fn json_float_notation_matches_pinned_python_two_bytes() {
-        let values = ["1000000000000", "1000000000000000", "10000000000000000"];
+        let below_upper = f64::from_bits(1e16_f64.to_bits() - 1).to_string();
+        let below_lower = f64::from_bits(1e-4_f64.to_bits() - 1).to_string();
+        let values = [
+            "1000000000000",
+            "1000000000000000",
+            below_upper.as_str(),
+            "10000000000000000",
+            below_lower.as_str(),
+            "0.0001",
+        ];
         let rows = vec![Vec::new(); values.len()];
         let json = column_json(
             "thresholds",
@@ -982,7 +991,7 @@ mod tests {
         );
         assert_eq!(
             json,
-            "{\"values\":[1000000000000.0,1000000000000000.0,1e+16],\"type\":\"double\",\"id\":\"thresholds\",\"label\":\"thresholds\"}"
+            "{\"values\":[1000000000000.0,1000000000000000.0,9999999999999998.0,1e+16,9.999999999999999e-05,0.0001],\"type\":\"double\",\"id\":\"thresholds\",\"label\":\"thresholds\"}"
         );
     }
 
