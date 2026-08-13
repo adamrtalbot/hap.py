@@ -967,6 +967,26 @@ mod tests {
     }
 
     #[test]
+    fn json_float_notation_matches_pinned_python_two_bytes() {
+        let values = ["1000000000000", "1000000000000000", "10000000000000000"];
+        let rows = vec![Vec::new(); values.len()];
+        let json = column_json(
+            "thresholds",
+            "thresholds",
+            "double",
+            &values,
+            &[],
+            &rows,
+            None,
+            None,
+        );
+        assert_eq!(
+            json,
+            "{\"values\":[1000000000000.0,1000000000000000.0,1e+16],\"type\":\"double\",\"id\":\"thresholds\",\"label\":\"thresholds\"}"
+        );
+    }
+
+    #[test]
     fn runinfo_final_args_preserve_legacy_json_scalar_types() {
         let args = CompareRunArgs {
             truth: "truth.vcf.gz",

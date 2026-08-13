@@ -133,6 +133,13 @@ mod tests {
     }
 
     #[test]
+    fn format_python_float_matches_pandas_notation_threshold_bytes() {
+        assert_eq!(format_python_float(1e12), "1000000000000.0");
+        assert_eq!(format_python_float(1e15), "1000000000000000.0");
+        assert_eq!(format_python_float(1e16), "1e+16");
+    }
+
+    #[test]
     fn format_python_float_nan_is_empty_cell() {
         assert_eq!(format_python_float(f64::NAN), "");
     }

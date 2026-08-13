@@ -678,7 +678,7 @@ pub(crate) fn full_repr_float(value: f64) -> String {
         };
     }
     let exponent = value.abs().log10().floor() as i32;
-    if !(-4..12).contains(&exponent) {
+    if !(-4..16).contains(&exponent) {
         let scientific = format!("{value:e}");
         let (mantissa, exponent_text) = scientific.split_once('e').unwrap();
         let exponent_value = exponent_text.parse::<i32>().unwrap();
@@ -692,8 +692,9 @@ pub(crate) fn full_repr_float(value: f64) -> String {
 }
 
 // Python 2's str(float), used by the other legacy adapters, keeps 12
-// significant digits. It uses fixed notation for exponents in [-4, 11] and
-// scientific notation otherwise. Integer-valued fixed numbers retain `.0`.
+// significant digits. It uses fixed notation for rounded exponents in
+// [-4, 10] and scientific notation otherwise. Integer-valued fixed numbers
+// retain `.0`.
 pub(crate) fn python_repr_float(value: f64) -> String {
     if value.is_nan() {
         return "nan".to_string();
@@ -712,13 +713,12 @@ pub(crate) fn python_repr_float(value: f64) -> String {
             "0.0".to_string()
         };
     }
-    let exponent = value.abs().log10().floor() as i32;
-    if !(-4..12).contains(&exponent) {
-        let scientific = format!("{value:.11e}");
-        let (mantissa, exponent_text) = scientific.split_once('e').unwrap();
+    let scientific = format!("{value:.11e}");
+    let (mantissa, exponent_text) = scientific.split_once('e').unwrap();
+    let exponent = exponent_text.parse::<i32>().unwrap();
+    if !(-4..11).contains(&exponent) {
         let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
-        let exponent_value = exponent_text.parse::<i32>().unwrap();
-        return format!("{mantissa}e{exponent_value:+03}");
+        return format!("{mantissa}e{exponent:+03}");
     }
     let decimal_places = usize::try_from(11 - exponent).unwrap_or(0);
     let mut rendered = format!("{value:.decimal_places$}");
@@ -778,6 +778,14 @@ mod format_tests {
         assert_eq!(format_ratio(1_234_567_890_123.0), "1.23456789012e+12");
         assert_eq!(format_ratio(1.713487071977638), "1.71348707198");
         assert_eq!(format_ratio(2.1964285714285716), "2.19642857143");
+    }
+
+    #[test]
+    fn python_two_ratio_notation_uses_the_rounded_exponent() {
+        assert_eq!(format_ratio(99_999_999_999.0), "99999999999.0");
+        assert_eq!(format_ratio(100_000_000_000.0), "1e+11");
+        assert_eq!(format_ratio(9.99999999999e-5), "9.99999999999e-05");
+        assert_eq!(format_ratio(9.999999999999e-5), "0.0001");
     }
 
     #[test]
