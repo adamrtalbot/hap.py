@@ -575,15 +575,15 @@ pub(crate) fn format_metric(value: f64) -> String {
     // pandas re-parses that string with its lossy `xstrtod` (a power-of-2
     // multiply/divide walk that introduces specific 1-ULP differences vs.
     // a correctly-rounded strtod), then pandas writes the resulting f64
-    // via Python's shortest_repr. Mirroring those three steps in Rust
-    // reproduces the exact decimal text legacy emits — which is generally
-    // 1 ULP off from a plain `(value * 1e6).round() / 1e6` round-trip.
+    // via Python 2's 12-significant-digit `str(float)`. Mirroring those
+    // three steps in Rust reproduces the exact decimal text legacy emits
+    // without exposing the parser's adjacent-double representation.
     if !value.is_finite() {
-        return full_repr_float(value);
+        return python_repr_float(value);
     }
     let formatted = format!("{value:.6}");
     let lossy = pandas_xstrtod(&formatted);
-    full_repr_float(lossy)
+    python_repr_float(lossy)
 }
 
 /// Rust port of pandas 0.24 `xstrtod` (the lossy parser used by
@@ -656,7 +656,7 @@ pub(crate) fn pandas_xstrtod(s: &str) -> f64 {
 }
 
 pub(crate) fn format_ratio(value: f64) -> String {
-    full_repr_float(value)
+    python_repr_float(value)
 }
 
 pub(crate) fn full_repr_float(value: f64) -> String {
@@ -769,18 +769,15 @@ mod format_tests {
     }
 
     #[test]
-    fn germline_ratio_preserves_the_shortest_round_trip_value() {
+    fn germline_ratio_matches_python_two_twelve_significant_digits() {
         let v: f64 = 0.9651790000000001;
-        assert_eq!(format_ratio(v), "0.9651790000000001");
+        assert_eq!(format_ratio(v), "0.965179");
         let w: f64 = 1.58980044345898;
-        assert_eq!(format_ratio(w), "1.58980044345898");
-        assert_eq!(
-            format_ratio(0.00009499999999999999),
-            "9.499999999999999e-05"
-        );
-        assert_eq!(format_ratio(1_234_567_890_123.0), "1.234567890123e+12");
-        assert_eq!(format_ratio(1.713487071977638), "1.713487071977638");
-        assert_eq!(format_ratio(2.1964285714285716), "2.1964285714285716");
+        assert_eq!(format_ratio(w), "1.58980044346");
+        assert_eq!(format_ratio(0.00009499999999999999), "9.5e-05");
+        assert_eq!(format_ratio(1_234_567_890_123.0), "1.23456789012e+12");
+        assert_eq!(format_ratio(1.713487071977638), "1.71348707198");
+        assert_eq!(format_ratio(2.1964285714285716), "2.19642857143");
     }
 
     #[test]
@@ -816,17 +813,17 @@ mod format_tests {
     #[test]
     fn format_metric_matches_legacy_byte_for_byte() {
         use super::format_metric;
-        assert_eq!(format_metric(7839.0 / 8937.0), "0.8771399999999999");
+        assert_eq!(format_metric(7839.0 / 8937.0), "0.87714");
         // Precision = 7949/8292 → "0.958635" → pandas-xstrtod → "0.958635"
         assert_eq!(format_metric(7949.0 / 8292.0), "0.958635");
-        // F1 ≈ 0.916078519... → C++ "0.916079" → pandas' adjacent double.
+        // F1 ≈ 0.916078519... → C++ "0.916079" → Python 2 "0.916079".
         let r = 7839.0 / 8937.0;
         let p = 7949.0 / 8292.0;
         let f1 = 2.0 * r * p / (r + p);
-        assert_eq!(format_metric(f1), "0.9160790000000001");
+        assert_eq!(format_metric(f1), "0.916079");
         // Frac_NA = 3520/11812 → "0.298002" → exact f64 → "0.298002"
         assert_eq!(format_metric(3520.0 / 11812.0), "0.298002");
-        assert_eq!(format_metric(0.976271), "0.9762709999999999");
+        assert_eq!(format_metric(0.976271), "0.976271");
     }
 
     #[test]
