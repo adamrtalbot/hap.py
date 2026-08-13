@@ -9,12 +9,12 @@ pass.
 
 ## Coverage
 
-The default matrix contains 155 comparisons:
+The default matrix contains 158 comparisons:
 
 | Lane | Legacy tool | hap-rs command | Rows |
 |---|---|---|---:|
-| `happy` | `hap.py` | `hap germline` | 33 |
-| `sompy` | `som.py` | `hap somatic` | 28 |
+| `happy` | `hap.py` | `hap germline` | 35 |
+| `sompy` | `som.py` | `hap somatic` | 29 |
 | `prepy` | `pre.py` | `hap pre` | 46 |
 | `ftxpy` | `ftx.py` | `hap ftx` | 27 |
 | `qfy` | `qfy.py` | `hap quantify` | 9 |
@@ -29,8 +29,9 @@ The repository pins Nextflow 26.04.6 and nf-test 0.9.5.
 
 ```bash
 cargo build --release --bin hap
+export PATH="$(pwd)/target/release:$PATH"
 cd verification
-PATH="../target/release:$PATH" nf-test test --ci --coverage
+nf-test test --ci --coverage
 ```
 
 CI runs all six lanes. Use a narrowed run to inspect one command.
@@ -40,8 +41,9 @@ CI runs all six lanes. Use a narrowed run to inspect one command.
 Use `HAP_TEST_CASES` to diagnose a discrepancy:
 
 ```bash
+export PATH="$(pwd)/target/release:$PATH"
 cd verification
-PATH="../target/release:$PATH" HAP_TEST_CASES=sompy \
+HAP_TEST_CASES=sompy \
   nf-test test --ci tests/main.nf.test
 ```
 

@@ -54,17 +54,46 @@ Build the Rust binary, make it available on `PATH`, then run the gate:
 
 ```bash
 cargo build --release
+export PATH="$(pwd)/target/release:$PATH"
 cd verification
-PATH="../target/release:$PATH" nf-test test --ci tests/main.nf.test
+nf-test test --ci tests/main.nf.test
 ```
 
 Use `HAP_TEST_CASES` to diagnose one lane:
 
 ```bash
-PATH="../target/release:$PATH" HAP_TEST_CASES=sompy nf-test test --ci tests/main.nf.test
+export PATH="$(pwd)/target/release:$PATH"
+cd verification
+HAP_TEST_CASES=sompy nf-test test --ci tests/main.nf.test
 ```
 
 CI runs all six lanes. Use a narrowed run to inspect one command.
+
+## Run the public germline discovery workflow
+
+Public-data cases stay outside nf-test. Build `hap`, then run the intact public
+germline samplesheet directly with Nextflow. The release-binary directory on
+`PATH` must be absolute because Nextflow tasks run from their own work
+directories:
+
+```bash
+cargo build --release --bin hap
+export PATH="$(pwd)/target/release:$PATH"
+cd verification
+nextflow run main.nf \
+  --cases happy \
+  --happy_samplesheet "$PWD/assets/samplesheet.happy.public.csv" \
+  --outdir "$PWD/results/public-germline"
+```
+
+Accept the run only when `results/public-germline/verification.json` reports
+`comparison_count: 3` and every comparison has `ok: true` with an empty
+`differences` list. The three comparisons are the intact
+`germline_hg001_platinum` public-data case and the two existing HAPPY contract
+cases. Also inspect
+`results/public-germline/happy/germline_hg001_platinum/comparison.json`; it must
+independently report `ok: true`, an empty `differences` list, and identical
+legacy and hap-rs artifact inventories.
 
 `--engine vcfeval` uses separate reference formats for the two implementations.
 Nextflow gives the pinned legacy image an RTG Tools 3.12.1 SDF `.tar.gz` bundle

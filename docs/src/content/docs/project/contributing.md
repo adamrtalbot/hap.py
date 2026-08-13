@@ -44,15 +44,18 @@ example below runs the germline lane:
 
 ```bash
 cargo build --release --bin hap
+export PATH="$(pwd)/target/release:$PATH"
 cd verification
-PATH="../target/release:$PATH" HAP_TEST_CASES=happy \
+HAP_TEST_CASES=happy \
   nf-test test --ci tests/main.nf.test
 ```
 
 Run Nextflow when you need process logs or work files:
 
 ```bash
-PATH="../target/release:$PATH" nextflow run main.nf \
+export PATH="$(pwd)/target/release:$PATH"
+cd verification
+nextflow run main.nf \
   --cases happy --outdir results
 ```
 
@@ -88,18 +91,21 @@ Rebuild `hap` and repeat the affected nf-test lane:
 
 ```bash
 cargo build --release --bin hap
+export PATH="$(pwd)/target/release:$PATH"
 cd verification
-PATH="../target/release:$PATH" HAP_TEST_CASES=happy \
+HAP_TEST_CASES=happy \
   nf-test test --ci tests/main.nf.test
 ```
 
 Once the focused case passes, run the complete gate:
 
 ```bash
-PATH="../target/release:$PATH" nf-test test --ci --coverage
+export PATH="$(pwd)/target/release:$PATH"
+cd verification
+nf-test test --ci --coverage
 ```
 
-Before opening a pull request, run all six lanes. `nf-test` expects 155 unique
+Before opening a pull request, run all six lanes. `nf-test` expects 158 unique
 comparisons, each with `ok: true` and an empty `differences` list.
 
 ## Rules that protect the signal
