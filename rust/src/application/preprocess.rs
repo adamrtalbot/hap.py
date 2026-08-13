@@ -6,7 +6,7 @@ use crate::{
     output::OutputTransaction,
 };
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -72,6 +72,8 @@ struct BlocksplitJob {
     reset_before_indices: Vec<usize>,
 }
 
+type RecordIdentity = (String, usize, String, String);
+
 #[cfg(test)]
 impl BlocksplitSelection {
     fn reset_indices(&self) -> HashSet<usize> {
@@ -88,6 +90,108 @@ impl BlocksplitSelection {
                 .flat_map(|job| job.included_indices.iter().copied())
                 .collect()
         })
+    }
+}
+
+fn observe_following_spanning_deletions(
+    record: &crate::domain::RawVcfRecord,
+    mixed_deletions_by_position: &mut HashMap<(String, usize), Vec<(RecordIdentity, usize)>>,
+    deletions_by_position: &mut HashMap<(String, usize), Vec<(usize, usize)>>,
+    following_spanning_deletions: &mut HashSet<RecordIdentity>,
+    equal_floor_blocked_deletions: &mut HashSet<RecordIdentity>,
+    released_mixed_deletions: &mut HashSet<RecordIdentity>,
+    released_following_deletions: &mut HashSet<RecordIdentity>,
+    mixed_deletion_merge_partners: &mut HashSet<RecordIdentity>,
+) {
+    if let Some(previous_position) = record.pos.checked_sub(1)
+        && let Some(candidates) =
+            mixed_deletions_by_position.get(&(record.chrom.clone(), previous_position))
+    {
+        for (candidate, mixed_deleted_length) in candidates {
+            let following_deleted_length = record
+                .alt_allele
+                .split(',')
+                .filter(|alternate| {
+                    record.ref_allele.len() > alternate.len()
+                        && record.ref_allele.starts_with(alternate)
+                })
+                .map(|alternate| record.ref_allele.len() - alternate.len())
+                .min();
+            if !released_mixed_deletions.contains(candidate)
+                && (record.ref_allele.len() > *mixed_deleted_length
+                    || following_deleted_length.is_some())
+            {
+                following_spanning_deletions.insert(candidate.clone());
+            }
+            if following_deleted_length
+                .is_some_and(|deleted_length| deleted_length < *mixed_deleted_length)
+            {
+                following_spanning_deletions.remove(candidate);
+                released_mixed_deletions.insert(candidate.clone());
+                let following_identity = (
+                    record.chrom.clone(),
+                    record.pos,
+                    record.ref_allele.clone(),
+                    record.alt_allele.clone(),
+                );
+                released_following_deletions.insert(following_identity.clone());
+                mixed_deletion_merge_partners.insert(following_identity);
+            } else if equal_floor_blocked_deletions.contains(candidate)
+                && following_deleted_length.is_some()
+            {
+                mixed_deletion_merge_partners.insert((
+                    record.chrom.clone(),
+                    record.pos,
+                    record.ref_allele.clone(),
+                    record.alt_allele.clone(),
+                ));
+            }
+        }
+    }
+
+    if record.ref_allele.len() <= 1 {
+        return;
+    }
+    let has_mixed_deletion = record.alt_allele.split(',').any(|alternate| {
+        alternate.len() == 1
+            && record
+                .ref_allele
+                .as_bytes()
+                .first()
+                .zip(alternate.as_bytes().first())
+                .is_some_and(|(reference, alternate)| reference != alternate)
+    });
+    if has_mixed_deletion {
+        let identity = (
+            record.chrom.clone(),
+            record.pos,
+            record.ref_allele.clone(),
+            record.alt_allele.clone(),
+        );
+        if record.pos > 1
+            && deletions_by_position
+                .get(&(record.chrom.clone(), record.pos - 1))
+                .is_some_and(|deletions| {
+                    deletions.iter().any(|(end, reference_length)| {
+                        *end >= record.pos && *reference_length == record.ref_allele.len()
+                    })
+                })
+        {
+            equal_floor_blocked_deletions.insert(identity.clone());
+        }
+        mixed_deletions_by_position
+            .entry((record.chrom.clone(), record.pos))
+            .or_default()
+            .push((identity, record.ref_allele.len() - 1));
+    }
+
+    if record.alt_allele.split(',').any(|alternate| {
+        record.ref_allele.len() > alternate.len() && record.ref_allele.starts_with(alternate)
+    }) {
+        deletions_by_position
+            .entry((record.chrom.clone(), record.pos))
+            .or_default()
+            .push((record.end_pos(), record.ref_allele.len()));
     }
 }
 
@@ -245,10 +349,27 @@ fn run_inner(
         append_somatic_info_headers(&mut headers, sample_names);
     }
     let mut input_contigs = BTreeSet::new();
+    let mut following_spanning_deletions = HashSet::new();
+    let mut equal_floor_blocked_deletions = HashSet::new();
+    let mut released_following_deletions = HashSet::new();
+    let mut released_mixed_deletions = HashSet::new();
+    let mut mixed_deletion_merge_partners = HashSet::new();
+    let mut mixed_deletions_by_position = HashMap::new();
+    let mut deletions_by_position = HashMap::new();
     let mut haploid_x = false;
     let mut diploid_x = false;
     for record in input {
         let record = record?;
+        observe_following_spanning_deletions(
+            &record,
+            &mut mixed_deletions_by_position,
+            &mut deletions_by_position,
+            &mut following_spanning_deletions,
+            &mut equal_floor_blocked_deletions,
+            &mut released_mixed_deletions,
+            &mut released_following_deletions,
+            &mut mixed_deletion_merge_partners,
+        );
         input_contigs.insert(record.chrom.clone());
         if args.gender == PreprocessGender::Auto {
             observe_gender(&record, &mut haploid_x, &mut diploid_x);
@@ -321,6 +442,10 @@ fn run_inner(
             somatic_mode,
             &string_format_fields,
             &reference_sequences,
+            &following_spanning_deletions,
+            &equal_floor_blocked_deletions,
+            &released_following_deletions,
+            &mixed_deletion_merge_partners,
             &mut output,
         )?;
     } else {
@@ -560,6 +685,12 @@ fn run_inner(
                     let record_chrom = record.chrom.clone();
                     let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
                     let previous_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
+                    let release_leftshift_floor = released_following_deletions.contains(&(
+                        record.chrom.clone(),
+                        record.pos,
+                        record.ref_allele.clone(),
+                        record.alt_allele.clone(),
+                    ));
                     let prev_end = previous_end;
 
                     let source_records = if matches!(
@@ -576,21 +707,45 @@ fn run_inner(
                     let mut emitted_groups = Vec::with_capacity(source_records.len());
                     for source in source_records {
                         let reverse_hetalt_samples = source.reverse_hetalt_samples;
-                        let source = source.record;
-                        let mut emitted =
-                            if decompose && !source.alt_allele.split(',').any(is_symbolic_allele) {
-                                if let Some(reference) = reference_sequences.get(&source.chrom) {
-                                    variant_pipeline::primitive_split_with_floor(
-                                        &source,
-                                        reference.as_bytes(),
-                                        prev_end,
-                                    )
-                                } else {
-                                    vec![source]
-                                }
+                        let mut source = source.record;
+                        let is_mixed_deletion_merge_partner = mixed_deletion_merge_partners
+                            .contains(&(
+                                source.chrom.clone(),
+                                source.pos,
+                                source.ref_allele.clone(),
+                                source.alt_allele.clone(),
+                            ));
+                        if is_mixed_deletion_merge_partner {
+                            source.mixed_edit_primitive = true;
+                        }
+                        let mut emitted = if is_mixed_deletion_merge_partner {
+                            vec![source]
+                        } else if decompose && !source.alt_allele.split(',').any(is_symbolic_allele)
+                        {
+                            if let Some(reference) = reference_sequences.get(&source.chrom) {
+                                variant_pipeline::primitive_split_with_context(
+                                    &source,
+                                    reference.as_bytes(),
+                                    prev_end,
+                                    following_spanning_deletions.contains(&(
+                                        source.chrom.clone(),
+                                        source.pos,
+                                        source.ref_allele.clone(),
+                                        source.alt_allele.clone(),
+                                    )),
+                                    equal_floor_blocked_deletions.contains(&(
+                                        source.chrom.clone(),
+                                        source.pos,
+                                        source.ref_allele.clone(),
+                                        source.alt_allele.clone(),
+                                    )),
+                                )
                             } else {
                                 vec![source]
-                            };
+                            }
+                        } else {
+                            vec![source]
+                        };
                         if decompose {
                             for record in &mut emitted {
                                 restore_legacy_hetalt_orientation(record, &reverse_hetalt_samples);
@@ -611,7 +766,11 @@ fn run_inner(
                                 && !is_symbolic_allele(&split.alt_allele)
                                 && let Some(reference) = reference_sequences.get(&split.chrom)
                             {
-                                apply_left_shift(&mut split, reference.as_bytes(), prev_end);
+                                if release_leftshift_floor {
+                                    extend_record_left(&mut split, reference.as_bytes());
+                                } else {
+                                    apply_left_shift(&mut split, reference.as_bytes(), prev_end);
+                                }
                             }
                             canonicalize_multi_allelic_order(&mut split);
                             canonicalize_legacy_genotypes(&mut split);
@@ -709,6 +868,10 @@ fn process_blocksplit_jobs(
     somatic_mode: Option<crate::application::SomaticGtMode>,
     string_format_fields: &BTreeSet<String>,
     reference_sequences: &std::collections::BTreeMap<String, String>,
+    following_spanning_deletions: &HashSet<RecordIdentity>,
+    equal_floor_blocked_deletions: &HashSet<RecordIdentity>,
+    released_following_deletions: &HashSet<RecordIdentity>,
+    mixed_deletion_merge_partners: &HashSet<RecordIdentity>,
     output: &mut PreprocessSpool,
 ) -> Result<()> {
     let job_count = selection.jobs.as_ref().map_or(1, Vec::len);
@@ -779,6 +942,10 @@ fn process_blocksplit_jobs(
                                 somatic_mode,
                                 string_format_fields,
                                 reference_sequences,
+                                following_spanning_deletions,
+                                equal_floor_blocked_deletions,
+                                released_following_deletions,
+                                mixed_deletion_merge_partners,
                                 |record| {
                                     sender.send((job_index, Ok(record))).map_err(|_| {
                                         anyhow::anyhow!("preprocess output receiver closed")
@@ -831,6 +998,10 @@ fn process_normalized_record(
     somatic_mode: Option<crate::application::SomaticGtMode>,
     string_format_fields: &BTreeSet<String>,
     reference_sequences: &std::collections::BTreeMap<String, String>,
+    following_spanning_deletions: &HashSet<RecordIdentity>,
+    equal_floor_blocked_deletions: &HashSet<RecordIdentity>,
+    released_following_deletions: &HashSet<RecordIdentity>,
+    mixed_deletion_merge_partners: &HashSet<RecordIdentity>,
     mut emit: impl FnMut(vcf::ValidatedVcfRecord) -> Result<()>,
 ) -> Result<()> {
     if args.convert_gvcf_to_vcf {
@@ -865,7 +1036,14 @@ fn process_normalized_record(
 
     let record_chrom = record.chrom.clone();
     let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
-    let prev_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
+    let previous_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
+    let release_leftshift_floor = released_following_deletions.contains(&(
+        record.chrom.clone(),
+        record.pos,
+        record.ref_allele.clone(),
+        record.alt_allele.clone(),
+    ));
+    let prev_end = previous_end;
     let source_records = if matches!(
         symbolic_deletion,
         Some(SymbolicDeletionMaterialization::LeadingAnchor)
@@ -880,13 +1058,36 @@ fn process_normalized_record(
     let mut emitted_groups = Vec::with_capacity(source_records.len());
     for source in source_records {
         let reverse_hetalt_samples = source.reverse_hetalt_samples;
-        let source = source.record;
-        let mut emitted = if decompose && !source.alt_allele.split(',').any(is_symbolic_allele) {
+        let mut source = source.record;
+        let is_mixed_deletion_merge_partner = mixed_deletion_merge_partners.contains(&(
+            source.chrom.clone(),
+            source.pos,
+            source.ref_allele.clone(),
+            source.alt_allele.clone(),
+        ));
+        if is_mixed_deletion_merge_partner {
+            source.mixed_edit_primitive = true;
+        }
+        let mut emitted = if is_mixed_deletion_merge_partner {
+            vec![source]
+        } else if decompose && !source.alt_allele.split(',').any(is_symbolic_allele) {
             if let Some(reference) = reference_sequences.get(&source.chrom) {
-                variant_pipeline::primitive_split_with_floor(
+                variant_pipeline::primitive_split_with_context(
                     &source,
                     reference.as_bytes(),
                     prev_end,
+                    following_spanning_deletions.contains(&(
+                        source.chrom.clone(),
+                        source.pos,
+                        source.ref_allele.clone(),
+                        source.alt_allele.clone(),
+                    )),
+                    equal_floor_blocked_deletions.contains(&(
+                        source.chrom.clone(),
+                        source.pos,
+                        source.ref_allele.clone(),
+                        source.alt_allele.clone(),
+                    )),
                 )
             } else {
                 vec![source]
@@ -912,7 +1113,11 @@ fn process_normalized_record(
                 && !is_symbolic_allele(&split.alt_allele)
                 && let Some(reference) = reference_sequences.get(&split.chrom)
             {
-                apply_left_shift(&mut split, reference.as_bytes(), prev_end);
+                if release_leftshift_floor {
+                    extend_record_left(&mut split, reference.as_bytes());
+                } else {
+                    apply_left_shift(&mut split, reference.as_bytes(), prev_end);
+                }
             }
             canonicalize_multi_allelic_order(&mut split);
             canonicalize_legacy_genotypes(&mut split);
@@ -932,6 +1137,21 @@ fn process_normalized_record(
         .and_modify(|end| *end = (*end).max(orig_end))
         .or_insert(orig_end);
     Ok(())
+}
+
+fn extend_record_left(record: &mut crate::domain::RawVcfRecord, reference: &[u8]) {
+    if record.pos <= 1 || record.pos > reference.len() {
+        return;
+    }
+    let anchor = reference[record.pos - 2].to_ascii_uppercase() as char;
+    record.pos -= 1;
+    record.ref_allele.insert(0, anchor);
+    record.alt_allele = record
+        .alt_allele
+        .split(',')
+        .map(|alternate| format!("{anchor}{alternate}"))
+        .collect::<Vec<_>>()
+        .join(",");
 }
 
 #[cfg(test)]

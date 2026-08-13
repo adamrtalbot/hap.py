@@ -446,6 +446,61 @@ mod scratch_tests {
     }
 
     #[test]
+    fn default_locations_exclude_query_only_contigs() {
+        let root = test_root("query-only-contig");
+        let reference = root.join("ref.fa");
+        fs::write(
+            &reference,
+            ">chr1\nAACCGGTTAACCGGTT\n>chrX\nAACCGGTTAACCGGTT\n",
+        )
+        .unwrap();
+        fs::write(
+            reference.with_extension("fa.fai"),
+            "chr1\t16\t6\t16\t17\nchrX\t16\t29\t16\t17\n",
+        )
+        .unwrap();
+        let truth = root.join("truth.vcf");
+        fs::write(
+            &truth,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=16>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTRUTH\n",
+                "chr1\t5\t.\tG\tT\t60\tPASS\t.\tGT\t1/1\n",
+            ),
+        )
+        .unwrap();
+        let query = root.join("query.vcf");
+        fs::write(
+            &query,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=16>\n",
+                "##contig=<ID=chrX,length=16>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tQUERY\n",
+                "chr1\t5\t.\tG\tT\t60\tPASS\t.\tGT\t1/1\n",
+                "chrX\t5\t.\tG\tA\t60\tPASS\t.\tGT\t0/1\n",
+            ),
+        )
+        .unwrap();
+        let prefix = root.join("result");
+        let mut options = CompareArgs::with_paths(
+            truth.display().to_string(),
+            query.display().to_string(),
+            reference.display().to_string(),
+            prefix.display().to_string(),
+        );
+        options.scratch_prefix = Some(root.join("scratch").display().to_string());
+        run_args(options).unwrap();
+
+        let (_, records) = vcf::load_raw_vcf(&suffixed_report_path(&prefix, "vcf.gz")).unwrap();
+        assert!(records.iter().all(|record| record.chrom == "chr1"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bcf_report_size_spans_the_full_reference() {
         let contig_lengths = BTreeMap::from([("chr1".to_string(), 100), ("chrX".to_string(), 40)]);
         let contigs_in_play = BTreeSet::from(["chr1".to_string()]);
@@ -1222,9 +1277,14 @@ mod memory_guards {
         assert!(tallies.all_counts.is_empty());
         assert!(tallies.pass_counts.is_empty());
 
+        // A halfcall carries its block's BK like every other record in the
+        // block: legacy's quantify derives BK from the block `ctype`, so a
+        // `*` allele inside a `hap:mismatch` block is `UNK/lm`, not `UNK/.`.
         let unk_row = unk_truth_row(&truth, "C", 984494, "", "lm");
         assert_eq!(unk_row.record.info, "END=984495;BS=984494");
-        assert_eq!(unk_row.record.samples[0], "0|.:UNK:.:.:UNK:halfcall:.");
+        assert_eq!(unk_row.record.samples[0], "0|.:UNK:lm:.:UNK:halfcall:.");
+        let matched_row = unk_truth_row(&truth, "C", 984494, "", ".");
+        assert_eq!(matched_row.record.samples[0], "0|.:UNK:.:.:UNK:halfcall:.");
     }
 
     #[test]
@@ -1246,6 +1306,83 @@ mod memory_guards {
         assert!(
             identical_gt_exact_indel_keys(&phased_truth).is_empty(),
             "the standard phased-truth fixture must retain its legacy lm verdict"
+        );
+    }
+
+    #[test]
+    fn complex_subtype_uses_net_length_change_at_bucket_boundaries() {
+        assert_eq!(
+            subtype_label(&variant(100, "C", "GAGGTA", "0/1")),
+            Some("C1_5,tv".to_string())
+        );
+        assert_eq!(
+            subtype_label(&variant(100, "TTTAGT", "A", "0/1")),
+            Some("C1_5,tv".to_string())
+        );
+        assert_eq!(
+            subtype_label(&variant(100, "G", "TAATTTTTAAATTTTT", "0/1")),
+            Some("C6_15,tv".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_graph_order_puts_records_paired_across_inputs_first() {
+        let insertion = variant(100, "A", "AT", "0|1");
+        let snp = variant(100, "A", "T", "1|1");
+        let later = variant(120, "A", "G", "0/1");
+        // htslib pairs on allele spelling: the insertion is the only key the
+        // other input also carries, so it leads its position regardless of
+        // which line came first in this file.
+        let paired = BTreeSet::from([insertion.key.clone()]);
+
+        let truth_order =
+            legacy_graph_truth_order(&[snp.clone(), insertion.clone(), later.clone()], &paired);
+        assert_eq!(
+            truth_order
+                .iter()
+                .map(|v| v.key.clone())
+                .collect::<Vec<_>>(),
+            vec![insertion.key.clone(), snp.key.clone(), later.key.clone()]
+        );
+
+        // Truth keeps raw input order inside a class: nothing paired here, so
+        // the insertion stays behind the substitution it followed in the file.
+        let raw = legacy_graph_truth_order(
+            &[snp.clone(), insertion.clone(), later.clone()],
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            raw.iter().map(|v| v.key.clone()).collect::<Vec<_>>(),
+            vec![snp.key.clone(), insertion.key.clone(), later.key.clone()]
+        );
+
+        // The query-only remainder instead follows pre.py's trimmed-start
+        // order, so the substitution at POS precedes the insertion anchored
+        // on it even when the file listed them the other way round.
+        let query_order = legacy_graph_query_order(
+            &[insertion.clone(), snp.clone(), later.clone()],
+            &BTreeSet::new(),
+            &[],
+        );
+        assert_eq!(
+            query_order
+                .iter()
+                .map(|v| v.key.clone())
+                .collect::<Vec<_>>(),
+            vec![snp.key.clone(), insertion.key.clone(), later.key]
+        );
+
+        // Paired query records take the truth stream's order instead.
+        let both = BTreeSet::from([snp.key.clone(), insertion.key.clone()]);
+        let truth = legacy_graph_truth_order(&[insertion.clone(), snp.clone()], &both);
+        let paired_query =
+            legacy_graph_query_order(&[snp.clone(), insertion.clone()], &both, &truth);
+        assert_eq!(
+            paired_query
+                .iter()
+                .map(|v| v.key.clone())
+                .collect::<Vec<_>>(),
+            vec![insertion.key, snp.key]
         );
     }
 
@@ -1397,42 +1534,6 @@ mod memory_guards {
         sort_comparison_rows(&mut rows, &keys);
 
         assert!(rows[0].record.alt_allele == "A");
-    }
-
-    #[test]
-    fn adjacent_decomposed_indels_are_split_siblings() {
-        let deletion = variant(18757292, "AT", "A", "0/1").with_qual("1110.88");
-        let insertion = variant(18757293, "T", "TT", "0/1").with_qual("1110.88");
-        let cluster = Cluster {
-            chrom: "chr21".to_string(),
-            start: deletion.key.pos,
-            end: insertion.end_pos(),
-            truth: Vec::new(),
-            query: vec![deletion.clone(), insertion.clone()],
-        };
-        let regions = RegionState::from_cluster(&cluster, "ATTT", Some(&[]));
-
-        assert!(has_nonconf_split_sibling(&deletion, &cluster, &regions));
-        assert!(has_nonconf_split_sibling(&insertion, &cluster, &regions));
-    }
-
-    #[test]
-    fn truth_edits_across_adjacent_indels_prevent_split_sibling_label() {
-        let deletion = variant(390, "TAAA", "T", "0/1").with_qual("50");
-        let insertion = variant(393, "A", "ATT", "0/1").with_qual("50");
-        let cluster = Cluster {
-            chrom: "chr19".to_string(),
-            start: deletion.key.pos,
-            end: insertion.end_pos(),
-            truth: vec![
-                variant(390, "TA", "T", "0|1"),
-                variant(392, "A", "T", "0|1"),
-            ],
-            query: vec![deletion.clone(), insertion],
-        };
-        let regions = RegionState::from_cluster(&cluster, "TAAA", Some(&[]));
-
-        assert!(!has_nonconf_split_sibling(&deletion, &cluster, &regions));
     }
 
     #[test]
@@ -1928,6 +2029,135 @@ mod memory_guards {
     }
 
     #[test]
+    fn later_truth_deletions_inside_paired_span_keep_haplotype_match() {
+        let paired_truth = variant(100, "GGA", "G", "0/1");
+        let paired_query = variant(100, "GGA", "G", "1/1");
+        let later_truth = variant(102, "AG", "A", "1/0");
+        let cluster = Cluster {
+            chrom: "chr13".to_string(),
+            start: 100,
+            end: 103,
+            truth: vec![paired_truth, later_truth],
+            query: vec![paired_query],
+        };
+
+        assert!(!legacy_overlapping_deletion_mismatch(&cluster));
+    }
+
+    #[test]
+    fn hapfail_does_not_propagate_row_mismatch_to_exact_rows() {
+        assert!(should_propagate_unreconciled_exact_rows(
+            "hap:mismatch",
+            true,
+            false,
+        ));
+        assert!(!should_propagate_unreconciled_exact_rows(
+            "hapfail:mismatch",
+            true,
+            false,
+        ));
+        assert!(should_propagate_unreconciled_exact_rows(
+            "hapfail:mismatch",
+            true,
+            true,
+        ));
+        assert!(!should_propagate_unreconciled_exact_rows(
+            "hap:mismatch",
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn exact_insert_counterpart_does_not_propagate_hapfail_mismatch() {
+        let truth_insert = variant(100, "A", "ATTT", "0/1");
+        let truth_snp = variant(100, "A", "T", "1/0");
+        let query_insert = variant(100, "A", "ATTT", "0/1");
+        let query_snp = variant(100, "A", "T", "1/1");
+        let counterpart = query_insert_conflict_has_truth_counterpart(
+            &[query_insert, query_snp],
+            &[truth_insert, truth_snp.clone()],
+            &[truth_snp],
+        );
+
+        assert_eq!(counterpart, Some(true));
+        assert!(!should_propagate_unreconciled_exact_rows(
+            "hapfail:mismatch",
+            true,
+            matches!(counterpart, Some(false)),
+        ));
+    }
+
+    #[test]
+    fn reciprocal_query_aggregate_accepts_truth_insertion_subset() {
+        let truth_insert = variant(100, "A", "ATTT", "0/1");
+        let query_insert = variant(100, "A", "AT,ATTT", "2/1");
+        let query_deletion = variant(100, "ATTT", "A", "0/1");
+
+        let counterpart = query_insert_conflict_has_truth_counterpart(
+            &[query_insert, query_deletion],
+            &[truth_insert.clone()],
+            &[truth_insert],
+        );
+
+        assert_eq!(counterpart, Some(true));
+    }
+
+    #[test]
+    fn insertion_and_snp_without_truth_insertion_remain_a_conflict() {
+        let truth_snp = variant(100, "A", "G", "0/1");
+        let query_insert = variant(100, "A", "ATTT", "0/1");
+        let query_snp = variant(100, "A", "G", "0/1");
+
+        let counterpart = query_insert_conflict_has_truth_counterpart(
+            &[query_insert, query_snp],
+            &[truth_snp.clone()],
+            &[truth_snp],
+        );
+
+        assert_eq!(counterpart, Some(false));
+    }
+
+    #[test]
+    fn one_deletion_covering_multiple_insert_substitution_conflicts_is_local() {
+        let query = vec![
+            variant(100, "ACGTAC", "A", "1|1"),
+            variant(103, "T", "TA", "0|1"),
+            variant(103, "T", "G", "0|1"),
+            variant(104, "A", "ACC", "0|1"),
+            variant(104, "A", "C", "0|1"),
+        ];
+
+        assert!(legacy_covered_multi_conflict_mismatch(&query));
+    }
+
+    #[test]
+    fn heterozygous_deletion_covering_multiple_conflicts_remains_hapfail() {
+        let query = vec![
+            variant(100, "ACGTAC", "A", "0|1"),
+            variant(103, "T", "TA", "0|1"),
+            variant(103, "T", "G", "0|1"),
+            variant(104, "A", "ACC", "0|1"),
+            variant(104, "A", "C", "0|1"),
+        ];
+
+        assert!(!legacy_covered_multi_conflict_mismatch(&query));
+    }
+
+    #[test]
+    fn separate_deletions_do_not_promote_multiple_conflicts() {
+        let query = vec![
+            variant(100, "ACGT", "A", "0|1"),
+            variant(103, "T", "TA", "0|1"),
+            variant(103, "T", "G", "0|1"),
+            variant(106, "A", "ACC", "0|1"),
+            variant(106, "A", "C", "0|1"),
+        ];
+
+        assert!(!legacy_covered_multi_conflict_mismatch(&query));
+    }
+
+    #[test]
     fn halfcall_order_follows_legacy_companion_kind() {
         let reference = "A".repeat(256);
         let halfcall = variant(102, "A", ".", "0|.");
@@ -1977,6 +2207,40 @@ mod memory_guards {
 
         assert_eq!(rows[0].sort_key.2, 1);
         assert_eq!(rows[1].sort_key.2, 0);
+    }
+
+    #[test]
+    fn discordant_snp_pair_keeps_same_locus_indel_rows_separate() {
+        let truth_indel = variant(102, "A", "AT", "0/1");
+        let query_indel = variant(102, "A", "AT", "1/1");
+        let truth_snp = variant(102, "A", "G", "1/0");
+        let query_snp = variant(102, "A", "G", "1/1");
+        let cluster = Cluster {
+            chrom: "chr6".to_string(),
+            start: 100,
+            end: 103,
+            truth: vec![truth_indel.clone(), truth_snp],
+            query: vec![query_indel.clone(), query_snp],
+        };
+
+        assert!(mixed_type_same_locus_keeps_indel_rows_separate(
+            &cluster,
+            &truth_indel,
+            &query_indel
+        ));
+
+        let indel_only = Cluster {
+            chrom: "chr6".to_string(),
+            start: 100,
+            end: 103,
+            truth: vec![truth_indel.clone()],
+            query: vec![query_indel.clone()],
+        };
+        assert!(!mixed_type_same_locus_keeps_indel_rows_separate(
+            &indel_only,
+            &truth_indel,
+            &query_indel
+        ));
     }
 
     #[test]
@@ -2213,6 +2477,24 @@ mod memory_guards {
             state.any_nonconf,
             "presence of an uncovered insertion primitive must mark cluster as non-CONF"
         );
+    }
+
+    #[test]
+    fn overlapping_deletion_keeps_persisted_hetalt_deletion_aggregate_final() {
+        let aggregate = variant(100, "CTCAACTAG", "C,CT", "1/2");
+        let neighbor = variant(101, "TCAACTAGTTAAG", "T", "0/1");
+
+        let split = split_query_primitives_with_neighbors(
+            &aggregate,
+            "N",
+            100,
+            &[aggregate.clone(), neighbor],
+            &[],
+        );
+
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].key, aggregate.key);
+        assert_eq!(split[0].gt, aggregate.gt);
     }
 
     // Class 3 support: SNPs at a single base inside any CONF interval
@@ -2456,17 +2738,16 @@ mod memory_guards {
         assert_eq!(canonical_hetalt_gt("CA,CAA", &query), "2/1");
     }
 
-    // Class 1 pin (shared_qq picker): truth-only TP rows on a hap-
-    // matched cluster must propagate the MINIMUM non-zero query QUAL
-    // across the superlocus, not the first query's QUAL. Chr21:
-    // 15246143 cluster contains query SNP qual=817.09 and query
-    // insertion qual=174.59 — legacy emits QQ=174.59 on the truth-
-    // only row `TA→TAA,T`.
+    // Class 1 pin (shared_qq picker): truth-only TP rows on a hap-matched
+    // cluster propagate the minimum query QUAL, including zero, across the
+    // superlocus. HG001 Platinum Genomes chr1:1876492 has QUAL=0 query
+    // alleles; legacy therefore writes QQ=0 on the truth-only TP rows.
     #[test]
-    fn shared_qq_picks_minimum_nonzero_query_qual() {
+    fn shared_qq_picks_zero_query_qual() {
         let queries = [
             variant(15246143, "G", "C", "0/1").with_qual("817.09"),
             variant(15246157, "T", "TA", "0/1").with_qual("174.59"),
+            variant(15246160, "A", "AT", "0/1").with_qual("0"),
         ];
         let min_qq: Option<&str> = queries
             .iter()
@@ -2474,12 +2755,12 @@ mod memory_guards {
                 q.qual
                     .parse::<f64>()
                     .ok()
-                    .filter(|v| *v > 0.0)
+                    .filter(|v| v.is_finite() && *v >= 0.0)
                     .map(|v| (v, q.qual.as_str()))
             })
             .min_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(_, s)| s);
-        assert_eq!(min_qq, Some("174.59"));
+        assert_eq!(min_qq, Some("0"));
     }
 
     // Class 5 pin: `cluster_signature` returns `Ok(None)` when two homalt

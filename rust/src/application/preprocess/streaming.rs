@@ -195,6 +195,7 @@ fn decode_raw_record(reader: &mut impl Read) -> Result<RawVcfRecord> {
         info,
         format,
         samples,
+        mixed_edit_primitive: false,
     })
 }
 
@@ -358,7 +359,8 @@ impl PreprocessSpool {
         for (rank, pos, serial, record) in self.buffer.drain(..) {
             writeln!(
                 chunk.as_file_mut(),
-                "{rank}\t{pos}\t{serial}\t{}",
+                "{rank}\t{pos}\t{serial}\t{}\t{}",
+                u8::from(record.mixed_edit_primitive),
                 record.to_line()
             )?;
         }
@@ -527,7 +529,7 @@ impl ExternalRecordMerge {
             return Ok(());
         }
         let line = line.trim_end_matches(['\r', '\n']);
-        let mut fields = line.splitn(4, '\t');
+        let mut fields = line.splitn(5, '\t');
         let rank = fields
             .next()
             .context("preprocess sort chunk lacks rank")?
@@ -540,12 +542,21 @@ impl ExternalRecordMerge {
             .next()
             .context("preprocess sort chunk lacks serial")?
             .parse()?;
-        let raw = RawVcfRecord::from_line(
+        let mixed_edit_primitive = match fields
+            .next()
+            .context("preprocess sort chunk lacks mixed-edit marker")?
+        {
+            "0" => false,
+            "1" => true,
+            marker => anyhow::bail!("invalid preprocess mixed-edit marker {marker}"),
+        };
+        let mut raw = RawVcfRecord::from_line(
             fields
                 .next()
                 .context("preprocess sort chunk lacks record")?,
             Path::new("preprocess-sort-chunk"),
         )?;
+        raw.mixed_edit_primitive = mixed_edit_primitive;
         let provenance = QueryProvenance::source(serial % self.stream_count, self.stream_count)?;
         let record = ValidatedVcfRecord::try_from_raw(raw, provenance)?;
         self.current[index] = Some(((rank, pos, serial), record));
@@ -600,7 +611,8 @@ fn collapse_preprocess_chunks(
                     let ((rank, pos, serial), record) = entry?;
                     writeln!(
                         writer,
-                        "{rank}\t{pos}\t{serial}\t{}",
+                        "{rank}\t{pos}\t{serial}\t{}\t{}",
+                        u8::from(record.raw().mixed_edit_primitive),
                         record.raw().to_line()
                     )?;
                 }

@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod genotype;
+mod legacy_graph;
 mod matching;
 mod metrics;
 mod output;
@@ -842,6 +843,20 @@ fn run_inner(
 
     let truth_headers = vcf::open_validated_vcf(&truth_prep)?.headers().to_vec();
     let query_headers = vcf::open_validated_vcf(&query_prep)?.headers().to_vec();
+    let truth_metadata = spool_comparison_contigs(&truth_prep)?;
+    // Without an explicit -l selector, legacy builds the comparison
+    // chromosome list from truth calls. Query-only chromosomes are not sent
+    // to xcmp (for example chrX in an autosome-only Platinum truth set).
+    let derived_locations = args.locations.is_none().then(|| {
+        truth_metadata
+            .keys()
+            .cloned()
+            .map(vcf::LocationFilter::Contig)
+            .collect::<Vec<_>>()
+    });
+    let comparison_locations = locations
+        .as_deref()
+        .or_else(|| derived_locations.as_deref());
 
     let cluster_gap = match args.engine {
         CompareEngine::ScmpSomatic => 0,
@@ -873,7 +888,7 @@ fn run_inner(
                     false,
                     regions.as_deref(),
                     targets.as_deref(),
-                    locations.as_deref(),
+                    comparison_locations,
                 )?,
                 Some(raw),
             )?
@@ -920,7 +935,7 @@ fn run_inner(
         true,
         regions.as_deref(),
         targets.as_deref(),
-        locations.as_deref(),
+        comparison_locations,
     )?;
     let query = vcf::open_variants(
         &query_prep,
@@ -928,12 +943,11 @@ fn run_inner(
         false,
         regions.as_deref(),
         targets.as_deref(),
-        locations.as_deref(),
+        comparison_locations,
     )?;
     let contig_ranks = comparison_contig_ranks(&truth_headers, &query_headers);
     let clusters = StreamingClusters::new(truth, query, cluster_gap, contig_ranks);
-    let mut contigs_in_play = locations
-        .as_deref()
+    let mut contigs_in_play = comparison_locations
         .map(|locations| {
             locations
                 .iter()
@@ -947,7 +961,6 @@ fn run_inner(
     let mut row_spool = ComparisonRowSpool::new();
     let needs_decoration =
         args.preserve_info || args.output_vtc || !matches!(args.roc.as_str(), "QUAL" | "QQ");
-    let truth_metadata = spool_comparison_contigs(&truth_prep)?;
     let query_metadata = if needs_decoration {
         spool_comparison_contigs(&query_prep)?
     } else {

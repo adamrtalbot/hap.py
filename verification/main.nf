@@ -47,6 +47,9 @@ def fixture(rel) {
     if (path.startsWith('local:')) {
         return file("${projectDir}/${path.substring('local:'.length())}")
     }
+    if (path.startsWith('https://') || path.startsWith('http://') || path.startsWith('file://') || path.startsWith('/')) {
+        return file(path)
+    }
     file("${params.fixture_base}/${path}")
 }
 
@@ -59,6 +62,15 @@ def fixtureIndexes(rel) {
         return [fixture("${path}${suffix}")]
     }
     []
+}
+
+def referenceIndexes(rel) {
+    def path = rel.toString()
+    def indexes = [fixture("${path}.fai")]
+    if (path.endsWith('.gz')) {
+        indexes.add(fixture("${path}.gzi"))
+    }
+    indexes
 }
 
 def samples(samplesheet, transform) {
@@ -97,7 +109,7 @@ workflow {
                 fixture(row.query_vcf),
                 fixtureIndexes(row.query_vcf),
                 fixture(row.reference),
-                fixture("${row.reference}.fai"),
+                referenceIndexes(row.reference),
                 fixture(row.fp_bed),
                 fixtureIndexes(row.fp_bed),
                 stratificationFiles,

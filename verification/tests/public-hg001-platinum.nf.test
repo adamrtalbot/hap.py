@@ -1,0 +1,37 @@
+nextflow_pipeline {
+
+    name "HG001 Platinum Genomes parity"
+    script "../main.nf"
+
+    test("public HG001 Platinum Genomes artifacts match") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                cases = 'happy'
+                happy_samplesheet = System.getenv('HAP_PUBLIC_SAMPLESHEET') ?:
+                    "$baseDir/assets/samplesheet.happy.public.csv"
+            }
+        }
+
+        then {
+            def verificationFile = new File("$outputDir/verification.json")
+            assert verificationFile.isFile() : 'verification.json was not published'
+            def verification = new groovy.json.JsonSlurper().parse(verificationFile)
+            def comparisons = verification.comparisons
+
+            assert verification.schema_version == 1
+            assert verification.comparison_count == 3
+            assert comparisons.size() == 3
+            assert comparisons.every { it.lane == 'happy' }
+            assert comparisons.collect { it.case_id }.toSet() == [
+                'germline_hg001_platinum',
+                'matrix_vcfeval_deprecated_flags',
+                'matrix_vcfeval_preserve_info',
+            ].toSet()
+            assert comparisons.every { it.ok && it.differences.isEmpty() } :
+                groovy.json.JsonOutput.toJson(comparisons.findAll { !it.ok })
+            assert workflow.success
+        }
+    }
+}
