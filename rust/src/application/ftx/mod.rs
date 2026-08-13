@@ -841,6 +841,7 @@ mod tests {
                 "20:0:0:0,0:20,20:0,0:0,0".to_string(),
             ],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         };
         let headers = vec!["##MaxDepth_chr1=100".to_string()];
         let depths = BTreeMap::from([("chr1".to_string(), 50.0)]);

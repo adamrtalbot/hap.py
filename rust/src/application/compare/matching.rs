@@ -7,9 +7,9 @@ use super::legacy_graph;
 use super::metrics::{add_variant_stats, add_variant_stats_subtype};
 use super::rows::{
     bk_for_row, cluster_query_filter, compute_shift_target, fn_fp_combined_row, fn_row,
-    fp_like_row, gt_selected_nonref_alts, split_query_primitives_with_neighbors, tp_combined_row,
-    tp_single_side_row, trim_variant, try_split_same_anchor_via_shift, unk_combined_row,
-    unk_truth_row,
+    fp_like_row, gt_selected_nonref_alts, legacy_duplicate_alt_query_output_projection,
+    split_query_primitives_with_neighbors, tp_combined_row, tp_single_side_row, trim_variant,
+    try_split_same_anchor_via_shift, unk_combined_row, unk_truth_row,
 };
 use super::{
     AnnotatedRow, Cluster, ComparisonConfig, ComparisonOutputs, Entry, Event, MAX_CLUSTER_VARIANTS,
@@ -2620,20 +2620,22 @@ pub(super) fn exact_match_pairs(
             // simple_compare_pairs_match only fires when neither side
             // primitive-splits, so the combined or remap paths always
             // emit a single TP row.
+            let projected_query = legacy_duplicate_alt_query_output_projection(query);
+            let query_for_output = projected_query.as_ref();
             if is_subset {
                 // Truth-subset path: truth's alts ⊊ query's selected.
                 // Emit at truth's representation; remap query GT so
                 // alleles missing from truth's column collapse to ref.
                 let canonicalized = Variant {
                     key: VariantKey {
-                        chrom: query.key.chrom.clone(),
-                        pos: query.key.pos,
-                        ref_allele: query.key.ref_allele.clone(),
+                        chrom: query_for_output.key.chrom.clone(),
+                        pos: query_for_output.key.pos,
+                        ref_allele: query_for_output.key.ref_allele.clone(),
                         alt_allele: truth.key.alt_allele.clone(),
                     },
-                    qual: query.qual.clone(),
-                    filter: query.filter.clone(),
-                    gt: remap_query_gt_subset(truth, query),
+                    qual: query_for_output.qual.clone(),
+                    filter: query_for_output.filter.clone(),
+                    gt: remap_query_gt_subset(truth, query_for_output),
                 };
                 let regions = region_state.row_tags(Some(truth), Some(query));
                 if combined_unk {
@@ -2740,26 +2742,26 @@ pub(super) fn exact_match_pairs(
             } else if truth.key.alt_allele == query.key.alt_allele
                 && equivalent_gt(&truth.gt, &query.gt)
             {
-                let query_for_row = if is_multi_allelic(query) {
+                let query_for_row = if is_multi_allelic(query_for_output) {
                     // For a phased query (GT has '|'), legacy mirrors truth's
                     // haplotype assignment unphased: truth 1|2 → query 1/2.
                     // canonical_hetalt_gt (alphabetical "later/earlier") is wrong
                     // for phased cases like CACACACAT,CAT where it gives 2|1.
                     // For an unphased query (GT has '/'), legacy uses canonical
                     // alphabetical ordering (e.g. C,G unphased 1/2 → 2/1).
-                    let gt = if query.gt.contains('|') {
+                    let gt = if query_for_output.gt.contains('|') {
                         truth.gt.replace('|', "/")
                     } else {
-                        canonical_hetalt_gt(&truth.key.alt_allele, query)
+                        canonical_hetalt_gt(&truth.key.alt_allele, query_for_output)
                     };
                     Variant {
-                        key: query.key.clone(),
-                        qual: query.qual.clone(),
-                        filter: query.filter.clone(),
+                        key: query_for_output.key.clone(),
+                        qual: query_for_output.qual.clone(),
+                        filter: query_for_output.filter.clone(),
                         gt,
                     }
                 } else {
-                    query.clone()
+                    query_for_output.clone()
                 };
                 let regions = region_state.row_tags(Some(truth), Some(query));
                 if combined_unk {
@@ -2792,14 +2794,14 @@ pub(super) fn exact_match_pairs(
                 // verbatim under truth's displayed alt ordering.
                 let canonicalized = Variant {
                     key: VariantKey {
-                        chrom: query.key.chrom.clone(),
-                        pos: query.key.pos,
-                        ref_allele: query.key.ref_allele.clone(),
+                        chrom: query_for_output.key.chrom.clone(),
+                        pos: query_for_output.key.pos,
+                        ref_allele: query_for_output.key.ref_allele.clone(),
                         alt_allele: truth.key.alt_allele.clone(),
                     },
-                    qual: query.qual.clone(),
-                    filter: query.filter.clone(),
-                    gt: canonical_hetalt_gt(&truth.key.alt_allele, query),
+                    qual: query_for_output.qual.clone(),
+                    filter: query_for_output.filter.clone(),
+                    gt: canonical_hetalt_gt(&truth.key.alt_allele, query_for_output),
                 };
                 let regions = region_state.row_tags(Some(truth), Some(query));
                 if combined_unk {
@@ -3299,21 +3301,23 @@ pub(super) fn mark_cluster_mismatch(
             });
         }
         let bk = compute_paired_bk(truth, query);
+        let projected_query = legacy_duplicate_alt_query_output_projection(query);
+        let query_for_output = projected_query.as_ref();
         // Canonicalise unphased hetalt query GT to legacy's
         // `<later>/<earlier>` ordering when the row is hetalt and the
         // declared alts have a non-canonical order. SNP cases like
         // chr21:9922359 (`T→A,C` query GT `1/2`) emit `2/1` per
         // VariantLocationAggregator's MAX_GT=2 rule. Phased / hom /
         // het-with-ref pass through unchanged.
-        let query_gt = if is_distinct_hetalt(&query.gt) {
-            canonical_hetalt_gt(&truth.key.alt_allele, query)
+        let query_gt = if is_distinct_hetalt(&query_for_output.gt) {
+            canonical_hetalt_gt(&truth.key.alt_allele, query_for_output)
         } else {
-            remap_query_gt_subset(truth, query)
+            remap_query_gt_subset(truth, query_for_output)
         };
         let query_for_row = Variant {
             key: truth.key.clone(),
-            qual: query.qual.clone(),
-            filter: query.filter.clone(),
+            qual: query_for_output.qual.clone(),
+            filter: query_for_output.filter.clone(),
             gt: query_gt,
         };
         rows.push(fn_fp_combined_row(

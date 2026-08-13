@@ -5,6 +5,7 @@ use super::{AnnotatedRow, Cluster, SPLIT_LEFT_SHIFT_WINDOW, Side, Variant, fp_cl
 use crate::adapters::vcf::VariantKey;
 use crate::domain::{ComparisonRecord, RawVcfRecord};
 use crate::engines::partial_credit;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 struct ComparisonRecordFields {
@@ -144,8 +145,37 @@ fn comparison_record(variant: &Variant, fields: ComparisonRecordFields) -> Compa
         format: Some("GT:BD:BK:BI:BVT:BLT:QQ".to_string()),
         samples: vec![fields.truth_sample, fields.query_sample],
         mixed_edit_primitive: false,
+        primitive_identity: None,
     }
     .into()
+}
+
+/// Projects the duplicate-ALT aggregate produced by preprocessing into the
+/// allele table that the legacy classified-VCF reader exposes.
+///
+/// This remains output-only: matching and haplotype comparison must see both
+/// distinct internal edits even when their padded VCF spellings are equal.
+pub(super) fn legacy_duplicate_alt_query_output_projection(query: &Variant) -> Cow<'_, Variant> {
+    let alts = query.key.alt_allele.split(',').collect::<Vec<_>>();
+    let duplicate = match alts.as_slice() {
+        [left, right] if left == right => *left,
+        _ => return Cow::Borrowed(query),
+    };
+    let is_symbolic = duplicate.is_empty()
+        || matches!(duplicate, "." | "*")
+        || (duplicate.starts_with('<') && duplicate.ends_with('>'))
+        || duplicate.contains(['[', ']']);
+    let selected = parse_gt_alleles(&query.gt);
+    let selects_both_duplicate_indices = selected.len() == 2
+        && selected.iter().copied().collect::<BTreeSet<_>>() == BTreeSet::from([1, 2]);
+    if !selects_both_duplicate_indices || is_symbolic {
+        return Cow::Borrowed(query);
+    }
+
+    let mut projected = query.clone();
+    projected.key.alt_allele = duplicate.to_string();
+    projected.gt = "1/1".to_string();
+    Cow::Owned(projected)
 }
 
 pub(super) fn combined_record_qual<'a>(truth: &'a Variant, query: &'a Variant) -> &'a str {
@@ -169,6 +199,8 @@ pub(super) fn tp_combined_row(
     block_start: usize,
     regions: &str,
 ) -> AnnotatedRow {
+    let projected_query = legacy_duplicate_alt_query_output_projection(query);
+    let query = projected_query.as_ref();
     let info = comparison_info(truth, reference);
     AnnotatedRow {
         sort_key: (truth.key.chrom.clone(), truth.key.pos, 1, 0),
@@ -216,6 +248,8 @@ pub(super) fn unk_combined_row(
     block_start: usize,
     regions: &str,
 ) -> AnnotatedRow {
+    let projected_query = legacy_duplicate_alt_query_output_projection(query);
+    let query = projected_query.as_ref();
     let info = comparison_info(truth, reference);
     AnnotatedRow {
         sort_key: (truth.key.chrom.clone(), truth.key.pos, 1, 0),
@@ -377,39 +411,43 @@ pub(super) fn tp_single_side_row(
                 },
             ),
         },
-        Side::Query => AnnotatedRow {
-            sort_key: (
-                variant.key.chrom.clone(),
-                variant.key.pos,
-                1,
-                // +1 so query-only TP rows sort after truth-only TP rows at
-                // the same position, matching legacy's truth-before-query
-                // output order when both sides have a single-side TP row.
-                query_type_rank(variant) + 1,
-            ),
-            query_pass: filter_is_pass(&variant.filter),
-            fp_class: None,
-            xcmp_ctype: None,
-            xcmp_hap_match: false,
-            record: comparison_record(
-                variant,
-                ComparisonRecordFields {
-                    reference: display_ref(variant, reference),
-                    alternate: display_alt(variant),
-                    quality: variant.qual.clone(),
-                    filter: filter_for_output(&variant.filter).to_string(),
-                    info: format!("BS={block_start}{regions}"),
-                    truth_sample: "./.:.:.:.:NOCALL:nocall:.".to_string(),
-                    query_sample: format!(
-                        "{}:TP:gm:{info}:{}:{}:{}",
-                        variant.gt,
-                        variant.primary_type(),
-                        genotype_label(variant),
-                        variant.qual
-                    ),
-                },
-            ),
-        },
+        Side::Query => {
+            let projected_variant = legacy_duplicate_alt_query_output_projection(variant);
+            let variant = projected_variant.as_ref();
+            AnnotatedRow {
+                sort_key: (
+                    variant.key.chrom.clone(),
+                    variant.key.pos,
+                    1,
+                    // +1 so query-only TP rows sort after truth-only TP rows at
+                    // the same position, matching legacy's truth-before-query
+                    // output order when both sides have a single-side TP row.
+                    query_type_rank(variant) + 1,
+                ),
+                query_pass: filter_is_pass(&variant.filter),
+                fp_class: None,
+                xcmp_ctype: None,
+                xcmp_hap_match: false,
+                record: comparison_record(
+                    variant,
+                    ComparisonRecordFields {
+                        reference: display_ref(variant, reference),
+                        alternate: display_alt(variant),
+                        quality: variant.qual.clone(),
+                        filter: filter_for_output(&variant.filter).to_string(),
+                        info: format!("BS={block_start}{regions}"),
+                        truth_sample: "./.:.:.:.:NOCALL:nocall:.".to_string(),
+                        query_sample: format!(
+                            "{}:TP:gm:{info}:{}:{}:{}",
+                            variant.gt,
+                            variant.primary_type(),
+                            genotype_label(variant),
+                            variant.qual
+                        ),
+                    },
+                ),
+            }
+        }
     }
 }
 
@@ -429,6 +467,8 @@ pub(super) fn fn_fp_combined_row(
     query_bd: &'static str,
     bk: &str,
 ) -> AnnotatedRow {
+    let projected_query = legacy_duplicate_alt_query_output_projection(query);
+    let query = projected_query.as_ref();
     // Per-sample BI: legacy emits each sample's `BI` based on the alleles
     // ITS own GT selects, not the merged record's overall subtype. The
     // chr21:9922359 fixture (truth `T→A,C 1|0` selects {A}=tv vs query
@@ -1036,6 +1076,8 @@ pub(super) fn fp_like_row(
     fp_class: Option<&'static str>,
     bk: &'static str,
 ) -> AnnotatedRow {
+    let projected_query = legacy_duplicate_alt_query_output_projection(query);
+    let query = projected_query.as_ref();
     let info = comparison_info(query, reference);
     AnnotatedRow {
         sort_key: (

@@ -1,5 +1,5 @@
 use crate::application::{PreprocessArgs, PreprocessGender, ValidatedPreprocessArgs};
-use crate::domain::QueryProvenance;
+use crate::domain::{PrimitiveIdentity, QueryProvenance, RawVcfRecord};
 use crate::{
     adapters::{fasta, vcf},
     engines::variant_pipeline,
@@ -73,6 +73,17 @@ struct BlocksplitJob {
 }
 
 type RecordIdentity = (String, usize, String, String);
+
+fn assign_passthrough_primitive_identity(record: &mut RawVcfRecord) {
+    if record.alt_allele.contains(',') {
+        return;
+    }
+    record.primitive_identity = Some(PrimitiveIdentity {
+        start: record.pos,
+        end: record.pos + record.ref_allele.len().saturating_sub(1),
+        alt: record.alt_allele.clone(),
+    });
+}
 
 #[cfg(test)]
 impl BlocksplitSelection {
@@ -717,6 +728,7 @@ fn run_inner(
                             ));
                         if is_mixed_deletion_merge_partner {
                             source.mixed_edit_primitive = true;
+                            assign_passthrough_primitive_identity(&mut source);
                         }
                         let mut emitted = if is_mixed_deletion_merge_partner {
                             vec![source]
@@ -1067,6 +1079,7 @@ fn process_normalized_record(
         ));
         if is_mixed_deletion_merge_partner {
             source.mixed_edit_primitive = true;
+            assign_passthrough_primitive_identity(&mut source);
         }
         let mut emitted = if is_mixed_deletion_merge_partner {
             vec![source]

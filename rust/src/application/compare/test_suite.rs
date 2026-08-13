@@ -2497,6 +2497,110 @@ mod memory_guards {
         assert_eq!(split[0].gt, aggregate.gt);
     }
 
+    #[test]
+    fn legacy_only_duplicate_alt_query_projects_for_unmatched_classified_rows() {
+        for gt in ["2/1", "1/2", "2|1"] {
+            let query = variant(104, "A", "AGTGTGTGT,AGTGTGTGT", gt);
+            let cluster = Cluster {
+                chrom: "chr21".to_string(),
+                start: 104,
+                end: 104,
+                truth: vec![],
+                query: vec![query],
+            };
+            let reference = BTreeMap::from([("chr21".to_string(), "A".repeat(256))]);
+            let mut rows = Vec::new();
+            process_cluster(
+                &cluster,
+                &reference,
+                None,
+                ComparisonConfig {
+                    no_hc: false,
+                    max_enum: 100_000,
+                    hb_expand: 0,
+                },
+                &mut BTreeMap::new(),
+                &mut BTreeMap::new(),
+                &mut rows,
+            )
+            .unwrap();
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+
+            assert_eq!(row.record.alt_allele, "AGTGTGTGT");
+            assert_eq!(row.record.sample_map(1).get("GT").unwrap(), "1/1");
+            assert_eq!(row.record.sample_map(1).get("BLT").unwrap(), "homalt");
+        }
+    }
+
+    #[test]
+    fn legacy_only_duplicate_alt_query_projects_for_paired_classified_rows() {
+        let truth = variant(104, "A", "AGTGTGTGT", "1|1");
+        let query = variant(104, "A", "AGTGTGTGT,AGTGTGTGT", "2/1");
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 104,
+            end: 104,
+            truth: vec![truth],
+            query: vec![query],
+        };
+        let reference = BTreeMap::from([("chr21".to_string(), "A".repeat(256))]);
+        let mut rows = Vec::new();
+        process_cluster(
+            &cluster,
+            &reference,
+            None,
+            ComparisonConfig {
+                no_hc: false,
+                max_enum: 100_000,
+                hb_expand: 0,
+            },
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut rows,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        assert_eq!(row.record.alt_allele, "AGTGTGTGT");
+        assert_eq!(row.record.sample_map(0).get("GT").unwrap(), "1|1");
+        assert_eq!(row.record.sample_map(1).get("GT").unwrap(), "1/1");
+        assert_eq!(row.record.sample_map(1).get("BLT").unwrap(), "homalt");
+    }
+
+    #[test]
+    fn normative_duplicate_alt_matching_representation_remains_distinct() {
+        let aggregate = variant(141113704, "A", "AGTGTGTGT,AGTGTGTGT", "2/1");
+
+        let split = split_query_primitives_with_neighbors(
+            &aggregate,
+            "A",
+            141113702,
+            &[aggregate.clone()],
+            &[],
+        );
+
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].key, aggregate.key);
+        assert_eq!(split[0].gt, aggregate.gt);
+    }
+
+    #[test]
+    fn normative_duplicate_alt_query_projection_leaves_other_shapes_unchanged() {
+        for query in [
+            variant(141113704, "A", "AGTGTGTGT,ACT", "2/1"),
+            variant(141113704, "A", "AGTGTGTGT,AGTGTGTGT", "0/1"),
+            variant(141113704, "A", "AGTGTGTGT,AGTGTGTGT", "1/1"),
+            variant(141113704, "A", "AGTGTGTGT,AGTGTGTGT,AGTGTGTGT", "2/1"),
+            variant(141113704, "A", "<DEL>,<DEL>", "2/1"),
+        ] {
+            let projected = legacy_duplicate_alt_query_output_projection(&query);
+            assert_eq!(projected.key, query.key);
+            assert_eq!(projected.gt, query.gt);
+        }
+    }
+
     // Class 3 support: SNPs at a single base inside any CONF interval
     // are covered regardless of the insertion-aware fully_covered
     // clause. Sanity-check that the refactored `variant_is_conf`
