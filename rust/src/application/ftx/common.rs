@@ -41,7 +41,7 @@ pub(super) fn format_python_float(value: f64) -> String {
     if value.is_nan() {
         return String::new();
     }
-    report::python_repr_float(value)
+    report::full_repr_float(value)
 }
 
 /// Numeric INFO values pass through htslib during legacy preprocessing,
@@ -127,8 +127,22 @@ mod tests {
         assert_eq!(format_python_float(-1.0), "-1.0");
         assert_eq!(format_python_float(0.5), "0.5");
         assert_eq!(format_python_float(0.1), "0.1");
-        assert_eq!(format_python_float(26.0 / 135.5), "0.191881918819");
-        assert_eq!(format_python_float(77.0 / 135.5), "0.568265682657");
+        assert_eq!(format_python_float(26.0 / 135.5), "0.1918819188191882");
+        assert_eq!(format_python_float(77.0 / 135.5), "0.5682656826568265");
+        assert_eq!(format_python_float(1.0 / 3.0), "0.3333333333333333");
+    }
+
+    #[test]
+    fn format_python_float_matches_pandas_notation_threshold_bytes() {
+        let below_upper = f64::from_bits(1e16_f64.to_bits() - 1);
+        let below_lower = f64::from_bits(1e-4_f64.to_bits() - 1);
+
+        assert_eq!(format_python_float(1e12), "1000000000000.0");
+        assert_eq!(format_python_float(1e15), "1000000000000000.0");
+        assert_eq!(format_python_float(below_upper), "9999999999999998.0");
+        assert_eq!(format_python_float(1e16), "1e+16");
+        assert_eq!(format_python_float(below_lower), "9.999999999999999e-05");
+        assert_eq!(format_python_float(1e-4), "0.0001");
     }
 
     #[test]

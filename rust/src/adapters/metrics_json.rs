@@ -776,12 +776,7 @@ fn limit_denominator(value: f64, maximum: u64) -> Option<(u64, u64)> {
 }
 
 fn json_repr_float(value: f64) -> String {
-    let rendered = format!("{value:?}");
-    let Some((mantissa, exponent)) = rendered.split_once('e') else {
-        return rendered;
-    };
-    let exponent = exponent.parse::<i32>().unwrap_or(0);
-    format!("{mantissa}e{exponent:+03}")
+    crate::adapters::report::full_repr_float(value)
 }
 
 fn push_field(out: &mut String, key: &str, value: &str) {
@@ -957,6 +952,47 @@ mod tests {
         assert!(json.contains(
             "\"values\":[1.8418772563176895],\"type\":\"double\",\"id\":\"TRUTH.TOTAL.TiTv_ratio\""
         ));
+    }
+
+    #[test]
+    fn compact_metric_recovers_the_pandas_numeric_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("summary.csv");
+        fs::write(&csv, "Type,METRIC.Recall\nINDEL,0.87714\n").unwrap();
+
+        let json = table_json("summary.metrics", "summary.metrics", &csv).unwrap();
+        assert!(json.contains(
+            "\"values\":[0.8771399999999999],\"type\":\"double\",\"id\":\"METRIC.Recall\""
+        ));
+    }
+
+    #[test]
+    fn json_float_notation_matches_pinned_python_two_bytes() {
+        let below_upper = f64::from_bits(1e16_f64.to_bits() - 1).to_string();
+        let below_lower = f64::from_bits(1e-4_f64.to_bits() - 1).to_string();
+        let values = [
+            "1000000000000",
+            "1000000000000000",
+            below_upper.as_str(),
+            "10000000000000000",
+            below_lower.as_str(),
+            "0.0001",
+        ];
+        let rows = vec![Vec::new(); values.len()];
+        let json = column_json(
+            "thresholds",
+            "thresholds",
+            "double",
+            &values,
+            &[],
+            &rows,
+            None,
+            None,
+        );
+        assert_eq!(
+            json,
+            "{\"values\":[1000000000000.0,1000000000000000.0,9999999999999998.0,1e+16,9.999999999999999e-05,0.0001],\"type\":\"double\",\"id\":\"thresholds\",\"label\":\"thresholds\"}"
+        );
     }
 
     #[test]

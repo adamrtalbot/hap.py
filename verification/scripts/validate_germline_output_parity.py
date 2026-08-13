@@ -7,8 +7,8 @@ import sys
 
 prefix = Path(sys.argv[1])
 comparison = Path(sys.argv[2])
-expected_metric = "0.14285699999999998"
-expected_ratio = "1.3333333333333333"
+expected_metric = "0.142857"
+expected_ratio = "1.33333333333"
 csv_suffixes = [
     "summary.csv",
     "extended.csv",
@@ -34,6 +34,16 @@ for suffix in csv_suffixes:
 metrics_path = prefix.with_name(f"{prefix.name}.metrics.json.gz")
 with gzip.open(metrics_path, "rt", encoding="utf-8") as handle:
     metrics = json.load(handle)["metrics"]
+
+summary = next((table for table in metrics if table.get("id") == "summary.metrics"), None)
+if summary is None:
+    errors.append(f"{metrics_path.name}: missing table summary.metrics")
+else:
+    recall = next((item for item in summary["data"] if item.get("id") == "METRIC.Recall"), None)
+    if recall is None or 0.14285699999999998 not in recall.get("values", []):
+        errors.append(
+            f"{metrics_path.name}: missing numeric METRIC.Recall=0.14285699999999998"
+        )
 
 location_ids = {
     "roc.Locations.SNP.PASS",
