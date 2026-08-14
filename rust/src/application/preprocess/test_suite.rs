@@ -15,6 +15,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_only_passthrough_merge_partner_retains_its_internal_edit() {
+        let mut record = make_record("0/1");
+        record.pos = 17;
+        record.ref_allele = "AC".to_string();
+        record.alt_allele = "A".to_string();
+
+        assign_passthrough_primitive_identity(&mut record);
+
+        let identity = record
+            .primitive_identity
+            .expect("single-allele passthrough identity");
+        assert_eq!(identity.start, 17);
+        assert_eq!(identity.end, 18);
+        assert_eq!(identity.alt, "A");
+
+        let mut multi = make_record("1/2");
+        multi.alt_allele = "C,G".to_string();
+        assign_passthrough_primitive_identity(&mut multi);
+        assert!(multi.primitive_identity.is_none());
+    }
+
+    #[test]
     fn filters_only_removes_records_carrying_only_selected_filters() {
         assert!(passes_filters_only("PASS", Some("LowQual,q10")));
         assert!(passes_filters_only(".", Some("LowQual,q10")));
@@ -1051,6 +1073,7 @@ mod tests {
             format: None,
             samples: vec![],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         }
     }
 
@@ -1955,6 +1978,52 @@ mod tests {
         assert_eq!(records[0].alt_allele, "ATCTC");
         assert_eq!(records[0].qual, "0");
         assert_eq!(records[0].samples, ["0/1:5,7:0:0"]);
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_internal_edits_can_serialize_as_duplicate_alleles() -> Result<()> {
+        let directory = tempdir()?;
+        let input = directory.path().join("input.vcf");
+        let reference = directory.path().join("ref.fa");
+        let output = directory.path().join("output.vcf.gz");
+        fs::write(
+            &input,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "##contig=<ID=chr1,length=20>\n",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+                // The direct insertion and the insertion produced by the complex
+                // allele are distinct internal edits before padding. They serialize
+                // identically afterward, so legacy preserves both ALT entries.
+                "chr1\t6\t.\tA\tAGTGTGTGT\t.\tPASS\t.\tGT\t0|1\n",
+                // Both SNPs are the same internal edit and collapse to one hom-alt.
+                "chr1\t6\t.\tA\tT\t.\tPASS\t.\tGT\t1|0\n",
+                "chr1\t6\t.\tA\tTGTGTGTGT\t.\tPASS\t.\tGT\t1|0\n",
+            ),
+        )?;
+        fs::write(&reference, ">chr1\nAAAAAAGCTAGCTAGCTAGC\n")?;
+
+        let mut args = interval_args(&input, &output, &reference, None, None);
+        args.decompose = true;
+        args.leftshift = true;
+        args.window_size = 4096;
+        run(args)?;
+
+        let (_, records) = vcf::load_raw_vcf(&output)?;
+        let insertion = records
+            .iter()
+            .find(|record| record.alt_allele.contains("AGTGTGTGT"))
+            .expect("duplicate insertion aggregate");
+        assert_eq!(insertion.alt_allele, "AGTGTGTGT,AGTGTGTGT");
+        assert_eq!(insertion.samples[0].split(':').next(), Some("2/1"));
+
+        let snp = records
+            .iter()
+            .find(|record| record.alt_allele == "T")
+            .expect("exact-duplicate SNP aggregate");
+        assert_eq!(snp.samples[0].split(':').next(), Some("1/1"));
         Ok(())
     }
 

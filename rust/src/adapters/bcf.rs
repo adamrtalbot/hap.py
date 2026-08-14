@@ -642,6 +642,7 @@ fn decode_record(
         format: (!format.is_empty()).then(|| format.join(":")),
         samples: samples.into_iter().map(|cells| cells.join(":")).collect(),
         mixed_edit_primitive: false,
+        primitive_identity: None,
     })
 }
 
@@ -1372,6 +1373,7 @@ mod tests {
                 "0/1:8,9,0:.:value".to_string(),
             ],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         }];
         write(&output, &headers, &records)?;
         let data = read_uncompressed(&output)?;
@@ -1503,6 +1505,7 @@ mod tests {
             format: Some("GT".into()),
             samples: vec!["0/1".into()],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         }];
         write(&output, &headers, &records)?;
         let seed = read_uncompressed(&output)?;
@@ -1545,6 +1548,7 @@ mod tests {
             format: Some("GT".into()),
             samples: vec!["0/1".into()],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         }];
         write(&output, &headers, &records)?;
         let seed = read_uncompressed(&output)?;

@@ -260,6 +260,7 @@ impl RawVcfRecord {
                 Vec::new()
             },
             mixed_edit_primitive: false,
+            primitive_identity: None,
         })
     }
 

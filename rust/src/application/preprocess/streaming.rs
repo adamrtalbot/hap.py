@@ -2,7 +2,7 @@
 
 use super::{LEFT_SHIFT_WINDOW, SymbolicDeletionMaterialization};
 use crate::adapters::vcf::{ValidatedVcfReader, ValidatedVcfRecord};
-use crate::domain::{QueryProvenance, RawVcfRecord};
+use crate::domain::{PrimitiveIdentity, QueryProvenance, RawVcfRecord};
 use anyhow::{Context, Result};
 use std::cmp::Reverse;
 use std::collections::VecDeque;
@@ -13,6 +13,28 @@ use std::path::Path;
 
 const PREPROCESS_SORT_CHUNK_RECORDS: usize = 65_536;
 const PREPROCESS_SORT_MERGE_FAN_IN: usize = 32;
+const PREPROCESS_SORT_CHUNK_VERSION: &str = "v2";
+
+fn write_preprocess_sort_record(
+    writer: &mut impl Write,
+    rank: usize,
+    pos: usize,
+    serial: usize,
+    record: &RawVcfRecord,
+) -> Result<()> {
+    let (identity_present, identity_start, identity_end, identity_alt) =
+        match record.primitive_identity.as_ref() {
+            Some(identity) => (1, identity.start, identity.end, identity.alt.as_str()),
+            None => (0, 0, 0, "."),
+        };
+    writeln!(
+        writer,
+        "{PREPROCESS_SORT_CHUNK_VERSION}\t{rank}\t{pos}\t{serial}\t{}\t{identity_present}\t{identity_start}\t{identity_end}\t{identity_alt}\t{}",
+        u8::from(record.mixed_edit_primitive),
+        record.to_line()
+    )?;
+    Ok(())
+}
 
 pub(super) struct PreparedRecordSpool {
     path: tempfile::TempPath,
@@ -196,6 +218,7 @@ fn decode_raw_record(reader: &mut impl Read) -> Result<RawVcfRecord> {
         format,
         samples,
         mixed_edit_primitive: false,
+        primitive_identity: None,
     })
 }
 
@@ -357,12 +380,7 @@ impl PreprocessSpool {
         let mut chunk =
             tempfile::NamedTempFile::new().context("failed to create preprocess sort chunk")?;
         for (rank, pos, serial, record) in self.buffer.drain(..) {
-            writeln!(
-                chunk.as_file_mut(),
-                "{rank}\t{pos}\t{serial}\t{}\t{}",
-                u8::from(record.mixed_edit_primitive),
-                record.to_line()
-            )?;
+            write_preprocess_sort_record(chunk.as_file_mut(), rank, pos, serial, &record)?;
         }
         chunk.as_file_mut().flush()?;
         self.chunks.push(chunk.into_temp_path());
@@ -529,7 +547,13 @@ impl ExternalRecordMerge {
             return Ok(());
         }
         let line = line.trim_end_matches(['\r', '\n']);
-        let mut fields = line.splitn(5, '\t');
+        let mut fields = line.splitn(10, '\t');
+        let version = fields
+            .next()
+            .context("preprocess sort chunk lacks version")?;
+        if version != PREPROCESS_SORT_CHUNK_VERSION {
+            anyhow::bail!("unsupported preprocess sort chunk version {version}");
+        }
         let rank = fields
             .next()
             .context("preprocess sort chunk lacks rank")?
@@ -550,6 +574,27 @@ impl ExternalRecordMerge {
             "1" => true,
             marker => anyhow::bail!("invalid preprocess mixed-edit marker {marker}"),
         };
+        let identity_present = fields
+            .next()
+            .context("preprocess sort chunk lacks primitive-identity marker")?;
+        let identity_start = fields
+            .next()
+            .context("preprocess sort chunk lacks primitive-identity start")?;
+        let identity_end = fields
+            .next()
+            .context("preprocess sort chunk lacks primitive-identity end")?;
+        let identity_alt = fields
+            .next()
+            .context("preprocess sort chunk lacks primitive-identity ALT")?;
+        let primitive_identity = match identity_present {
+            "0" => None,
+            "1" => Some(PrimitiveIdentity {
+                start: identity_start.parse()?,
+                end: identity_end.parse()?,
+                alt: identity_alt.to_string(),
+            }),
+            marker => anyhow::bail!("invalid preprocess primitive-identity marker {marker}"),
+        };
         let mut raw = RawVcfRecord::from_line(
             fields
                 .next()
@@ -557,6 +602,7 @@ impl ExternalRecordMerge {
             Path::new("preprocess-sort-chunk"),
         )?;
         raw.mixed_edit_primitive = mixed_edit_primitive;
+        raw.primitive_identity = primitive_identity;
         let provenance = QueryProvenance::source(serial % self.stream_count, self.stream_count)?;
         let record = ValidatedVcfRecord::try_from_raw(raw, provenance)?;
         self.current[index] = Some(((rank, pos, serial), record));
@@ -609,12 +655,7 @@ fn collapse_preprocess_chunks(
                 let mut merge = ExternalRecordMerge::open(batch, stream_count)?;
                 while let Some(entry) = merge.next_keyed() {
                     let ((rank, pos, serial), record) = entry?;
-                    writeln!(
-                        writer,
-                        "{rank}\t{pos}\t{serial}\t{}\t{}",
-                        u8::from(record.raw().mixed_edit_primitive),
-                        record.raw().to_line()
-                    )?;
+                    write_preprocess_sort_record(&mut writer, rank, pos, serial, record.raw())?;
                 }
                 writer.flush()?;
             }
@@ -623,4 +664,71 @@ fn collapse_preprocess_chunks(
         chunks = merged;
     }
     Ok(chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(pos: usize, identity: Option<PrimitiveIdentity>) -> RawVcfRecord {
+        RawVcfRecord {
+            chrom: "chr1".to_string(),
+            pos,
+            id: ".".to_string(),
+            ref_allele: "A".to_string(),
+            alt_allele: "T".to_string(),
+            qual: "0".to_string(),
+            filter: "PASS".to_string(),
+            info: ".".to_string(),
+            format: Some("GT".to_string()),
+            samples: vec!["0/1".to_string()],
+            mixed_edit_primitive: false,
+            primitive_identity: identity,
+        }
+    }
+
+    #[test]
+    fn legacy_only_primitive_identity_survives_multi_pass_chunk_rewrite() -> Result<()> {
+        let mut chunks = Vec::new();
+        for serial in 0..=PREPROCESS_SORT_MERGE_FAN_IN {
+            let identity = (serial % 2 == 0).then(|| PrimitiveIdentity {
+                start: serial + 1,
+                end: serial,
+                alt: format!("I{serial}"),
+            });
+            let mut chunk = tempfile::NamedTempFile::new()?;
+            write_preprocess_sort_record(
+                chunk.as_file_mut(),
+                0,
+                serial + 1,
+                serial,
+                &record(serial + 1, identity),
+            )?;
+            chunk.as_file_mut().flush()?;
+            chunks.push(chunk.into_temp_path());
+        }
+
+        let collapsed = collapse_preprocess_chunks(chunks, 1)?;
+        assert_eq!(collapsed.len(), 2, "33 chunks require one rewrite pass");
+        let observed = ExternalRecordMerge::open(collapsed, 1)?
+            .map(|entry| entry.map(|record| record.into_raw().primitive_identity))
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(observed.len(), PREPROCESS_SORT_MERGE_FAN_IN + 1);
+        for (serial, identity) in observed.into_iter().enumerate() {
+            if serial % 2 == 0 {
+                assert_eq!(
+                    identity,
+                    Some(PrimitiveIdentity {
+                        start: serial + 1,
+                        end: serial,
+                        alt: format!("I{serial}"),
+                    })
+                );
+            } else {
+                assert!(identity.is_none());
+            }
+        }
+        Ok(())
+    }
 }

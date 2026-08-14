@@ -375,6 +375,9 @@ fn prepare_records(
     let mut output = Vec::with_capacity(records.len());
     let mut seen = HashSet::new();
     for mut record in records {
+        if crate::application::preprocess::calls_non_ref_allele(&record) {
+            continue;
+        }
         if args.fixchr {
             record.chrom = legacy_fix_chrom(&record.chrom);
         }
@@ -661,12 +664,30 @@ mod tests {
     }
 
     #[test]
-    fn called_final_non_ref_alleles_are_retained_like_legacy_ftx() {
+    fn legacy_only_called_final_non_ref_alleles_are_removed_by_ftx() {
         let (_scratch, input, reference) = fixture(
             concat!(
                 "##fileformat=VCFv4.2\n",
                 "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNORMAL\tTUMOR\n",
                 "chr1\t1\tcalled\tA\tC,<NON_REF>\t60\tPASS\t.\tGT\t0/1\t0|2\n",
+            ),
+            ">chr1\nAAAA\n",
+        );
+        let sequences = fasta::read_sequences(&reference).unwrap();
+        let contigs = sequences.keys().cloned().collect();
+
+        let (_, records) =
+            prepare_records(&args(&input, &reference), &sequences, &contigs).unwrap();
+
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn normative_uncalled_or_nonfinal_non_ref_alleles_are_retained_by_ftx() {
+        let (_scratch, input, reference) = fixture(
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNORMAL\tTUMOR\n",
                 "chr1\t2\tuncalled\tA\tC,<NON_REF>\t60\tPASS\t.\tGT\t0/1\t0/0\n",
                 "chr1\t3\tnot-final\tA\t<NON_REF>,C\t60\tPASS\t.\tGT\t0/1\t0/0\n",
             ),
@@ -683,7 +704,7 @@ mod tests {
                 .iter()
                 .map(|record| record.id.as_str())
                 .collect::<Vec<_>>(),
-            ["called", "uncalled", "not-final"]
+            ["uncalled", "not-final"]
         );
     }
 
@@ -841,6 +862,7 @@ mod tests {
                 "20:0:0:0,0:20,20:0,0:0,0".to_string(),
             ],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         };
         let headers = vec!["##MaxDepth_chr1=100".to_string()];
         let depths = BTreeMap::from([("chr1".to_string(), 50.0)]);

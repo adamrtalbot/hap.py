@@ -13,7 +13,18 @@ use std::path::Path;
 
 const COMPARISON_ROW_CHUNK: usize = 65_536;
 const COMPARISON_MERGE_FAN_IN: usize = 32;
-type ComparisonSortKey = (String, usize, u8, String, String, u8, String, usize);
+type ComparisonSortKey = (
+    String,
+    usize,
+    u8,
+    usize,
+    usize,
+    String,
+    String,
+    u8,
+    String,
+    usize,
+);
 
 fn legacy_same_key_rank(samples: &[String]) -> u8 {
     if samples
@@ -56,10 +67,16 @@ impl ComparisonRowSpool {
         sort_line: String,
     ) -> Result<()> {
         let raw = row.record.raw();
+        // Pinned classified VCFs first group filtered truth matches, then keep
+        // the side/type ranks assigned by row construction before comparing
+        // allele spelling. The HG001 graph-order rule therefore remains the
+        // leading rank while ordinary truth/query row precedence is retained.
         let key = (
             row.sort_key.0.clone(),
             row.sort_key.1,
             u8::from(!filtered_truth_match),
+            row.sort_key.2,
+            row.sort_key.3,
             raw.ref_allele.clone(),
             raw.alt_allele.clone(),
             legacy_same_key_rank(&raw.samples),
@@ -196,15 +213,17 @@ fn write_comparison_spool_row(
 ) -> Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         key.0,
         key.1,
         key.2,
         key.3,
         key.4,
         key.5,
+        key.6,
         key.7,
-        hex_encode(key.6.as_bytes()),
+        key.9,
+        hex_encode(key.8.as_bytes()),
         u8::from(row.query_pass),
         row.fp_class.unwrap_or("."),
         row.xcmp_ctype.unwrap_or("."),
@@ -215,7 +234,7 @@ fn write_comparison_spool_row(
 }
 
 fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, AnnotatedRow)> {
-    let mut fields = line.splitn(13, '\t');
+    let mut fields = line.splitn(15, '\t');
     let chrom = fields
         .next()
         .context("comparison spool lacks chromosome")?
@@ -227,6 +246,14 @@ fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, Annotate
     let filtered = fields
         .next()
         .context("comparison spool lacks filtered rank")?
+        .parse()?;
+    let row_side_rank = fields
+        .next()
+        .context("comparison spool lacks row side rank")?
+        .parse()?;
+    let row_type_rank = fields
+        .next()
+        .context("comparison spool lacks row type rank")?
         .parse()?;
     let reference = fields
         .next()
@@ -272,6 +299,8 @@ fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, Annotate
         chrom.clone(),
         pos,
         filtered,
+        row_side_rank,
+        row_type_rank,
         reference,
         alternate,
         same_key_rank,
@@ -281,7 +310,7 @@ fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, Annotate
     Ok((
         key,
         AnnotatedRow {
-            sort_key: (chrom, pos, 0, 0),
+            sort_key: (chrom, pos, row_side_rank, row_type_rank),
             record: record.into(),
             query_pass,
             fp_class,
@@ -349,31 +378,6 @@ fn collapse_comparison_chunks(
         chunks = merged;
     }
     Ok(chunks)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::legacy_same_key_rank;
-
-    #[test]
-    fn duplicate_keys_order_truth_then_query_homalt_then_query_het() {
-        let truth_only = vec![
-            "0/1:UNK:lm:i6_15:INDEL:het:.".to_string(),
-            "./.:.:.:.:NOCALL:nocall:0".to_string(),
-        ];
-        let query_homalt = vec![
-            "./.:.:.:.:NOCALL:nocall:.".to_string(),
-            "1/1:UNK:lm:i6_15:INDEL:homalt:0".to_string(),
-        ];
-        let query_het = vec![
-            "./.:.:.:.:NOCALL:nocall:.".to_string(),
-            "1/0:UNK:.:ti:SNP:het:0".to_string(),
-        ];
-
-        assert_eq!(legacy_same_key_rank(&truth_only), 0);
-        assert_eq!(legacy_same_key_rank(&query_homalt), 1);
-        assert_eq!(legacy_same_key_rank(&query_het), 2);
-    }
 }
 
 pub(super) struct ComparisonContigSpool {
@@ -527,5 +531,104 @@ impl ComparisonMetadataCursor {
             decorations.observe(record, preserve_info, roc_field);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComparisonRowSpool, legacy_same_key_rank};
+    use crate::application::compare::AnnotatedRow;
+    use crate::domain::RawVcfRecord;
+
+    fn row(
+        reference: &str,
+        alternate: &str,
+        side_rank: usize,
+        samples: Vec<String>,
+    ) -> AnnotatedRow {
+        let raw = RawVcfRecord {
+            chrom: "chr1".to_string(),
+            pos: 25,
+            id: ".".to_string(),
+            ref_allele: reference.to_string(),
+            alt_allele: alternate.to_string(),
+            qual: "60".to_string(),
+            filter: ".".to_string(),
+            info: ".".to_string(),
+            format: Some("GT:BD:BK:BI:BVT:BLT:QQ".to_string()),
+            samples,
+            mixed_edit_primitive: false,
+            primitive_identity: None,
+        };
+        AnnotatedRow {
+            sort_key: ("chr1".to_string(), 25, 1, side_rank),
+            record: raw.into(),
+            query_pass: true,
+            fp_class: None,
+            xcmp_ctype: None,
+            xcmp_hap_match: false,
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_order_truth_then_query_homalt_then_query_het() {
+        let truth_only = vec![
+            "0/1:UNK:lm:i6_15:INDEL:het:.".to_string(),
+            "./.:.:.:.:NOCALL:nocall:0".to_string(),
+        ];
+        let query_homalt = vec![
+            "./.:.:.:.:NOCALL:nocall:.".to_string(),
+            "1/1:UNK:lm:i6_15:INDEL:homalt:0".to_string(),
+        ];
+        let query_het = vec![
+            "./.:.:.:.:NOCALL:nocall:.".to_string(),
+            "1/0:UNK:.:ti:SNP:het:0".to_string(),
+        ];
+
+        assert_eq!(legacy_same_key_rank(&truth_only), 0);
+        assert_eq!(legacy_same_key_rank(&query_homalt), 1);
+        assert_eq!(legacy_same_key_rank(&query_het), 2);
+    }
+
+    #[test]
+    fn production_spool_preserves_truth_before_query_row_rank() {
+        let query = row(
+            "A",
+            "G",
+            1,
+            vec![
+                "./.:.:.:.:NOCALL:nocall:.".to_string(),
+                "0/1:TP:gm:ti:SNP:het:55".to_string(),
+            ],
+        );
+        let truth = row(
+            "ACG",
+            "GTA",
+            0,
+            vec![
+                "0/1:TP:gm:ti:SNP:het:45".to_string(),
+                "./.:.:.:.:NOCALL:nocall:0".to_string(),
+            ],
+        );
+        let mut spool = ComparisonRowSpool::new();
+        spool
+            .push(query, false, "query".to_string())
+            .expect("query row spools");
+        spool
+            .push(truth, false, "truth".to_string())
+            .expect("truth row spools");
+
+        let rows = spool
+            .finish()
+            .expect("spool finishes")
+            .rows()
+            .expect("spool opens")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows decode");
+
+        assert_eq!(rows[0].sort_key.3, 0);
+        assert_eq!(rows[0].record.raw().ref_allele, "ACG");
+        assert_eq!(rows[1].sort_key.3, 1);
+        assert_eq!(rows[1].record.raw().ref_allele, "A");
     }
 }

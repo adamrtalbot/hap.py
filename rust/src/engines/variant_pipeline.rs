@@ -10,9 +10,9 @@
 //!   its primitive SNP / pure-insertion / pure-deletion components via
 //!   [`crate::align::realign_ref_var`] and emit one VCF record per
 //!   primitive.  AD is projected from the original allele list down to
-//!   `[AD[0], AD[i+1]]` per split; GT is canonicalized to `0/1` (het) or
-//!   `1/1` (hom-alt); each primitive carries the same QUAL/FILTER/INFO as
-//!   the parent.
+//!   `[AD[0], AD[i+1]]` per split; GT is emitted unphased as `0/1` for a
+//!   passthrough het, `1/0` for a realigned het, or `1/1` for hom-alt; each
+//!   primitive carries the same QUAL/FILTER/INFO as the parent.
 //!
 //! * **Stage 6 — VariantAlleleNormalizer 2nd pass** (folded into the
 //!   anchoring step for now)
@@ -34,10 +34,13 @@
 //! lengths fan out into separate per-position records. Either way, byte
 //! parity with legacy comes from one code path.
 
-use crate::domain::RawVcfRecord;
+use crate::domain::{PrimitiveIdentity, RawVcfRecord};
 use crate::engines::align;
 use crate::engines::partial_credit::{self, RefVar};
 use std::collections::BTreeMap;
+
+type TaggedPrimitive = (RefVar, bool);
+type AllelePrimitives = (usize, bool, Vec<TaggedPrimitive>);
 
 /// Decompose any multi-allelic indel record into primitive per-position
 /// records and re-aggregate primitives that land at the same position.
@@ -81,6 +84,13 @@ pub(crate) fn primitive_split_with_context(
     // (reflen > 1 && altlen > 1) — same-position primitives re-merge below.
     if !needs_primitive_split(record, &alts) {
         let mut passthrough = record.clone();
+        if alts.len() == 1 {
+            passthrough.primitive_identity = Some(PrimitiveIdentity {
+                start: record.pos,
+                end: record.pos + record.ref_allele.len().saturating_sub(1),
+                alt: alts[0].to_string(),
+            });
+        }
         // Even for passthrough records the legacy aggregator's reversed
         // het-of-alts GT order applies — see `merge_records` for the
         // derivation. Apply the swap unconditionally here so SNP-only
@@ -93,7 +103,7 @@ pub(crate) fn primitive_split_with_context(
     }
 
     // Per-allele decomposition into primitive RefVars.
-    let mut primitives: Vec<(usize, bool, Vec<RefVar>)> = Vec::with_capacity(alts.len());
+    let mut primitives: Vec<AllelePrimitives> = Vec::with_capacity(alts.len());
     for (idx, alt) in alts.iter().enumerate() {
         primitives.push((
             idx,
@@ -123,7 +133,7 @@ pub(crate) fn primitive_split_with_context(
     let mut output: Vec<(RawVcfRecord, bool)> = Vec::new();
     for (allele_idx, preserve_mixed_anchor, prims) in primitives {
         let target = (allele_idx + 1) as u32;
-        for prim in prims {
+        for (prim, was_realigned) in prims {
             if let Some(rec) = primitive_to_record(
                 record,
                 &prim,
@@ -133,6 +143,7 @@ pub(crate) fn primitive_split_with_context(
                 &format_keys,
                 reference,
                 preserve_mixed_anchor,
+                was_realigned,
                 previous_end,
                 has_following_spanning_deletion,
                 equal_floor_blocked,
@@ -345,7 +356,7 @@ fn allele_has_mixed_edit(reference: &str, alternate: &str) -> bool {
 /// convention. Mirrors the per-allele body of
 /// `VariantPrimitiveSplitter::advance` plus its post-trim realign-or-passthrough
 /// guard (`src/c++/lib/variant/VariantPrimitiveSplitter.cpp:135-178`).
-fn allele_primitives(record: &RawVcfRecord, alt: &str, reference: &[u8]) -> Vec<RefVar> {
+fn allele_primitives(record: &RawVcfRecord, alt: &str, reference: &[u8]) -> Vec<(RefVar, bool)> {
     let original = RefVar {
         start: record.pos,
         end: record.pos + record.ref_allele.len().saturating_sub(1),
@@ -369,10 +380,13 @@ fn allele_primitives(record: &RawVcfRecord, alt: &str, reference: &[u8]) -> Vec<
             Vec::new()
         };
         align::realign_ref_var(probe.start, &ref_bytes, probe.alt.as_bytes())
+            .into_iter()
+            .map(|primitive| (primitive, true))
+            .collect()
     } else {
         // Pass the ORIGINAL untrimmed RefVar through — leftshift in stage 6
         // handles its trim-and-slide differently than this pre-check would.
-        vec![original]
+        vec![(original, false)]
     }
 }
 
@@ -392,6 +406,7 @@ fn primitive_to_record(
     format_keys: &[String],
     reference: &[u8],
     preserve_mixed_anchor: bool,
+    was_realigned: bool,
     previous_end: usize,
     has_following_spanning_deletion: bool,
     equal_floor_blocked: bool,
@@ -478,10 +493,15 @@ fn primitive_to_record(
             ad_index,
             gt_index,
             format_keys.len(),
-            preserve_mixed_anchor,
+            was_realigned,
         ));
     }
     out.samples = new_samples;
+    out.primitive_identity = Some(PrimitiveIdentity {
+        start: prim.start,
+        end: prim.end,
+        alt: prim.alt.clone(),
+    });
     Some(out)
 }
 
@@ -542,14 +562,12 @@ fn project_ad(ad: &str, target: u32) -> String {
     format!("{ref_depth},{alt_depth}")
 }
 
-/// Canonicalise a split-allele GT to the legacy form. Matches what the
-/// legacy primitive splitter emits: het calls become `1/0`, hom-alt calls
-/// become `1/1`, no-call passes through unchanged.
+/// Canonicalise a split-allele GT to the unphased legacy form. Het calls become
+/// `0/1`, hom-alt calls become `1/1`, and no-call passes through unchanged.
 fn canonical_split_gt(gt: &str, target: u32) -> String {
     if gt == "." || gt == "./." || gt == ".|." || gt.is_empty() {
         return gt.to_string();
     }
-    let separator = if gt.contains('|') { '|' } else { '/' };
     let mut tokens: Vec<i32> = Vec::new();
     for tok in gt.split(['/', '|']) {
         match tok.parse::<i32>() {
@@ -558,14 +576,6 @@ fn canonical_split_gt(gt: &str, target: u32) -> String {
         }
     }
     let target_i = target as i32;
-    if tokens.len() == 2 {
-        let selected = tokens.iter().filter(|allele| **allele == target_i).count();
-        return match selected {
-            2 => "1/1".to_string(),
-            1 => "1/0".to_string(),
-            _ => "0/0".to_string(),
-        };
-    }
     let mut projected = tokens
         .iter()
         .map(|allele| if *allele == target_i { 1 } else { 0 })
@@ -575,7 +585,7 @@ fn canonical_split_gt(gt: &str, target: u32) -> String {
         .iter()
         .map(i32::to_string)
         .collect::<Vec<_>>()
-        .join(&separator.to_string())
+        .join("/")
 }
 
 /// Stage 7 — aggregate primitives that landed at the same anchor position
@@ -724,6 +734,7 @@ fn merge_records(
         new_samples.push(cells.join(":"));
     }
     base.samples = new_samples;
+    base.primitive_identity = None;
     base
 }
 
@@ -942,21 +953,21 @@ fn aggregate_location_records_inner(
         record.alt_allele.push_str(suffix);
     }
     if records[0].alt_allele == records[1].alt_allele {
-        // Two independently emitted heterozygous copies of the same allele
-        // occupy both genotype slots in VariantLocationAggregator. This
-        // occurs when a complex allele contributes the same SNP as an
-        // adjacent biallelic record (C>A plus CAG>A => C>A 1/1 and CAG>C).
-        //
-        // Known gap: when the two copies sit on *opposite* source haplotypes
-        // the aggregator lists both instead of folding them, so pre.py emits
-        // `ALT=X,X` with `GT=2/1` (quantify still renders that as one hom-alt
-        // row). xcmp reads the het-alt genotype and builds two heterozygous
-        // alternative nodes where this `1/1` spelling builds one homozygous
-        // node every enumerated path must use — the residual difference at
-        // chr6:141113704, where the fold leaves no path at all and turns
-        // legacy's `hap:mismatch` into `hapfail`. Closing it needs the
-        // matching hom-alt collapse in the row emitter, which belongs with the
-        // `hap pre` lane rather than this one.
+        // VariantAlleleUniq.cpp keys alleles on their internal RefVar before
+        // final VCF padding. Exact internal duplicates collapse to one hom-alt.
+        // Distinct edits can serialize to the same padded REF/ALT spelling;
+        // legacy preserves both ALT entries and their aggregator-derived
+        // het-alt genotype. xcmp's VariantReader.cpp then deduplicates those
+        // spellings when it reads the VCF.
+        let distinct_internal_edits = records[0]
+            .primitive_identity
+            .as_ref()
+            .zip(records[1].primitive_identity.as_ref())
+            .is_some_and(|(first, second)| first != second);
+        if distinct_internal_edits {
+            let merged = merge_records(records, ad_index, Some(gt_index));
+            return vec![merged];
+        }
         let mut merged = records.remove(0);
         for sample in &mut merged.samples {
             let mut cells = sample.split(':').map(str::to_string).collect::<Vec<_>>();
@@ -965,6 +976,7 @@ fn aggregate_location_records_inner(
             }
             *sample = cells.join(":");
         }
+        merged.primitive_identity = None;
         return vec![merged];
     }
 
@@ -1019,12 +1031,20 @@ fn merge_unphased_genotypes(genotypes: &[&str]) -> String {
     } else if alt_calls.len() == 1 {
         format!("0/{}", alt_calls[0])
     } else {
-        if genotypes.len() == 2 && genotypes.iter().all(|genotype| *genotype == "1/0") {
-            // Two complex primitives already carry the legacy reversed
-            // single-call orientation. Their distinct alleles nevertheless
-            // occupy source haplotypes in forward order (1/2), as at the
-            // GIAB A>GG plus A>GGG location.
-            return "1/2".to_string();
+        if genotypes.len() == 2
+            && genotypes
+                .iter()
+                .all(|genotype| matches!(*genotype, "0/1" | "1/0"))
+        {
+            // VariantLocationMap.cpp fills the buffered call's remaining zero
+            // slot. The first call therefore decides whether the later
+            // alternate lands before (`0/1` -> `2/1`) or after (`1/0` ->
+            // `1/2`) the buffered alternate, independently for every sample.
+            return if genotypes[0] == "1/0" {
+                "1/2".to_string()
+            } else {
+                "2/1".to_string()
+            };
         }
         // `VariantLocationAggregator` fills the last zero slot first,
         // yielding the later alternate before the earlier one.
@@ -1058,6 +1078,7 @@ mod tests {
             format: Some(format.into()),
             samples: vec![sample.into()],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         }
     }
 
@@ -1469,17 +1490,17 @@ mod tests {
     }
 
     #[test]
-    fn split_genotypes_use_legacy_alt_then_ref_order() {
-        assert_eq!(canonical_split_gt("1|2", 1), "1/0");
-        assert_eq!(canonical_split_gt("1|2", 2), "1/0");
-        assert_eq!(canonical_split_gt("2|1", 1), "1/0");
-        assert_eq!(canonical_split_gt("2|1", 2), "1/0");
+    fn split_genotypes_are_unphased_before_realignment_orientation() {
+        assert_eq!(canonical_split_gt("1|2", 1), "0/1");
+        assert_eq!(canonical_split_gt("1|2", 2), "0/1");
+        assert_eq!(canonical_split_gt("2|1", 1), "0/1");
+        assert_eq!(canonical_split_gt("2|1", 2), "0/1");
     }
 
     #[test]
-    fn phased_insertions_remain_phased_after_alt_reordering() {
+    fn passthrough_insertions_are_unphased_after_alt_reordering() {
         let reference = windowed_ref(11_101_380, b"NNNNNNTNNNN");
-        for (input_gt, expected_gt) in [("1|2", "2|1"), ("2|1", "1|2")] {
+        for input_gt in ["1|2", "2|1"] {
             let sample = format!("{input_gt}:2,36,137");
             let record = make_record("chr21", 11_101_386, "T", "TTG,TG", "GT:AD", &sample);
 
@@ -1487,7 +1508,7 @@ mod tests {
 
             assert_eq!(output.len(), 1);
             assert_eq!(output[0].alt_allele, "TG,TTG");
-            assert_eq!(output[0].samples[0].split(':').next(), Some(expected_gt));
+            assert_eq!(output[0].samples[0].split(':').next(), Some("2/1"));
         }
     }
 
@@ -1622,6 +1643,40 @@ mod tests {
     }
 
     #[test]
+    fn normative_non_realignable_mixed_allele_uses_canonical_unphased_het() {
+        let reference = windowed_ref(100, b"NNNNNCANNNNN");
+        for input_gt in ["0/1", "1|0"] {
+            let sample = format!("{input_gt}:5,9");
+            let record = make_record("chr1", 105, "CA", "CG", "GT:AD", &sample);
+
+            let output = primitive_split(&record, &reference);
+
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].ref_allele, "CA");
+            assert_eq!(output[0].alt_allele, "CG");
+            assert_eq!(output[0].samples[0], "0/1:5,9");
+        }
+    }
+
+    #[test]
+    fn legacy_only_realigned_mixed_allele_uses_reversed_unphased_het() {
+        let reference = windowed_ref(100, b"NNNNNANNNNN");
+        for input_gt in ["0/1", "0|1"] {
+            let sample = format!("{input_gt}:5,9");
+            let record = make_record("chr1", 105, "A", "TT", "GT:AD", &sample);
+
+            let output = primitive_split(&record, &reference);
+
+            assert_eq!(output.len(), 2);
+            assert!(
+                output
+                    .iter()
+                    .all(|primitive| primitive.samples[0] == "1/0:5,9")
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_snp_primitives_fill_both_genotype_slots() {
         let first = make_record("chr1", 105, "C", "A", "GT:AD", "1/0:5,9");
         let second = make_record("chr1", 105, "C", "A", "GT:AD", "1/0:5,9");
@@ -1631,6 +1686,94 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].alt_allele, "A");
         assert_eq!(out[0].samples[0], "1/1:5,9");
+    }
+
+    #[test]
+    fn legacy_only_distinct_internal_edits_keep_duplicate_padded_alleles() {
+        let mut direct = make_record("chr1", 105, "A", "AT", "GT", "0/1");
+        direct.primitive_identity = Some(PrimitiveIdentity {
+            start: 105,
+            end: 105,
+            alt: "AT".to_string(),
+        });
+        let mut realigned = make_record("chr1", 105, "A", "AT", "GT", "1/0");
+        realigned.mixed_edit_primitive = true;
+        realigned.primitive_identity = Some(PrimitiveIdentity {
+            start: 106,
+            end: 105,
+            alt: "T".to_string(),
+        });
+
+        let out = aggregate_location_records(vec![direct, realigned]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alt_allele, "AT,AT");
+        assert_eq!(out[0].samples[0], "2/1");
+    }
+
+    #[test]
+    fn normative_exact_internal_edits_collapse_duplicate_padded_alleles() {
+        let identity = PrimitiveIdentity {
+            start: 105,
+            end: 105,
+            alt: "AT".to_string(),
+        };
+        let mut first = make_record("chr1", 105, "A", "AT", "GT", "0/1");
+        first.primitive_identity = Some(identity.clone());
+        let mut second = make_record("chr1", 105, "A", "AT", "GT", "1/0");
+        second.primitive_identity = Some(identity);
+
+        let out = aggregate_location_records(vec![first, second]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alt_allele, "AT");
+        assert_eq!(out[0].samples[0], "1/1");
+    }
+
+    #[test]
+    fn legacy_only_distinct_internal_edits_respect_each_sample_buffered_slot() {
+        let mut direct = make_record("chr1", 105, "A", "AT", "GT", "0/1");
+        direct.samples.push("1/0".to_string());
+        direct.primitive_identity = Some(PrimitiveIdentity {
+            start: 105,
+            end: 105,
+            alt: "AT".to_string(),
+        });
+        let mut realigned = make_record("chr1", 105, "A", "AT", "GT", "1/0");
+        realigned.samples.push("0/1".to_string());
+        realigned.mixed_edit_primitive = true;
+        realigned.primitive_identity = Some(PrimitiveIdentity {
+            start: 106,
+            end: 105,
+            alt: "T".to_string(),
+        });
+
+        let out = aggregate_location_records(vec![direct, realigned]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alt_allele, "AT,AT");
+        assert_eq!(out[0].samples, ["2/1", "1/2"]);
+    }
+
+    #[test]
+    fn normative_exact_internal_edits_fold_every_compatible_sample() {
+        let identity = PrimitiveIdentity {
+            start: 105,
+            end: 105,
+            alt: "AT".to_string(),
+        };
+        let mut first = make_record("chr1", 105, "A", "AT", "GT", "0/1");
+        first.samples.push("1/0".to_string());
+        first.primitive_identity = Some(identity.clone());
+        let mut second = make_record("chr1", 105, "A", "AT", "GT", "1/0");
+        second.samples.push("0/1".to_string());
+        second.primitive_identity = Some(identity);
+
+        let out = aggregate_location_records(vec![first, second]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].alt_allele, "AT");
+        assert_eq!(out[0].samples, ["1/1", "1/1"]);
     }
 
     #[test]
@@ -1752,14 +1895,13 @@ mod tests {
     }
 
     #[test]
-    fn canonical_split_gt_uses_alt_then_ref_for_diploid_het() {
-        // Legacy creates the split ALT call first, then appends reference.
-        assert_eq!(canonical_split_gt("1/2", 1), "1/0");
-        assert_eq!(canonical_split_gt("1/2", 2), "1/0");
+    fn canonical_split_gt_uses_ref_then_alt_for_unphased_diploid_het() {
+        assert_eq!(canonical_split_gt("1/2", 1), "0/1");
+        assert_eq!(canonical_split_gt("1/2", 2), "0/1");
         // Hom-alt of target stays homozygous.
         assert_eq!(canonical_split_gt("1/1", 1), "1/1");
-        // Primitive calls are emitted unphased regardless of source phase.
-        assert_eq!(canonical_split_gt("1|2", 1), "1/0");
+        // Phased source calls are also emitted unphased.
+        assert_eq!(canonical_split_gt("1|2", 1), "0/1");
         // No-call passes through.
         assert_eq!(canonical_split_gt("./.", 1), "./.");
     }
@@ -1781,7 +1923,7 @@ mod tests {
         }
 
         #[test]
-        fn unphased_projection_preserves_ploidy_and_uses_alt_then_ref(
+        fn unphased_projection_preserves_ploidy_and_uses_ref_then_alt(
             alleles in proptest::collection::vec(0u32..4, 2..=2),
             target in 1u32..4,
         ) {
@@ -1796,12 +1938,12 @@ mod tests {
                 .iter()
                 .map(|allele| u32::from(*allele == target))
                 .collect::<Vec<_>>();
-            expected.sort_unstable_by(|left, right| right.cmp(left));
+            expected.sort_unstable();
             prop_assert_eq!(observed, expected);
         }
 
         #[test]
-        fn phased_projection_becomes_unphased_alt_then_ref(
+        fn phased_projection_becomes_unphased_ref_then_alt(
             alleles in proptest::collection::vec(0u32..4, 2..=2),
             target in 1u32..4,
         ) {
@@ -1813,7 +1955,7 @@ mod tests {
                 .iter()
                 .map(|allele| u32::from(*allele == target))
                 .collect::<Vec<_>>();
-            expected.sort_unstable_by(|left, right| right.cmp(left));
+            expected.sort_unstable();
             prop_assert_eq!(observed, expected.iter().map(u32::to_string).collect::<Vec<_>>());
         }
     }

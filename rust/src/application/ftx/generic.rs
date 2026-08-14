@@ -125,6 +125,7 @@ mod tests {
             format: Some("GT".to_string()),
             samples: vec!["0/1".to_string(), "1/1".to_string()],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         }
     }
 

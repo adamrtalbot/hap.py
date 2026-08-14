@@ -170,6 +170,7 @@ mod tests {
             format: Some("DP:TAR:TIR:BCN50:FDP50".to_string()),
             samples: vec!["10:8,9:2,3:0.5:1".to_string(), "20:5,6:15,16:0.25:2".to_string()],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         }
     }
 

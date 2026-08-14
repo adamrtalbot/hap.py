@@ -513,6 +513,7 @@ fn merge_record_pair_ordered(
         format: Some(format_keys.join(":")),
         samples: vec![truth_sample, query_sample],
         mixed_edit_primitive: false,
+        primitive_identity: None,
     };
     canonicalize_bcftools_info(&mut merged, truth_numbers, query_numbers);
     minimize_record_alleles(&mut merged);
@@ -1458,6 +1459,7 @@ mod tests {
             format: Some("GT".to_string()),
             samples: vec![truth_gt.to_string(), query_gt.to_string()],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         }
     }
 

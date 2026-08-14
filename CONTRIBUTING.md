@@ -101,7 +101,7 @@ cd verification
 nf-test test --ci --coverage
 ```
 
-Before opening a pull request, run all six lanes. `nf-test` expects 158 unique
+Before opening a pull request, run all six lanes. `nf-test` expects 160 unique
 comparisons, each with `ok: true` and an empty `differences` list.
 
 Dependency and attribution policy can be checked locally with:

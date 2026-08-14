@@ -380,29 +380,21 @@ fn index_column_json(count: usize, indices: Option<&[usize]>) -> String {
 }
 
 fn legacy_column_type(table: &str, column: &str, values: &[&str]) -> &'static str {
-    if (column == "Subset.Size"
-        && matches!(
-            table,
-            "roc.Locations.SNP.PASS"
-                | "roc.Locations.INDEL"
-                | "roc.Locations.SNP"
-                | "roc.Locations.INDEL.PASS"
-        )
-        && !values.is_empty()
-        && values.iter().all(|value| value.parse::<i64>().is_ok()))
-        || matches!(
-            column,
-            "TRUTH.TOTAL"
-                | "TRUTH.TP"
-                | "TRUTH.FN"
-                | "QUERY.TOTAL"
-                | "QUERY.TP"
-                | "QUERY.FP"
-                | "QUERY.UNK"
-                | "FP.gt"
-                | "FP.al"
-        )
-    {
+    // Legacy pandas leaves integer-looking Location `Subset.Size` columns
+    // string-typed. Keep them out of the numeric count-column list so the
+    // metrics JSON schema matches the pinned report artifacts.
+    if matches!(
+        column,
+        "TRUTH.TOTAL"
+            | "TRUTH.TP"
+            | "TRUTH.FN"
+            | "QUERY.TOTAL"
+            | "QUERY.TP"
+            | "QUERY.FP"
+            | "QUERY.UNK"
+            | "FP.gt"
+            | "FP.al"
+    ) {
         "int64"
     } else if column.starts_with("METRIC.")
         || column.ends_with(".TiTv_ratio")
@@ -877,7 +869,10 @@ mod tests {
         ));
 
         let locations = table_json("roc.Locations.SNP", "roc.Locations.SNP", &csv).unwrap();
-        assert!(locations.contains("\"values\":[42,42],\"type\":\"int64\",\"id\":\"Subset.Size\""));
+        assert!(
+            locations
+                .contains("\"values\":[\"42\",\"42\"],\"type\":\"string\",\"id\":\"Subset.Size\"")
+        );
         assert!(locations.contains(
             "\"values\":[\"21.000000\",\"\"],\"type\":\"string\",\"id\":\"Subset.IS_CONF.Size\""
         ));

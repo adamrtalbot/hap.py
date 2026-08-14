@@ -11,4 +11,4 @@ pub(crate) use interval::Interval;
 pub(crate) use metrics::{AnnotatedRow, ComparisonRecord, CountsBucket, TypeCounts};
 pub(crate) use statistics::jeffreys_interval;
 pub(crate) use validated::{OutputPlan, QueryProvenance, ValidatedVcfRecord, VariantOutputFormat};
-pub(crate) use variant::RawVcfRecord;
+pub(crate) use variant::{PrimitiveIdentity, RawVcfRecord};

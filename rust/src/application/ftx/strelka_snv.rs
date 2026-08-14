@@ -386,6 +386,7 @@ mod tests {
             format: Some(fmt.to_string()),
             samples: vec![n.to_string(), t.to_string()],
             mixed_edit_primitive: false,
+            primitive_identity: None,
         }
     }
 

@@ -9,13 +9,13 @@ pass.
 
 ## Coverage
 
-The default matrix contains 158 comparisons:
+The default matrix contains 160 comparisons:
 
 | Lane | Legacy tool | hap-rs command | Rows |
 |---|---|---|---:|
-| `happy` | `hap.py` | `hap germline` | 35 |
+| `happy` | `hap.py` | `hap germline` | 36 |
 | `sompy` | `som.py` | `hap somatic` | 29 |
-| `prepy` | `pre.py` | `hap pre` | 46 |
+| `prepy` | `pre.py` | `hap pre` | 47 |
 | `ftxpy` | `ftx.py` | `hap ftx` | 27 |
 | `qfy` | `qfy.py` | `hap quantify` | 9 |
 | `vcfcheck` | `vcfcheck` | `hap validate` | 12 |

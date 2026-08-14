@@ -225,7 +225,7 @@ pub(super) fn resolve_somatic_mode(args: &PreprocessArgs) -> Option<SomaticGtMod
 /// `<NON_REF>`, and a record is dropped when any sample's first cell calls its
 /// allele index. The legacy script intentionally assumes GT is the first FORMAT
 /// cell, so this helper does too.
-pub(super) fn calls_non_ref_allele(record: &RawVcfRecord) -> bool {
+pub(crate) fn calls_non_ref_allele(record: &RawVcfRecord) -> bool {
     let alts: Vec<&str> = record.alt_allele.split(',').collect();
     if alts.last() != Some(&"<NON_REF>") {
         return false;

@@ -61,10 +61,10 @@ for table_id in sorted(location_ids):
     if column is None:
         errors.append(f"{table_id}: missing Subset.Size")
         continue
-    if column.get("type") != "int64":
-        errors.append(f"{table_id}: Subset.Size type={column.get('type')!r}, expected 'int64'")
-    if not all(type(value) is int for value in column.get("values", [])):
-        errors.append(f"{table_id}: Subset.Size values are not all JSON integers")
+    if column.get("type") != "string":
+        errors.append(f"{table_id}: Subset.Size type={column.get('type')!r}, expected 'string'")
+    if not all(type(value) is str for value in column.get("values", [])):
+        errors.append(f"{table_id}: Subset.Size values are not all JSON strings")
 
 if errors:
     raise SystemExit("\n".join(errors))
