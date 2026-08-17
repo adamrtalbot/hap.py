@@ -19,11 +19,17 @@ departs from the pinned legacy implementation:
 
 1. `--engine-vcfeval-path` and `--engine-vcfeval-template` are accepted and
    ignored.
-2. `pre` and `quantify` return exit 0 on an unknown option, until 1.0.0.
+2. `hap validate --help` returns exit 0 where legacy `vcfcheck --help` returns 1.
 
-Both are scheduled for removal under the deprecation transition below. Adding a
-third entry requires maintainer sign-off, so the register's length is checkable
-at release.
+The first is scheduled for removal under the deprecation transition below; the
+second is permanent. Adding a third entry requires maintainer sign-off, so the
+register's length is checkable at release.
+
+`pre` and `quantify` returning exit 0 on an unknown option previously held the
+second slot. Malformed invocations now sit outside the supported invocation
+surface, so that behavior needs no exemption; it remains documented under the
+deprecation transition. See
+`docs/adr/0003-bound-the-invocation-surface-to-the-pinned-parsers.md`.
 
 ## Governance classes
 
@@ -43,7 +49,7 @@ no switch that silently changes all algorithms into a second implementation.
 |---|---|---|---|
 | Command aliases (`compare`, `preprocess`, `prepy`, `ftxpy`, `qfy`, `vcfcheck`) and historical option spellings | Indefinite, CLI adapter | Existing wrappers invoke the Python entry-point names. | CLI parser tests in `rust/src/cli_compat/cli.rs` |
 | argparse-style repeated options and unique long-option abbreviations | Legacy-only, CLI adapter | hap.py uses argparse and last-value-wins parsing. | `repeated_legacy_options_match_each_wrapper_parser`, abbreviation tests in `rust/src/cli_compat/cli.rs` |
-| Invalid `germline` arguments exit 1 and render historical help | Indefinite, CLI adapter | hap.py automation may distinguish its exit 1 from clap's exit 2. | `legacy_only_germline_invalid_option_retains_failure_exit_one` |
+| Invalid `germline` arguments exit 1 and render historical help | Documented hap-rs behavior, CLI adapter | Malformed invocations are outside the covered invocation surface, so this is no longer a compatibility promise. It stays because hap.py automation may distinguish its exit 1 from clap's exit 2. | `legacy_only_germline_invalid_option_retains_failure_exit_one` |
 | Unknown `pre` and `quantify` options exit 0 | **Deprecated**; retain in 0.x, change to non-zero in 1.0.0 | pre.py/qfy.py historically return success for unknown-option parser errors, but success is unsafe for new automation. Unknown-option occurrences warn now; missing required arguments already exit non-zero. | `legacy_only_pre_and_quantify_unknown_options_exit_success_with_transition_warning` |
 | Missing `pre`/`quantify` arguments and invalid commands without a governed override use clap's non-zero usage exit | Normative | New interfaces must not inherit legacy success codes accidentally. | `normative_pre_and_quantify_missing_arguments_use_standard_nonzero_exit`, `normative_validate_invalid_option_uses_standard_nonzero_exit` |
 | `--engine-vcfeval-path` and `--engine-vcfeval-template` are accepted and ignored | **Deprecated**; remove in 1.0.0 | Native vcfeval needs neither external RTG nor an SDF template. Remove both options from wrappers; use `--engine vcfeval --reference <FASTA>`. | `matrix_vcfeval_deprecated_flags` verification contract |
@@ -67,7 +73,12 @@ must name the upstream hap.py/Python/C++ behavior in a nearby comment. See
 
 The single-environment rule is not yet in force for the SOMPY and FTXPY lanes.
 They still run a second hap.py 0.3.15 image through an interpreter shim; both are
-known violations, tracked in `verification/README.md` and pending removal.
+known violations, tracked in `verification/README.md` and pending removal. They
+are not moving onto the currently named digest: its pandas 0.19.2 cannot group by
+an index level name, so `ftx.py` and `som.py` with `--bam` raise
+`KeyError: 'CHROM'`. The reference is being re-pinned to a rebuilt image at pandas
+0.20.3, which runs all six tools unpatched and renders floats identically. See the
+correction in `docs/adr/0002-drop-in-claim-against-one-unpatched-legacy-image.md`.
 
 ## Deprecation transition
 

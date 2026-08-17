@@ -28,17 +28,36 @@ Regenerate it with `scripts/dump-legacy-conda-lock.sh`. The recipe lists what wa
 requested; the lock lists what was installed, and the lock is what explains a
 number.
 
-The SOMPY and FTXPY lanes have not moved onto it yet. They still run
+That image cannot run all six tools, so the reference is being re-pinned. pandas
+0.19.2 cannot group by an index level name, which `ftx.py` and `som.py` both do
+when `--bam` is supplied: `bamStats` returns a frame indexed on `CHROM`, and
+`pandas.concat(bams).groupby("CHROM")` raises `KeyError: 'CHROM'`. Grouping by
+index level arrived in pandas 0.20.0. Four rows hit it: `ftx_bam_depth`,
+`ftx_multi_bam`, `somatic_bam_depth`, `matrix_multi_bam`.
+
+Those rows pass today only because the SOMPY and FTXPY lanes still run
 `quay.io/biocontainers/hap.py@sha256:d63b963a6cb01b4830393b22369e7b91d298e4156dde353739e74e4cfa4f96d0`,
-whose pandas 0.24.2 writes CSV floats as shortest-repr where the reference
-image's pandas 0.19.2 truncates to twelve significant digits — `1/3` as
-`0.3333333333333333` against `0.333333333333`. That image also dropped pandas'
+whose pandas 0.24.2 groups by index level but writes CSV floats as shortest-repr
+where 0.19.2 truncates to twelve significant digits, `1/3` as
+`0.3333333333333333` against `0.333333333333`. 0.24.2 also removed pandas'
 `display.height`, which som.py sets while rendering ambiguity explanations, so
 the SOMPY process injects a `sitecustomize.py` shim to swallow it. The second
-image and the shim are both known violations of the rule above, kept only until
-those lanes are repointed and their legacy CSVs re-observed at pandas 0.19.2. The
-reference image needs no shim: pandas removed `display.height` in 0.20, and the
-reference pins 0.19.2.
+image and the shim both violate the rule above.
+
+The resolution is one rebuilt image pinning pandas 0.20.3, leaving numpy 1.12.1,
+scipy 1.2.1, and the libstdcxx build untouched. Measured at 0.20.3: index-level
+grouping works, `display.height` still exists as a deprecation, and both `to_csv`
+and `to_json` render `1/3`, `0.1+0.2`, and `123456789.123456789` identically to
+0.19.2. `pandas-0.20.3-np112py27_0` carries the same np112 tagging as the lock's
+current `pandas-0.19.2-np112py27_1`, so one line of the lock moves.
+
+Adoption is gated on a differential run. The comparison is three-way, because the
+four `--bam` rows cannot run on the current reference at all: the 102 rows already
+observed there, happy 34 plus prepy 47 plus qfy 9 plus vcfcheck 12, must come back
+byte-identical, and that is the gate. The 52 sompy and ftxpy rows without `--bam`
+are expected to move on float rendering, which was accepted when the single-image
+rule was adopted. The four `--bam` rows get a fresh baseline with nothing to
+compare against, so they also absorb the numpy 1.16.5 to 1.12.1 change unisolated.
 
 `HAPPY_LEGACY` runs with `maxForks = 1`. Serialization is a scheduling
 constraint on the harness, not a modification of legacy, so it is compatible with

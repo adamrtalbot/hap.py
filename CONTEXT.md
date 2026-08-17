@@ -40,6 +40,13 @@ An emitted value describing the run rather than its result, such as a version,
 timestamp, command line, or generated description. Outside the drop-in claim.
 _Avoid_: Metadata, excluded field, noise
 
+**Covered invocation surface**:
+The set of invocations the drop-in claim applies to: `hap <subcommand>` with the
+options, positionals, and input forms the pinned parsers accept. For those, the
+claim reaches exit status and produced artifacts, not message text or stream
+choice. Malformed invocations are outside it.
+_Avoid_: CLI compatibility, supported flags
+
 **Exemption register**:
 The sealed list of ratified intentional divergences. Additions require
 maintainer sign-off, so its length is checkable at release.

@@ -46,6 +46,59 @@ than a general escape hatch: `--engine-vcfeval-path` and
 return zero on an unknown option until 1.0.0. Nothing joins that register
 without maintainer sign-off, and its length is checkable.
 
+The register's second entry was later replaced. Once malformed invocations moved
+outside the claim, unknown-option exit codes stopped needing an exemption, and
+`hap validate --help` returning 0 took that slot. The register is still two
+entries; see `0003-bound-the-invocation-surface-to-the-pinned-parsers.md`.
+
+## Correction: the named digest cannot run all six tools
+
+The claim above that the Wave image serves as the single authority for all six
+lanes was wrong, and measurement settled it. pandas 0.19.2 cannot group by an
+index level name. `Tools/bamstats.py` returns a frame indexed on `CHROM`, and both
+`ftx.py` and `som.py` then call `pandas.concat(bams).groupby("CHROM")` when
+`--bam` is supplied, which raises `KeyError: 'CHROM'` at 0.19.2. Grouping by index
+level arrived in pandas 0.20.0. Four samplesheet rows depend on it:
+`ftx_bam_depth`, `ftx_multi_bam`, `somatic_bam_depth`, `matrix_multi_bam`.
+
+The related claim that pandas removed `display.height` in 0.20 was also wrong.
+It survives as a deprecation at 0.20.3 and 0.22.0, and the removal that breaks
+som.py landed later, which is why 0.24.2 raises `OptionError`. So the 0.19.2 pin
+was never the only way to run som.py unpatched.
+
+There is a window where one image runs everything unpatched. At pandas 0.20.3
+with numpy 1.12.1, index-level grouping works, `display.height` still exists, and
+both `to_csv` and `to_json` render `1/3`, `0.1+0.2`, and `123456789.123456789`
+exactly as 0.19.2 does, `123456789.123456791` in JSON included. som.py's seven
+`.ix` accessors, which pandas 0.20 deprecated, print nothing: CPython 2.7 silences
+`DeprecationWarning`, measured at zero bytes on stderr. The
+`hap.py-0.3.15-py27hcb73b3d_0` package
+pins neither pandas nor numpy, and `pandas-0.20.3-np112py27_0` exists on
+conda-forge with the same np112 tagging as the lock's current
+`pandas-0.19.2-np112py27_1`, so the rebuild moves one line of the lock rather
+than re-solving the environment.
+
+The reference is therefore re-pinned to a rebuilt image at pandas 0.20.3, with
+numpy, scipy, and libstdcxx unchanged. The rule this ADR establishes is
+unaffected: one immutable digest, six tools, no patching. Only the digest changes.
+
+Adoption is gated on a differential run, and the comparison is three-way rather
+than two, because the four `--bam` rows cannot run on the Wave image at all:
+
+| set | currently observed on | expectation at 0.20.3 |
+|---|---|---|
+| 102 rows: happy 34, prepy 47, qfy 9, vcfcheck 12 | Wave 0.19.2 | **byte-identical.** This is the gate. |
+| 52 sompy and ftxpy rows without `--bam` | quay 0.24.2 | move on float rendering, which this ADR already accepted |
+| 4 `--bam` rows | quay 0.24.2 | fresh baseline, no prior Wave observation to check against |
+
+If any of the 102 moves, the bump is not free and the decision returns for a
+second look. The four `--bam` rows carry the numpy residual recorded above with no
+way to isolate it: they move from numpy 1.16.5 to 1.12.1 and from pandas 0.24.2 to
+0.20.3 at the same time, and no earlier observation exists to compare against.
+
+Patching legacy to call `groupby(level="CHROM")` was rejected under the
+no-patching rule.
+
 Because the digest is opaque, its recipe and
 `verification/containers/happy-0.3.15.conda-lock.txt` are governed artifacts:
 they are the only readable account of which pandas, scipy, numpy, and libstdc++
