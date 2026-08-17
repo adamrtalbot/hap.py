@@ -5,7 +5,7 @@ channels:
 dependencies:
   - hap.py=0.3.15
   - python=2.7.15
-  - pandas=0.19.2
+  - pandas=0.20.3
   - rtg-tools=3.12.1
   - samtools=1.18
   - pysam=0.20.0

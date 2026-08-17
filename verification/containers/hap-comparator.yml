@@ -1,0 +1,7 @@
+name: hap-comparator
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - bcftools=1.17

@@ -16,18 +16,7 @@ process SOMPY_LEGACY {
     script:
     def bam_args = bams.collect { bam -> "--bam ${bam}" }.join(' ')
     """
-    mkdir legacy_python_compat
-    printf '%s\\n' \\
-        'import pandas' \\
-        '_set_option = pandas.set_option' \\
-        'def set_option(*args, **kwargs):' \\
-        '    if args and args[0] == "display.height":' \\
-        '        return None' \\
-        '    return _set_option(*args, **kwargs)' \\
-        'pandas.set_option = set_option' \\
-        > legacy_python_compat/sitecustomize.py
-
-    PYTHONPATH=legacy_python_compat som.py ${args} ${bam_args} ${truth_vcf} ${query_vcf} \\
+    som.py ${args} ${bam_args} ${truth_vcf} ${query_vcf} \\
         -o result \\
         --reference ${reference} \\
         --false-positives ${fp_bed} \\

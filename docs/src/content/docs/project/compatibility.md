@@ -83,15 +83,12 @@ constraint, allowed only when named in
 any pin re-baselines: legacy is re-run and its fresh output becomes the
 expectation, because the harness stores no legacy baselines.
 
-The single-environment rule is not yet in force for the SOMPY and FTXPY lanes.
-They still run a second hap.py 0.3.15 image through an interpreter shim; both are
-known violations, tracked in `verification/README.md` and pending removal in
-issue #38. They
-are not moving onto the currently named digest: its pandas 0.19.2 cannot group by
-an index level name, so `ftx.py` and `som.py` with `--bam` raise
-`KeyError: 'CHROM'`. The reference is being re-pinned to a rebuilt image at pandas
-0.20.3, which runs all six tools unpatched and renders floats identically. See the
-correction in `docs/adr/0002-drop-in-claim-against-one-unpatched-legacy-image.md`.
+The single-environment rule is in force for all six lanes. The reference is
+`community.wave.seqera.io/library/happy-0.3.15:2c2b5746d6b0da37`, rebuilt at
+pandas 0.20.3, which runs all six tools unpatched and renders `to_csv` floats
+exactly as the 0.19.2 build it replaces. The second image and the som.py
+interpreter shim are gone. See the corrections in
+`docs/adr/0002-drop-in-claim-against-one-unpatched-legacy-image.md`.
 
 ## Deprecation transition
 

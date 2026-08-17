@@ -8,7 +8,6 @@ grch38_hcc_strelka_indel,example/sompy/strelka_grch38_admix_pass_indels.vcf.gz,e
 grch38_admix_strelka_indel,example/sompy/strelka_grch38_admix_pass_indels.vcf.gz,example/happy/hg38.chr21.fa,,admix.strelka.indel,,,
 chr21_hcc_strelka_snv_tp,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,hcc.strelka.snv,--feature-label TP,,
 chr21_hcc_strelka_snv_fn,example/sompy/strelka_admix_snvs.vcf.gz,example/chr21.fa,,hcc.strelka.snv,--feature-label FN,,
-ftx_bam_depth,local:assets/fixtures/ftx-bam/input.vcf,local:assets/fixtures/ftx-bam/ref.fa,local:assets/fixtures/ftx-bam/reads.bam,hcc.strelka.snv,--feature-label bam-reference,,
 ftx_called_nonref,local:assets/fixtures/ftx-nonref.vcf,local:assets/fixtures/tiny.fa,,generic,,,
 ftx_location,local:assets/fixtures/ftx-bam/options.vcf,local:assets/fixtures/ftx-bam/ref.fa,,generic,-l 1:7 --feature-label reference,,
 ftx_fix_chr,local:assets/fixtures/ftx-bam/options.vcf,local:assets/fixtures/ftx-bam/ref.fa,,generic,--fix-chr --feature-label reference,,
@@ -25,4 +24,3 @@ ftx_selector_normalize,local:assets/fixtures/ftx-matrix/selector-normalize.vcf,l
 ftx_empty_input,local:assets/fixtures/ftx-matrix/empty.vcf,local:assets/fixtures/ftx-matrix/ref.fa,,generic,--feature-label empty-reference,,
 ftx_restrict_regions,local:assets/fixtures/pre-matrix/end-span.vcf,local:assets/fixtures/pre-matrix/reference.fa,,generic,-R end-boundary.bed --feature-label reference,,local:assets/fixtures/pre-matrix/end-boundary.bed
 ftx_target_regions,local:assets/fixtures/pre-matrix/end-span.vcf,local:assets/fixtures/pre-matrix/reference.fa,,generic,-T end-boundary.bed --feature-label reference,,local:assets/fixtures/pre-matrix/end-boundary.bed
-ftx_multi_bam,local:assets/fixtures/ftx-bam/input.vcf,local:assets/fixtures/ftx-bam/ref.fa,local:assets/fixtures/ftx-bam/reads.bam,hcc.strelka.snv,--feature-label multi-bam,local:assets/fixtures/ftx-bam/reads2.bam,

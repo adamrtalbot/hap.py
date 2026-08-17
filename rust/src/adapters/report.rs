@@ -659,6 +659,10 @@ pub(crate) fn format_ratio(value: f64) -> String {
     python_repr_float(value)
 }
 
+// Python 3's shortest round-trippable `repr(float)`. The only remaining
+// caller is `adapters::metrics_json`, which serves the compare and quantify
+// JSON reports; `to_json` rendering does not move with the pandas pin, so
+// those lanes keep this. The CSV adapters use `python_repr_float`.
 pub(crate) fn full_repr_float(value: f64) -> String {
     if value.is_nan() {
         return "nan".to_string();

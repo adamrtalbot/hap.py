@@ -1294,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn somatic_stats_preserve_full_float_precision() {
+    fn somatic_stats_render_pinned_pandas_csv_floats() {
         let counts = SomaticCounts {
             truth_total: 3,
             query_total: 2,
@@ -1317,9 +1317,9 @@ mod tests {
         );
         let cells = row.split(',').collect::<Vec<_>>();
 
-        assert_eq!(cells[9], "0.3333333333333333");
-        assert_eq!(cells[11], "0.8232639028687426");
-        assert_eq!(cells[12], "0.3333333333333333");
+        assert_eq!(cells[9], "0.333333333333");
+        assert_eq!(cells[11], "0.823263902869");
+        assert_eq!(cells[12], "0.333333333333");
     }
 
     #[test]

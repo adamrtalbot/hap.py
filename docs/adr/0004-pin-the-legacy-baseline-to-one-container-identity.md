@@ -10,13 +10,14 @@ Wave builds and stores the reference image, so the image is its own archive.
 The digest fixes the contents and the lock names them.
 `verification/containers/happy-0.3.15.conda-lock.txt` lists 108 packages with
 URL and md5, regenerated from the image by
-`verification/scripts/dump-legacy-conda-lock.sh`. We store no copy of the image
-and keep no separate manifest file.
+`verification/scripts/dump-conda-lock.sh`, which takes the image as a required
+argument so a stale default cannot produce a governed artifact. We store no copy
+of the image and keep no separate manifest file.
 
 The lock already pins everything that would otherwise be listed separately:
 rtg-tools 3.12.1, openjdk 11.0.8, libstdcxx 16.1.0, bcftools 1.17,
-samtools 1.18, python 2.7.15, numpy 1.12.1, scipy 1.2.1, and pandas 0.20.3 once
-the re-pin lands. No second list is kept. A second list can drift from the image
+samtools 1.18, python 2.7.15, numpy 1.12.1, scipy 1.2.1, and pandas 0.20.3.
+No second list is kept. A second list can drift from the image
 without anyone noticing, which is the failure
 `0003-bound-the-invocation-surface-to-the-pinned-parsers.md` already rejected for
 the option surface.
@@ -33,7 +34,7 @@ A bcftools change can flip a verdict without either implementation moving.
 
 linux/amd64. The conda lock is entirely `linux-64`, so the image has no other
 build, and Docker on an arm64 host selects the amd64 image and emulates it.
-`verification/scripts/dump-legacy-conda-lock.sh` already passes
+`verification/scripts/dump-conda-lock.sh` already passes
 `--platform linux/amd64`; the harness that produces the observations did not, and
 nothing recorded which substrate produced a number.
 

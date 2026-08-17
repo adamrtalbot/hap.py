@@ -4,9 +4,9 @@ Read the [website guide](https://adamrtalbot.github.io/hap.py/project/verificati
 for an overview. Use this file for work in `verification/`.
 
 This directory contains the parity gate for the Rust `hap` migration. For every
-samplesheet row, Nextflow runs the named legacy hap.py tool in one of two pinned
-container environments and the matching `hap` subcommand from `PATH`, then
-compares the emitted `result*` files. nf-test fails when a comparison contains a
+samplesheet row, Nextflow runs the named legacy hap.py tool in the pinned
+reference container and the matching `hap` subcommand from `PATH`, then
+compares the emitted `result*` files in the pinned comparator container. nf-test fails when a comparison contains a
 difference outside the metadata exclusions below.
 
 ## Legacy reference environment
@@ -19,58 +19,51 @@ reference; `hap.py 0.3.15` names more than one behavior. See
 `docs/adr/0002-drop-in-claim-against-one-unpatched-legacy-image.md`.
 
 The reference is
-`community.wave.seqera.io/library/happy-0.3.15:41c2102638513597`, the frozen Wave
+`community.wave.seqera.io/library/happy-0.3.15:2c2b5746d6b0da37`, the frozen Wave
 build of `containers/happy-0.3.15.yml`. It carries all six legacy tools plus
 `rtg`, `bcftools`, `samtools`, and `java`. Because the digest is opaque,
 `containers/happy-0.3.15.conda-lock.txt` records the 108 packages it installs,
 including the `libstdcxx` and `openjdk` builds the recipe never names.
-Regenerate it with `scripts/dump-legacy-conda-lock.sh`. The recipe lists what was
-requested; the lock lists what was installed, and the lock is what explains a
+Regenerate it with `scripts/dump-conda-lock.sh <image>`. The recipe lists what
+was requested; the lock lists what was installed, and the lock is what explains a
 number.
 
-That image cannot run all six tools, so the reference is being re-pinned. pandas
-0.19.2 cannot group by an index level name, which `ftx.py` and `som.py` both do
-when `--bam` is supplied: `bamStats` returns a frame indexed on `CHROM`, and
-`pandas.concat(bams).groupby("CHROM")` raises `KeyError: 'CHROM'`. Grouping by
-index level arrived in pandas 0.20.0. Four rows hit it: `ftx_bam_depth`,
-`ftx_multi_bam`, `somatic_bam_depth`, `matrix_multi_bam`.
+It pins pandas 0.20.3, which is the version window where one image runs all six
+tools unpatched. Measured on the image: index-level `groupby` works,
+`display.height` survives as a deprecation so som.py needs no shim, and `to_csv`
+renders every float as Python 2 `str()` does, identically to the 0.19.2 build it
+replaces. numpy 1.12.1, scipy 1.2.1, and libstdcxx 16.1.0 did not move. The
+rebuild did move 17 peripheral packages the earlier solve had resolved
+differently; the lock is the record of which.
 
-Those rows pass today only because the SOMPY and FTXPY lanes still run
-`quay.io/biocontainers/hap.py@sha256:d63b963a6cb01b4830393b22369e7b91d298e4156dde353739e74e4cfa4f96d0`,
-whose pandas 0.24.2 groups by index level but writes CSV floats as shortest-repr
-where 0.19.2 truncates to twelve significant digits, `1/3` as
-`0.3333333333333333` against `0.333333333333`. 0.24.2 also removed pandas'
-`display.height`, which som.py sets while rendering ambiguity explanations, so
-the SOMPY process injects a `sitecustomize.py` shim to swallow it. The second
-image and the shim both violate the rule above. Removing them, and moving the
-comparator into a container of its own, is issue #38.
+The comparator is pinned the same way, because it decides pass and fail.
+`DIFF_OUTPUTS` runs
+`community.wave.seqera.io/library/hap-comparator:3fd84dea2dc8fda1`, the frozen
+Wave build of `containers/hap-comparator.yml`, with its contents in
+`containers/hap-comparator.conda-lock.txt`. It carries python 3.12.3 and the same
+`bcftools` 1.17 build the reference image carries, so a BCF decode difference
+cannot be an htslib-version artifact. It previously inherited `container = null`
+and ran host `python3` and host `bcftools`, so a host change could flip a verdict
+without either implementation moving.
 
-The resolution is one rebuilt image pinning pandas 0.20.3, leaving numpy 1.12.1,
-scipy 1.2.1, and the libstdcxx build untouched. Measured at 0.20.3: index-level
-grouping works, `display.height` still exists as a deprecation, and both `to_csv`
-and `to_json` render `1/3`, `0.1+0.2`, and `123456789.123456789` identically to
-0.19.2. `pandas-0.20.3-np112py27_0` carries the same np112 tagging as the lock's
-current `pandas-0.19.2-np112py27_1`, so one line of the lock moves.
-
-Adoption needs no differential run. Moving a pin re-baselines: legacy is re-run
-on the new image and its fresh output is the expectation. Nothing is preserved,
-because nothing is stored: `results/` is gitignored, there are no nf-test
-snapshots, and the harness runs legacy and `hap` together in one execution and
-diffs them live. The 52 sompy and ftxpy rows without `--bam` are expected to
-move on float rendering, which was accepted when the single-image rule was
-adopted.
+Moving a pin re-baselines: legacy is re-run on the new image and its fresh output
+is the expectation. Nothing is preserved, because nothing is stored: `results/`
+is gitignored, there are no nf-test snapshots, and the harness runs legacy and
+`hap` together in one execution and diffs them live.
 
 The gate that remains is the ordinary one. `hap` is frozen while legacy moves, so
 a legacy change surfaces immediately as a failed comparison. See
 `docs/adr/0004-pin-the-legacy-baseline-to-one-container-identity.md`.
 
-The four `--bam` rows leave the truth set: `ftx_bam_depth`, `ftx_multi_bam`,
+The four `--bam` rows are out of the truth set: `ftx_bam_depth`, `ftx_multi_bam`,
 `somatic_bam_depth`, `matrix_multi_bam`. The original never pinned pandas, so it
 permits installations where its own `--bam` paths cannot run, and any observation
 of them reflects the pandas version this project picks rather than legacy
 behavior. `--bam` is classed **no legacy reference** in the compatibility policy,
-which makes hap-rs behavior there normative. The matrix goes from 158 six-lane
-comparisons to 154.
+which makes hap-rs behavior there normative. Their fixtures stay under
+`assets/fixtures/ftx-bam/` for the `normative_` expectations, which are separate
+work. The matrix is 154 six-lane comparisons plus two hap-rs vcfeval contract
+cases with no legacy side.
 
 The line that rule draws is the layer a setting reaches. Configure the
 interpreter or VM legacy runs on, or the order the harness schedules it in, and

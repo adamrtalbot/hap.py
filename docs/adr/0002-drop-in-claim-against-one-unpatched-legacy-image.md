@@ -135,3 +135,36 @@ Because the digest is opaque, its recipe and
 `verification/containers/happy-0.3.15.conda-lock.txt` are governed artifacts:
 they are the only readable account of which pandas, scipy, numpy, and libstdc++
 produced a given number.
+
+## Correction: the rebuild took a different pandas build, and `full_repr_float` stays
+
+Three statements above did not survive the rebuild. The digest is
+`community.wave.seqera.io/library/happy-0.3.15:2c2b5746d6b0da37`,
+`sha256:4dda6b77c0b1bd778300ea33c498f9d6267537c05d1b655bf9385a11b8702d1c`.
+
+The re-pin named `pandas-0.20.3-np112py27_0`, and gave that np112 tagging as the
+reason to prefer 0.20.3 over 0.22.0: it was the only version in the window with
+an np112-tagged build, so numpy would stay byte-for-byte. The solve took
+`pandas-0.20.3-py27_1` instead. Both builds exist on conda-forge linux-64 and
+conda ranked build number 1 over 0. numpy did stay at 1.12.1, along with scipy
+1.2.1 and libstdcxx 16.1.0, so the outcome holds, but not by the mechanism
+credited for it. The pin is the digest and its lock, never a predicted build
+string, and the lock records `pandas-0.20.3-py27_1`.
+
+The claim that one line of the lock would move was also wrong. Seventeen further
+packages moved because the python 2.7 solve re-resolved against current
+repodata: sixteen same-version rebuilds and a `libxcrypt` 4.4.36 to 4.4.38 bump.
+The package count is unchanged at 108, and none of the governed pins moved. The
+drift is accepted into the new baseline under the re-baselining rule in
+`0004-pin-the-legacy-baseline-to-one-container-identity.md`. The effect of
+`libxcrypt` 4.4.38 on the legacy tools is unmeasured.
+
+`full_repr_float` is not retired. It had three callers, not the one this ADR
+assumed. `application/somatic/metrics.rs::py_float` and
+`application/ftx/common.rs::format_python_float` both move to
+`python_repr_float`, because those are the two lanes leaving pandas 0.24.2 and
+0.20.3 renders `to_csv` floats exactly as Python 2 `str()` does, measured on the
+image across the notation thresholds. `adapters::metrics_json` keeps
+`full_repr_float`: it serves the compare and quantify JSON reports, which were
+already observed on the 0.19.2 build and pass, and `to_json` rendering does not
+move with the pandas pin.
