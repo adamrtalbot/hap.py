@@ -281,17 +281,7 @@ fn crate_root_exposes_only_run() {
             syn::Item::Fn(function) if matches!(function.vis, syn::Visibility::Public(_)) => {
                 Some(function.sig.ident.to_string())
             }
-            syn::Item::Mod(module)
-                if matches!(module.vis, syn::Visibility::Public(_))
-                    && !module.attrs.iter().any(|attribute| {
-                        matches!(
-                            &attribute.meta,
-                            syn::Meta::List(list)
-                                if list.path.is_ident("cfg")
-                                    && list.tokens.to_string() == "feature = \"fuzzing\""
-                        )
-                    }) =>
-            {
+            syn::Item::Mod(module) if matches!(module.vis, syn::Visibility::Public(_)) => {
                 Some(module.ident.to_string())
             }
             syn::Item::Use(item) if matches!(item.vis, syn::Visibility::Public(_)) => {

@@ -38,7 +38,7 @@ pub(crate) fn is_bcf_data(data: &[u8]) -> bool {
     data.starts_with(BCF_MAGIC) || data.starts_with(b"BCF\x02\x01")
 }
 
-#[cfg(any(test, feature = "fuzzing"))]
+#[cfg(test)]
 pub(crate) fn decode(data: &[u8], path: &Path) -> Result<(Vec<String>, Vec<RawVcfRecord>)> {
     if !is_bcf_data(data) {
         bail!("{} is not BCF2", path.display());
@@ -776,7 +776,7 @@ impl<'a> Cursor<'a> {
         Self { data, offset: 0 }
     }
 
-    #[cfg(any(test, feature = "fuzzing"))]
+    #[cfg(test)]
     fn remaining(&self) -> usize {
         self.data.len().saturating_sub(self.offset)
     }

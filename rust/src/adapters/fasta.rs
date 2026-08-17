@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-#[cfg(any(test, feature = "fuzzing"))]
+#[cfg(test)]
 use std::io::Cursor;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -64,7 +64,7 @@ pub(crate) fn read_sequences(path: &Path) -> Result<BTreeMap<String, String>> {
     })
 }
 
-#[cfg(any(test, feature = "fuzzing"))]
+#[cfg(test)]
 pub(crate) fn parse_sequences(text: &str, path: &Path) -> Result<BTreeMap<String, String>> {
     parse_fasta(Cursor::new(text), path, |sequence: &mut String, line| {
         sequence.push_str(line);
