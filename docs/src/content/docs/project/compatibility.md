@@ -73,9 +73,20 @@ an image digest instead. Where a comparison cannot explain intent, an emulation
 must name the upstream hap.py/Python/C++ behavior in a nearby comment. See
 `docs/adr/0002-drop-in-claim-against-one-unpatched-legacy-image.md`.
 
+That identity is the digest URI plus the conda lock extracted from the image,
+observed on linux/amd64, and the comparator carries the same pair because it
+decides pass and fail. Running unmodified means no interpreter shim, no source
+patch, and no library option override; a setting that configures the interpreter
+or VM legacy runs on, or the order the harness schedules it in, is a harness
+constraint, allowed only when named in
+`docs/adr/0004-pin-the-legacy-baseline-to-one-container-identity.md`. Moving
+any pin re-baselines: legacy is re-run and its fresh output becomes the
+expectation, because the harness stores no legacy baselines.
+
 The single-environment rule is not yet in force for the SOMPY and FTXPY lanes.
 They still run a second hap.py 0.3.15 image through an interpreter shim; both are
-known violations, tracked in `verification/README.md` and pending removal. They
+known violations, tracked in `verification/README.md` and pending removal in
+issue #38. They
 are not moving onto the currently named digest: its pandas 0.19.2 cannot group by
 an index level name, so `ftx.py` and `som.py` with `--bam` raise
 `KeyError: 'CHROM'`. The reference is being re-pinned to a rebuilt image at pandas

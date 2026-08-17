@@ -18,11 +18,20 @@ _Avoid_: Old implementation, Python version
 
 **Reference environment**:
 The single immutable container image digest defining authoritative legacy
-behavior for every lane. Legacy runs there unmodified; an observation taken
-through a patched interpreter, patched source, or environment override is not
-evidence of legacy behavior. Its recipe and conda lock are governed artifacts,
+behavior for every lane, run on linux/amd64. Legacy runs there unmodified; an
+observation taken through a patched interpreter, patched source, or library
+option override is not evidence of legacy behavior. A setting that configures the
+interpreter or VM legacy runs on, or the order the harness schedules it in, is a
+harness constraint, allowed only when named in ADR 0004. Its recipe and conda lock are governed artifacts,
 because a digest alone cannot say which library produced a number.
 _Avoid_: Legacy container, pinned images, the oracle
+
+**Re-baseline**:
+What moving any pin does. Legacy is re-run on the new image and its fresh output
+becomes the expectation; no earlier observation is preserved or reconciled,
+because the harness stores none. Before hap-rs 1.0 a re-baseline invalidates no
+claim.
+_Avoid_: Regenerate the golden files, update the snapshots
 
 **Drop-in claim**:
 The compatibility claim hap-rs makes: every meaningful observable agrees with

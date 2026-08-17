@@ -91,8 +91,15 @@ than two, because the four `--bam` rows cannot run on the Wave image at all:
 | 52 sompy and ftxpy rows without `--bam` | quay 0.24.2 | move on float rendering, which this ADR already accepted |
 | 4 `--bam` rows | quay 0.24.2 | **leave the truth set.** See below. |
 
-If any of the 102 moves, the bump is not free and the decision returns for a
-second look. The matrix goes from 158 six-lane comparisons to 154.
+The matrix goes from 158 six-lane comparisons to 154.
+
+That gate is withdrawn by
+`0004-pin-the-legacy-baseline-to-one-container-identity.md`. It assumed stored
+baselines that do not exist: `verification/results/` is gitignored, there are no
+nf-test snapshots, and legacy and hap-rs run together in one execution and are
+diffed live, so no artifact of the old digest survives to compare a new one
+against. Moving a pin re-baselines instead: rebuild, re-run everything, keep the
+result. The re-pin to pandas 0.20.3 and the `--bam` removal below are unchanged.
 
 Patching legacy to call `groupby(level="CHROM")` was rejected under the
 no-patching rule.

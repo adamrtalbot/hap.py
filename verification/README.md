@@ -42,7 +42,8 @@ where 0.19.2 truncates to twelve significant digits, `1/3` as
 `0.3333333333333333` against `0.333333333333`. 0.24.2 also removed pandas'
 `display.height`, which som.py sets while rendering ambiguity explanations, so
 the SOMPY process injects a `sitecustomize.py` shim to swallow it. The second
-image and the shim both violate the rule above.
+image and the shim both violate the rule above. Removing them, and moving the
+comparator into a container of its own, is issue #38.
 
 The resolution is one rebuilt image pinning pandas 0.20.3, leaving numpy 1.12.1,
 scipy 1.2.1, and the libstdcxx build untouched. Measured at 0.20.3: index-level
@@ -51,11 +52,17 @@ and `to_json` render `1/3`, `0.1+0.2`, and `123456789.123456789` identically to
 0.19.2. `pandas-0.20.3-np112py27_0` carries the same np112 tagging as the lock's
 current `pandas-0.19.2-np112py27_1`, so one line of the lock moves.
 
-Adoption is gated on a differential run. The 102 rows already observed on the
-current reference, happy 34 plus prepy 47 plus qfy 9 plus vcfcheck 12, must come
-back byte-identical, and that is the gate. The 52 sompy and ftxpy rows without
-`--bam` are expected to move on float rendering, which was accepted when the
-single-image rule was adopted.
+Adoption needs no differential run. Moving a pin re-baselines: legacy is re-run
+on the new image and its fresh output is the expectation. Nothing is preserved,
+because nothing is stored: `results/` is gitignored, there are no nf-test
+snapshots, and the harness runs legacy and `hap` together in one execution and
+diffs them live. The 52 sompy and ftxpy rows without `--bam` are expected to
+move on float rendering, which was accepted when the single-image rule was
+adopted.
+
+The gate that remains is the ordinary one. `hap` is frozen while legacy moves, so
+a legacy change surfaces immediately as a failed comparison. See
+`docs/adr/0004-pin-the-legacy-baseline-to-one-container-identity.md`.
 
 The four `--bam` rows leave the truth set: `ftx_bam_depth`, `ftx_multi_bam`,
 `somatic_bam_depth`, `matrix_multi_bam`. The original never pinned pandas, so it
@@ -65,9 +72,20 @@ behavior. `--bam` is classed **no legacy reference** in the compatibility policy
 which makes hap-rs behavior there normative. The matrix goes from 158 six-lane
 comparisons to 154.
 
-`HAPPY_LEGACY` runs with `maxForks = 1`. Serialization is a scheduling
-constraint on the harness, not a modification of legacy, so it is compatible with
-the rule above.
+The line that rule draws is the layer a setting reaches. Configure the
+interpreter or VM legacy runs on, or the order the harness schedules it in, and
+that is a harness constraint. Change the behaviour of a library the tool calls
+and that is an override. `maxForks = 1` on `HAPPY_LEGACY` constrains scheduling;
+`RTG_JAVA_OPTS=-Xint` on the legacy vcfeval path in `modules/happy.nf` puts the
+JVM in interpreted mode. The `sitecustomize.py` shim changed how pandas answered
+som.py, so it fails the same test. Allowed settings are named in
+`docs/adr/0004-pin-the-legacy-baseline-to-one-container-identity.md`; a setting
+not named there is not allowed.
+
+Parity is observed on linux/amd64. The conda lock is entirely `linux-64`, so the
+image has no other build, and Docker on an arm64 host emulates it. CI runs
+`ubuntu-24.04` natively, so authoritative runs already satisfy this. A local run
+on arm64 is a development diagnostic, not parity evidence.
 
 ## Lanes
 
@@ -161,8 +179,10 @@ lane also writes a `comparison.json` with its differences.
 - Keep the named lane processes visible.
 - Keep the reference image immutable and pinned by digest, never a mutable tag.
 - Never patch legacy to make it run. No interpreter shim, no source patch, no
-  environment override. A legacy tool that will not run means the environment is
-  wrong.
+  library option override. A legacy tool that will not run means the environment
+  is wrong. Settings that change how the same code executes or when it is
+  scheduled are harness constraints; they are allowed only when named in
+  `docs/adr/0004-pin-the-legacy-baseline-to-one-container-identity.md`.
 - Put product behavior in Rust and artifact comparison in Nextflow.
 - Fix the Rust implementation when a case differs. Keep the case and comparison
   rule intact.
