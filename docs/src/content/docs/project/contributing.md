@@ -106,7 +106,8 @@ nf-test test --ci --coverage
 ```
 
 Before opening a pull request, run all six lanes. `nf-test` expects 160 unique
-comparisons, each with `ok: true` and an empty `differences` list.
+checks: 158 paired legacy/Rust comparisons and two Rust-only HAPPY contract
+checks. Each must have `ok: true` and an empty `differences` list.
 
 ## Rules that protect the signal
 

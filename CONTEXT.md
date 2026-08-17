@@ -12,8 +12,38 @@ _Avoid_: Rust rewrite, replacement binary
 
 **Legacy implementation**:
 The pinned hap.py, som.py, pre.py, ftx.py, qfy.py, and vcfcheck behavior against
-which migration compatibility is evaluated.
+which migration compatibility is evaluated, as observed by running those tools
+unmodified in the reference environment.
 _Avoid_: Old implementation, Python version
+
+**Reference environment**:
+The single immutable container image digest defining authoritative legacy
+behavior for every lane. Legacy runs there unmodified; an observation taken
+through a patched interpreter, patched source, or environment override is not
+evidence of legacy behavior. Its recipe and conda lock are governed artifacts,
+because a digest alone cannot say which library produced a number.
+_Avoid_: Legacy container, pinned images, the oracle
+
+**Drop-in claim**:
+The compatibility claim hap-rs makes: every meaningful observable agrees with
+the legacy implementation, rather than scientific results or the invocation
+interface alone.
+_Avoid_: Full parity, byte parity, bug-for-bug compatibility
+
+**Meaningful observable**:
+What the drop-in claim covers — data cells, the categorical labels carrying a
+classification verdict, and record identity and order.
+_Avoid_: Numerical output, the numbers
+
+**Provenance field**:
+An emitted value describing the run rather than its result, such as a version,
+timestamp, command line, or generated description. Outside the drop-in claim.
+_Avoid_: Metadata, excluded field, noise
+
+**Exemption register**:
+The sealed list of ratified intentional divergences. Additions require
+maintainer sign-off, so its length is checkable at release.
+_Avoid_: Waiver list, known differences
 
 **Parity case**:
 A named, reproducible comparison of legacy and hap-rs behavior for one defined

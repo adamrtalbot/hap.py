@@ -7,8 +7,9 @@ description: What hap-rs does and which command to use.
 callsets. One `hap` executable provides comparison, preprocessing,
 quantification, feature extraction, and validation workflows.
 
-`hap-rs` reimplements hap.py in Rust and keeps its command contracts, report
-formats, and benchmarking terms.
+`hap-rs` reimplements hap.py in Rust. It retains command aliases, report formats,
+and benchmarking terms covered by current tests; documented compatibility
+differences remain.
 
 ## Choose a command
 
@@ -35,7 +36,8 @@ Contributors use Java and pinned legacy tools to run the
 
 ## Compatibility
 
-The following aliases help existing workflows move to the single executable:
+The following aliases help existing workflows move to the single executable.
+They do not imply that every historical behavior is identical:
 
 | Previous entry point | hap-rs command |
 |---|---|

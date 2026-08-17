@@ -3,11 +3,27 @@ title: Compatibility Policy
 description: Governed hap.py compatibility behavior, deprecations, and removal policy.
 ---
 
-`hap-rs` preserves established hap.py interfaces where that lets existing
-workflows migrate without changing scientific results. Compatibility is not a
-license to reproduce every historical accident. Every known quirk belongs to
-one of the governed classes below and is kept at an input, CLI, codec, or report
+`hap-rs` claims drop-in compatibility with the pinned legacy implementation:
+every meaningful observable agrees, meaning data cells, the categorical labels
+carrying a classification verdict, and record identity and order. Provenance
+fields such as version, timestamp, and command line are outside the claim. The
+only permitted departures are the two entries in the sealed exemption register
+below; nothing joins it without maintainer sign-off. Recorded quirks belong to
+one of the governed classes below and are kept at an input, CLI, codec, or report
 adapter boundary where practical.
+
+## Exemption register
+
+Sealed at two entries. These are the only behaviors where hap-rs deliberately
+departs from the pinned legacy implementation:
+
+1. `--engine-vcfeval-path` and `--engine-vcfeval-template` are accepted and
+   ignored.
+2. `pre` and `quantify` return exit 0 on an unknown option, until 1.0.0.
+
+Both are scheduled for removal under the deprecation transition below. Adding a
+third entry requires maintainer sign-off, so the register's length is checkable
+at release.
 
 ## Governance classes
 
@@ -25,8 +41,8 @@ no switch that silently changes all algorithms into a second implementation.
 
 | Behavior | Class and decision | Rationale or source | Regression evidence |
 |---|---|---|---|
-| Command aliases (`compare`, `preprocess`, `prepy`, `ftxpy`, `qfy`, `vcfcheck`) and historical option spellings | Indefinite, CLI adapter | Existing wrappers invoke the Python entry-point names. | CLI parser tests in `rust/src/cli.rs` |
-| argparse-style repeated options and unique long-option abbreviations | Legacy-only, CLI adapter | hap.py uses argparse and last-value-wins parsing. | `repeated_legacy_options_match_each_wrapper_parser`, abbreviation tests in `rust/src/cli.rs` |
+| Command aliases (`compare`, `preprocess`, `prepy`, `ftxpy`, `qfy`, `vcfcheck`) and historical option spellings | Indefinite, CLI adapter | Existing wrappers invoke the Python entry-point names. | CLI parser tests in `rust/src/cli_compat/cli.rs` |
+| argparse-style repeated options and unique long-option abbreviations | Legacy-only, CLI adapter | hap.py uses argparse and last-value-wins parsing. | `repeated_legacy_options_match_each_wrapper_parser`, abbreviation tests in `rust/src/cli_compat/cli.rs` |
 | Invalid `germline` arguments exit 1 and render historical help | Indefinite, CLI adapter | hap.py automation may distinguish its exit 1 from clap's exit 2. | `legacy_only_germline_invalid_option_retains_failure_exit_one` |
 | Unknown `pre` and `quantify` options exit 0 | **Deprecated**; retain in 0.x, change to non-zero in 1.0.0 | pre.py/qfy.py historically return success for unknown-option parser errors, but success is unsafe for new automation. Unknown-option occurrences warn now; missing required arguments already exit non-zero. | `legacy_only_pre_and_quantify_unknown_options_exit_success_with_transition_warning` |
 | Missing `pre`/`quantify` arguments and invalid commands without a governed override use clap's non-zero usage exit | Normative | New interfaces must not inherit legacy success codes accidentally. | `normative_pre_and_quantify_missing_arguments_use_standard_nonzero_exit`, `normative_validate_invalid_option_uses_standard_nonzero_exit` |
@@ -41,9 +57,17 @@ no switch that silently changes all algorithms into a second implementation.
 | Engine matching, haplotype enumeration, normalization, and metric calculations | Normative domain behavior unless a row above names an emulation | These are scientific algorithms, not a compatibility switch. Differences without documented legacy evidence are bugs. | Engine unit tests plus verification fixtures |
 | Unsupported or malformed inputs with no pinned legacy evidence | Accidental/fixable | Guessing an emulation would create a new undocumented contract. | Add positive and negative regression evidence before a fix |
 
-The pinned Wave images and fixture checksums in `verification/` are the primary
-behavioral source. Where parity alone cannot explain intent, an emulation must
-name the upstream hap.py/Python/C++ behavior in a nearby comment.
+The pinned reference image, executable fixtures, and comparison results in
+`verification/` are the behavioral evidence, and legacy must run there
+unmodified. A tool version alone is insufficient: `hap.py 0.3.15` named two
+environments with different dependency sets, which is why authority attaches to
+an image digest instead. Where a comparison cannot explain intent, an emulation
+must name the upstream hap.py/Python/C++ behavior in a nearby comment. See
+`docs/adr/0002-drop-in-claim-against-one-unpatched-legacy-image.md`.
+
+The single-environment rule is not yet in force for the SOMPY and FTXPY lanes.
+They still run a second hap.py 0.3.15 image through an interpreter shim; both are
+known violations, tracked in `verification/README.md` and pending removal.
 
 ## Deprecation transition
 

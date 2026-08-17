@@ -20,7 +20,7 @@
 `hap-rs` compares variant callsets, normalizes VCF data, extracts somatic
 features, calculates benchmark metrics, and validates inputs. It packages the
 established hap.py workflows as the single `hap` executable, implemented in
-Rust and verified against pinned legacy releases.
+Rust, with a verification matrix compared against one pinned legacy environment.
 
 ## Benefits
 
@@ -28,11 +28,12 @@ Rust and verified against pinned legacy releases.
   RTG runtime.
 - **Rust comparison engines:** use `vcfeval` with a FASTA reference instead of
   an SDF bundle.
-- **Compatible interfaces:** keep the command options and report formats that
-  existing workflows use.
+- **Compatibility coverage:** keep the aliases and report formats covered by
+  current tests, with documented divergences.
 - **Common genomics formats:** read VCF, BGZF-compressed VCF, and BCF with
   Tabix or CSI indexes.
-- **Verification matrix:** 160 comparisons cover all six commands.
+- **Verification matrix:** 158 paired comparisons and two Rust-only contract
+  checks cover all six commands.
 
 ## Commands
 

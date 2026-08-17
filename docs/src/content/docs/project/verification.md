@@ -3,25 +3,27 @@ title: Verification
 description: Compare hap-rs output with pinned legacy tools.
 ---
 
-Nextflow runs a pinned legacy tool and the local `hap` command for each case.
-nf-test compares their artifacts after the Rust unit and integration tests
-pass.
+Nextflow runs a pinned legacy tool and the local `hap` command for 158
+samplesheet cases. It also runs two HAPPY contract checks against the Rust
+command alone. nf-test collects all 160 results after the Rust unit and
+integration tests pass.
 
 ## Coverage
 
-The default matrix contains 160 comparisons:
+The default matrix contains 158 paired comparisons and two Rust-only contract
+checks:
 
-| Lane | Legacy tool | hap-rs command | Rows |
+| Lane | Legacy tool | hap-rs command | Checks |
 |---|---|---|---:|
-| `happy` | `hap.py` | `hap germline` | 36 |
+| `happy` | `hap.py` | `hap germline` | 34 paired + 2 Rust-only |
 | `sompy` | `som.py` | `hap somatic` | 29 |
 | `prepy` | `pre.py` | `hap pre` | 47 |
 | `ftxpy` | `ftx.py` | `hap ftx` | 27 |
 | `qfy` | `qfy.py` | `hap quantify` | 9 |
 | `vcfcheck` | `vcfcheck` | `hap validate` | 12 |
 
-Six `verification/assets/samplesheet.*.csv` files list the matrix inputs and
-arguments.
+Six `verification/assets/samplesheet.*.csv` files list the 158 paired inputs and
+arguments. `verification/main.nf` defines the two additional Rust-only checks.
 
 ## Run the complete gate
 
@@ -74,8 +76,9 @@ The comparator excludes these runtime and provenance fields from all cases:
 ## vcfeval references
 
 Nextflow gives the legacy lane a committed RTG Tools 3.12.1 SDF bundle and the
-Rust lane the matching FASTA. Contributors need RTG and Java for verification;
-`hap` uses neither at runtime.
+Rust lane the matching FASTA. Contributors need Java and a supported container
+runtime for verification; RTG runs inside the pinned container, and `hap` uses
+neither RTG nor Java at runtime.
 
 ## Governing a discrepancy
 

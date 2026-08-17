@@ -41,11 +41,11 @@ export const base = import.meta.env.BASE_URL.endsWith("/")
   <Card title="Native engines" icon="seti:rust">
     Run haplotype comparison, vcfeval, or somatic matching inside `hap`.
   </Card>
-  <Card title="Compatible reports" icon="approve-check">
-    Keep the command options and report formats that existing workflows use.
+  <Card title="Compatibility coverage" icon="approve-check">
+    Keep tested aliases and report formats, with documented divergences.
   </Card>
   <Card title="Verification matrix" icon="rocket">
-    Check 160 cases across six commands against pinned hap.py tools.
+    Run 158 paired comparisons and two Rust-only contract checks.
   </Card>
 </CardGrid>
 
@@ -62,9 +62,11 @@ export const base = import.meta.env.BASE_URL.endsWith("/")
 
 ## hap.py compatibility
 
-`hap-rs` reimplements the hap.py workflows in Rust. It keeps documented command
-aliases and report schemas and removes the Python, C++, Java, and RTG runtime
-dependencies. See the [quick start](./getting-started/quick-start/) and the
+`hap-rs` reimplements the hap.py workflows in Rust. It keeps command aliases and
+report schemas covered by current tests, with deliberate differences documented
+in the [compatibility policy](./project/compatibility/). It removes the Python,
+C++, Java, and RTG runtime dependencies. See the
+[quick start](./getting-started/quick-start/) and the
 [verification matrix](./project/verification/).
 
 <style>{`
