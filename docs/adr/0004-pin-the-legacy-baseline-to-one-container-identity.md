@@ -69,8 +69,9 @@ here is not allowed.
 ## Host tooling
 
 The host JVM runs Nextflow and nf-test. Legacy runs on the openjdk 11.0.8 inside
-the image. The host JVM is not part of the baseline. Nextflow 26.04.6 and
-nf-test 0.9.5 are pinned by sha256 in `scripts/install-verification-tools.sh`.
+the image. The host JVM is not part of the baseline. CI installs Nextflow 26.04.6
+and nf-test 0.9.5 with `nf-core/setup-nextflow` and `nf-core/setup-nf-test`, both
+pinned to a commit SHA, and asserts both versions before the gate runs.
 
 Verification lives in the same repository as the code, so the repository commit
 is the harness revision and no separate record is kept.
