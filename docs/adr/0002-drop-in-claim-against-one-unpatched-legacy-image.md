@@ -85,19 +85,44 @@ unaffected: one immutable digest, six tools, no patching. Only the digest change
 Adoption is gated on a differential run, and the comparison is three-way rather
 than two, because the four `--bam` rows cannot run on the Wave image at all:
 
-| set | currently observed on | expectation at 0.20.3 |
+| set | currently observed on | disposition at 0.20.3 |
 |---|---|---|
 | 102 rows: happy 34, prepy 47, qfy 9, vcfcheck 12 | Wave 0.19.2 | **byte-identical.** This is the gate. |
 | 52 sompy and ftxpy rows without `--bam` | quay 0.24.2 | move on float rendering, which this ADR already accepted |
-| 4 `--bam` rows | quay 0.24.2 | fresh baseline, no prior Wave observation to check against |
+| 4 `--bam` rows | quay 0.24.2 | **leave the truth set.** See below. |
 
 If any of the 102 moves, the bump is not free and the decision returns for a
-second look. The four `--bam` rows carry the numpy residual recorded above with no
-way to isolate it: they move from numpy 1.16.5 to 1.12.1 and from pandas 0.24.2 to
-0.20.3 at the same time, and no earlier observation exists to compare against.
+second look. The matrix goes from 158 six-lane comparisons to 154.
 
 Patching legacy to call `groupby(level="CHROM")` was rejected under the
 no-patching rule.
+
+## The `--bam` paths have no legacy reference
+
+The original never pinned pandas. `happy.requirements.txt` lists a bare `pandas`,
+and `hap.py-0.3.15-py27hcb73b3d_0` depends on an unconstrained `pandas` too. So
+the original permits installations where its own features cannot run: below 0.20
+`ftx.py --bam` and `som.py --bam` raise `KeyError: 'CHROM'`, and from 0.23 som.py
+raises `OptionError` on `display.height`. Only 0.20.x through 0.22.x runs both, and
+nothing upstream requires that window. The 0.19.2 pin was a permitted choice, so
+this is a defect in the original rather than an error in the recipe.
+
+That makes any `--bam` observation a property of the pandas version this project
+selects, not of the legacy implementation. There is no legacy behaviour there to
+be authoritative about. The four rows therefore leave the truth set:
+`ftx_bam_depth`, `ftx_multi_bam`, `somatic_bam_depth`, `matrix_multi_bam`.
+
+`--bam` is still an accepted option, so it does not fall under the covered
+invocation surface as
+`0003-bound-the-invocation-surface-to-the-pinned-parsers.md` defines it, nor is it
+an hap-rs addition. It gets a third classification, **no legacy reference**:
+legacy accepts the option, no reliable legacy behaviour exists for it, and hap-rs
+behaviour is therefore normative, defined by hap-rs and tested against its own
+expectations. The exemption register stays at two entries, because there is no
+observed legacy behaviour to deliberately diverge from.
+
+Removing the rows also removes the one place the numpy 1.16.5 to 1.12.1 residual
+could not be isolated. It stays visible in the 52.
 
 Because the digest is opaque, its recipe and
 `verification/containers/happy-0.3.15.conda-lock.txt` are governed artifacts:

@@ -51,13 +51,19 @@ and `to_json` render `1/3`, `0.1+0.2`, and `123456789.123456789` identically to
 0.19.2. `pandas-0.20.3-np112py27_0` carries the same np112 tagging as the lock's
 current `pandas-0.19.2-np112py27_1`, so one line of the lock moves.
 
-Adoption is gated on a differential run. The comparison is three-way, because the
-four `--bam` rows cannot run on the current reference at all: the 102 rows already
-observed there, happy 34 plus prepy 47 plus qfy 9 plus vcfcheck 12, must come back
-byte-identical, and that is the gate. The 52 sompy and ftxpy rows without `--bam`
-are expected to move on float rendering, which was accepted when the single-image
-rule was adopted. The four `--bam` rows get a fresh baseline with nothing to
-compare against, so they also absorb the numpy 1.16.5 to 1.12.1 change unisolated.
+Adoption is gated on a differential run. The 102 rows already observed on the
+current reference, happy 34 plus prepy 47 plus qfy 9 plus vcfcheck 12, must come
+back byte-identical, and that is the gate. The 52 sompy and ftxpy rows without
+`--bam` are expected to move on float rendering, which was accepted when the
+single-image rule was adopted.
+
+The four `--bam` rows leave the truth set: `ftx_bam_depth`, `ftx_multi_bam`,
+`somatic_bam_depth`, `matrix_multi_bam`. The original never pinned pandas, so it
+permits installations where its own `--bam` paths cannot run, and any observation
+of them reflects the pandas version this project picks rather than legacy
+behavior. `--bam` is classed **no legacy reference** in the compatibility policy,
+which makes hap-rs behavior there normative. The matrix goes from 158 six-lane
+comparisons to 154.
 
 `HAPPY_LEGACY` runs with `maxForks = 1`. Serialization is a scheduling
 constraint on the harness, not a modification of legacy, so it is compatible with
