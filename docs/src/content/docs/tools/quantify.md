@@ -77,9 +77,12 @@ hap quantify comparison.vcf.gz \
 - `<prefix>.summary.csv`
 - `<prefix>.extended.csv` unless `--no-write-counts`
 - `<prefix>.metrics.json.gz` unless `--no-json`
-- `<prefix>.roc.*.csv.gz` when the input has benchmark samples and ROC output
-  is on
+- `<prefix>.roc.all.csv.gz`, which `--no-roc` does not remove, plus a
+  `<prefix>.roc.*.csv.gz` per selected region when the input carries ROC data
 - `<prefix>.vcf.gz` or `<prefix>.bcf` with `--write-vcf`
+
+Unlike `hap germline`, `hap quantify` writes no `.runinfo.json` and no annotated
+VCF unless asked.
 
 The input and output variant paths must differ. Quantification requires an index
 for compressed VCF or BCF input.

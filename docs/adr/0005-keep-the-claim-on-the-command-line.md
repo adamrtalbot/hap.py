@@ -198,3 +198,21 @@ Two residual risks stay open. A second artifact matching a caller's glob would
 change that caller's output arity, and per-artifact comparison would not catch it;
 file an issue if it happens. The confirmation run also lands after the port is
 complete, so it finds its edge cases later than the harness would.
+
+## Correction: legacy does consult `TMPDIR`
+
+The scratch section above reads as though legacy never touches `TMPDIR` and as
+though `pre`, `quantify` and `ftx` create no scratch. Measured on the pinned
+image, four of the six tools write there: `germline` and `pre` leave an orphan
+`tmpXXXXXX.vcf.gz.tbi` behind, `germline` doing so even when `--scratch-prefix`
+is supplied; `somatic` leaves a directory; `ftx` creates its scratch there and
+deletes it; `quantify` and `validate` wrote nothing.
+
+The decision is unchanged. Not consulting `TMPDIR` is normative hap-rs
+behaviour, and it is a design choice rather than agreement with legacy. The
+site list has moved on too: `engines/roc.rs:47` and `roc_publication.rs:73` no
+longer exist, and the current sites are `output.rs:638`,
+`adapters/vcf.rs:923`, `application/somatic.rs:65`, and
+`application/ftx/mod.rs:56`.
+`0007-observe-the-output-prefix-set.md` places auxiliary writes outside the
+observed set and records what follows.

@@ -53,10 +53,28 @@ _Avoid_: Metadata, excluded field, noise
 The set of invocations the drop-in claim applies to: `hap <subcommand>` with the
 options, positionals, and input forms the pinned parsers accept. For those, the
 claim reaches exit status and produced artifacts, not message text or stream
-choice. Malformed invocations are outside it, as is an environment-supplied
+choice. Where legacy exits 0, hap-rs exits 0 and the observed set matches; where
+legacy exits non-zero, hap-rs's status and artifacts are its own. Malformed invocations are outside it, as is an environment-supplied
 reference: the reference is passed as an argument. No caller sits inside it,
 because a caller only issues a command line.
 _Avoid_: CLI compatibility, supported flags
+
+**Observed set**:
+Every file whose name begins with the output prefix an invocation names, in the
+directory that prefix names. What the drop-in claim compares. The two
+implementations' sets must be equal name for name; nothing outside is compared,
+so scratch, temporary files, lock files, and logs carry no comparison.
+_Avoid_: Output glob, artifact list, result files
+
+**Product artifact**:
+A member of the observed set, written because the invocation asked for it.
+_Avoid_: Output, deliverable, report
+
+**Campaign evidence**:
+What the harness writes about a run rather than what a tool produced:
+`comparison.json`, `verification.json`, the streamed artifact records,
+`.command.*`, and captured output. Never compared as product.
+_Avoid_: Results, output, artifacts
 
 **Exemption register**:
 The sealed list of ratified intentional divergences. Additions require

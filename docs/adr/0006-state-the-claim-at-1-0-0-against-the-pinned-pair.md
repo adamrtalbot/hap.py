@@ -170,3 +170,17 @@ divergence triggers, not only the ignored-flags case that
 two entries and dates the `pre` and `quantify` behaviour to 1.0.0. Both entries
 survive, both are permanent, and neither the vcfeval removal nor the 1.0.0 date
 does; a note there points here.
+
+## Amendment: exit status is claimed where legacy succeeds
+
+The claim above reaches "the same exit status and the same artifacts" for any
+invocation the pinned parsers accept.
+`0007-observe-the-output-prefix-set.md` narrows that. Where legacy exits 0,
+hap-rs exits 0 and the observed artifact names match. Where legacy exits
+non-zero, neither hap-rs's status nor its artifacts are claimed, and hap-rs's own
+convention governs: 0 for success including `--help` and `--version`, 1 for a
+failure it detects, and the ordinary Unix status where the cause is external.
+
+Legacy's failure statuses are among the behaviours the port corrects, so
+reproducing them was never wanted, and a partial artifact set left by a run that
+stopped early would be a contract on write ordering rather than on a result.

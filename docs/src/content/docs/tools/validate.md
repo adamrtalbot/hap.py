@@ -41,6 +41,18 @@ hap validate calls.vcf.gz \
 Without `--output-json` or `--errors-bed`, `hap` writes diagnostics to standard
 error.
 
+## Outputs
+
+`hap validate` is the one command that produces no file by default, so a bare
+invocation reports through its exit status and its diagnostics alone.
+
+- the JSON path given to `--output-json`, when supplied
+- the BED path given to `--errors-bed`, when supplied
+
+Legacy `vcfcheck` has `--output-file` and no error-BED option at all, so
+`--errors-bed` is a declared extension with no legacy behaviour to compare
+against.
+
 ## Selection
 
 | Option | Description |

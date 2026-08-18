@@ -9,10 +9,14 @@ hap-rs 1.0.0 is a drop-in replacement for the Legacy implementation, pinned as
 `community.wave.seqera.io/library/happy-0.3.15@sha256:4dda6b77c0b1bd778300ea33c498f9d6267537c05d1b655bf9385a11b8702d1c`
 together with `verification/containers/happy-0.3.15.conda-lock.txt`.
 
-For any invocation the pinned parsers accept, `hap <subcommand>` produces the
-same exit status and the same artifacts as the corresponding legacy tool,
-agreeing on every data cell, every categorical verdict label, and record identity
-and order. Observed on linux/amd64. Legacy has no build for any other platform,
+For any invocation the pinned parsers accept where legacy exits 0,
+`hap <subcommand>` exits 0 and produces the same artifacts as the corresponding
+legacy tool, agreeing on every data cell, every categorical verdict label, and
+record identity and order. The artifacts compared are every file whose name
+begins with the output prefix the invocation names, and nothing else. Where
+legacy exits non-zero, neither hap-rs's exit status nor its artifacts are
+claimed: hap-rs exits 0 for success, 1 for a failure it detects, and the ordinary
+Unix status where the cause is external. Observed on linux/amd64. Legacy has no build for any other platform,
 so no comparison exists elsewhere, and hap-rs behavior on other platforms is
 defined by hap-rs and tested against its own expectations.
 
@@ -37,6 +41,12 @@ including where legacy is wrong.
 
 Standard error is not output. hap-rs may emit clearer error messages than legacy,
 and doing so is not a divergence.
+
+Anything a run leaves outside the output prefix set: scratch directories,
+temporary files, lock files, and logs. Artifacts left behind by a run that exited
+non-zero. hap-rs writes only inside the output directory and inside an explicitly
+requested scratch prefix, which is its own behavior rather than agreement with
+legacy. See `docs/adr/0007-observe-the-output-prefix-set.md`.
 
 Recorded quirks belong to one of the governed classes below and are kept at an
 input, CLI, codec, or report adapter boundary where practical.

@@ -96,7 +96,9 @@ profile names before comparison.
 ## Outputs
 
 - `<prefix>.stats.csv`: primary somatic counts and rates
-- `<prefix>.metrics.json`: structured metrics
-- `<prefix>.summary.csv` and `<prefix>.extended.csv`: optional hap.py-style
-  reports with `--happy-stats`
-- caller-specific ROC and feature outputs when requested
+- `<prefix>.metrics.json`: structured metrics, uncompressed, unlike the
+  `.metrics.json.gz` that `hap germline` and `hap quantify` write
+- `<prefix>.features.csv`: with `--feature-table <name>`
+- `<prefix>.summary.csv`: hap.py-style reports, which need `-P` and a feature
+  table alongside `--happy-stats`; `--happy-stats` on its own exits 1
+- caller-specific ROC output when `--roc` selects one of its supported profiles

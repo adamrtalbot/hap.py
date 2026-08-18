@@ -136,8 +136,11 @@ The default prefix produces:
 - `.extended.csv`
 - `.runinfo.json`
 - `.metrics.json.gz` unless `--no-json`
-- `.roc.*.csv.gz` unless `--no-roc`
-- `.vcf.gz` or `.bcf` with `--write-vcf`
+- `.roc.all.csv.gz`, which `--no-roc` does not remove
+- `.roc.Locations.SNP.csv.gz`, `.roc.Locations.INDEL.csv.gz` and their `.PASS`
+  counterparts, unless `--no-roc`
+- the annotated `.vcf.gz` and its `.tbi`, written by default; `-V, --write-vcf`
+  does not gate them
 
 See [Metrics](../../reference/metrics/) for interpretation and
 [Inputs & Outputs](../../reference/inputs-outputs/) for format requirements.
