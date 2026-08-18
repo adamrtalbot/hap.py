@@ -53,7 +53,9 @@ _Avoid_: Metadata, excluded field, noise
 The set of invocations the drop-in claim applies to: `hap <subcommand>` with the
 options, positionals, and input forms the pinned parsers accept. For those, the
 claim reaches exit status and produced artifacts, not message text or stream
-choice. Malformed invocations are outside it.
+choice. Malformed invocations are outside it, as is an environment-supplied
+reference: the reference is passed as an argument. No caller sits inside it,
+because a caller only issues a command line.
 _Avoid_: CLI compatibility, supported flags
 
 **Exemption register**:
@@ -70,6 +72,12 @@ _Avoid_: Edge case, test row
 A full-scale legacy-versus-hap-rs workflow used to discover discrepancies and
 confirm fixes in their original real-data context, including on remote compute.
 _Avoid_: Full parity case, integration test
+
+**Confirmation run**:
+A discovery workflow issued through a third-party pipeline rather than this
+repository's harness, run once the port is complete to demonstrate hap-rs in a
+real caller and surface missed edge cases. It gates nothing and settles no value.
+_Avoid_: Admitted caller, integration test, caller lane
 
 **Public-data case**:
 One intact real-world truth/query comparison represented by a single row in
@@ -109,7 +117,7 @@ _Avoid_: Test suite, comparator
 
 **Representative corpus**:
 A documented set of real datasets selected to exercise supported commands,
-engines, callers, assemblies, and materially different variant structures.
+engines, assemblies, and materially different variant structures.
 _Avoid_: Full coverage, exhaustive dataset
 
 **Supported clean machine**:

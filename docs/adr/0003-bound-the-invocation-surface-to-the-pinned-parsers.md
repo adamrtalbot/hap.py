@@ -120,3 +120,30 @@ One residual risk is unmeasured. The recorded surface is captured from `--help`,
 so an option a legacy parser accepts without advertising would be missed.
 Conditional registration is the known instance of that shape, and
 `--force-interactive` is the one case found.
+
+## Correction: `vcfcheck` does accept `--version`
+
+The covered option set above says `validate` "lacks `--version`". Measured in the
+pinned image, `vcfcheck --version` exits 0 and prints `vcfcheck version ` with an
+empty version number, so the option is there and the sentence is wrong. Two of the
+Python tools also behave differently from what a reading of `--help` suggests:
+
+| command | `--version` |
+|---|---|
+| `hap.py` | exit 0, prints `Hap.py ` with an empty version |
+| `vcfcheck` | exit 0, prints `vcfcheck version ` with an empty version |
+| `pre.py`, `qfy.py` | advertised in `--help`, but exit 2, because the flag parses and the required positionals are then missing |
+| `som.py`, `ftx.py` | not advertised, exit 2 |
+
+No legacy tool yields a usable version string, which is why
+nf-core/variantbenchmarking hardcodes `val('0.3.15')` in both its happy modules
+with the comment that the tool provides no version on the CLI.
+
+The consequence stated above, that `hap validate --version` has to exist and
+return 0, is unchanged, and nothing in the register moves.
+[Define the downstream caller and integration boundary](https://github.com/adamrtalbot/hap.py/issues/19)
+then settled that `--version` prints the version and exits 0 on every subcommand as
+ordinary tool behaviour, with no comparison owed and none possible, so the
+divergence this correction exposes is not a compatibility question at all. The
+`pre.py`/`qfy.py` exit 2 needs no exemption either: a missing required argument is
+a malformed invocation, which this decision already places outside the surface.
