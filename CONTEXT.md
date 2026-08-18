@@ -76,6 +76,18 @@ What the harness writes about a run rather than what a tool produced:
 `.command.*`, and captured output. Never compared as product.
 _Avoid_: Results, output, artifacts
 
+**Equivalence contract**:
+How the observed set is compared, one artifact class at a time. Byte identity is
+the default; a documented content comparison replaces it only where the encoding
+carries a provenance field or is not a function of the result.
+_Avoid_: Diff rules, comparison logic, tolerance
+
+**Unstable encoding**:
+A serialization whose bytes are not determined by the result alone, such as a
+gzip container carrying an mtime, a deflate stream, or an index storing offsets
+into one. The reason a class is compared by content rather than by bytes.
+_Avoid_: Nondeterministic output, binary noise
+
 **Exemption register**:
 The sealed list of ratified intentional divergences. Additions require
 maintainer sign-off, so its length is checkable at release.
