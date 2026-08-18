@@ -159,7 +159,7 @@ records the lane, case, artifact, and location for each difference. It ignores
 these runtime and provenance fields:
 
 - JSON version, timestamp, command-line, generated description fields, and the
-  deprecated vcfeval template argument that the Rust engine ignores.
+  `engine_vcfeval_template` argument the native engine ignores.
 - CSV columns named `sompyversion` and `sompycmd`.
 - VCF runtime headers such as source, date, and bcftools command/version.
 

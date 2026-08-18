@@ -127,8 +127,11 @@ toolchain or pre-fetched corpus data.
 _Avoid_: Blank machine, fresh laptop
 
 **Intentional divergence**:
-A maintainer-approved hap-rs behavior that deliberately differs from a
-diagnosed legacy defect under an explicit versioned contract.
+A maintainer-approved hap-rs behavior that legacy does not share, stated as hap-rs
+behavior rather than as a departure from legacy. The two in force are that
+`--engine-vcfeval-path` and `--engine-vcfeval-template` are ignored, because the
+native engine reads a FASTA and needs no SDF bundle, and that
+`hap validate --help` exits 0.
 _Avoid_: Acceptable difference, exception
 
 **Migration complete**:

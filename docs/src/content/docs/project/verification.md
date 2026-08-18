@@ -69,7 +69,7 @@ combined `verification.json` to decide pass or failure.
 The comparator excludes these runtime and provenance fields from all cases:
 
 - version, timestamp, command line, and generated description fields;
-- deprecated vcfeval template metadata ignored by the native engine;
+- vcfeval template metadata the native engine ignores;
 - `sompyversion` and `sompycmd` CSV columns;
 - runtime VCF headers such as source, date, and bcftools command/version.
 

@@ -51,6 +51,12 @@ outside the claim, unknown-option exit codes stopped needing an exemption, and
 `hap validate --help` returning 0 took that slot. The register is still two
 entries; see `0003-bound-the-invocation-surface-to-the-pinned-parsers.md`.
 
+Both entries are permanent, and the behaviour behind the retired entry is no longer
+scheduled either. `0006-state-the-claim-at-1-0-0-against-the-pinned-pair.md`
+withdraws the 1.0.0 removal of the vcfeval option pair and makes an unknown option
+to `pre` or `quantify` return a non-zero status now. It also states each entry as
+hap-rs behaviour rather than as a departure from legacy.
+
 ## Correction: the named digest cannot run all six tools
 
 The claim above that the Wave image serves as the single authority for all six
