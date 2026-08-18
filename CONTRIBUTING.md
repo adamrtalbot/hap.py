@@ -101,9 +101,9 @@ cd verification
 nf-test test --ci --coverage
 ```
 
-Before opening a pull request, run all six lanes. `nf-test` expects 160 unique
-checks: 158 paired legacy/Rust comparisons and two Rust-only HAPPY contract
-checks. Each must have `ok: true` and an empty `differences` list.
+Before opening a pull request, run all six lanes. `nf-test` expects 154 paired
+legacy/Rust comparisons. Each must have `ok: true` and an empty `differences`
+list. `verification/README.md` tables every one of them.
 
 Dependency and attribution policy can be checked locally with:
 

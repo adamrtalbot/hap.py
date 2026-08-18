@@ -385,3 +385,49 @@ An artifact whose bytes are a function of the result but whose extension is
 unknown will fail on sha256 rather than being compared as the text or JSON it
 is. That is intended, and the fix is a decision under the widening tier, not a
 comparator patch.
+
+## Correction: the ROC evidence was taken on the previous reference image
+
+This correction covers the ROC clause. The ROC clause above rests on three
+counts: ordered comparison of every ROC CSV
+and every ROC table in JSON "passes all 131 cases", removing the table
+canonicalization entirely "passes 131 of 131", and 11,689 float tokens across 83
+JSON artifacts agree. All three were measured on
+`community.wave.seqera.io/library/happy-0.3.15:41c2102638513597`. `65476ee` moved
+`params.legacy_image` to `...:2c2b5746d6b0da37`, and under
+`0004-pin-the-legacy-baseline-to-one-container-identity.md` that re-baselines,
+so the counts describe an image the harness no longer runs.
+
+Measured on the current pin at `18548d1`, by running the gate twice on one host
+and comparing the two runs against each other: legacy's own ROC output moves
+between runs. 14 of its 171 `.csv.gz` and 4 of its 111 JSON artifacts differ in
+content between the two runs, all of them HAPPY ROC tables belonging to `chr21`,
+`chr21_region`, `chr21_passonly` and `chr21_xcmp_controls`. Legacy retains a
+different set of QQ threshold rows each time; rows present in both agree cell for
+cell, and one row emitted in the first run and not the second carries a number
+where the variant type belongs. hap-rs reproduced every artifact byte for byte
+across the same pair. The tables are in `verification/README.md` under "Replay
+and resource baseline", and the defect is
+[#46](https://github.com/adamrtalbot/hap.py/issues/46).
+
+The decision is unchanged, and this ADR's consequences are not yet implemented in
+`verification/modules/diff.nf`. What changes is the claim that tightening ROC
+comparison costs nothing: on the current image the multiset comparison this ADR
+retires already fails two cases per run, a different two each time, and the
+ordered comparison it adopts would fail them harder. The tightening waits on #46
+rather than on a fresh count.
+
+The header-authorship counts in the same ADR come from the same image and are
+superseded too, without threatening the rule they support. That table reads 68
+paired VCF and BCF cases with 66 resolvable, `##reference=` in 48 lines and
+`##fileDate=` in 5. The current corpus publishes 78 `.vcf.gz` and 5 `.bcf` on
+each side, and legacy reproduced all 83 across the two runs once runtime headers
+are dropped, so nothing there needs a decision, only a fresh count when the
+comparator change lands.
+
+Whether the earlier image was stable and this one is not, or whether the movement
+was always present and the old expectation happened to sit on the stable side, is
+unmeasured. The measurement above was taken on an arm64 host with the legacy
+container emulated, which `verification/README.md` classes as a development
+diagnostic, so a native amd64 run is owed before anything is concluded about the
+image itself.

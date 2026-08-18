@@ -32,8 +32,7 @@ Rust, with a verification matrix compared against one pinned legacy environment.
   current tests, with documented divergences.
 - **Common genomics formats:** read VCF, BGZF-compressed VCF, and BCF with
   Tabix or CSI indexes.
-- **Verification matrix:** 158 paired comparisons and two Rust-only contract
-  checks cover all six commands.
+- **Verification matrix:** 154 paired comparisons cover all six commands.
 
 ## Commands
 

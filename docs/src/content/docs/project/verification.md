@@ -3,27 +3,26 @@ title: Verification
 description: Compare hap-rs output with pinned legacy tools.
 ---
 
-Nextflow runs a pinned legacy tool and the local `hap` command for 158
-samplesheet cases. It also runs two HAPPY contract checks against the Rust
-command alone. nf-test collects all 160 results after the Rust unit and
+Nextflow runs a pinned legacy tool and the local `hap` command for 154
+samplesheet cases. nf-test collects all 154 results after the Rust unit and
 integration tests pass.
 
 ## Coverage
 
-The default matrix contains 158 paired comparisons and two Rust-only contract
-checks:
+The default matrix contains 154 paired comparisons:
 
 | Lane | Legacy tool | hap-rs command | Checks |
 |---|---|---|---:|
-| `happy` | `hap.py` | `hap germline` | 34 paired + 2 Rust-only |
-| `sompy` | `som.py` | `hap somatic` | 29 |
+| `happy` | `hap.py` | `hap germline` | 34 |
+| `sompy` | `som.py` | `hap somatic` | 27 |
 | `prepy` | `pre.py` | `hap pre` | 47 |
-| `ftxpy` | `ftx.py` | `hap ftx` | 27 |
+| `ftxpy` | `ftx.py` | `hap ftx` | 25 |
 | `qfy` | `qfy.py` | `hap quantify` | 9 |
 | `vcfcheck` | `vcfcheck` | `hap validate` | 12 |
 
-Six `verification/assets/samplesheet.*.csv` files list the 158 paired inputs and
-arguments. `verification/main.nf` defines the two additional Rust-only checks.
+Six `verification/assets/samplesheet.*.csv` files list the 154 paired inputs and
+arguments. `verification/README.md` tables every row, the option surface each
+one binds, and the provenance of every input file.
 
 ## Run the complete gate
 
