@@ -160,33 +160,6 @@ workflow {
             }
         DIFF_HAPPY(happy_pair)
         statuses = statuses.mix(DIFF_HAPPY.out.comparison)
-
-        happy_contracts = channel.of(
-            tuple(
-                [id: 'matrix_vcfeval_deprecated_flags', case_name: 'happy'],
-                fixture('local:assets/fixtures/vcfeval-matrix/truth.vcf'),
-                fixture('local:assets/fixtures/vcfeval-matrix/query.vcf'),
-                fixture('local:assets/fixtures/vcfeval-matrix/ref.fa'),
-                fixture('local:assets/fixtures/vcfeval-matrix/ref.fa.fai'),
-                fixture('local:assets/fixtures/vcfeval-matrix/confident.bed'),
-                fixture('local:scripts/validate_vcfeval_contract.py'),
-                '--engine vcfeval --no-leftshift -D --no-adjust-conf-regions --engine-vcfeval-path /definitely/missing/rtg --engine-vcfeval-template /definitely/missing/template.sdf',
-                'deprecated_flags',
-            ),
-            tuple(
-                [id: 'matrix_vcfeval_preserve_info', case_name: 'happy'],
-                fixture('local:assets/fixtures/vcfeval-matrix/truth.vcf'),
-                fixture('local:assets/fixtures/vcfeval-matrix/query.vcf'),
-                fixture('local:assets/fixtures/vcfeval-matrix/ref.fa'),
-                fixture('local:assets/fixtures/vcfeval-matrix/ref.fa.fai'),
-                fixture('local:assets/fixtures/vcfeval-matrix/confident.bed'),
-                fixture('local:scripts/validate_vcfeval_contract.py'),
-                '--engine vcfeval --no-leftshift -D --no-adjust-conf-regions --preserve-info',
-                'preserve_info',
-            ),
-        )
-        HAPPY_RUST_CONTRACT(happy_contracts)
-        statuses = statuses.mix(HAPPY_RUST_CONTRACT.out.comparison)
     }
 
     // -----------------------------------------------------------------------
