@@ -25,7 +25,3 @@ This is a single-context repository:
 When naming a domain concept in an issue, proposal, hypothesis, or test, use the term defined in `CONTEXT.md`. Do not substitute synonyms the glossary explicitly avoids.
 
 If a required concept is absent, reconsider whether the term belongs to the project or record the gap for domain modeling.
-
-## Flag ADR conflicts
-
-If proposed work contradicts an existing ADR, identify the conflict explicitly rather than silently overriding the decision.

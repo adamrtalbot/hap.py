@@ -5,9 +5,7 @@ description: Governed hap.py compatibility behavior, deprecations, and removal p
 
 ## The claim
 
-hap-rs 1.0.0 is a drop-in replacement for the Legacy implementation, pinned as
-`community.wave.seqera.io/library/happy-0.3.15@sha256:4dda6b77c0b1bd778300ea33c498f9d6267537c05d1b655bf9385a11b8702d1c`
-together with `verification/containers/happy-0.3.15.conda-lock.txt`.
+hap-rs is a drop-in replacement for the Legacy implementation.
 
 For any invocation the pinned parsers accept where legacy exits 0,
 `hap <subcommand>` exits 0 and produces the same artifacts as the corresponding
@@ -19,13 +17,6 @@ claimed: hap-rs exits 0 for success, 1 for a failure it detects, and the ordinar
 Unix status where the cause is external. Observed on linux/amd64. Legacy has no build for any other platform,
 so no comparison exists elsewhere, and hap-rs behavior on other platforms is
 defined by hap-rs and tested against its own expectations.
-
-The only permitted departures are the two entries in the sealed exemption
-register below. A single covered invocation where a claimed observable disagrees,
-and which is not a register entry, falsifies this.
-
-No 0.x release carries the claim. See
-`docs/adr/0006-state-the-claim-at-1-0-0-against-the-pinned-pair.md`.
 
 ## Not claimed
 
@@ -42,38 +33,6 @@ including where legacy is wrong.
 Standard error is not output. hap-rs may emit clearer error messages than legacy,
 and doing so is not a divergence.
 
-Anything a run leaves outside the output prefix set: scratch directories,
-temporary files, lock files, and logs. Artifacts left behind by a run that exited
-non-zero. hap-rs writes only inside the output directory and inside an explicitly
-requested scratch prefix, which is its own behavior rather than agreement with
-legacy. See `docs/adr/0007-observe-the-output-prefix-set.md`.
-
-Recorded quirks belong to one of the governed classes below and are kept at an
-input, CLI, codec, or report adapter boundary where practical.
-
-## Exemption register
-
-Sealed at two entries. Within the covered invocation surface, these are the only
-behaviors that disagree with the pinned legacy implementation:
-
-1. `--engine-vcfeval-path` and `--engine-vcfeval-template` are accepted and
-   ignored. The native engine reads the FASTA supplied with `--reference`, so it
-   needs neither an external RTG install nor an SDF bundle.
-2. `hap validate --help` returns exit 0.
-
-Both are permanent and neither has a removal date. Adding a third entry requires
-maintainer sign-off, so the register's length is checkable at release.
-
-Entry 1 is narrow. Supply a working RTG path and an SDF matching `--reference`, and
-hap-rs produces byte-identical `summary.csv`, `extended.csv`, `roc.*.csv.gz`, and
-VCF body. Only a path with no working RTG behind it, or an SDF that disagrees with
-the reference, falls outside the claim.
-
-`pre` and `quantify` returning exit 0 on an unknown option previously held the
-second slot. Malformed invocations now sit outside the supported invocation
-surface, so that behavior needs no exemption and is fixed rather than emulated.
-See `docs/adr/0003-bound-the-invocation-surface-to-the-pinned-parsers.md`.
-
 ## Governance classes
 
 | Class | Meaning | Change policy |
@@ -83,9 +42,6 @@ See `docs/adr/0003-bound-the-invocation-surface-to-the-pinned-parsers.md`.
 | **Deprecated** | Accepted temporarily to support migration. | Emit a warning with the replacement and removal release. |
 | **Accidental/fixable** | An implementation difference with no supported compatibility rationale. | Fix with a regression case; do not turn it into a compatibility promise. |
 | **No legacy reference** | Legacy accepts the option, but no reliable legacy behavior exists for it, because the original's own unpinned dependency range cannot run it. | hap-rs behavior is normative: define it, test it against `normative_` expectations, and keep the case out of the truth set. Never invent a legacy observation for it. |
-
-“Legacy-only” describes an explicit legacy trigger, not a global mode. There is
-no switch that silently changes all algorithms into a second implementation.
 
 ## Compatibility inventory
 
@@ -110,45 +66,23 @@ no switch that silently changes all algorithms into a second implementation.
 
 The pinned reference image, executable fixtures, and comparison results in
 `verification/` are the behavioral evidence, and legacy must run there
-unmodified. A tool version alone is insufficient: `hap.py 0.3.15` named two
-environments with different dependency sets, which is why authority attaches to
-an image digest instead. Where a comparison cannot explain intent, an emulation
-must name the upstream hap.py/Python/C++ behavior in a nearby comment. See
-`docs/adr/0002-drop-in-claim-against-one-unpatched-legacy-image.md`.
+unmodified.
 
 That identity is the digest URI plus the conda lock extracted from the image,
 observed on linux/amd64, and the comparator carries the same pair because it
 decides pass and fail. Running unmodified means no interpreter shim, no source
 patch, and no library option override; a setting that configures the interpreter
 or VM legacy runs on, or the order the harness schedules it in, is a harness
-constraint, allowed only when named in
-`docs/adr/0004-pin-the-legacy-baseline-to-one-container-identity.md`. Moving
-any pin re-baselines: legacy is re-run and its fresh output becomes the
+constraint. Moving any pin re-baselines: legacy is re-run and its fresh output becomes the
 expectation, because the harness stores no legacy baselines.
-
-The single-environment rule is in force for all six lanes. The reference is
-`community.wave.seqera.io/library/happy-0.3.15:2c2b5746d6b0da37`, rebuilt at
-pandas 0.20.3, which runs all six tools unpatched and renders `to_csv` floats
-exactly as the 0.19.2 build it replaces. The second image and the som.py
-interpreter shim are gone. See the corrections in
-`docs/adr/0002-drop-in-claim-against-one-unpatched-legacy-image.md`.
 
 ## Deprecation transition
 
 There are no scheduled deprecations. The claimed version narrows nothing on its
 own surface.
 
-`--engine-vcfeval-path` and `--engine-vcfeval-template` were previously scheduled
-for removal in 1.0.0. That schedule is withdrawn and both options stay supported.
-Wrappers that pass them keep working; new wrappers should supply
-`--engine vcfeval --reference <FASTA>` instead.
-
-`pre` and `quantify` returning exit 0 on an unknown option was previously
-scheduled to change in 1.0.0. It is fixed rather than scheduled: an unknown option
-returns a non-zero status.
-
-Warnings go to stderr so report artifacts and machine-readable stdout remain
-unchanged.
+Future versions may introduce new breaking changes from the legacy code once parity is
+established, proven and used.
 
 ## Adding or removing emulation
 
