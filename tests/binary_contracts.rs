@@ -122,8 +122,7 @@ fn help_version_and_failure_stream_contracts_are_pinned() {
 
     for subcommand in SUBCOMMANDS {
         let output = run(&[subcommand]);
-        let expected_code = if subcommand == "germline" { 1 } else { 2 };
-        assert_eq!(output.status.code(), Some(expected_code), "{subcommand}");
+        assert_eq!(output.status.code(), Some(2), "{subcommand}");
         assert!(output.stdout.is_empty(), "{subcommand} failure stdout");
         assert!(
             String::from_utf8_lossy(&output.stderr)
@@ -162,22 +161,22 @@ fn legacy_alias_version_delimiter_and_unknown_option_contracts_are_pinned() {
         assert!(output.stderr.is_empty(), "{arguments:?}");
     }
 
-    for (subcommand, expected_code) in [
-        ("germline", 1),
-        ("compare", 1),
-        ("somatic", 2),
-        ("pre", 0),
-        ("preprocess", 0),
-        ("prepy", 0),
-        ("ftx", 2),
-        ("ftxpy", 2),
-        ("quantify", 0),
-        ("qfy", 0),
-        ("validate", 2),
-        ("vcfcheck", 2),
+    for subcommand in [
+        "germline",
+        "compare",
+        "somatic",
+        "pre",
+        "preprocess",
+        "prepy",
+        "ftx",
+        "ftxpy",
+        "quantify",
+        "qfy",
+        "validate",
+        "vcfcheck",
     ] {
         let output = run(&[subcommand, "--unknown-option"]);
-        assert_eq!(output.status.code(), Some(expected_code), "{subcommand}");
+        assert_eq!(output.status.code(), Some(2), "{subcommand}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
 
@@ -193,7 +192,7 @@ fn legacy_alias_version_delimiter_and_unknown_option_contracts_are_pinned() {
 
     for alias in ["germline", "compare"] {
         let delimiter = run(&[alias, "--", "--version", "query.vcf"]);
-        assert_eq!(delimiter.status.code(), Some(1), "{alias}");
+        assert_eq!(delimiter.status.code(), Some(2), "{alias}");
         assert!(delimiter.stdout.is_empty(), "{alias}");
         assert!(
             String::from_utf8_lossy(&delimiter.stderr).contains("required arguments"),

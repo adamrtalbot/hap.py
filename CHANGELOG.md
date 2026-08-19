@@ -22,3 +22,7 @@
 - Return a non-zero status when `pre` or `quantify` receives an unknown option,
   rather than deferring the change to 1.0.0. Malformed invocations sit outside the
   covered invocation surface, so this narrows no compatibility claim.
+- Report `germline` usage errors through the argument parser as well, replacing
+  exit 1 and the help page hap-rs wrote to standard output. All six subcommands
+  and their aliases now share one usage-error path: the parser's status, its
+  message on standard error, and nothing on standard output.

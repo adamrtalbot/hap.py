@@ -1,8 +1,5 @@
 use std::process::{Command, Output};
 
-const LEGACY_SUCCESS_WARNING: &str =
-    "success exit status for unknown pre/quantify arguments is deprecated";
-
 fn hap(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hap"))
         .args(arguments)
@@ -10,43 +7,41 @@ fn hap(arguments: &[&str]) -> Output {
         .expect("hap process should start")
 }
 
+const SUBCOMMANDS: [&str; 6] = ["germline", "somatic", "pre", "quantify", "ftx", "validate"];
+const ALIASES: [&str; 6] = ["compare", "preprocess", "prepy", "qfy", "ftxpy", "vcfcheck"];
+
+fn assert_usage_error(invocation: &[&str]) {
+    let label = invocation.join(" ");
+    let output = hap(invocation);
+    assert_eq!(output.status.code(), Some(2), "{label}");
+    assert!(output.stdout.is_empty(), "{label}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("error: "), "{label}: {stderr}");
+    assert!(stderr.contains("Usage:"), "{label}: {stderr}");
+    assert!(
+        stderr.contains("For more information, try '--help'"),
+        "{label}: {stderr}"
+    );
+}
+
 #[test]
-fn legacy_only_pre_and_quantify_unknown_options_exit_success_with_transition_warning() {
-    for command in ["pre", "quantify"] {
-        let output = hap(&[command, "--definitely-invalid"]);
-        assert_eq!(output.status.code(), Some(0), "{command}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("unexpected argument"),
-            "{command}: {stderr}"
-        );
-        assert!(
-            stderr.contains(LEGACY_SUCCESS_WARNING),
-            "{command}: {stderr}"
-        );
-        assert!(stderr.contains("hap-rs 1.0.0"), "{command}: {stderr}");
+fn normative_unknown_option_uses_clap_usage_exit_for_every_subcommand() {
+    for command in SUBCOMMANDS {
+        assert_usage_error(&[command, "--definitely-invalid"]);
     }
 }
 
 #[test]
-fn normative_pre_and_quantify_missing_arguments_use_standard_nonzero_exit() {
-    for command in ["pre", "quantify"] {
-        let output = hap(&[command]);
-        assert_eq!(output.status.code(), Some(2), "{command}");
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(LEGACY_SUCCESS_WARNING));
+fn normative_missing_required_argument_uses_clap_usage_exit_for_every_subcommand() {
+    for command in SUBCOMMANDS {
+        assert_usage_error(&[command]);
     }
 }
 
 #[test]
-fn normative_validate_invalid_option_uses_standard_nonzero_exit() {
-    let output = hap(&["validate", "--definitely-invalid"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains(LEGACY_SUCCESS_WARNING));
-}
-
-#[test]
-fn legacy_only_germline_invalid_option_retains_failure_exit_one() {
-    let output = hap(&["germline", "--definitely-invalid"]);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains(LEGACY_SUCCESS_WARNING));
+fn normative_legacy_aliases_use_clap_usage_exit() {
+    for alias in ALIASES {
+        assert_usage_error(&[alias, "--definitely-invalid"]);
+        assert_usage_error(&[alias]);
+    }
 }

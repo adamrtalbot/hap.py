@@ -52,9 +52,11 @@ The set of invocations the drop-in claim applies to: `hap <subcommand>` with the
 options, positionals, and input forms the pinned parsers accept. For those, the
 claim reaches exit status and produced artifacts, not message text or stream
 choice. Where legacy exits 0, hap-rs exits 0 and the observed set matches; where
-legacy exits non-zero, hap-rs's status and artifacts are its own. Malformed invocations are outside it, as is an environment-supplied
-reference: the reference is passed as an argument. No caller sits inside it,
-because a caller only issues a command line.
+legacy exits non-zero, hap-rs's status and artifacts are its own. Malformed
+invocations are outside it, and hap-rs reports them with the argument parser's
+status. An environment-supplied reference is outside it too: the reference is
+passed as an argument. No caller sits inside it, because a caller only issues a
+command line.
 _Avoid_: CLI compatibility, supported flags
 
 **Observed set**:

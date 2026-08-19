@@ -8,50 +8,6 @@ fn hap(arguments: &[&str]) -> Output {
 }
 
 #[test]
-fn legacy_aliases_keep_command_specific_unknown_argument_exit_codes() {
-    for (command, arguments, expected_code) in [
-        (
-            "compare",
-            vec!["compare", "truth.vcf", "query.vcf", "-o", "report", "--wat"],
-            1,
-        ),
-        (
-            "prepy",
-            vec!["prepy", "input.vcf", "output.vcf.gz", "--wat"],
-            0,
-        ),
-        (
-            "qfy",
-            vec![
-                "qfy",
-                "input.vcf.gz",
-                "-o",
-                "report",
-                "-r",
-                "reference.fa",
-                "--wat",
-            ],
-            0,
-        ),
-    ] {
-        let output = hap(&arguments);
-        assert_eq!(
-            output.status.code(),
-            Some(expected_code),
-            "legacy exit status for {command}"
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--wat'"),
-            "legacy diagnostic for {command}"
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("Usage:"),
-            "legacy help for {command}"
-        );
-    }
-}
-
-#[test]
 fn ordinary_adapter_errors_keep_clap_exit_status() {
     let output = hap(&["validate", "input.vcf", "--wat"]);
     assert_eq!(output.status.code(), Some(2));
