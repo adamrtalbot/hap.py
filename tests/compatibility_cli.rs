@@ -45,3 +45,38 @@ fn normative_legacy_aliases_use_clap_usage_exit() {
         assert_usage_error(&[alias]);
     }
 }
+
+const VCFEVAL_OPTIONS_IGNORED_WARNING: &str = "warning: --engine-vcfeval-path and --engine-vcfeval-template are ignored; hap-rs reads the FASTA supplied with --reference instead";
+
+/// The warning is emitted after parsing and before dispatch, so an invocation
+/// that fails afterwards still carries it. Absent paths keep the test cheap.
+fn germline_stderr(extra: &[&str]) -> String {
+    let mut invocation = vec![
+        "germline",
+        "absent-truth.vcf",
+        "absent-query.vcf",
+        "-o",
+        "absent-report",
+        "-r",
+        "absent-ref.fa",
+    ];
+    invocation.extend_from_slice(extra);
+    String::from_utf8_lossy(&hap(&invocation).stderr).into_owned()
+}
+
+#[test]
+fn germline_warns_on_stderr_for_each_ignored_vcfeval_option() {
+    for option in ["--engine-vcfeval-path", "--engine-vcfeval-template"] {
+        let stderr = germline_stderr(&[option, "ignored-value"]);
+        assert!(
+            stderr.contains(VCFEVAL_OPTIONS_IGNORED_WARNING),
+            "{option}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn germline_without_the_vcfeval_options_emits_no_warning() {
+    let stderr = germline_stderr(&[]);
+    assert!(!stderr.contains("--engine-vcfeval-path"), "{stderr}");
+}

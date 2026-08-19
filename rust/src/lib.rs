@@ -43,7 +43,7 @@ pub fn run() -> Result<()> {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
-    compatibility::emit_deprecation_warnings(&cli.command);
+    compatibility::emit_compatibility_warnings(&cli.command);
     match cli.command {
         Command::Germline(args) => application::compare::run(args.try_into()?),
         Command::Somatic(args) => application::somatic::run(args.try_into()?),

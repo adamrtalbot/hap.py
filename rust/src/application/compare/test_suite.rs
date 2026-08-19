@@ -625,8 +625,8 @@ mod scratch_tests {
     }
 
     #[test]
-    fn vcfeval_ignores_deprecated_external_runtime_flags() {
-        let root = test_root("vcfeval-deprecated-flags");
+    fn vcfeval_ignores_external_runtime_flags() {
+        let root = test_root("vcfeval-ignored-flags");
         let mut options = CompareArgs::with_paths(
             fixture_path("truth.vcf").display().to_string(),
             fixture_path("query.vcf").display().to_string(),
