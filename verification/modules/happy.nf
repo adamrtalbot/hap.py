@@ -57,28 +57,3 @@ process HAPPY_RUST {
         -o result
     """
 }
-
-process HAPPY_RUST_CONTRACT {
-    tag { "${meta.id}" }
-    publishDir { "${params.outdir}/happy/${meta.id}/rust" }, mode: 'copy', pattern: 'result*'
-    publishDir { "${params.outdir}/happy/${meta.id}" }, mode: 'copy', pattern: 'comparison.json'
-
-    input:
-    tuple val(meta), path(truth_vcf), path(query_vcf), path(reference), path(reference_fai), path(fp_bed), path(contract_validator), val(args), val(contract)
-
-    output:
-    tuple val(meta), val('happy'), path('comparison.json'), emit: comparison
-    path 'result*', emit: artifacts
-
-    script:
-    """
-    hap germline ${args} ${truth_vcf} ${query_vcf} \\
-        --reference ${reference} \\
-        --threads ${task.cpus ?: 1} \\
-        --false-positives ${fp_bed} \\
-        -o result \\
-        2> stderr.log
-
-    python3 ${contract_validator} '${meta.id}' '${contract}'
-    """
-}

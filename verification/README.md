@@ -62,7 +62,7 @@ of them reflects the pandas version this project picks rather than legacy
 behavior. `--bam` is classed **no legacy reference** in the compatibility policy,
 which makes hap-rs behavior there normative. Their fixtures stay under
 `assets/fixtures/ftx-bam/` for the `normative_` expectations, which are separate
-work. The matrix is 154 six-lane comparisons. Coverage below tables every row.
+work. The matrix is 155 six-lane comparisons. Coverage below tables every row.
 
 The line that rule draws is the layer a setting reaches. Configure the
 interpreter or VM legacy runs on, or the order the harness schedules it in, and
@@ -154,11 +154,11 @@ Measured on 2026-08-18 at `18548d1` by running `nextflow run main.nf` with the
 default `--cases` list, twice. The measurement drives the pipeline directly
 rather than through nf-test, because it needs `-with-trace` and two separate
 output directories. `nf-test` adds the assertions: its per-lane expected counts
-now sum to 154 and match what the pipeline emitted in both runs, while its
+now sum to 155 and match what the pipeline emitted in both runs, while its
 `every { it.ok }` assertion still fails on the two cases below.
 
-The six samplesheets hold 154 rows and the gate emits 154 comparisons, of which
-152 have an empty difference list in each run.
+The six samplesheets hold 155 rows and the gate emits 155 comparisons, of which
+153 have an empty difference list in each run.
 The pair moved between the runs: run 1 reported HAPPY `chr21` and
 `chr21_region`, run 2 reported `chr21_passonly` and `chr21_xcmp_controls`, and
 all four differences sit in ROC artifacts. The replay section below records
@@ -169,17 +169,18 @@ tables moved. Tracked as
 | Lane | Command | Rows |
 |---|---|---:|
 | HAPPY | `hap germline` | 34 |
-| SOMPY | `hap somatic` | 27 |
+| SOMPY | `hap somatic` | 28 |
 | PREPY | `hap pre` | 47 |
 | FTXPY | `hap ftx` | 25 |
 | QFY | `hap quantify` | 9 |
 | VCFCHECK | `hap validate` | 12 |
-| | | **154** |
+| | | **155** |
 
 The two hap-rs vcfeval contract cases are gone. `1a1bbca` deleted the
-`happy_contracts` channel, so `HAPPY_RUST_CONTRACT` in `modules/happy.nf`, its
-import in `main.nf`, and `scripts/validate_vcfeval_contract.py` are unreferenced
-([#47](https://github.com/adamrtalbot/hap.py/issues/47)). The gate is 154
+`happy_contracts` channel, and the leftovers it named have since been removed:
+`HAPPY_RUST_CONTRACT`, its import in `main.nf`, and
+`scripts/validate_vcfeval_contract.py`
+([#47](https://github.com/adamrtalbot/hap.py/issues/47)). The gate is 155
 comparisons with no contract case.
 
 One row per committed case follows. The option-bindings column lists what the
@@ -229,7 +230,7 @@ an SDF bundle.
 | `hg001_graph_record_order` | truth vcf; query vcf; reference fasta + .fai; fp bed bed | xcmp (default) | — | — | `--no-json`, `--no-roc`, `--no-write-counts`, `--write-vcf`, `--gender none` |
 | `hg001_float_rendering` | truth vcf; query vcf; reference fasta + .fai; fp bed bed | xcmp (default) | — | — | `--no-roc`, `--gender none` |
 
-#### SOMPY: `hap somatic`, 27 rows
+#### SOMPY: `hap somatic`, 28 rows
 
 | Case | Input format and index | Engine or table | Region or stratification | Filtering | Other option bindings |
 |---|---|---|---|---|---|
@@ -260,6 +261,7 @@ an SDF bundle.
 | `matrix_roc_mutect_snv` | truth vcf; query vcf; reference fasta + .fai; fp bed bed | `generic` + `--roc mutect.snv` | — | `--include-nonpass` | — |
 | `matrix_roc_varscan2_snv` | truth vcf; query vcf; reference fasta + .fai; fp bed bed | `generic` + `--roc varscan2.snv` | — | `--include-nonpass` | — |
 | `matrix_strelka_indel_af_type_compat` | truth vcf; query vcf; reference fasta + .fai; fp bed bed | `hcc.strelka.indel` | — | `--include-nonpass` | `--bin-afs` |
+| `somatic_output_parity_bin_afs` | truth vcf; query vcf; reference fasta + .fai; fp bed bed | `hcc.strelka.indel` | — | `--include-nonpass` | `--bin-afs` |
 
 #### PREPY: `hap pre`, 47 rows
 
@@ -785,7 +787,7 @@ observation.
 
 ## Corpus provenance
 
-Every file the 154 committed rows consume, including the index companions
+Every file the 155 committed rows consume, including the index companions
 `main.nf` stages alongside each input: 19 upstream files and 123 repository
 fixtures, 142 in total. Sizes and SHA-256 measured on 2026-08-18, the upstream
 ones by fetching each pinned URL and the fixtures over the working tree at
@@ -900,6 +902,9 @@ Repository fixtures:
 | `verification/assets/fixtures/somatic-af-type-parity/confident.bed` | 11 | `904f3dfd384dc3979e5ec96a359b3fb297209d90b3e53bd386a303c64b5bc614` | `f662d6a` | SOMPY |
 | `verification/assets/fixtures/somatic-af-type-parity/query.vcf` | 852 | `638db51c883e6cf8339a24cc41f5d2fda18231cba5660cadffcab71eedc29db6` | `f662d6a` | SOMPY |
 | `verification/assets/fixtures/somatic-af-type-parity/truth.vcf` | 308 | `8760bed4e65b664c60b1b6078043ff19d03960124e211fde67e5ab7144a697c5` | `f662d6a` | SOMPY |
+| `verification/assets/fixtures/somatic-output-parity/confident.bed` | 11 | `904f3dfd384dc3979e5ec96a359b3fb297209d90b3e53bd386a303c64b5bc614` | `ac539dc` | SOMPY |
+| `verification/assets/fixtures/somatic-output-parity/query.vcf` | 967 | `58db62ee13a62625194b96fc891837da86a422b35367a8e7d82935cde68cd804` | `ac539dc` | SOMPY |
+| `verification/assets/fixtures/somatic-output-parity/truth.vcf` | 469 | `45e800f340989d53e8452c5db166887159a680a1e7fe48469e23b45fe083b7c1` | `ac539dc` | SOMPY |
 | `verification/assets/fixtures/somatic-matrix/classification.bed` | 88 | `2ba083bcfe2521f466ade7b036229582be8c86a95e6f26793e1510c30d0a3096` | `eb37118` | SOMPY |
 | `verification/assets/fixtures/somatic-matrix/query-classification.vcf` | 285 | `7c493e151c9f8d1f060fd43fda1281b67cbe3f7ab803f6667ccc3846e4862f8f` | `eb37118` | SOMPY |
 | `verification/assets/fixtures/somatic-matrix/query-denominator.vcf` | 253 | `949f82118333214de9706d5e107d893ea8ba5c87cddb1c5d42d8eb87bf548fb1` | `eb37118` | SOMPY |
@@ -960,10 +965,9 @@ recorded in a README beside the files:
   `fixtures/hg001-primitive-identity/`: minimized from the public GIAB HG001
   v4.2.1 and Illumina Platinum Genomes NA12878 comparison, with the source URLs
   in each README.
-- `fixtures/somatic-af-type-parity/`: synthesized from a full-size legacy som.py
-  run of 2026-08-12. Its sibling `fixtures/somatic-output-parity/` carries the
-  same provenance but no committed row consumes it, so it is absent from the
-  table above.
+- `fixtures/somatic-af-type-parity/` and `fixtures/somatic-output-parity/`:
+  synthesized from a full-size legacy som.py run of 2026-08-12. Both are
+  consumed by a committed SOMPY row.
 
 ### Public data
 

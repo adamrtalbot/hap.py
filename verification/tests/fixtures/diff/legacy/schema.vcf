@@ -1,5 +1,0 @@
-##fileformat=VCFv4.2
-##source=legacy
-##contig=<ID=chr1,length=10>
-#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
-chr1	1	.	A	T	.	PASS	.

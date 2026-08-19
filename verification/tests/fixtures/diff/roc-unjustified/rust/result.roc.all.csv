@@ -1,4 +1,0 @@
-Type,Subtype,Subset,Filter,Genotype,QQ.Field,QQ,QUERY.TP,QUERY.FP
-SNP,*,*,ALL,*,QUAL,10.000000,4,8
-SNP,*,*,ALL,*,QUAL,20.000000,2,6
-SNP,*,*,ALL,*,QUAL,25.000000,1,5

@@ -17,7 +17,7 @@
 
 nextflow.enable.dsl = 2
 
-include { HAPPY_LEGACY ; HAPPY_RUST ; HAPPY_RUST_CONTRACT } from './modules/happy'
+include { HAPPY_LEGACY ; HAPPY_RUST } from './modules/happy'
 include { SOMPY_LEGACY ; SOMPY_RUST } from './modules/sompy'
 include { PREPY_LEGACY ; PREPY_RUST } from './modules/prepy'
 include { FTXPY_LEGACY ; FTXPY_RUST } from './modules/ftxpy'

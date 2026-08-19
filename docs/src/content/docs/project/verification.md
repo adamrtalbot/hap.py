@@ -3,24 +3,24 @@ title: Verification
 description: Compare hap-rs output with pinned legacy tools.
 ---
 
-Nextflow runs a pinned legacy tool and the local `hap` command for 154
-samplesheet cases. nf-test collects all 154 results after the Rust unit and
+Nextflow runs a pinned legacy tool and the local `hap` command for 155
+samplesheet cases. nf-test collects all 155 results after the Rust unit and
 integration tests pass.
 
 ## Coverage
 
-The default matrix contains 154 paired comparisons:
+The default matrix contains 155 paired comparisons:
 
 | Lane | Legacy tool | hap-rs command | Checks |
 |---|---|---|---:|
 | `happy` | `hap.py` | `hap germline` | 34 |
-| `sompy` | `som.py` | `hap somatic` | 27 |
+| `sompy` | `som.py` | `hap somatic` | 28 |
 | `prepy` | `pre.py` | `hap pre` | 47 |
 | `ftxpy` | `ftx.py` | `hap ftx` | 25 |
 | `qfy` | `qfy.py` | `hap quantify` | 9 |
 | `vcfcheck` | `vcfcheck` | `hap validate` | 12 |
 
-Six `verification/assets/samplesheet.*.csv` files list the 154 paired inputs and
+Six `verification/assets/samplesheet.*.csv` files list the 155 paired inputs and
 arguments. `verification/README.md` tables every row, the option surface each
 one binds, and the provenance of every input file.
 

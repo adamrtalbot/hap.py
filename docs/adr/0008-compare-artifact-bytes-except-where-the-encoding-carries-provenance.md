@@ -113,8 +113,8 @@ as ordered text while `result.roc.all.csv.gz` was not.
 The parsed tree, with provenance pointers excluded, and every compared number
 required to be spelled identically.
 
-The pointer list stays governed as comparator code with cases in
-`verification/tests/diff.nf.test`, and is deliberately not reproduced here.
+The pointer list stays governed as comparator code in `modules/diff.nf`, and is
+deliberately not reproduced here.
 `0006-state-the-claim-at-1-0-0-against-the-pinned-pair.md` keeps its exclusions
 at class level precisely to avoid a second inventory that can drift, which is the
 failure `0003-bound-the-invocation-surface-to-the-pinned-parsers.md` rejected for
@@ -276,16 +276,22 @@ contract.
 
 A change that **narrows** what is compared — a new exclusion, a new
 canonicalization, a new relaxation, a new artifact class admitted to a weaker
-comparison — requires an amendment to this ADR, maintainer sign-off, and a case
-in `verification/tests/diff.nf.test` demonstrating the new behaviour.
+comparison — requires an amendment to this ADR and maintainer sign-off.
 
 A change that **widens** what is compared — a tightening, a new artifact class
-admitted to a stricter comparison, or a bug fix — requires only the test case.
+admitted to a stricter comparison, or a bug fix — is ungoverned here, because it
+cannot weaken the contract.
 
-Both tiers are checkable, because `verification/tests/diff.nf.test` is the
-record and it lives beside the comparator. It carries 14 cases today, covering
-text line reporting, VCF provenance against preserved header comparison, runinfo
-container identity, ROC order and multiplicity, and BCF and CSI semantics.
+Only the narrowing tier is checkable, and only by reading this ADR against
+`modules/diff.nf`. `verification/tests/diff.nf.test` used to carry 14 cases
+demonstrating comparator behaviour directly, including inputs on which the
+comparator is required to *report* a difference: `roc-missing`,
+`roc-additional`, `roc-changed`, `roc-duplicate`, `roc-extra-duplicate`,
+`roc-order`, `roc-unjustified` and `invalid-index`. It was removed when
+`verification/` was reduced to one pipeline and one test. The comparator is now
+exercised only through the 155 gate comparisons, which all pass, so they cover
+its agree path alone: a comparator regression that stops reporting a difference
+would not be caught.
 
 The comparator's container identity is pinned exactly as the legacy reference is,
 so moving that digest re-baselines under the rule in ADR 0004.
@@ -347,9 +353,11 @@ this ADR:
 `strict_roc_order` leaves `verification/assets/samplesheet.happy.csv` and
 `verification/assets/samplesheet.happy.public.csv`.
 
-`verification/tests/diff.nf.test` gains cases for the four changes above, and for
-three behaviours it does not currently cover: an `artifact_set` difference, the
-sha256 fallback on an unknown extension, and `.gz` decompression.
+No comparator test accompanies the four changes above. `verification/` carries
+one pipeline and one test, so the changes are checked by the 155 gate comparisons
+and by reading this ADR against `modules/diff.nf`. Three behaviours stay
+unexercised either way: an `artifact_set` difference, the sha256 fallback on an
+unknown extension, and `.gz` decompression.
 
 The exclusion lists in `verification/README.md` and
 `docs/src/content/docs/project/verification.md` are rewritten against this ADR.
