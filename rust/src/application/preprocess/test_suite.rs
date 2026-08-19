@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn the_reference_comes_from_the_argument_alone() -> Result<()> {
+    fn normative_the_reference_comes_from_the_argument_alone() -> Result<()> {
         let directory = tempdir()?;
         let explicit = directory.path().join("explicit.fa");
         fs::write(&explicit, ">chr1\nA\n")?;

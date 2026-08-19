@@ -351,10 +351,18 @@ fn somatic_artifacts(args: &SomaticArgs) -> Result<Vec<String>> {
     Ok(artifacts)
 }
 
+/// The reference is an argument, and only normalization and the automatic
+/// FP denominator need one.
+fn require_reference(args: &SomaticArgs) -> Result<&str> {
+    args.reference
+        .as_deref()
+        .context("no reference file found; pass --reference")
+}
+
 fn somatic_inputs(args: &SomaticArgs) -> Vec<PathBuf> {
     std::iter::once(args.truth.as_str())
         .chain(std::iter::once(args.query.as_str()))
-        .chain(std::iter::once(args.reference.as_str()))
+        .chain(args.reference.as_deref())
         .chain(args.regions_bedfile.as_deref())
         .chain(args.targets_bedfile.as_deref())
         .chain(args.fp_bedfile.as_deref())
@@ -386,12 +394,12 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
     let ci_alpha = 1.0 - args.ci_level;
     let (normalize_truth, normalize_query) = selected_normalizations(&args);
 
-    // Legacy som.py opens the reference only for bcftools normalization or
-    // when it must derive an automatic reference-sized FP denominator. Plain
-    // allele comparison with an explicit/FP-BED denominator must therefore
-    // remain usable even when the default hg19 path is absent.
+    // som.py opens the reference only for bcftools normalization or when it
+    // must derive an automatic reference-sized FP denominator. Plain allele
+    // comparison with an explicit/FP-BED denominator therefore stays usable
+    // with no reference at all, which is why `--reference` is not required.
     let reference_sequences = if normalize_truth || normalize_query {
-        Some(fasta::read_sequences(Path::new(&args.reference))?)
+        Some(fasta::read_sequences(Path::new(require_reference(&args)?))?)
     } else {
         None
     };
@@ -835,7 +843,7 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         &ambiguous_regions,
     ) && reference_lengths.is_empty()
     {
-        reference_lengths = fasta::contig_lengths(Path::new(&args.reference))?;
+        reference_lengths = fasta::contig_lengths(Path::new(require_reference(&args)?))?;
     }
     validate_legacy_fp_location_denominator(
         args.fp_region_size.as_deref(),

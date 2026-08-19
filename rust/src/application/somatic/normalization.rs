@@ -621,8 +621,10 @@ pub(super) fn somatic_commandline(args: &SomaticArgs) -> String {
     parts.push(args.query.clone());
     parts.push("-o".to_string());
     parts.push(args.output.clone());
-    parts.push("--reference".to_string());
-    parts.push(args.reference.clone());
+    if let Some(reference) = &args.reference {
+        parts.push("--reference".to_string());
+        parts.push(reference.clone());
+    }
     if let Some(fp_bed) = &args.fp_bedfile {
         parts.push("--false-positives".to_string());
         parts.push(fp_bed.clone());

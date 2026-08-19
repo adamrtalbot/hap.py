@@ -30,6 +30,18 @@ mod strelka_snv;
 
 static SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
+/// The reference is an argument, and `--normalize` is the only ftx feature
+/// that opens one.
+fn normalize_reference(args: &FtxArgs) -> Result<Option<&str>> {
+    if !args.normalize {
+        return Ok(None);
+    }
+    args.reference
+        .as_deref()
+        .map(Some)
+        .context("no reference file found for --normalize; pass --reference")
+}
+
 struct ScratchRun(PathBuf);
 
 impl ScratchRun {
@@ -84,9 +96,7 @@ impl Drop for ScratchRun {
 
 pub(crate) fn run(args: ValidatedFtxArgs) -> Result<()> {
     let mut args = args.into_inner();
-    if args.normalize && args.reference.is_none() {
-        bail!("no reference file found for --normalize; pass --reference");
-    }
+    normalize_reference(&args)?;
     let output = ftx_output_path(&args.output);
     let inputs = std::iter::once(args.input.as_str())
         .chain(args.reference.as_deref())
@@ -123,14 +133,9 @@ fn run_inner(args: FtxArgs) -> Result<()> {
     // Legacy passes the reference only to `bcftools norm`; ordinary feature
     // extraction never opens or validates it. Preserve that lazy behavior so
     // an explicitly missing path is harmless unless normalization is enabled.
-    let reference_sequences = if args.normalize {
-        let reference_path = args
-            .reference
-            .as_deref()
-            .context("no reference file found for --normalize; pass --reference")?;
-        fasta::read_sequences(Path::new(reference_path))?
-    } else {
-        BTreeMap::new()
+    let reference_sequences = match normalize_reference(&args)? {
+        Some(path) => fasta::read_sequences(Path::new(path))?,
+        None => BTreeMap::new(),
     };
     let reference_contigs: BTreeSet<String> = reference_sequences.keys().cloned().collect();
 

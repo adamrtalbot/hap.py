@@ -219,7 +219,7 @@ mod tests {
             let mut args = parsed_somatic(&[]);
             args.truth = truth.display().to_string();
             args.query = query.display().to_string();
-            args.reference = reference.display().to_string();
+            args.reference = Some(reference.display().to_string());
             args.output = output.display().to_string();
             args.scratch_prefix = Some(scratch.display().to_string());
             args.cont = cont;
@@ -263,7 +263,7 @@ mod tests {
         args.truth = truth.display().to_string();
         args.query = query.display().to_string();
         args.output = root.join("result").display().to_string();
-        args.reference = root.join("missing.fa").display().to_string();
+        args.reference = Some(root.join("missing.fa").display().to_string());
         args.ambiguous_beds = vec![ambiguous.display().to_string()];
         args.explain_ambiguous = true;
         args.fp_region_size = Some("10".to_string());
@@ -309,7 +309,7 @@ mod tests {
         args.truth = truth.display().to_string();
         args.query = query.display().to_string();
         args.output = root.join("result").display().to_string();
-        args.reference = root.join("missing.fa").display().to_string();
+        args.reference = Some(root.join("missing.fa").display().to_string());
         args.ambiguous_beds = vec![ambiguous.display().to_string()];
         args.explain_ambiguous = true;
         args.fp_region_size = Some("10".to_string());
@@ -361,7 +361,7 @@ mod tests {
         args.truth = truth.display().to_string();
         args.query = query.display().to_string();
         args.output = root.join("result").display().to_string();
-        args.reference = root.join("missing.fa").display().to_string();
+        args.reference = Some(root.join("missing.fa").display().to_string());
         args.fp_bedfile = Some(fp.display().to_string());
         args.ambiguous_beds = vec![ambiguous.display().to_string()];
         args.explain_ambiguous = true;
@@ -420,7 +420,7 @@ mod tests {
         args.truth = truth.display().to_string();
         args.query = query.display().to_string();
         args.output = root.join("result").display().to_string();
-        args.reference = reference.display().to_string();
+        args.reference = Some(reference.display().to_string());
         args.quiet = true;
         run_args(args).expect("run truth-only automatic denominator comparison");
 
@@ -450,7 +450,7 @@ mod tests {
         args.truth = truth.display().to_string();
         args.query = query.display().to_string();
         args.output = root.join("result").display().to_string();
-        args.reference = root.join("missing.fa").display().to_string();
+        args.reference = Some(root.join("missing.fa").display().to_string());
         args.fp_bedfile = Some(fp.display().to_string());
         args.quiet = true;
         run_args(args).expect("usable FP BED must avoid loading the missing reference");
@@ -478,7 +478,7 @@ mod tests {
         args.truth = truth.display().to_string();
         args.query = query.display().to_string();
         args.output = root.join("result").display().to_string();
-        args.reference = root.join("missing.fa").display().to_string();
+        args.reference = Some(root.join("missing.fa").display().to_string());
         args.normalize_all = true;
         args.count_filtered_fn = true;
         args.include_nonpass = true;
@@ -608,7 +608,7 @@ mod tests {
             args.truth = truth.display().to_string();
             args.query = query.display().to_string();
             args.output = root.join(label).display().to_string();
-            args.reference = root.join("missing.fa").display().to_string();
+            args.reference = Some(root.join("missing.fa").display().to_string());
             args.feature_table = Some("generic".to_string());
             args.af_strat = true;
             args.af_strat_binsize = value.to_string();
@@ -649,7 +649,7 @@ mod tests {
         args.truth = truth.display().to_string();
         args.query = query.display().to_string();
         args.output = root.join("result").display().to_string();
-        args.reference = root.join("missing.fa").display().to_string();
+        args.reference = Some(root.join("missing.fa").display().to_string());
         args.feature_table = Some("generic".to_string());
         args.af_strat = true;
         args.af_strat_binsize = "0.2".to_string();
@@ -959,7 +959,7 @@ mod tests {
         args.truth = truth.display().to_string();
         args.query = query.display().to_string();
         args.output = root.join("result").display().to_string();
-        args.reference = root.join("missing.fa").display().to_string();
+        args.reference = Some(root.join("missing.fa").display().to_string());
         args.fp_bedfile = Some(fp.display().to_string());
         args.location = Some("chr1:1-10".to_string());
         args.feature_table = Some("generic".to_string());

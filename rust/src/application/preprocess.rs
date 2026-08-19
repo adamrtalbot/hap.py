@@ -227,9 +227,8 @@ fn run_with_optional_reference(
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if args.reference.is_none() {
-        args.reference = Some(resolve_reference(None)?.to_string_lossy().into_owned());
-    }
+    // The reference is an argument: fail before any output path is staged.
+    resolve_reference(args.reference.as_deref())?;
     let output_path = preprocess_output_path(&args);
     let index_path = if output_path.extension().and_then(|value| value.to_str()) == Some("bcf") {
         output_path.with_extension("bcf.csi")

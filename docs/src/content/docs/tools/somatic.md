@@ -20,7 +20,7 @@ hap somatic [OPTIONS] --output <OUTPUT> <TRUTH> <QUERY>
 | `<TRUTH>` | Yes | Trusted somatic callset. |
 | `<QUERY>` | Yes | Somatic callset to evaluate. |
 | `-o, --output <PREFIX>` | Yes | Output prefix for stats and metrics files. |
-| `-r, --reference <FASTA>` | Yes | Reference FASTA. `hap` reads no environment variable in its place. |
+| `-r, --reference <FASTA>` | For normalization | Reference FASTA. Needed by `--normalize-*` and by an automatic FP denominator; plain allele comparison runs without one. `hap` reads no environment variable in its place. |
 
 ## Example
 

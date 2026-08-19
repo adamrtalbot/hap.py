@@ -94,7 +94,7 @@ fn hap_with_reference_environment(arguments: &[&str]) -> Output {
 
 #[test]
 fn normative_reference_environment_variables_are_never_consulted() {
-    let invocations: [&[&str]; 3] = [
+    let invocations: [&[&str]; 4] = [
         &[
             "germline",
             "absent-truth.vcf",
@@ -110,6 +110,14 @@ fn normative_reference_environment_variables_are_never_consulted() {
             "absent-output.csv",
             "--normalize",
         ],
+        &[
+            "somatic",
+            "absent-truth.vcf",
+            "absent-query.vcf",
+            "-o",
+            "absent-report",
+            "--normalize-all",
+        ],
     ];
     for invocation in invocations {
         let label = invocation.join(" ");
@@ -122,8 +130,11 @@ fn normative_reference_environment_variables_are_never_consulted() {
     }
 }
 
+/// Legacy `som.py` compares alleles with no reference at all, so `--reference`
+/// is demanded only by the two somatic features that open one. The parser must
+/// therefore let the argument stay absent.
 #[test]
-fn normative_somatic_requires_the_reference_argument() {
+fn normative_somatic_accepts_an_absent_reference() {
     let output = hap_with_reference_environment(&[
         "somatic",
         "absent-truth.vcf",
@@ -131,7 +142,7 @@ fn normative_somatic_requires_the_reference_argument() {
         "-o",
         "absent-report",
     ]);
-    assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--reference"), "{stderr}");
+    assert!(!stderr.contains("--reference"), "{stderr}");
+    assert!(!stderr.contains("Usage:"), "{stderr}");
 }

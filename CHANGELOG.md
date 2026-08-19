@@ -28,6 +28,8 @@
   message on standard error, and nothing on standard output.
 - Take the reference from `--reference` alone. The `HG19` and `HGREF`
   environment variables and the `/opt/hap.py-data/hg19.fa` install path are no
-  longer consulted, and `somatic` now requires `--reference` at parse time.
-  This narrows the covered invocation surface: an environment-supplied
-  reference was already outside it.
+  longer consulted. This narrows the covered invocation surface: an
+  environment-supplied reference was already outside it. `germline` and `pre`
+  now report a missing reference instead of resolving one; `somatic` and `ftx`
+  demand one only where they open it, so a somatic allele comparison with an
+  FP BED still runs with no reference at all.

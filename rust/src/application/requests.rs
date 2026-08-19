@@ -545,7 +545,7 @@ pub(crate) struct SomaticArgs {
     pub(crate) truth: String,
     pub(crate) query: String,
     pub(crate) output: String,
-    pub(crate) reference: String,
+    pub(crate) reference: Option<String>,
     pub(crate) location: Option<String>,
     pub(crate) regions_bedfile: Option<String>,
     pub(crate) targets_bedfile: Option<String>,
@@ -589,7 +589,7 @@ impl SomaticArgs {
         require_text(&self.truth, "truth")?;
         require_text(&self.query, "query")?;
         require_text(&self.output, "output")?;
-        require_text(&self.reference, "reference")?;
+        require_optional_text(self.reference.as_deref(), "reference")?;
         require_optional_text(self.regions_bedfile.as_deref(), "regions_bedfile")?;
         require_optional_text(self.targets_bedfile.as_deref(), "targets_bedfile")?;
         require_optional_text(self.fp_bedfile.as_deref(), "fp_bedfile")?;

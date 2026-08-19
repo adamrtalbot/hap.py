@@ -725,7 +725,7 @@ pub(crate) struct SomaticArgs {
     pub output: String,
 
     #[arg(short = 'r', long = "reference")]
-    pub reference: String,
+    pub reference: Option<String>,
 
     #[arg(short = 'l', long = "location")]
     pub location: Option<String>,
@@ -1680,7 +1680,7 @@ mod tests {
             panic!("somatic should parse");
         };
         assert_eq!(args.output, "last");
-        assert_eq!(args.reference, "last.fa");
+        assert_eq!(args.reference.as_deref(), Some("last.fa"));
         assert_eq!(args.location.as_deref(), Some("chr2"));
 
         let cli = Cli::try_parse_from([
