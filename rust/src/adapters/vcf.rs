@@ -6,24 +6,14 @@ use flate2::read::MultiGzDecoder;
 use noodles_bgzf as bgzf;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-#[cfg(test)]
-use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::{Mutex, MutexGuard};
 
 const TBI_MAX_POSITION: usize = 1 << 29;
 const TBI_LINEAR_SHIFT: usize = 14;
 const TBI_METADATA_BIN: u32 = 37_450;
 const MAX_VCF_LINE_BYTES: usize = 64 * 1024 * 1024;
 const BGZF_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
-#[cfg(test)]
-static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static PUBLICATION_MUTEX: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct VariantKey {
@@ -765,229 +755,6 @@ where
     transaction.commit()
 }
 
-/// Publishes the VCF and index as one recoverable transaction.
-///
-/// POSIX filesystems do not offer a two-path atomic rename. Keeping any old
-/// pair in adjacent backup files lets us roll both destinations back if either
-/// publication rename fails, avoiding a VCF paired with an index from a
-/// different generation.
-#[cfg(test)]
-fn publish_pair(
-    temporary_vcf: &Path,
-    destination_vcf: &Path,
-    temporary_tbi: &Path,
-    destination_tbi: &Path,
-) -> Result<()> {
-    // A stable lock keyed by the canonical destination coordinates separate
-    // hap-rs processes without adding an artifact beside the requested pair.
-    // The process-local mutex is also necessary because advisory lock
-    // semantics for two descriptors owned by one process vary by platform.
-    let _publication_lock = PairPublicationLock::acquire(destination_vcf)?;
-
-    validate_regular_destination(destination_vcf)?;
-    validate_regular_destination(destination_tbi)?;
-
-    let backup_vcf = move_existing_to_backup(destination_vcf)?;
-    let backup_tbi = match move_existing_to_backup(destination_tbi) {
-        Ok(backup) => backup,
-        Err(error) => {
-            if let Some(backup) = &backup_vcf
-                && let Err(restore_error) = fs::rename(backup, destination_vcf)
-            {
-                return Err(error.context(format!(
-                    "also failed to restore {}: {restore_error}",
-                    destination_vcf.display()
-                )));
-            }
-            return Err(error);
-        }
-    };
-
-    let mut published_tbi = false;
-    let mut published_vcf = false;
-    let publication = (|| {
-        fs::rename(temporary_tbi, destination_tbi).with_context(|| {
-            format!(
-                "failed to publish {} as {}",
-                temporary_tbi.display(),
-                destination_tbi.display()
-            )
-        })?;
-        published_tbi = true;
-
-        fs::rename(temporary_vcf, destination_vcf).with_context(|| {
-            format!(
-                "failed to publish {} as {}",
-                temporary_vcf.display(),
-                destination_vcf.display()
-            )
-        })?;
-        published_vcf = true;
-        Ok(())
-    })();
-
-    if let Err(error) = publication {
-        let mut rollback_errors = Vec::new();
-        if published_vcf && let Err(rollback_error) = fs::remove_file(destination_vcf) {
-            rollback_errors.push(format!(
-                "failed to remove new {}: {rollback_error}",
-                destination_vcf.display()
-            ));
-        }
-        if published_tbi && let Err(rollback_error) = fs::remove_file(destination_tbi) {
-            rollback_errors.push(format!(
-                "failed to remove new {}: {rollback_error}",
-                destination_tbi.display()
-            ));
-        }
-        restore_backup(&backup_vcf, destination_vcf, &mut rollback_errors);
-        restore_backup(&backup_tbi, destination_tbi, &mut rollback_errors);
-
-        if rollback_errors.is_empty() {
-            return Err(error);
-        }
-        return Err(error.context(format!("rollback errors: {}", rollback_errors.join("; "))));
-    }
-
-    remove_backup(&backup_vcf)?;
-    remove_backup(&backup_tbi)?;
-    Ok(())
-}
-
-#[cfg(test)]
-struct PairPublicationLock {
-    file: File,
-    _process_guard: MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl PairPublicationLock {
-    fn acquire(destination: &Path) -> Result<Self> {
-        let process_guard = PUBLICATION_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = publication_lock_path(destination)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create publication lock directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("failed to open publication lock {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("failed to lock publication path {}", path.display()))?;
-        Ok(Self {
-            file,
-            _process_guard: process_guard,
-        })
-    }
-}
-
-#[cfg(test)]
-impl Drop for PairPublicationLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-#[cfg(test)]
-fn publication_lock_path(destination: &Path) -> Result<PathBuf> {
-    // `Path::parent()` returns `Some("")` for a bare relative filename.
-    // Canonicalize the working directory in that case, exactly as for an
-    // explicit `./result.vcf.gz` destination.
-    let parent = destination
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let canonical_parent = parent.canonicalize().with_context(|| {
-        format!(
-            "failed to resolve publication directory {}",
-            parent.display()
-        )
-    })?;
-    let canonical_destination = canonical_parent.join(
-        destination
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("output.vcf.gz")),
-    );
-    let mut hasher = std::hash::DefaultHasher::new();
-    canonical_destination.hash(&mut hasher);
-    Ok(std::env::temp_dir()
-        .join("hap-rs-publication-locks")
-        .join(format!("{:016x}.lock", hasher.finish())))
-}
-
-#[cfg(test)]
-fn validate_regular_destination(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
-            Ok(())
-        }
-        Ok(_) => bail!(
-            "refusing to replace non-file output destination {}",
-            path.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
-    }
-}
-
-#[cfg(test)]
-fn move_existing_to_backup(destination: &Path) -> Result<Option<PathBuf>> {
-    if !destination.try_exists().with_context(|| {
-        format!(
-            "failed to determine whether {} exists",
-            destination.display()
-        )
-    })? {
-        return Ok(None);
-    }
-
-    let (backup, placeholder) = create_temporary_file(destination)?;
-    drop(placeholder);
-    fs::remove_file(&backup)
-        .with_context(|| format!("failed to prepare backup path {}", backup.display()))?;
-    fs::rename(destination, &backup).with_context(|| {
-        format!(
-            "failed to preserve existing {} as {}",
-            destination.display(),
-            backup.display()
-        )
-    })?;
-    Ok(Some(backup))
-}
-
-#[cfg(test)]
-fn restore_backup(backup: &Option<PathBuf>, destination: &Path, errors: &mut Vec<String>) {
-    let Some(backup) = backup else {
-        return;
-    };
-    if let Err(error) = fs::rename(backup, destination) {
-        errors.push(format!(
-            "failed to restore {} as {}: {error}",
-            backup.display(),
-            destination.display()
-        ));
-    }
-}
-
-#[cfg(test)]
-fn remove_backup(backup: &Option<PathBuf>) -> Result<()> {
-    if let Some(path) = backup {
-        fs::remove_file(path)
-            .with_context(|| format!("failed to remove backup {}", path.display()))?;
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
 struct IndexRecord {
     chrom: String,
@@ -1346,39 +1113,6 @@ fn tabix_path(vcf_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-#[cfg(test)]
-fn create_temporary_file(destination: &Path) -> Result<(PathBuf, File)> {
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("output");
-    for _ in 0..100 {
-        let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".{file_name}.hap-rs.{}.{}.tmp",
-            std::process::id(),
-            id
-        ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to create temporary file near {}",
-                        destination.display()
-                    )
-                });
-            }
-        }
-    }
-    bail!(
-        "failed to allocate a temporary file near {}",
-        destination.display()
-    )
-}
-
 pub(crate) fn load_variants(
     path: &Path,
     reference_contigs: &BTreeSet<String>,
@@ -1664,10 +1398,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{BufRead, Cursor};
-    use std::process::{Command, Stdio};
 
-    use std::sync::{Arc, Barrier};
-    use std::thread;
     use tempfile::tempdir;
 
     proptest! {
@@ -2168,136 +1899,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_same_prefix_writers_publish_one_complete_generation() -> Result<()> {
-        let directory = tempdir()?;
-        let path = Arc::new(directory.path().join("shared.vcf.gz"));
-        let writers = 12;
-        let barrier = Arc::new(Barrier::new(writers));
-        let mut handles = Vec::new();
-
-        for generation in 0..writers {
-            let path = Arc::clone(&path);
-            let barrier = Arc::clone(&barrier);
-            handles.push(thread::spawn(move || -> Result<()> {
-                let headers = [
-                    "##fileformat=VCFv4.2".to_string(),
-                    "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO".to_string(),
-                ];
-                let chrom = format!("generation_{generation}");
-                let records: Vec<String> = (0..200)
-                    .map(|record| {
-                        format!(
-                            "{chrom}\t{}\t{chrom}_{record}\tA\tC\t.\tPASS\tPAD={}",
-                            record + 1,
-                            "ACGT".repeat(20)
-                        )
-                    })
-                    .collect();
-                barrier.wait();
-                write_indexed_vcf(&path, &headers, records.iter().map(String::as_str))
-            }));
-        }
-
-        for handle in handles {
-            handle.join().expect("writer thread panicked")?;
-        }
-
-        let text = read_text(&path)?;
-        let published_chrom = text
-            .lines()
-            .find(|line| !line.starts_with('#'))
-            .and_then(|line| line.split('\t').next())
-            .expect("published VCF has a record");
-        let index = read_tabix_index(&tabix_path(&path))?;
-        assert_eq!(index.names, [published_chrom]);
-        assert_eq!(
-            text.lines()
-                .filter(|line| !line.starts_with('#'))
-                .filter(|line| line.starts_with(published_chrom))
-                .count(),
-            200
-        );
-        assert_no_transaction_files(directory.path())?;
-        Ok(())
-    }
-
-    #[test]
-    fn concurrent_processes_publish_one_complete_generation() -> Result<()> {
-        if let Ok(path) = std::env::var("HAP_RS_PUBLICATION_TEST_PATH") {
-            return publication_process_helper(&path);
-        }
-
-        let directory = tempdir()?;
-        let path = directory.path().join("shared-process.vcf.gz");
-        let mut children = Vec::new();
-        for generation in 0..8 {
-            children.push(
-                Command::new(std::env::current_exe()?)
-                    .arg("--exact")
-                    .arg("adapters::vcf::tests::concurrent_processes_publish_one_complete_generation")
-                    .env("HAP_RS_PUBLICATION_TEST_PATH", &path)
-                    .env("HAP_RS_PUBLICATION_TEST_GENERATION", generation.to_string())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()?,
-            );
-        }
-        for child in children {
-            let output = child.wait_with_output()?;
-            assert!(
-                output.status.success(),
-                "publication helper failed with {}:\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        let text = read_text(&path)?;
-        let published_chrom = text
-            .lines()
-            .find(|line| !line.starts_with('#'))
-            .and_then(|line| line.split('\t').next())
-            .expect("published VCF has a record");
-        assert_eq!(
-            read_tabix_index(&tabix_path(&path))?.names,
-            [published_chrom]
-        );
-        assert_eq!(
-            text.lines()
-                .filter(|line| !line.starts_with('#'))
-                .filter(|line| line.starts_with(published_chrom))
-                .count(),
-            500
-        );
-        assert_no_transaction_files(directory.path())?;
-        Ok(())
-    }
-
-    fn publication_process_helper(path: &str) -> Result<()> {
-        let generation = std::env::var("HAP_RS_PUBLICATION_TEST_GENERATION")?;
-        let chrom = format!("process_generation_{generation}");
-        let headers = [
-            "##fileformat=VCFv4.2".to_string(),
-            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO".to_string(),
-        ];
-        let records: Vec<String> = (0..500)
-            .map(|record| {
-                format!(
-                    "{chrom}\t{}\t{chrom}_{record}\tA\tC\t.\tPASS\tPAD={}",
-                    record + 1,
-                    "ACGT".repeat(50)
-                )
-            })
-            .collect();
-        write_indexed_vcf(
-            Path::new(&path),
-            &headers,
-            records.iter().map(String::as_str),
-        )
-    }
-
-    #[test]
     fn replacing_an_existing_pair_removes_transaction_files() -> Result<()> {
         let directory = tempdir()?;
         let path = directory.path().join("output.vcf.gz");
@@ -2314,41 +1915,6 @@ mod tests {
 
         assert!(read_text(&path)?.contains("chr1\t1"));
         assert_eq!(read_tabix_index(&index_path)?.names, ["chr1"]);
-        assert_no_transaction_files(directory.path())?;
-        Ok(())
-    }
-
-    #[test]
-    fn bare_relative_destination_resolves_publication_lock_from_working_directory() -> Result<()> {
-        assert_eq!(
-            publication_lock_path(Path::new("result.vcf.gz"))?,
-            publication_lock_path(Path::new("./result.vcf.gz"))?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn publication_failure_rolls_back_both_existing_outputs() -> Result<()> {
-        let directory = tempdir()?;
-        let destination_vcf = directory.path().join("output.vcf.gz");
-        let destination_tbi = tabix_path(&destination_vcf);
-        let missing_temporary_vcf = directory.path().join("missing.vcf.gz.tmp");
-        let temporary_tbi = directory.path().join("new.vcf.gz.tbi.tmp");
-        fs::write(&destination_vcf, b"old-vcf")?;
-        fs::write(&destination_tbi, b"old-index")?;
-        fs::write(&temporary_tbi, b"new-index")?;
-
-        let error = publish_pair(
-            &missing_temporary_vcf,
-            &destination_vcf,
-            &temporary_tbi,
-            &destination_tbi,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("failed to publish"));
-        assert_eq!(fs::read(&destination_vcf)?, b"old-vcf");
-        assert_eq!(fs::read(&destination_tbi)?, b"old-index");
         assert_no_transaction_files(directory.path())?;
         Ok(())
     }

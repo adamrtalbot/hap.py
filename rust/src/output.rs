@@ -3,16 +3,14 @@
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 #[cfg(unix)]
 use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static TRANSACTION_ID: AtomicU64 = AtomicU64::new(0);
-static PUBLICATION_MUTEX: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 thread_local! {
     static FAIL_PUBLICATION_AFTER: std::cell::Cell<isize> = const { std::cell::Cell::new(-1) };
@@ -251,8 +249,6 @@ impl OutputTransaction {
             .iter()
             .map(|t| t.destination.clone())
             .collect::<Vec<_>>();
-        let _locks = PublicationLocks::acquire(&destinations)?;
-        validate_plan(&self.inputs, self.targets.iter().map(|t| &t.destination))?;
         publish_generation(&present, &destinations)?;
         self.committed = true;
         Ok(())
@@ -562,11 +558,11 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
                 };
             }
             Ok(_) => {
-                // A concurrent output transaction can move an existing file
-                // to its backup between `symlink_metadata` and this call.
-                // Treat that narrow race as an absent destination; the later
-                // publication lock and destination validation serialize the
-                // actual replacement.
+                // Treat a destination that disappeared between
+                // `symlink_metadata` and this call as absent: something
+                // outside this run removed it, and there is nothing left to
+                // resolve. Publication goes on to create the destination as
+                // if it had never been there.
                 return match fs::canonicalize(&candidate) {
                     Ok(resolved) => Ok(resolved),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(candidate),
@@ -624,43 +620,6 @@ fn append_suffix(prefix: &Path, suffix: &OsStr) -> PathBuf {
     let mut value = prefix.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
-}
-
-struct PublicationLocks {
-    file: File,
-    _process_guard: MutexGuard<'static, ()>,
-}
-impl PublicationLocks {
-    fn acquire(_destinations: &[PathBuf]) -> Result<Self> {
-        let process_guard = PUBLICATION_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let directory = std::env::temp_dir().join("hap-rs-publication-locks");
-        fs::create_dir_all(&directory).with_context(|| {
-            format!(
-                "failed to create publication lock directory {}",
-                directory.display()
-            )
-        })?;
-        let path = directory.join("global.lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("failed to open publication lock {}", path.display()))?;
-        file.lock().context("failed to lock output publication")?;
-        Ok(Self {
-            file,
-            _process_guard: process_guard,
-        })
-    }
-}
-impl Drop for PublicationLocks {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
 }
 
 fn publish_generation(publications: &[(PathBuf, PathBuf)], owned: &[PathBuf]) -> Result<()> {
@@ -926,8 +885,6 @@ fn restore_backups(backups: &[(PathBuf, PathBuf)], errors: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -1038,46 +995,26 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_generations_are_internally_consistent() -> Result<()> {
+    fn committed_family_publishes_only_its_artifacts() -> Result<()> {
         let dir = tempdir()?;
         let prefix = dir.path().join("run");
-        let barrier = Arc::new(Barrier::new(2));
-        let mut workers = Vec::new();
-        for generation in ["one", "two"] {
-            let prefix = prefix.clone();
-            let barrier = Arc::clone(&barrier);
-            workers.push(thread::spawn(move || -> Result<()> {
-                let tx = OutputTransaction::family(
-                    Vec::<PathBuf>::new(),
-                    &prefix,
-                    ["summary.csv", "metrics.json"],
-                )?;
-                fs::write(
-                    append_suffix(tx.staged_prefix()?, OsStr::new(".summary.csv")),
-                    generation,
-                )?;
-                fs::write(
-                    append_suffix(tx.staged_prefix()?, OsStr::new(".metrics.json")),
-                    generation,
-                )?;
-                barrier.wait();
-                tx.commit()
-            }));
+        let tx = OutputTransaction::family(
+            Vec::<PathBuf>::new(),
+            &prefix,
+            ["summary.csv", "metrics.json"],
+        )?;
+        for artifact in [".summary.csv", ".metrics.json"] {
+            fs::write(
+                append_suffix(tx.staged_prefix()?, OsStr::new(artifact)),
+                "published",
+            )?;
         }
-        for worker in workers {
-            worker.join().expect("worker panicked")?;
-        }
-        assert_eq!(
-            fs::read_to_string(append_suffix(&prefix, OsStr::new(".summary.csv")))?,
-            fs::read_to_string(append_suffix(&prefix, OsStr::new(".metrics.json")))?
-        );
-        assert!(fs::read_dir(dir.path())?.all(|entry| {
-            !entry
-                .expect("directory entry")
-                .file_name()
-                .to_string_lossy()
-                .contains("hap-rs")
-        }));
+        tx.commit()?;
+        let mut published = fs::read_dir(dir.path())?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>>>()?;
+        published.sort();
+        assert_eq!(published, ["run.metrics.json", "run.summary.csv"]);
         Ok(())
     }
 

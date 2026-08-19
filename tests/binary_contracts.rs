@@ -489,3 +489,42 @@ fn complex_native_vcf_and_bcf_records_have_equivalent_behavior() {
     };
     assert_eq!(data_lines(&from_vcf), data_lines(&from_bcf));
 }
+
+#[test]
+fn germline_ignores_an_unusable_lock_path_under_the_temporary_directory() {
+    let directory = tempdir().expect("temporary output directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).expect("temporary root");
+    // A regular file where an earlier hap-rs release put its lock directory.
+    // Nothing reads the path, so planting an unusable one cannot fail the run;
+    // a process that still wanted the directory would fail to create it here.
+    let planted = temporary_root.join("hap-rs-publication-locks");
+    fs::write(&planted, b"not a lock directory").expect("plant the former lock path");
+
+    let prefix = directory.path().join("germline");
+    let output = hap()
+        .args([
+            "germline",
+            "tests/fixtures/synth-snp-match/truth.vcf",
+            "tests/fixtures/synth-snp-match/query.vcf",
+            "-r",
+            "tests/fixtures/synth-snp-match/ref.fa",
+            "-o",
+            &path(&prefix),
+        ])
+        .env("TMPDIR", &temporary_root)
+        .output()
+        .expect("run hap binary");
+
+    assert_success(&output, "germline with an unusable former lock path");
+    assert!(
+        fs::metadata(&planted)
+            .expect("planted path survives")
+            .is_file(),
+        "publication must leave the former lock path alone"
+    );
+    assert!(
+        prefix.with_extension("summary.csv").is_file(),
+        "germline must still publish its report family"
+    );
+}
