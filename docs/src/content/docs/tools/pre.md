@@ -33,7 +33,7 @@ hap pre input.vcf.gz normalized.vcf.gz \
 
 | Option | Description |
 |---|---|
-| `-r, --reference <FASTA>` | Reference FASTA. Required; `hap` reads no environment variable in its place. |
+| `-r, --reference <FASTA>` | Reference FASTA. Required. |
 | `-l, --location <REGION>` | Limit processing to a genomic location. |
 | `-R, --restrict-regions <BED>` | Restrict records to intervals. |
 | `-T, --target-regions <BED>` | Apply target intervals. |

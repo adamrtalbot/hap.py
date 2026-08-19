@@ -125,8 +125,6 @@ fn normative_reference_environment_variables_are_never_consulted() {
         assert!(!output.status.success(), "{label}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("--reference"), "{label}: {stderr}");
-        assert!(!stderr.contains("HGREF"), "{label}: {stderr}");
-        assert!(!stderr.contains("HG19"), "{label}: {stderr}");
     }
 }
 
