@@ -23,7 +23,8 @@ defined by hap-rs and tested against its own expectations.
 
 Provenance fields: version, timestamp, command line, generated descriptions,
 runtime VCF headers. Message text and which stream carries it. Malformed
-invocations. A reference supplied through `HGREF` or `HG19`. VCF on standard
+invocations. A reference supplied through the environment: `hap` takes the
+reference as an argument and reads no variable in its place. VCF on standard
 input. hap-rs's own added options. `--bam` feature extraction. Platforms other
 than linux/amd64.
 

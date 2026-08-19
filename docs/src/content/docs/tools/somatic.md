@@ -20,7 +20,7 @@ hap somatic [OPTIONS] --output <OUTPUT> <TRUTH> <QUERY>
 | `<TRUTH>` | Yes | Trusted somatic callset. |
 | `<QUERY>` | Yes | Somatic callset to evaluate. |
 | `-o, --output <PREFIX>` | Yes | Output prefix for stats and metrics files. |
-| `-r, --reference <FASTA>` | For most runs | Reference FASTA; fallback order: `HG19`, `HGREF`, `/opt/hap.py-data/hg19.fa`. |
+| `-r, --reference <FASTA>` | Yes | Reference FASTA. `hap` reads no environment variable in its place. |
 
 ## Example
 

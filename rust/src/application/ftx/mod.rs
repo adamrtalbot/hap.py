@@ -30,25 +30,6 @@ mod strelka_snv;
 
 static SCRATCH_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Resolves the explicit reference or the legacy HG19/HGREF fallback chain.
-pub(crate) fn resolve_legacy_reference(explicit: Option<&str>) -> Option<String> {
-    if let Some(path) = explicit {
-        return Some(path.to_string());
-    }
-    for variable in ["HG19", "HGREF"] {
-        if let Some(path) = std::env::var_os(variable) {
-            let path = PathBuf::from(path);
-            if path.is_file() {
-                return Some(path.to_string_lossy().into_owned());
-            }
-        }
-    }
-    let fallback = Path::new("/opt/hap.py-data/hg19.fa");
-    fallback
-        .is_file()
-        .then(|| fallback.to_string_lossy().into_owned())
-}
-
 struct ScratchRun(PathBuf);
 
 impl ScratchRun {
@@ -103,10 +84,8 @@ impl Drop for ScratchRun {
 
 pub(crate) fn run(args: ValidatedFtxArgs) -> Result<()> {
     let mut args = args.into_inner();
-    if args.normalize {
-        args.reference = Some(resolve_legacy_reference(args.reference.as_deref()).context(
-            "no reference file found for --normalize; pass --reference or set HG19/HGREF",
-        )?);
+    if args.normalize && args.reference.is_none() {
+        bail!("no reference file found for --normalize; pass --reference");
     }
     let output = ftx_output_path(&args.output);
     let inputs = std::iter::once(args.input.as_str())
@@ -145,10 +124,11 @@ fn run_inner(args: FtxArgs) -> Result<()> {
     // extraction never opens or validates it. Preserve that lazy behavior so
     // an explicitly missing path is harmless unless normalization is enabled.
     let reference_sequences = if args.normalize {
-        let reference_path = resolve_legacy_reference(args.reference.as_deref()).context(
-            "no reference file found for --normalize; pass --reference or set HG19/HGREF",
-        )?;
-        fasta::read_sequences(Path::new(&reference_path))?
+        let reference_path = args
+            .reference
+            .as_deref()
+            .context("no reference file found for --normalize; pass --reference")?;
+        fasta::read_sequences(Path::new(reference_path))?
     } else {
         BTreeMap::new()
     };

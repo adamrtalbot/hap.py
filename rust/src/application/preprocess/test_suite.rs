@@ -158,28 +158,24 @@ mod tests {
     }
 
     #[test]
-    fn reference_candidates_follow_legacy_hg19_then_hgref_precedence() -> Result<()> {
+    fn the_reference_comes_from_the_argument_alone() -> Result<()> {
         let directory = tempdir()?;
         let explicit = directory.path().join("explicit.fa");
-        let hg19 = directory.path().join("hg19.fa");
-        let hgref = directory.path().join("hgref.fa");
-        let fallback = directory.path().join("fallback.fa");
-        for path in [&explicit, &hg19, &hgref, &fallback] {
-            fs::write(path, ">chr1\nA\n")?;
-        }
+        fs::write(&explicit, ">chr1\nA\n")?;
         assert_eq!(
-            resolve_reference_candidates(Some(&explicit), Some(&hg19), Some(&hgref), &fallback)?,
+            resolve_reference(Some(&explicit.display().to_string()))?,
             explicit
         );
+
+        let absent = directory.path().join("absent.fa");
         assert_eq!(
-            resolve_reference_candidates(None, Some(&hg19), Some(&hgref), &fallback)?,
-            hg19
+            resolve_reference(Some(&absent.display().to_string()))?,
+            absent
         );
-        fs::remove_file(&hg19)?;
-        assert_eq!(
-            resolve_reference_candidates(None, Some(&hg19), Some(&hgref), &fallback)?,
-            hgref
-        );
+
+        let error = resolve_reference(None).expect_err("an omitted reference is an error");
+        let message = format!("{error:#}");
+        assert!(message.contains("--reference"), "{message}");
         Ok(())
     }
 

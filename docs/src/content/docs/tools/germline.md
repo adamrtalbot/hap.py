@@ -19,7 +19,7 @@ hap germline [OPTIONS] --report-prefix <REPORT_PREFIX> <TRUTH> <QUERY>
 | `<TRUTH>` | Yes | Trusted VCF, compressed VCF, or BCF. |
 | `<QUERY>` | Yes | Callset to evaluate. |
 | `-o, --report-prefix <PATH>` | Yes | Prefix applied to every report file. The parent directory must exist. |
-| `-r, --reference <FASTA>` | For most runs | Reference FASTA. Without this option, `hap` checks `HG19`, then `HGREF`. |
+| `-r, --reference <FASTA>` | For most runs | Reference FASTA. `hap` reads no environment variable in its place. |
 
 ## Example
 

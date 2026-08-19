@@ -1,4 +1,3 @@
-use crate::application::ftx::resolve_legacy_reference;
 use clap::{
     Arg, ArgAction, ArgMatches, Args, Command as ClapCommand, CommandFactory, Error,
     FromArgMatches, Parser, Subcommand, ValueEnum,
@@ -725,11 +724,7 @@ pub(crate) struct SomaticArgs {
     #[arg(short = 'o', long = "output")]
     pub output: String,
 
-    #[arg(
-        short = 'r',
-        long = "reference",
-        default_value_t = default_somatic_reference()
-    )]
+    #[arg(short = 'r', long = "reference")]
     pub reference: String,
 
     #[arg(short = 'l', long = "location")]
@@ -939,10 +934,6 @@ fn parse_somatic_roc(value: &str) -> Result<String, String> {
         | "mutect.indel" => Ok(value.to_string()),
         _ => Err(format!("unsupported somatic ROC mode '{value}'")),
     }
-}
-
-fn default_somatic_reference() -> String {
-    resolve_legacy_reference(None).unwrap_or_else(|| "/opt/hap.py-data/hg19.fa".to_string())
 }
 
 /// argparse accepted the historical multi-character short option `-FN`.
@@ -1675,6 +1666,10 @@ mod tests {
             "first",
             "-o",
             "last",
+            "-r",
+            "first.fa",
+            "-r",
+            "last.fa",
             "-l",
             "chr1",
             "-l",
@@ -1685,6 +1680,7 @@ mod tests {
             panic!("somatic should parse");
         };
         assert_eq!(args.output, "last");
+        assert_eq!(args.reference, "last.fa");
         assert_eq!(args.location.as_deref(), Some("chr2"));
 
         let cli = Cli::try_parse_from([

@@ -29,6 +29,11 @@ reference.fa.fai
 The Rust `vcfeval` engine reads this FASTA. Compatibility flags accept an RTG
 SDF path but ignore its value.
 
+Pass the FASTA with `--reference`. No environment variable stands in for it, and
+`hap` ships no reference data, so nothing is resolved from an install path.
+GRCh37, hg19 and b37 work the same way as any other assembly: supply the FASTA
+and its `.fai` companion as arguments.
+
 ## Region files
 
 - BED files use zero-based, half-open intervals.

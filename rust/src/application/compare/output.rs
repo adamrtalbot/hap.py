@@ -18,9 +18,9 @@ use crate::adapters::{
 use crate::application::CompareArgs;
 use crate::application::preprocess;
 use crate::domain::RawVcfRecord;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(super) fn rewrite_compare_metrics(
     args: &CompareArgs,
@@ -627,23 +627,6 @@ pub(super) fn decorate_existing_comparison_vcf(
         Ok(row.record.into_validated())
     });
     vcf::write_validated_vcf_iter(output_path, &headers, decorated)
-}
-
-pub(super) fn resolve_default_reference() -> Result<String> {
-    for candidate in [
-        std::env::var_os("HG19"),
-        std::env::var_os("HGREF"),
-        Some("/opt/hap.py-data/hg19.fa".into()),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return Ok(path.display().to_string());
-        }
-    }
-    bail!("no reference file found; pass --reference or set HG19/HGREF")
 }
 
 pub(super) fn build_vcf_headers(

@@ -26,3 +26,8 @@
   exit 1 and the help page hap-rs wrote to standard output. All six subcommands
   and their aliases now share one usage-error path: the parser's status, its
   message on standard error, and nothing on standard output.
+- Take the reference from `--reference` alone. The `HG19` and `HGREF`
+  environment variables and the `/opt/hap.py-data/hg19.fa` install path are no
+  longer consulted, and `somatic` now requires `--reference` at parse time.
+  This narrows the covered invocation surface: an environment-supplied
+  reference was already outside it.

@@ -611,7 +611,7 @@ pub(crate) fn run(args: ValidatedCompareArgs) -> Result<()> {
     let explicit_bcf = args.bcf;
     args.bcf = comparison_requests_bcf(&args);
     if args.reference.is_empty() {
-        args.reference = resolve_default_reference()?;
+        bail!("no reference file found; pass --reference");
     }
     ensure_aggregate_roc_region(&mut args.roc_regions);
     normalize_engine_preprocessing(&mut args);

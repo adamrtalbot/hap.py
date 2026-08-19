@@ -80,3 +80,58 @@ fn germline_without_the_vcfeval_options_emits_no_warning() {
     let stderr = germline_stderr(&[]);
     assert!(!stderr.contains("--engine-vcfeval-path"), "{stderr}");
 }
+
+/// The reference comes from the command line only. `HGREF` and `HG19` name a
+/// file that exists, so a run that still fails proves neither variable is read.
+fn hap_with_reference_environment(arguments: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_hap"))
+        .args(arguments)
+        .env("HGREF", env!("CARGO_BIN_EXE_hap"))
+        .env("HG19", env!("CARGO_BIN_EXE_hap"))
+        .output()
+        .expect("hap process should start")
+}
+
+#[test]
+fn normative_reference_environment_variables_are_never_consulted() {
+    let invocations: [&[&str]; 3] = [
+        &[
+            "germline",
+            "absent-truth.vcf",
+            "absent-query.vcf",
+            "-o",
+            "absent-report",
+        ],
+        &["pre", "absent-input.vcf", "absent-output.vcf.gz"],
+        &[
+            "ftx",
+            "absent-input.vcf",
+            "-o",
+            "absent-output.csv",
+            "--normalize",
+        ],
+    ];
+    for invocation in invocations {
+        let label = invocation.join(" ");
+        let output = hap_with_reference_environment(invocation);
+        assert!(!output.status.success(), "{label}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--reference"), "{label}: {stderr}");
+        assert!(!stderr.contains("HGREF"), "{label}: {stderr}");
+        assert!(!stderr.contains("HG19"), "{label}: {stderr}");
+    }
+}
+
+#[test]
+fn normative_somatic_requires_the_reference_argument() {
+    let output = hap_with_reference_environment(&[
+        "somatic",
+        "absent-truth.vcf",
+        "absent-query.vcf",
+        "-o",
+        "absent-report",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--reference"), "{stderr}");
+}

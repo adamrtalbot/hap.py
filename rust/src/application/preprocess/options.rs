@@ -170,14 +170,9 @@ pub(super) fn declared_contig_order(headers: &[String], fixchr: bool) -> Vec<Str
 }
 
 pub(super) fn resolve_reference(explicit: Option<&str>) -> Result<PathBuf> {
-    let hg19 = std::env::var_os("HG19").map(PathBuf::from);
-    let hgref = std::env::var_os("HGREF").map(PathBuf::from);
-    resolve_reference_candidates(
-        explicit.map(Path::new),
-        hg19.as_deref(),
-        hgref.as_deref(),
-        Path::new("/opt/hap.py-data/hg19.fa"),
-    )
+    explicit
+        .map(PathBuf::from)
+        .context("no reference file found; pass --reference")
 }
 
 pub(super) fn require_output_parent(output: &Path) -> Result<()> {
@@ -204,23 +199,6 @@ pub(super) fn require_vcf_sample(headers: &[String]) -> Result<()> {
         bail!("input VCF has no samples");
     }
     Ok(())
-}
-
-pub(super) fn resolve_reference_candidates(
-    explicit: Option<&Path>,
-    hg19: Option<&Path>,
-    hgref: Option<&Path>,
-    fallback: &Path,
-) -> Result<PathBuf> {
-    if let Some(path) = explicit {
-        return Ok(path.to_path_buf());
-    }
-    [hg19, hgref, Some(fallback)]
-        .into_iter()
-        .flatten()
-        .find(|path| path.is_file())
-        .map(Path::to_path_buf)
-        .context("no reference file found; pass --reference or set HG19/HGREF")
 }
 
 pub(super) fn has_chr_prefix(contigs: &BTreeSet<String>) -> Option<bool> {
