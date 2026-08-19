@@ -157,14 +157,17 @@ output directories. `nf-test` adds the assertions: its per-lane expected counts
 now sum to 155 and match what the pipeline emitted in both runs, while its
 `every { it.ok }` assertion still fails on the two cases below.
 
-The six samplesheets hold 155 rows and the gate emits 155 comparisons, of which
-153 have an empty difference list in each run.
-The pair moved between the runs: run 1 reported HAPPY `chr21` and
+The six samplesheets held 154 rows at `18548d1` and the gate emitted 154
+comparisons, of which 152 had an empty difference list in each run. The matrix is
+155 rows now, one SOMPY row heavier since `66bea49`.
+
+The failing pair moved between the runs: run 1 reported HAPPY `chr21` and
 `chr21_region`, run 2 reported `chr21_passonly` and `chr21_xcmp_controls`, and
-all four differences sit in ROC artifacts. The replay section below records
-hap-rs emitting identical bytes for all four in both runs while the legacy ROC
-tables moved. Tracked as
-[#46](https://github.com/adamrtalbot/hap.py/issues/46).
+all four differences sit in ROC artifacts. That is a property of this host, not of
+the gate. It does not occur on `ubuntu-24.04`: four CI runs report every
+comparison with an empty difference list, and the emulated-against-native rate is
+4 corrupted HAPPY case-runs in 68 against 0 in 142. See the replay section below
+and [#46](https://github.com/adamrtalbot/hap.py/issues/46).
 
 | Lane | Command | Rows |
 |---|---|---:|
@@ -1058,15 +1061,56 @@ Happy matrix does not make the legacy ROC report repeatable here.
 
 So the failing case set moves between runs. Run 1 reported `chr21` and
 `chr21_region` different; run 2 reported `chr21_passonly` and
-`chr21_xcmp_controls`. hap-rs emitted identical bytes for all four in both runs,
-so what moved is the reference. Tracked as
-[#46](https://github.com/adamrtalbot/hap.py/issues/46). Whether a native amd64
-host shows the same is not measured here.
+`chr21_xcmp_controls`. hap-rs emitted identical bytes for all four in both runs.
+
+#### What that was
+
+Measured on 2026-08-19 and closed as [#46](https://github.com/adamrtalbot/hap.py/issues/46).
+It is a property of running legacy under whole-system software translation on this
+laptop, and it does not happen on the authoritative host.
+
+Nothing was truncated or mis-captured. All 574 legacy `.gz` across the two runs
+pass CRC32 and match their ISIZE trailer against the real uncompressed length; all
+342 legacy ROC CSVs carry the header's 65 fields on every row and end in a
+newline; and the published bytes equal the work-directory bytes in all 40 ROC
+pairs, so `publishDir` copied faithfully. Every task exited 0 with peak RSS at
+7.8% of its 8 GB limit.
+
+The differences are cell substitutions. One row per affected `roc.all` has its
+leading label cells overwritten and matches its counterpart in the other run from
+`METRIC.Recall` onward. The value that lands in the wrong cell belongs to another
+column or another row of the same table: `TS_boundary` from the row's own
+`Subset`, or the `QQ` of a different row. The `2943.000000` row quoted above is
+line 2, the first data row, not a cut tail. Eleven to fourteen further rows drop
+out alongside it, which is what a changed label cell does to a group-wise
+selection downstream.
+
+Only ROC tables move. `result.extended.csv`, `result.summary.csv` and the VCF body
+are byte-identical between the two runs, so the counts and the classification are
+stable.
+
+The legacy container here does not run on hardware virtualization. The VM serving
+`--platform=linux/amd64` is `qemu-system-x86_64 ... -accel tcg,thread=multi` on an
+arm64 host: multi-threaded TCG, every legacy instruction software translated. The
+Colima `x86` profile declares `vmType: vz` and `rosetta: true` and neither is in
+force. Whether TCG preserves the memory ordering x86 guest code depends on is not
+measured, so no mechanism inside QEMU is asserted here.
+
+What is measured is that the fault is absent natively. Four CI runs on
+`ubuntu-24.04` (`32144535177`, `32132626336`, `32122424815`, `32072586966`) upload
+their full parity evidence as `nextflow-parity-output`; each reports `ok` with
+every comparison's difference list empty, no flagged ROC table among 684 legacy
+files, and ROC rows matching the clean local output in 20 of 20 tables for the
+four cases. Four corrupted HAPPY case-runs in 68 emulated against 0 in 142 native,
+where the emulated rate would predict about eight.
+
+So a local arm64 run is a development diagnostic, as the top of this file already
+says, and CI is where the matrix is judged.
 
 `docs/adr/0008-compare-artifact-bytes-except-where-the-encoding-carries-provenance.md`
 carries a correction for this. Its ROC counts were taken on the image `65476ee`
-replaced, and its finding that tightening ROC comparison costs nothing does not
-hold while the reference moves.
+replaced, and its finding that tightening ROC comparison costs nothing was
+measured on a host where the reference appeared to move.
 
 ### Resources
 
