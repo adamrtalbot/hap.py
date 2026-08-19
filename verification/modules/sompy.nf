@@ -15,10 +15,11 @@ process SOMPY_LEGACY {
 
     script:
     def bam_args = bams.collect { bam -> "--bam ${bam}" }.join(' ')
+    def reference_arg = reference ? "--reference ${reference}" : ''
     """
     som.py ${args} ${bam_args} ${truth_vcf} ${query_vcf} \\
         -o result \\
-        --reference ${reference} \\
+        ${reference_arg} \\
         --false-positives ${fp_bed} \\
         --feature-table ${feature_table}
     """
@@ -37,10 +38,11 @@ process SOMPY_RUST {
 
     script:
     def bam_args = bams.collect { bam -> "--bam ${bam}" }.join(' ')
+    def reference_arg = reference ? "--reference ${reference}" : ''
     """
     hap somatic ${args} ${bam_args} ${truth_vcf} ${query_vcf} \\
         -o result \\
-        --reference ${reference} \\
+        ${reference_arg} \\
         --false-positives ${fp_bed} \\
         --feature-table ${feature_table}
     """
