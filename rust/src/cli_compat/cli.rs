@@ -908,6 +908,13 @@ pub(crate) struct FtxArgs {
 
     #[arg(long = "fix-chr", default_value_t = false)]
     pub fixchr: bool,
+
+    // Declared extension beyond legacy ftx.py, mirroring `germline`/`somatic`.
+    #[arg(long = "scratch-prefix")]
+    pub scratch_prefix: Option<String>,
+
+    #[arg(long = "keep-scratch", default_value_t = false)]
+    pub keep_scratch: bool,
 }
 
 fn parse_somatic_feature_table(value: &str) -> Result<String, String> {
@@ -1487,6 +1494,8 @@ impl TryFrom<FtxArgs> for crate::application::ValidatedFtxArgs {
             reference: args.reference,
             normalize: args.normalize,
             fixchr: args.fixchr,
+            scratch_prefix: args.scratch_prefix,
+            keep_scratch: args.keep_scratch,
         }
         .validated()
     }
@@ -2329,6 +2338,26 @@ mod tests {
             panic!("ftx should parse");
         };
         assert_eq!(args.bams, ["normal.bam", "tumor.bam"]);
+    }
+
+    #[test]
+    fn ftx_accepts_scratch_options_as_a_declared_extension() {
+        let cli = Cli::try_parse_from([
+            "hap",
+            "ftx",
+            "input.vcf.gz",
+            "-o",
+            "features",
+            "--scratch-prefix",
+            ".",
+            "--keep-scratch",
+        ])
+        .expect("ftx scratch options should parse");
+        let Command::Ftx(args) = cli.command else {
+            panic!("ftx should parse");
+        };
+        assert_eq!(args.scratch_prefix.as_deref(), Some("."));
+        assert!(args.keep_scratch);
     }
 
     #[test]

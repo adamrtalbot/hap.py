@@ -691,6 +691,11 @@ pub(crate) struct FtxArgs {
     pub(crate) reference: Option<String>,
     pub(crate) normalize: bool,
     pub(crate) fixchr: bool,
+    // Declared extension: legacy ftx.py offers no scratch options. hap-rs adds
+    // them for interface consistency with `germline`/`somatic`; an invocation
+    // that passes neither behaves exactly as legacy would.
+    pub(crate) scratch_prefix: Option<String>,
+    pub(crate) keep_scratch: bool,
 }
 
 impl FtxArgs {
@@ -702,6 +707,7 @@ impl FtxArgs {
         require_optional_text(self.targets_bedfile.as_deref(), "targets_bedfile")?;
         require_optional_text(self.reference.as_deref(), "reference")?;
         require_texts(&self.bams, "bams")?;
+        require_optional_text(self.scratch_prefix.as_deref(), "scratch_prefix")?;
         Ok(())
     }
 

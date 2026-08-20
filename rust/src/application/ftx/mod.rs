@@ -42,10 +42,13 @@ fn normalize_reference(args: &FtxArgs) -> Result<Option<&str>> {
         .context("no reference file found for --normalize; pass --reference")
 }
 
-struct ScratchRun(PathBuf);
+struct ScratchRun {
+    path: PathBuf,
+    keep: bool,
+}
 
 impl ScratchRun {
-    fn create(parent: &Path) -> Result<Self> {
+    fn create(parent: &Path, keep: bool) -> Result<Self> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create scratch parent {}", parent.display()))?;
         let timestamp = SystemTime::now()
@@ -57,7 +60,7 @@ impl ScratchRun {
             let id = SCRATCH_RUN_ID.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!("run-{}-{timestamp}-{id}", std::process::id()));
             match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
+                Ok(()) => return Ok(Self { path, keep }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -74,23 +77,37 @@ impl ScratchRun {
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 
     fn cleanup(mut self) -> Result<()> {
-        fs::remove_dir_all(&self.0)
-            .with_context(|| format!("failed to remove scratch directory {}", self.0.display()))?;
-        self.0 = PathBuf::new();
+        if self.keep {
+            return Ok(());
+        }
+        fs::remove_dir_all(&self.path).with_context(|| {
+            format!("failed to remove scratch directory {}", self.path.display())
+        })?;
+        self.keep = true;
         Ok(())
     }
 }
 
 impl Drop for ScratchRun {
     fn drop(&mut self) {
-        if !self.0.as_os_str().is_empty() {
-            let _ = fs::remove_dir_all(&self.0);
+        if !self.keep {
+            let _ = fs::remove_dir_all(&self.path);
         }
     }
+}
+
+/// Where a scratch run directory is allocated. Honours `--scratch-prefix` when
+/// present (a declared extension mirroring `germline`/`somatic`); otherwise
+/// places scratch under the output directory, never `$TMPDIR`.
+fn scratch_parent(args: &FtxArgs, output: &Path) -> PathBuf {
+    if let Some(prefix) = args.scratch_prefix.as_deref() {
+        return PathBuf::from(prefix);
+    }
+    output_parent(output).join(".hap_scratch")
 }
 
 pub(crate) fn run(args: ValidatedFtxArgs) -> Result<()> {
@@ -159,12 +176,12 @@ fn run_inner(args: FtxArgs) -> Result<()> {
     let reference_contigs: BTreeSet<String> = reference_sequences.keys().cloned().collect();
 
     // Keep staging scoped to a unique RAII scratch directory: VCF writers can
-    // create index sidecars, and both files must disappear on success/error.
-    // Scratch lives inside the output directory, never $TMPDIR, so a caller's
-    // disk accounting and cleanup reach it. ftx has no --scratch-prefix flag
-    // (legacy offers none), so there is nothing to honour.
+    // create index sidecars, and both files must disappear on success/error
+    // unless --keep-scratch is set. Scratch honours --scratch-prefix and
+    // otherwise lives inside the output directory, never $TMPDIR, so a caller's
+    // disk accounting and cleanup reach it.
     let output_path = ftx_output_path(&args.output);
-    let scratch = ScratchRun::create(&output_parent(&output_path).join(".hap_scratch"))?;
+    let scratch = ScratchRun::create(&scratch_parent(&args, &output_path), args.keep_scratch)?;
     let temp_path = scratch.path().join("input.vcf.gz");
     let (headers, staged_records) =
         prepare_records(&args, &reference_sequences, &reference_contigs)?;
@@ -567,6 +584,8 @@ mod tests {
             reference: Some(reference.display().to_string()),
             normalize: false,
             fixchr: false,
+            scratch_prefix: None,
+            keep_scratch: false,
         }
     }
 
@@ -586,7 +605,7 @@ mod tests {
     #[test]
     fn scratch_run_is_created_under_the_given_parent() {
         let parent = tempfile::tempdir().unwrap();
-        let scratch = ScratchRun::create(parent.path()).unwrap();
+        let scratch = ScratchRun::create(parent.path(), false).unwrap();
         assert!(scratch.path().starts_with(parent.path()));
         let run_path = scratch.path().to_path_buf();
         assert!(run_path.is_dir());
@@ -595,12 +614,32 @@ mod tests {
     }
 
     #[test]
+    fn keep_scratch_retains_the_run_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let scratch = ScratchRun::create(parent.path(), true).unwrap();
+        let run_path = scratch.path().to_path_buf();
+        scratch.cleanup().unwrap();
+        assert!(run_path.is_dir(), "--keep-scratch must retain the run dir");
+    }
+
+    #[test]
+    fn scratch_prefix_is_honoured_over_the_output_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("explicit");
+        let mut arguments = args(Path::new("in.vcf"), Path::new("ref.fa"));
+        arguments.output = root.path().join("features").display().to_string();
+        arguments.scratch_prefix = Some(prefix.display().to_string());
+        let parent = scratch_parent(&arguments, &ftx_output_path(&arguments.output));
+        assert_eq!(parent, prefix);
+    }
+
+    #[test]
     fn concurrent_scratch_runs_are_unique_and_cleanup_sidecars() {
         let parent = tempfile::tempdir().unwrap();
         let first_parent = parent.path().to_path_buf();
         let second_parent = parent.path().to_path_buf();
-        let first = thread::spawn(move || ScratchRun::create(&first_parent));
-        let second = thread::spawn(move || ScratchRun::create(&second_parent));
+        let first = thread::spawn(move || ScratchRun::create(&first_parent, false));
+        let second = thread::spawn(move || ScratchRun::create(&second_parent, false));
         let first = first.join().expect("first thread panicked").unwrap();
         let second = second.join().expect("second thread panicked").unwrap();
         assert_ne!(first.path(), second.path());

@@ -42,6 +42,8 @@ hap ftx calls.vcf.gz \
 | `-r, --reference <FASTA>` | Reference FASTA for normalization or BAM features. |
 | `--normalize` | Normalize records before feature extraction. |
 | `--fix-chr` | Repair systematic `chr` prefix differences. |
+| `--scratch-prefix <PATH>` | Parent for temporary files. Extension beyond legacy `ftx.py`; scratch otherwise lives under the output directory. |
+| `--keep-scratch` | Retain temporary files after completion. |
 | `-h, --help` | Print command help. |
 
 ## Feature profiles
