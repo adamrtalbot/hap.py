@@ -45,9 +45,8 @@ fn normalize_reference(args: &FtxArgs) -> Result<Option<&str>> {
 struct ScratchRun(PathBuf);
 
 impl ScratchRun {
-    fn create() -> Result<Self> {
-        let parent = std::env::temp_dir().join("hap-ftx");
-        fs::create_dir_all(&parent)
+    fn create(parent: &Path) -> Result<Self> {
+        fs::create_dir_all(parent)
             .with_context(|| format!("failed to create scratch parent {}", parent.display()))?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -98,6 +97,10 @@ pub(crate) fn run(args: ValidatedFtxArgs) -> Result<()> {
     let mut args = args.into_inner();
     normalize_reference(&args)?;
     let output = ftx_output_path(&args.output);
+    // Scratch now lives inside the output directory, so refuse a missing
+    // output parent up front rather than materialising it when scratch is
+    // created. Mirrors the germline guard in application/compare.rs.
+    validate_output_parent(&output)?;
     let inputs = std::iter::once(args.input.as_str())
         .chain(args.reference.as_deref())
         .chain(args.regions_bedfile.as_deref())
@@ -117,6 +120,22 @@ pub(crate) fn run(args: ValidatedFtxArgs) -> Result<()> {
         )
     })?;
     transaction.commit()
+}
+
+fn output_parent(output: &Path) -> &Path {
+    output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn validate_output_parent(output: &Path) -> Result<()> {
+    if !output_parent(output).exists() {
+        bail!(
+            "The output path does not exist. Please specify a valid output path and prefix using -o"
+        );
+    }
+    Ok(())
 }
 
 fn ftx_output_path(output: &str) -> PathBuf {
@@ -141,7 +160,11 @@ fn run_inner(args: FtxArgs) -> Result<()> {
 
     // Keep staging scoped to a unique RAII scratch directory: VCF writers can
     // create index sidecars, and both files must disappear on success/error.
-    let scratch = ScratchRun::create()?;
+    // Scratch lives inside the output directory, never $TMPDIR, so a caller's
+    // disk accounting and cleanup reach it. ftx has no --scratch-prefix flag
+    // (legacy offers none), so there is nothing to honour.
+    let output_path = ftx_output_path(&args.output);
+    let scratch = ScratchRun::create(&output_parent(&output_path).join(".hap_scratch"))?;
     let temp_path = scratch.path().join("input.vcf.gz");
     let (headers, staged_records) =
         prepare_records(&args, &reference_sequences, &reference_contigs)?;
@@ -551,8 +574,8 @@ mod tests {
         super::run(args.validated()?)
     }
 
-    fn fixture(contents: &str, reference: &str) -> (ScratchRun, PathBuf, PathBuf) {
-        let scratch = ScratchRun::create().unwrap();
+    fn fixture(contents: &str, reference: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let scratch = tempfile::tempdir().unwrap();
         let input = scratch.path().join("input.vcf");
         let fasta = scratch.path().join("ref.fa");
         fs::write(&input, contents).unwrap();
@@ -561,9 +584,23 @@ mod tests {
     }
 
     #[test]
+    fn scratch_run_is_created_under_the_given_parent() {
+        let parent = tempfile::tempdir().unwrap();
+        let scratch = ScratchRun::create(parent.path()).unwrap();
+        assert!(scratch.path().starts_with(parent.path()));
+        let run_path = scratch.path().to_path_buf();
+        assert!(run_path.is_dir());
+        scratch.cleanup().unwrap();
+        assert!(!run_path.exists());
+    }
+
+    #[test]
     fn concurrent_scratch_runs_are_unique_and_cleanup_sidecars() {
-        let first = thread::spawn(ScratchRun::create);
-        let second = thread::spawn(ScratchRun::create);
+        let parent = tempfile::tempdir().unwrap();
+        let first_parent = parent.path().to_path_buf();
+        let second_parent = parent.path().to_path_buf();
+        let first = thread::spawn(move || ScratchRun::create(&first_parent));
+        let second = thread::spawn(move || ScratchRun::create(&second_parent));
         let first = first.join().expect("first thread panicked").unwrap();
         let second = second.join().expect("second thread panicked").unwrap();
         assert_ne!(first.path(), second.path());

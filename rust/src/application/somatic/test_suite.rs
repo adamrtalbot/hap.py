@@ -1578,4 +1578,33 @@ mod tests {
         assert_eq!(cpp_default_six(0.872_429_31), "0.872429");
         assert_eq!(cpp_default_six(-1.0), "-1");
     }
+
+    #[test]
+    fn scratch_without_prefix_lives_under_the_output_directory() {
+        let root = tempfile::tempdir().expect("scratch placement test root");
+        let output = root.path().join("report");
+        let scratch =
+            SomaticScratch::create(None, &output, false).expect("scratch under output directory");
+        assert!(scratch.path.starts_with(root.path().join(".hap_scratch")));
+        assert!(scratch.path.is_dir());
+        let path = scratch.path.clone();
+        scratch.cleanup().expect("scratch cleanup");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn scratch_prefix_is_honoured_and_retained() {
+        let root = tempfile::tempdir().expect("scratch prefix test root");
+        let prefix = root.path().join("explicit-scratch");
+        let scratch = SomaticScratch::create(
+            Some(&prefix.to_string_lossy()),
+            Path::new("unused/report"),
+            false,
+        )
+        .expect("explicit scratch prefix honoured");
+        assert_eq!(scratch.path, prefix);
+        // som.py retains an explicit scratch prefix for a later --continue run.
+        scratch.cleanup().expect("cleanup is a no-op when retained");
+        assert!(prefix.is_dir());
+    }
 }

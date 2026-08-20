@@ -48,7 +48,7 @@ struct SomaticScratch {
 }
 
 impl SomaticScratch {
-    fn create(prefix: Option<&str>, keep_requested: bool) -> Result<Self> {
+    fn create(prefix: Option<&str>, output: &Path, keep_requested: bool) -> Result<Self> {
         if let Some(prefix) = prefix {
             let path = PathBuf::from(prefix);
             fs::create_dir_all(&path).with_context(|| {
@@ -62,7 +62,15 @@ impl SomaticScratch {
             return Ok(Self { path, keep: true });
         }
 
-        let parent = std::env::temp_dir().join("hap-somatic");
+        // No explicit --scratch-prefix: place scratch inside the output
+        // directory, never $TMPDIR, so a caller's disk accounting and cleanup
+        // reach it. Mirrors the germline path in application/compare.rs.
+        let base = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let parent = base.join(".hap_scratch");
         fs::create_dir_all(&parent)
             .with_context(|| format!("failed to create scratch parent {}", parent.display()))?;
         let timestamp = SystemTime::now()
@@ -147,7 +155,11 @@ impl SomaticOperationalControls {
                     .with_context(|| format!("failed to open somatic log file {}", path.display()))
             })
             .transpose()?;
-        let scratch = SomaticScratch::create(args.scratch_prefix.as_deref(), args.keep_scratch)?;
+        let scratch = SomaticScratch::create(
+            args.scratch_prefix.as_deref(),
+            Path::new(&args.output),
+            args.keep_scratch,
+        )?;
         Ok(Self {
             scratch,
             logfile,
