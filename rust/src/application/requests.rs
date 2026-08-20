@@ -578,7 +578,6 @@ pub(crate) struct SomaticArgs {
     pub(crate) ci_level: f64,
     pub(crate) scratch_prefix: Option<String>,
     pub(crate) keep_scratch: bool,
-    pub(crate) cont: bool,
     pub(crate) logfile: Option<String>,
     pub(crate) verbose: bool,
     pub(crate) quiet: bool,

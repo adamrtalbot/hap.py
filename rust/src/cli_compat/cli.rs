@@ -859,9 +859,6 @@ pub(crate) struct SomaticArgs {
     #[arg(long = "keep-scratch", default_value_t = false)]
     pub keep_scratch: bool,
 
-    #[arg(long = "continue", default_value_t = false)]
-    pub cont: bool,
-
     #[arg(long = "logfile")]
     pub logfile: Option<String>,
 
@@ -1469,7 +1466,6 @@ impl From<SomaticArgs> for crate::application::SomaticArgs {
             ci_level: args.ci_level,
             scratch_prefix: args.scratch_prefix,
             keep_scratch: args.keep_scratch,
-            cont: args.cont,
             logfile: args.logfile,
             verbose: args.verbose,
             quiet: args.quiet,

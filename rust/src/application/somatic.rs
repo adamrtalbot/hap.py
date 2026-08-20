@@ -57,8 +57,9 @@ impl SomaticScratch {
                     path.display()
                 )
             })?;
-            // Legacy som.py always retains an explicit scratch prefix so it
-            // can be consumed by a later --continue invocation.
+            // An explicit scratch prefix is a path the caller named, so hap-rs
+            // retains it rather than deleting a directory it did not choose.
+            // The generated fallback below honours --keep-scratch instead.
             return Ok(Self { path, keep: true });
         }
 
@@ -466,49 +467,25 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
     controls.info("Normalizing/reading inputs")?;
     let truth_cache = controls.scratch.path.join("normalized_truth.vcf.gz");
     let query_cache = controls.scratch.path.join("normalized_query.vcf.gz");
-    let reuse_truth = args.cont && truth_cache.exists();
-    let reuse_query = args.cont && query_cache.exists();
-    if reuse_truth {
-        controls.info(&format!("Continuing from {}", truth_cache.display()))?;
-    }
-    if reuse_query {
-        controls.info(&format!("Continuing from {}", query_cache.display()))?;
-    }
     let truth_source = Path::new(&args.truth);
     let query_source = Path::new(&args.query);
-    let truth_headers = vcf::open_validated_vcf(if reuse_truth {
-        &truth_cache
-    } else {
-        truth_source
-    })?
-    .headers()
-    .to_vec();
-    let query_headers = vcf::open_validated_vcf(if reuse_query {
-        &query_cache
-    } else {
-        query_source
-    })?
-    .headers()
-    .to_vec();
+    let truth_headers = vcf::open_validated_vcf(truth_source)?.headers().to_vec();
+    let query_headers = vcf::open_validated_vcf(query_source)?.headers().to_vec();
     let bam_depths = ftx::bam_normalization_depths(&args.bams)?;
-    if !reuse_truth {
-        prepare_somatic_cache(
-            truth_source,
-            &truth_cache,
-            &truth_headers,
-            normalize_truth,
-            reference_sequences.as_ref(),
-        )?;
-    }
-    if !reuse_query {
-        prepare_somatic_cache(
-            query_source,
-            &query_cache,
-            &query_headers,
-            normalize_query,
-            reference_sequences.as_ref(),
-        )?;
-    }
+    prepare_somatic_cache(
+        truth_source,
+        &truth_cache,
+        &truth_headers,
+        normalize_truth,
+        reference_sequences.as_ref(),
+    )?;
+    prepare_somatic_cache(
+        query_source,
+        &query_cache,
+        &query_headers,
+        normalize_query,
+        reference_sequences.as_ref(),
+    )?;
     let truth_spools = spool_filtered_contigs(
         &truth_cache,
         Path::new(&args.truth),

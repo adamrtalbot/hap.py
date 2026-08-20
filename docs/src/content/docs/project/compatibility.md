@@ -25,8 +25,9 @@ Provenance fields: version, timestamp, command line, generated descriptions,
 runtime VCF headers. Message text and which stream carries it. Malformed
 invocations. A reference supplied through the environment: `hap` takes the
 reference as an argument and reads no variable in its place. VCF on standard
-input. hap-rs's own added options. `--bam` feature extraction. Platforms other
-than linux/amd64.
+input. hap-rs's own added options. `--bam` feature extraction. The somatic
+`--continue` flag, which hap-rs does not implement. Platforms other than
+linux/amd64.
 
 Runtime and resource use is not a compatibility question. Neither is independent
 scientific correctness: this is an agreement claim, and hap-rs reproduces legacy

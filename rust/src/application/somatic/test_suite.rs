@@ -204,47 +204,6 @@ mod tests {
     }
 
     #[test]
-    fn continue_reuses_cached_normalized_inputs() {
-        let root = unique_test_dir("continue");
-        let scratch = root.join("scratch");
-        let truth = root.join("truth.vcf");
-        let query = root.join("query.vcf");
-        let reference = root.join("reference.fa");
-        fs::create_dir_all(&root).expect("create continue test root");
-        fs::write(&reference, ">chr1\nAAAAAAAAAAAAAAAAAAAA\n").expect("write reference");
-        write_test_vcf(&truth, 7);
-        write_test_vcf(&query, 7);
-
-        let comparison = |output: &Path, cont: bool| {
-            let mut args = parsed_somatic(&[]);
-            args.truth = truth.display().to_string();
-            args.query = query.display().to_string();
-            args.reference = Some(reference.display().to_string());
-            args.output = output.display().to_string();
-            args.scratch_prefix = Some(scratch.display().to_string());
-            args.cont = cont;
-            args.quiet = true;
-            run_args(args).expect("run somatic comparison");
-        };
-
-        comparison(&root.join("first"), false);
-        assert!(scratch.join("normalized_truth.vcf.gz").is_file());
-        assert!(scratch.join("normalized_query.vcf.gz").is_file());
-
-        write_test_vcf(&query, 8);
-        comparison(&root.join("continued"), true);
-        let stats =
-            fs::read_to_string(root.join("continued.stats.csv")).expect("read continued stats");
-        let snv = stats
-            .lines()
-            .find(|line| line.starts_with("1,SNVs,"))
-            .expect("continued SNV row");
-        assert!(snv.starts_with("1,SNVs,1,1,1,0,0,0,0,"));
-
-        fs::remove_dir_all(&root).expect("remove continue test root");
-    }
-
-    #[test]
     fn explain_ambiguous_without_features_writes_csv_and_metrics_tables() {
         let root = unique_test_dir("explain-no-features");
         let truth = root.join("truth.vcf");

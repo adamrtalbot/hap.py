@@ -87,7 +87,6 @@ profile names before comparison.
 |---|---|
 | `--scratch-prefix <PATH>` | Parent or prefix for temporary files. |
 | `--keep-scratch` | Keep temporary files after completion. |
-| `--continue` | Preserve established continuation behavior. |
 | `--logfile <PATH>` | Write command logging to a file. |
 | `--verbose` | Increase logging; conflicts with `--quiet`. |
 | `--quiet` | Reduce logging; conflicts with `--verbose`. |
