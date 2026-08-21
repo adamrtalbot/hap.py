@@ -15,7 +15,7 @@ pub(super) fn ratio(numerator: usize, denominator: usize) -> f64 {
 }
 
 pub(super) fn py_float(value: f64) -> String {
-    crate::adapters::report::python_repr_float(value)
+    crate::adapters::report::full_repr_float(value)
 }
 
 pub(super) fn write_legacy_metrics_json(
@@ -312,10 +312,9 @@ pub(super) fn column_json(
             "int64" | "double" if value.parse::<f64>().is_ok_and(|number| !number.is_finite()) => {
                 "null".to_string()
             }
-            // pandas writes the displayed CSV with Python 2's 12-significant-
-            // digit `str(float)`, but json.dumps serializes the underlying
-            // binary64 value. Keep the full round-trippable value here instead
-            // of reusing the deliberately lossy CSV formatter.
+            // json.dumps serializes the numeric binary64 value, not the CSV
+            // cell's quoted text, so parse the cell back to f64 and emit the
+            // number here.
             "double" => value
                 .parse::<f64>()
                 .map(json_float)

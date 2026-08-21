@@ -570,20 +570,15 @@ pub(crate) fn het_hom_ratio(het: usize, homalt: usize) -> String {
 }
 
 pub(crate) fn format_metric(value: f64) -> String {
-    // Legacy data flow for METRIC.* columns: C++ writes the raw double via
-    // `std::to_string` (printf "%.6f" — six fractional decimals), Python
-    // pandas re-parses that string with its lossy `xstrtod` (a power-of-2
-    // multiply/divide walk that introduces specific 1-ULP differences vs.
-    // a correctly-rounded strtod), then pandas writes the resulting f64
-    // via Python 2's 12-significant-digit `str(float)`. Mirroring those
-    // three steps in Rust reproduces the exact decimal text legacy emits
-    // without exposing the parser's adjacent-double representation.
+    // METRIC.* data flow: C++ writes the double with printf "%.6f", pandas
+    // re-parses it with its lossy `xstrtod`, then `to_csv` renders the shortest
+    // round-trippable decimal. Mirroring the three steps reproduces the bytes.
     if !value.is_finite() {
-        return python_repr_float(value);
+        return full_repr_float(value);
     }
     let formatted = format!("{value:.6}");
     let lossy = pandas_xstrtod(&formatted);
-    python_repr_float(lossy)
+    full_repr_float(lossy)
 }
 
 /// Rust port of pandas 0.24 `xstrtod` (the lossy parser used by
@@ -656,13 +651,12 @@ pub(crate) fn pandas_xstrtod(s: &str) -> f64 {
 }
 
 pub(crate) fn format_ratio(value: f64) -> String {
-    python_repr_float(value)
+    full_repr_float(value)
 }
 
-// Python 3's shortest round-trippable `repr(float)`. The only remaining
-// caller is `adapters::metrics_json`, which serves the compare and quantify
-// JSON reports; `to_json` rendering does not move with the pandas pin, so
-// those lanes keep this. The CSV adapters use `python_repr_float`.
+// Shortest round-trippable float text, matching pandas 0.24.2 `to_csv` and
+// `to_json` (both emit the shortest decimal that round-trips). Every CSV and
+// JSON float cell across all subcommands routes through this.
 pub(crate) fn full_repr_float(value: f64) -> String {
     if value.is_nan() {
         return "nan".to_string();
@@ -698,50 +692,6 @@ pub(crate) fn full_repr_float(value: f64) -> String {
     rendered
 }
 
-// Python 2's str(float), used by the other legacy adapters, keeps 12
-// significant digits. It uses fixed notation for rounded exponents in
-// [-4, 10] and scientific notation otherwise. Integer-valued fixed numbers
-// retain `.0`.
-pub(crate) fn python_repr_float(value: f64) -> String {
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_negative() {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    if value == 0.0 {
-        return if value.is_sign_negative() {
-            "-0.0".to_string()
-        } else {
-            "0.0".to_string()
-        };
-    }
-    let scientific = format!("{value:.11e}");
-    let (mantissa, exponent_text) = scientific.split_once('e').unwrap();
-    let exponent = exponent_text.parse::<i32>().unwrap();
-    if !(-4..11).contains(&exponent) {
-        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
-        return format!("{mantissa}e{exponent:+03}");
-    }
-    let decimal_places = usize::try_from(11 - exponent).unwrap_or(0);
-    let mut rendered = format!("{value:.decimal_places$}");
-    if rendered.contains('.') {
-        while rendered.ends_with('0') {
-            rendered.pop();
-        }
-        if rendered.ends_with('.') {
-            rendered.push('0');
-        }
-    } else {
-        rendered.push_str(".0");
-    }
-    rendered
-}
-
 pub(crate) fn append_ci_cells(
     row: &mut Vec<String>,
     observations: [(usize, usize); 3],
@@ -749,51 +699,53 @@ pub(crate) fn append_ci_cells(
 ) {
     for (successes, trials) in observations {
         let (lower, upper) = crate::domain::jeffreys_interval(successes, trials, alpha);
-        row.push(python_repr_float(lower));
-        row.push(python_repr_float(upper));
+        row.push(full_repr_float(lower));
+        row.push(full_repr_float(upper));
     }
 }
 
 #[cfg(test)]
 mod format_tests {
     use super::{
-        SubsetSubtypeFpCounts, format_ratio, full_repr_float, python_repr_float, write_extended,
-        write_summary,
+        SubsetSubtypeFpCounts, format_ratio, full_repr_float, write_extended, write_summary,
     };
     use crate::domain::TypeCounts;
     use std::collections::BTreeMap;
 
     #[test]
     fn integer_valued_float_keeps_trailing_zero() {
-        assert_eq!(python_repr_float(1.0), "1.0");
-        assert_eq!(python_repr_float(0.0), "0.0");
-        assert_eq!(python_repr_float(-1.0), "-1.0");
+        assert_eq!(full_repr_float(1.0), "1.0");
+        assert_eq!(full_repr_float(0.0), "0.0");
+        assert_eq!(full_repr_float(-1.0), "-1.0");
     }
 
     #[test]
     fn short_decimal_stays_short() {
-        assert_eq!(python_repr_float(0.1), "0.1");
-        assert_eq!(python_repr_float(0.861224), "0.861224");
+        assert_eq!(full_repr_float(0.1), "0.1");
+        assert_eq!(full_repr_float(0.861224), "0.861224");
     }
 
     #[test]
-    fn germline_ratio_matches_python_two_twelve_significant_digits() {
-        let v: f64 = 0.9651790000000001;
-        assert_eq!(format_ratio(v), "0.965179");
-        let w: f64 = 1.58980044345898;
-        assert_eq!(format_ratio(w), "1.58980044346");
-        assert_eq!(format_ratio(0.00009499999999999999), "9.5e-05");
-        assert_eq!(format_ratio(1_234_567_890_123.0), "1.23456789012e+12");
-        assert_eq!(format_ratio(1.713487071977638), "1.71348707198");
-        assert_eq!(format_ratio(2.1964285714285716), "2.19642857143");
+    fn germline_ratio_renders_the_shortest_round_trip() {
+        // Values captured from pandas 0.24.2 `to_csv` in the reference
+        // container: the ratio cell is the shortest decimal that round-trips.
+        assert_eq!(format_ratio(0.9651790000000001), "0.9651790000000001");
+        assert_eq!(format_ratio(1.58980044345898), "1.58980044345898");
+        assert_eq!(format_ratio(1.713487071977638), "1.713487071977638");
+        assert_eq!(format_ratio(2.1964285714285716), "2.1964285714285716");
+        assert_eq!(format_ratio(1_234_567_890_123.0), "1234567890123.0");
     }
 
     #[test]
-    fn python_two_ratio_notation_uses_the_rounded_exponent() {
+    fn germline_ratio_notation_uses_full_repr_thresholds() {
+        // Fixed notation holds across [1e-4, 1e16); pandas 0.24.2 keeps
+        // 1e11 fixed and drops 9.5e-5 into scientific.
+        assert_eq!(format_ratio(100_000_000_000.0), "100000000000.0");
         assert_eq!(format_ratio(99_999_999_999.0), "99999999999.0");
-        assert_eq!(format_ratio(100_000_000_000.0), "1e+11");
-        assert_eq!(format_ratio(9.99999999999e-5), "9.99999999999e-05");
-        assert_eq!(format_ratio(9.999999999999e-5), "0.0001");
+        assert_eq!(
+            format_ratio(0.00009499999999999999),
+            "9.499999999999999e-05"
+        );
     }
 
     #[test]
@@ -810,10 +762,11 @@ mod format_tests {
     #[test]
     fn pandas_xstrtod_matches_legacy_reference() {
         use super::pandas_xstrtod;
-        // (input, expected pandas-parsed f64). These were captured by
-        // running `pandas.to_numeric` inside the legacy Wave container
-        // (pandas 0.19.2 / Python 2.7) — the exact pipeline that drives
-        // legacy METRIC.* CSV emission.
+        // (input, expected pandas-parsed f64). Captured by running
+        // `pandas.to_numeric` in a Wave container (Python 2.7). pandas'
+        // `xstrtod` parser is unchanged across the pinned pandas versions, so
+        // these bytes hold for the pandas 0.24.2 reference that drives METRIC.*
+        // CSV emission.
         let cases: &[(&str, f64)] = &[
             ("0.877140", f64::from_bits(0x3fec1187e7c06e19)), // predecessor of 0.87714
             ("0.958635", f64::from_bits(0x3feead234eb9a177)), // exact
@@ -838,19 +791,27 @@ mod format_tests {
     }
 
     #[test]
-    fn format_metric_matches_legacy_byte_for_byte() {
+    fn format_metric_renders_pandas_shortest_round_trip() {
         use super::format_metric;
-        assert_eq!(format_metric(7839.0 / 8937.0), "0.87714");
-        // Precision = 7949/8292 → "0.958635" → pandas-xstrtod → "0.958635"
+        // C++ writes "%.6f", pandas 0.24.2 re-parses (xstrtod) then `to_csv`
+        // renders the shortest round-trip of the parsed double. Expected cells
+        // captured from the reference container. Whether the six-digit text
+        // survives depends on the parsed double: when xstrtod lands on the
+        // adjacent double the shortest repr carries a long tail, when it lands
+        // exactly the six-digit form is already shortest.
+        // "0.877140" parses to the adjacent double -> long tail.
+        assert_eq!(format_metric(7839.0 / 8937.0), "0.8771399999999999");
+        // "0.958635" parses exactly -> six digits stay.
         assert_eq!(format_metric(7949.0 / 8292.0), "0.958635");
-        // F1 ≈ 0.916078519... → C++ "0.916079" → Python 2 "0.916079".
+        // F1 "0.916079" parses to the adjacent double -> long tail.
         let r = 7839.0 / 8937.0;
         let p = 7949.0 / 8292.0;
         let f1 = 2.0 * r * p / (r + p);
-        assert_eq!(format_metric(f1), "0.916079");
-        // Frac_NA = 3520/11812 → "0.298002" → exact f64 → "0.298002"
+        assert_eq!(format_metric(f1), "0.9160790000000001");
+        // "0.298002" parses exactly -> six digits stay.
         assert_eq!(format_metric(3520.0 / 11812.0), "0.298002");
-        assert_eq!(format_metric(0.976271), "0.976271");
+        // "0.976271" parses to the adjacent double -> long tail.
+        assert_eq!(format_metric(0.976271), "0.9762709999999999");
     }
 
     #[test]

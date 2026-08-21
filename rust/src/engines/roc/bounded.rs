@@ -16,8 +16,7 @@
 
 use crate::adapters::report::{
     EXTENDED_HEADER, append_stats_with_missing, empty_comparison_extended_lines, f1_score,
-    format_count, het_hom_ratio, metric_ratio, python_repr_float, suffixed_report_path,
-    ti_tv_ratio,
+    format_count, full_repr_float, het_hom_ratio, metric_ratio, suffixed_report_path, ti_tv_ratio,
 };
 use crate::domain::{AnnotatedRow, CountsBucket};
 use anyhow::{Context, Result, bail};
@@ -4718,7 +4717,7 @@ pub(crate) fn append_ci_cells(
 }
 
 fn format_ci(value: f64) -> String {
-    python_repr_float(value)
+    full_repr_float(value)
 }
 
 /// Modified Jeffreys interval used by legacy Tools/ci.py.
@@ -5957,9 +5956,12 @@ mod tests {
     }
 
     #[test]
-    fn confidence_interval_csv_uses_python_scientific_notation() {
-        assert_eq!(format_ci(5.280_579_842_943_484e-5), "5.28057984294e-05");
-        assert_eq!(format_ci(0.000_814_921_550_822_522_7), "0.000814921550823");
+    fn confidence_interval_csv_renders_full_repr() {
+        assert_eq!(format_ci(5.280_579_842_943_484e-5), "5.280579842943484e-05");
+        assert_eq!(
+            format_ci(0.000_814_921_550_822_522_7),
+            "0.0008149215508225227"
+        );
     }
 
     #[test]
@@ -6006,10 +6008,10 @@ mod tests {
         assert_eq!(
             &cells[cells.len() - 6..],
             [
-                "0.158113883008",
+                "0.15811388300841897",
                 "1.0",
                 "0.0",
-                "0.716248320437",
+                "0.7162483204365873",
                 "0.0",
                 "1.0",
             ]

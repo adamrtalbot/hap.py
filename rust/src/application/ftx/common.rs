@@ -32,16 +32,15 @@ pub(super) fn render_filter(value: &str) -> String {
     }
 }
 
-/// Formats an `f64` the way pandas `DataFrame.to_csv` does for a float
-/// column on the pinned reference: integer-valued floats keep a trailing
-/// `.0`, non-integer floats keep Python 2's twelve significant digits, and
-/// `NaN` renders as an empty cell. Infinities survive as `inf` / `-inf`
-/// because that's Python `repr()`'s choice for the same values.
+/// Formats an `f64` the way pandas 0.24.2 `DataFrame.to_csv` does for a float
+/// column: integer-valued floats keep a trailing `.0`, non-integer floats take
+/// the shortest round-trippable decimal, and `NaN` renders as an empty cell.
+/// Infinities survive as `inf` / `-inf`, `repr()`'s choice for the same values.
 pub(super) fn format_python_float(value: f64) -> String {
     if value.is_nan() {
         return String::new();
     }
-    report::python_repr_float(value)
+    report::full_repr_float(value)
 }
 
 /// Numeric INFO values pass through htslib during legacy preprocessing,
@@ -127,26 +126,26 @@ mod tests {
         assert_eq!(format_python_float(-1.0), "-1.0");
         assert_eq!(format_python_float(0.5), "0.5");
         assert_eq!(format_python_float(0.1), "0.1");
-        assert_eq!(format_python_float(26.0 / 135.5), "0.191881918819");
-        assert_eq!(format_python_float(77.0 / 135.5), "0.568265682657");
-        assert_eq!(format_python_float(1.0 / 3.0), "0.333333333333");
+        assert_eq!(format_python_float(26.0 / 135.5), "0.1918819188191882");
+        assert_eq!(format_python_float(77.0 / 135.5), "0.5682656826568265");
+        assert_eq!(format_python_float(1.0 / 3.0), "0.3333333333333333");
     }
 
-    // Every expectation below was read off the pinned reference image, where
-    // pandas 0.20.3 `to_csv` renders each of these values byte-for-byte the
-    // same as Python 2 `str()`.
+    // Every expectation below was read off pandas 0.24.2 `to_csv` in the
+    // reference image: fixed notation holds across [1e-4, 1e16), scientific
+    // otherwise.
     #[test]
     fn format_python_float_matches_pandas_notation_threshold_bytes() {
         let below_upper = f64::from_bits(1e16_f64.to_bits() - 1);
         let below_lower = f64::from_bits(1e-4_f64.to_bits() - 1);
 
         assert_eq!(format_python_float(99999999999.0), "99999999999.0");
-        assert_eq!(format_python_float(1e11), "1e+11");
-        assert_eq!(format_python_float(1e12), "1e+12");
-        assert_eq!(format_python_float(1e15), "1e+15");
-        assert_eq!(format_python_float(below_upper), "1e+16");
+        assert_eq!(format_python_float(1e11), "100000000000.0");
+        assert_eq!(format_python_float(1e12), "1000000000000.0");
+        assert_eq!(format_python_float(1e15), "1000000000000000.0");
+        assert_eq!(format_python_float(below_upper), "9999999999999998.0");
         assert_eq!(format_python_float(1e16), "1e+16");
-        assert_eq!(format_python_float(below_lower), "0.0001");
+        assert_eq!(format_python_float(below_lower), "9.999999999999999e-05");
         assert_eq!(format_python_float(1e-4), "0.0001");
     }
 

@@ -1276,9 +1276,9 @@ mod tests {
         );
         let cells = row.split(',').collect::<Vec<_>>();
 
-        assert_eq!(cells[9], "0.333333333333");
-        assert_eq!(cells[11], "0.823263902869");
-        assert_eq!(cells[12], "0.333333333333");
+        assert_eq!(cells[9], "0.3333333333333333");
+        assert_eq!(cells[11], "0.8232639028687426");
+        assert_eq!(cells[12], "0.3333333333333333");
     }
 
     #[test]

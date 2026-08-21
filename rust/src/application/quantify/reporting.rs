@@ -511,7 +511,7 @@ pub(super) fn format_metric(value: f64) -> String {
 }
 
 pub(super) fn format_ratio(value: f64) -> String {
-    report::python_repr_float(value)
+    report::full_repr_float(value)
 }
 
 pub(super) fn write_metrics_json(

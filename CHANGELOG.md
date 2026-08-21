@@ -4,9 +4,14 @@
 
 ### Compatibility
 
-- Restore legacy string typing for integer-looking `Subset.Size` values in
-  germline location metrics JSON. This corrects hap-rs output that previously
-  used JSON integers and does not change comparison normalization.
+- Render every metric CSV float cell as the shortest round-trippable decimal,
+  matching the pandas 0.24.2 `to_csv` build nf-core/variantbenchmarking runs:
+  germline `summary.csv`, `extended.csv`, `*.roc.*.csv.gz`, somatic
+  `*.stats.csv`, and the `ftx` feature tables. Values are unchanged; this
+  replaces the earlier Python-2 twelve-significant-digit text.
+- Type a germline location `Subset.Size` metrics-JSON column as `int64` when
+  every cell is a bare integer, matching pandas 0.24.2 dtype inference; a column
+  carrying a `%.6f` BED sum such as `141.000000` stays string-typed.
 - Preserve legacy classified-row ordering and the narrow shared-insertion
   `hapfail` classification used by existing HAPPY artifacts.
 - Apply the legacy preprocessing rule that removes FTX records when a sample

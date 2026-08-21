@@ -380,9 +380,23 @@ fn index_column_json(count: usize, indices: Option<&[usize]>) -> String {
 }
 
 fn legacy_column_type(table: &str, column: &str, values: &[&str]) -> &'static str {
-    // Legacy pandas leaves integer-looking Location `Subset.Size` columns
-    // string-typed. Keep them out of the numeric count-column list so the
-    // metrics JSON schema matches the pinned report artifacts.
+    // pandas 0.24.2 dtype inference for a Location `Subset.Size` column: int64
+    // when every cell is a bare integer count, double when every cell is a
+    // `.0`-suffixed size or empty, else string (a mixed column carrying a
+    // `%.6f` BED sum such as `141.000000` stays string).
+    if column == "Subset.Size" && !values.is_empty() {
+        if values.iter().all(|value| value.parse::<i64>().is_ok()) {
+            return "int64";
+        }
+        if values.iter().all(|value| value.is_empty())
+            || values
+                .iter()
+                .all(|value| value.ends_with(".0") && !value.ends_with(".000000"))
+        {
+            return "double";
+        }
+        return "string";
+    }
     if matches!(
         column,
         "TRUTH.TOTAL"
@@ -399,11 +413,6 @@ fn legacy_column_type(table: &str, column: &str, values: &[&str]) -> &'static st
     } else if column.starts_with("METRIC.")
         || column.ends_with(".TiTv_ratio")
         || column.ends_with(".het_hom_ratio")
-        || (column == "Subset.Size"
-            && !values.is_empty()
-            && values
-                .iter()
-                .all(|value| value.ends_with(".0") && !value.ends_with(".000000")))
         || (!values.is_empty() && values.iter().all(|value| value.is_empty()))
         || (table == "roc.all" && values.iter().all(|value| *value == "."))
         || (column == "Subset.IS_CONF.Size"
@@ -619,10 +628,9 @@ fn render_legacy_ratio(
 }
 
 /// Recover the unrounded integer ratios retained by legacy pandas from the
-/// extended table. The summary CSV prints only 12 significant digits, which
-/// is insufficient to reconstruct a unique fraction for multi-million-call
-/// GIAB rows; the sibling extended table carries the exact ti/tv and
-/// het/homalt counts used to create the JSON value.
+/// extended table. A rendered ratio cell cannot always reconstruct a unique
+/// fraction for multi-million-call GIAB rows; the sibling extended table
+/// carries the exact ti/tv and het/homalt counts used to create the JSON value.
 fn ratio_overrides_from_extended(path: &Path) -> Result<RatioOverrides> {
     let text = crate::adapters::vcf::read_text(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -723,7 +731,7 @@ fn parse_finite(value: &str) -> Option<f64> {
 /// Return the closest rational to `value` whose denominator is no larger
 /// than `maximum`. This is the continued-fraction algorithm used by Python's
 /// `Fraction.limit_denominator`, and recovers the integer count division that
-/// pandas retained before formatting the CSV ratio to 12 significant digits.
+/// pandas retained before rendering the CSV ratio.
 fn limit_denominator(value: f64, maximum: u64) -> Option<(u64, u64)> {
     if !value.is_finite() || value < 0.0 || maximum == 0 {
         return None;
@@ -861,18 +869,13 @@ mod tests {
         assert!(json.contains(
             "\"values\":[3.0,null],\"type\":\"double\",\"id\":\"TRUTH.TOTAL.TiTv_ratio\""
         ));
-        assert!(
-            json.contains("\"values\":[\"42\",\"42\"],\"type\":\"string\",\"id\":\"Subset.Size\"")
-        );
+        assert!(json.contains("\"values\":[42,42],\"type\":\"int64\",\"id\":\"Subset.Size\""));
         assert!(json.contains(
             "\"values\":[\"21.000000\",\"\"],\"type\":\"string\",\"id\":\"Subset.IS_CONF.Size\""
         ));
 
         let locations = table_json("roc.Locations.SNP", "roc.Locations.SNP", &csv).unwrap();
-        assert!(
-            locations
-                .contains("\"values\":[\"42\",\"42\"],\"type\":\"string\",\"id\":\"Subset.Size\"")
-        );
+        assert!(locations.contains("\"values\":[42,42],\"type\":\"int64\",\"id\":\"Subset.Size\""));
         assert!(locations.contains(
             "\"values\":[\"21.000000\",\"\"],\"type\":\"string\",\"id\":\"Subset.IS_CONF.Size\""
         ));

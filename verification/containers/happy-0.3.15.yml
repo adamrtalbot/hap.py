@@ -1,3 +1,6 @@
+# Legacy reference for all six verification lanes: hap.py 0.3.15 on the pandas
+# 0.24.2 stack that nf-core/variantbenchmarking runs, plus rtg-tools for the
+# vcfeval lanes.
 name: happy-0.3.15
 channels:
   - conda-forge
@@ -5,10 +8,10 @@ channels:
 dependencies:
   - hap.py=0.3.15
   - python=2.7.15
-  - pandas=0.20.3
+  - pandas=0.24.2
   - rtg-tools=3.12.1
-  - samtools=1.18
+  - samtools=1.17
   - pysam=0.20.0
-  - numpy=1.12.1
+  - numpy=1.16.5
   - scipy=1.2.1
   - pybedtools=0.8.2
