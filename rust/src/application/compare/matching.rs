@@ -567,9 +567,28 @@ pub(super) fn process_cluster(
     // narrow shape as hapfail (rather than hap:mismatch), so its unmatched SNP
     // rows retain BK=`.`. The counterpart predicate is deliberately limited to
     // a same-anchor Insert+Subst conflict with a matching truth insertion.
+    //
+    // The suppression only holds while the Insert+Subst conflict is still
+    // *live* — i.e. at least one record at a conflict position remains
+    // unmatched after `exact_match_pairs`. When both members of the conflict
+    // were exact-matched (drained to TP), the conflict no longer explains the
+    // disjoint signatures: the genuine mismatch lies at another position, and
+    // legacy reaches `hap:mismatch` → BK=lm there. Broad germline data hits
+    // this via a compound-het insertion pair (truth split, query merged into a
+    // hetalt) sitting one anchor away from an already-matched Insert+Subst
+    // pair; without this gate those leftover FN/FP rows lost their BK=lm.
+    let conflict_positions_still_unmatched = {
+        let query_remaining_positions: BTreeSet<usize> =
+            query_remaining.iter().map(|v| v.key.pos).collect();
+        let (insert_positions, subst_positions) = insert_subst_positions(&cluster.query);
+        insert_positions
+            .intersection(&subst_positions)
+            .any(|pos| query_remaining_positions.contains(pos))
+    };
     let shared_insert_conflict = truth_sig.is_some()
         && query_sig.is_some()
         && matches!(insert_conflict_counterpart, Some(true))
+        && conflict_positions_still_unmatched
         && cluster.query.iter().any(|variant| {
             variant.key.alt_allele.contains(',')
                 && variant
@@ -1485,18 +1504,15 @@ pub(super) fn compute_class_c_relaxation_positions(
     out
 }
 
-pub(super) fn query_insert_conflict_has_truth_counterpart(
-    query_variants: &[Variant],
-    truth_variants: &[Variant],
-    truth_remaining: &[Variant],
-) -> Option<bool> {
-    // Classify each query variant position as Insert (any alt longer than ref)
-    // or Subst (all alts no longer than ref). The graph drain path groups a
-    // same-anchor deletion with substitutions; the truth-counterpart check
-    // below distinguishes the reciprocal aggregate that remains hapfail.
+/// Partition variant positions into Insert (any alt longer than ref) and
+/// Subst (all alts no longer than ref, i.e. SNP/MNP/deletion) buckets. A
+/// position present in both sets carries a same-anchor Insert+Subst conflict.
+/// Shared by the hapfail-suppression predicate and its still-unmatched gate so
+/// both classify identically.
+fn insert_subst_positions(variants: &[Variant]) -> (BTreeSet<usize>, BTreeSet<usize>) {
     let mut insert_positions: BTreeSet<usize> = BTreeSet::new();
     let mut subst_positions: BTreeSet<usize> = BTreeSet::new();
-    for v in query_variants {
+    for v in variants {
         let max_alt_len = v
             .key
             .alt_allele
@@ -1510,6 +1526,19 @@ pub(super) fn query_insert_conflict_has_truth_counterpart(
             subst_positions.insert(v.key.pos);
         }
     }
+    (insert_positions, subst_positions)
+}
+
+pub(super) fn query_insert_conflict_has_truth_counterpart(
+    query_variants: &[Variant],
+    truth_variants: &[Variant],
+    truth_remaining: &[Variant],
+) -> Option<bool> {
+    // Classify each query variant position as Insert (any alt longer than ref)
+    // or Subst (all alts no longer than ref). The graph drain path groups a
+    // same-anchor deletion with substitutions; the truth-counterpart check
+    // below distinguishes the reciprocal aggregate that remains hapfail.
+    let (insert_positions, subst_positions) = insert_subst_positions(query_variants);
     // Positions where both an Insert and a Subst coexist.
     let conflict_positions: Vec<usize> = insert_positions
         .intersection(&subst_positions)

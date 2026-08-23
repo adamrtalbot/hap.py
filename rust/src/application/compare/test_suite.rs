@@ -2165,6 +2165,71 @@ mod memory_guards {
     }
 
     #[test]
+    fn matched_insert_subst_conflict_does_not_suppress_adjacent_compound_het_mismatch() {
+        // Broad-germline shape (reduced from GRCh37 HG002 7:130838422). Anchor
+        // 100 carries a compound-het insertion pair: truth spells it as two
+        // separate het records, the query as one merged hetalt. Anchor 101
+        // carries an Insert+Subst pair (G>GT insert + G>T SNP) that exact-
+        // matches between truth and query and drains to TP before hap-compare.
+        //
+        // The drained 101 conflict must NOT suppress the block's hap:mismatch
+        // verdict: the genuine disagreement is the 100 compound-het pair, and
+        // legacy stamps BK=lm on those leftover FN/FP rows. Before the
+        // `conflict_positions_still_unmatched` gate, the matched 101 conflict
+        // forced hapfail and the 100 rows lost their BK=lm.
+        let cluster = Cluster {
+            chrom: "chr21".to_string(),
+            start: 100,
+            end: 101,
+            truth: vec![
+                variant(100, "G", "GT", "1/0"),
+                variant(100, "G", "GTT", "0/1"),
+                variant(101, "G", "GT", "1/0"),
+                variant(101, "G", "T", "0/1"),
+            ],
+            query: vec![
+                variant(100, "G", "GT,GTT", "2/1"),
+                variant(101, "G", "GT", "0/1"),
+                variant(101, "G", "T", "0/1"),
+            ],
+        };
+        let reference = BTreeMap::from([("chr21".to_string(), "G".repeat(256))]);
+        let mut counts = BTreeMap::new();
+        let mut subtype_counts = BTreeMap::new();
+        let mut rows = Vec::new();
+        process_cluster(
+            &cluster,
+            &reference,
+            None,
+            ComparisonConfig {
+                no_hc: false,
+                max_enum: 100_000,
+                hb_expand: 0,
+            },
+            &mut counts,
+            &mut subtype_counts,
+            &mut rows,
+        )
+        .unwrap();
+
+        let anchor_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row.record.raw().pos == 100)
+            .collect();
+        assert!(!anchor_rows.is_empty(), "expected leftover rows at anchor 100");
+        assert!(
+            anchor_rows.iter().all(|row| {
+                row.record.samples_contain(":FN:lm:") || row.record.samples_contain(":FP:lm:")
+            }),
+            "anchor-100 FN/FP rows must carry BK=lm, got {:?}",
+            anchor_rows
+                .iter()
+                .map(|row| row.record.raw().to_line())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn reciprocal_query_aggregate_accepts_truth_insertion_subset() {
         let truth_insert = variant(100, "A", "ATTT", "0/1");
         let query_insert = variant(100, "A", "AT,ATTT", "2/1");
