@@ -46,3 +46,5 @@ matrix_overlapping_locations,local:assets/fixtures/pre-matrix/window.vcf,local:a
 matrix_bcf_input,local:assets/fixtures/pre-matrix/input.bcf,local:assets/fixtures/pre-matrix/reference.fa,local:assets/fixtures/pre-matrix/all.bed,--no-leftshift --no-decompose --gender none
 chr21_parallel_blocksplit,example/happy/NA12878_chr21.vcf.gz,example/chr21.fa,example/happy/PG_Conf_chr21.bed.gz,-w 1,2
 hg001_primitive_identity,local:assets/fixtures/hg001-primitive-identity/input.vcf,local:assets/fixtures/hg001-primitive-identity/ref.fa,local:assets/fixtures/hg001-primitive-identity/regions.bed,--decompose --leftshift --gender none
+multiallelic_aggregate,local:assets/fixtures/pre-multiallelic-aggregate/query.vcf,local:assets/fixtures/pre-multiallelic-aggregate/reference.fa,local:assets/fixtures/pre-multiallelic-aggregate/confident.bed,--decompose --leftshift --gender none
+multiallelic_aggregate_split,local:assets/fixtures/pre-multiallelic-aggregate-split/query.vcf,local:assets/fixtures/pre-multiallelic-aggregate-split/reference.fa,local:assets/fixtures/pre-multiallelic-aggregate-split/confident.bed,--decompose --leftshift --gender none

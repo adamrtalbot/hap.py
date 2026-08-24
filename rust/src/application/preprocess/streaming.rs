@@ -462,13 +462,29 @@ impl Iterator for LocationAggregatedRecords {
             }
         }
 
+        // The legacy aggregator leaves an insertion + mixed-edit deletion split
+        // when the same stream carries a record at the anchor's next reference
+        // position (anchor + 1); `self.pending` is exactly that lookahead. Track
+        // which stream it belongs to so the merge decision stays stream-local.
+        let successor_stream = self
+            .pending
+            .as_ref()
+            .and_then(|entry| entry.as_ref().ok())
+            .filter(|record| record.raw().chrom == chrom && record.raw().pos == pos + 1)
+            .map(|record| record.provenance().source_index().unwrap_or(0));
+
         let mut streams = BTreeMap::<usize, Vec<RawVcfRecord>>::new();
         for (stream, record) in group {
             streams.entry(stream.unwrap_or(0)).or_default().push(record);
         }
         let streams = streams
-            .into_values()
-            .map(crate::engines::variant_pipeline::aggregate_location_records)
+            .into_iter()
+            .map(|(stream, records)| {
+                crate::engines::variant_pipeline::aggregate_location_records_with_successor(
+                    records,
+                    successor_stream == Some(stream),
+                )
+            })
             .collect::<Vec<_>>();
         // Legacy merges independent block/location streams round-wise at an
         // equal normalized position: first record from every stream, then

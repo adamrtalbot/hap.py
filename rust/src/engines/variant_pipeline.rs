@@ -745,13 +745,30 @@ fn merge_records(
 /// It pads shorter REF alleles to the longest sibling span, extends each ALT
 /// by the same suffix, and emits one het-alt record. Records that cannot fit
 /// that diploid shape pass through unchanged.
+#[cfg(test)]
 pub(crate) fn aggregate_location_records(records: Vec<RawVcfRecord>) -> Vec<RawVcfRecord> {
-    aggregate_location_records_inner(records, false)
+    aggregate_location_records_inner(records, false, false)
+}
+
+/// Aggregate a location group knowing whether the same stream carries a record
+/// at the immediately following reference position (anchor + 1).
+///
+/// Legacy merges an ordinary insertion and a mixed-edit deletion sharing an
+/// anchor into one het-alt record, but leaves them split when another variant
+/// sits at the deletion's first deleted base (anchor + 1). Measured against the
+/// pinned hap.py 0.3.15 aggregator: chr1:152194725 (no anchor+1 record) merges,
+/// chr11:95814076 (a record at anchor+1) stays split.
+pub(crate) fn aggregate_location_records_with_successor(
+    records: Vec<RawVcfRecord>,
+    successor_present: bool,
+) -> Vec<RawVcfRecord> {
+    aggregate_location_records_inner(records, false, successor_present)
 }
 
 fn aggregate_location_records_inner(
     mut records: Vec<RawVcfRecord>,
     preserve_pair_order: bool,
+    successor_present: bool,
 ) -> Vec<RawVcfRecord> {
     let mixed_insertion_order = |left: &RawVcfRecord, right: &RawVcfRecord| {
         let is_insertion =
@@ -816,6 +833,7 @@ fn aggregate_location_records_inner(
             let merged = aggregate_location_records_inner(
                 vec![previous.clone(), record.clone()],
                 preserve_sorted_pair_order,
+                successor_present,
             );
             if merged.len() == 1 {
                 aggregated.extend(merged);
@@ -882,7 +900,11 @@ fn aggregate_location_records_inner(
             && !records[1].mixed_edit_primitive
             && is_deletion(&records[0])
             && records[0].mixed_edit_primitive);
-    if opposite_slots && ordinary_insertion_with_mixed_deletion {
+    if opposite_slots && ordinary_insertion_with_mixed_deletion && successor_present {
+        // A variant at the deletion's first deleted base (anchor + 1) blocks the
+        // legacy aggregator from folding the pair into a het-alt. Without one it
+        // merges (chr1:152194725), so only keep them split when the successor is
+        // present (chr11:95814076).
         return records;
     }
     let both_deletions = records
@@ -1247,12 +1269,30 @@ mod tests {
     }
 
     #[test]
-    fn location_aggregator_keeps_ordinary_insertion_and_mixed_deletion_separate() {
+    fn location_aggregator_merges_isolated_ordinary_insertion_and_mixed_deletion() {
+        // chr11:95814076 pattern with no variant at anchor + 1: legacy folds the
+        // pair into one het-alt (measured on the pinned aggregator, isolated).
         let insertion = make_record("chr11", 95_814_076, "T", "TA", "GT", "0/1");
         let mut deletion = make_record("chr11", 95_814_076, "TCT", "T", "GT", "1/0");
         deletion.mixed_edit_primitive = true;
 
         let out = aggregate_location_records(vec![insertion, deletion]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ref_allele, "TCT");
+        assert_eq!(out[0].alt_allele, "TACT,T");
+        assert_eq!(out[0].samples[0], "2/1");
+    }
+
+    #[test]
+    fn location_aggregator_keeps_pair_split_when_successor_present() {
+        // The real chr11:95814076 cluster carries a variant at 95814077
+        // (anchor + 1), which blocks the fold: legacy leaves the pair split.
+        let insertion = make_record("chr11", 95_814_076, "T", "TA", "GT", "0/1");
+        let mut deletion = make_record("chr11", 95_814_076, "TCT", "T", "GT", "1/0");
+        deletion.mixed_edit_primitive = true;
+
+        let out = aggregate_location_records_with_successor(vec![insertion, deletion], true);
 
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].ref_allele, "T");
