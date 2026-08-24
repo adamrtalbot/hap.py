@@ -994,31 +994,6 @@ pub(super) fn legacy_unknown_aggregate_local_mismatch(
             return None;
         }
 
-        // Legacy's graph rejects an otherwise linear hap match
-        // when a preceding shared insertion's rendered allele reaches the
-        // aggregate anchor. This is the overlapping-graph shape in the
-        // test_full chr9 block; its whole outside-CONF block is BK=lm.
-        let preceded_by_shared_reaching_insertion = cluster.truth.iter().any(|truth| {
-            let max_alt_len = truth
-                .key
-                .alt_allele
-                .split(',')
-                .map(str::len)
-                .max()
-                .unwrap_or(0);
-            truth.key.pos < query.key.pos
-                && max_alt_len > truth.key.ref_allele.len()
-                && max_alt_len >= 16
-                && max_alt_len <= 64
-                && truth.key.pos.saturating_add(max_alt_len).saturating_add(2) >= query.key.pos
-                && cluster.query.iter().any(|candidate| {
-                    candidate.key == truth.key && equivalent_gt(&candidate.gt, &truth.gt)
-                })
-        });
-        if preceded_by_shared_reaching_insertion {
-            return Some(true);
-        }
-
         if rust_hap_mismatch {
             // A GT=2/1 insertion aggregate immediately followed by a shared
             // hom-alt deletion can reconstruct the same two legacy graph

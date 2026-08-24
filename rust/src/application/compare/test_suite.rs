@@ -2405,7 +2405,12 @@ mod memory_guards {
     }
 
     #[test]
-    fn outside_conf_aggregate_mismatch_marks_the_whole_block_local() {
+    fn outside_conf_reaching_insertion_aggregate_is_not_local_mismatch() {
+        // test_full chr9:113463932 shape: a shared reaching insertion before a
+        // two-allele aggregate. Measured against pinned legacy (hap.py 0.3.15):
+        // the isolated block reconciles to `ctype=hap:match` and the full
+        // test_full block to `ctype=hapfail:mismatch` — both leave BK=`.`. This
+        // shape is NOT a local mismatch, so the function must not promote it.
         let cluster = Cluster {
             chrom: "chr9".to_string(),
             start: 113463932,
@@ -2422,17 +2427,19 @@ mod memory_guards {
         };
         assert_eq!(
             legacy_unknown_aggregate_local_mismatch(&cluster, &RegionState::default(), false),
-            Some(true)
+            None
         );
     }
 
     #[test]
-    fn matched_outside_conf_reaching_insertion_aggregate_marks_whole_block_local() {
-        // Reduced form of test_full chr9:113463932. The first insertion is
-        // byte-equal across truth/query and reaches the later two-allele
-        // aggregate. The remaining truth primitives and query aggregate
-        // reconstruct the same haplotypes, but legacy's graph still stamps
-        // the entire outside-CONF block BK=lm.
+    fn outside_conf_reaching_insertion_aggregate_keeps_block_kind_missing() {
+        // Synthetic shape guard (all-T reference, invented aggregate) for the
+        // reaching-insertion + two-allele aggregate shape. It is NOT itself
+        // oracle-verified; the pinned-legacy measurements are on the real
+        // blocks — chr6:52278844 (ctype=hap:match) and the real test_full
+        // chr9:113463932 (ctype=hapfail:mismatch), both BK=`.`. Guards against
+        // re-introducing the reaching-insertion over-fire that stamped
+        // chr6:52278844 BK=lm.
         let reaching = "TATTTTTTTTATTGTATTGTATTG";
         let aggregate = "TATTTTATTTTATTTTATTTTATTTTATTTTATTTT";
         let cluster = Cluster {
@@ -2470,9 +2477,8 @@ mod memory_guards {
 
         assert!(!rows.is_empty());
         assert!(
-            rows.iter().all(|row| !row.record.samples_contain(":UNK:.:")
-                && row.record.samples_contain(":UNK:lm:")),
-            "rows={:?}",
+            rows.iter().all(|row| !row.record.samples_contain(":UNK:lm:")),
+            "reaching-insertion aggregate must stay BK=`.`, rows={:?}",
             rows.iter()
                 .map(|row| row.record.raw().to_line())
                 .collect::<Vec<_>>()
