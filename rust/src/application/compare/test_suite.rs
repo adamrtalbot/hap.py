@@ -2165,6 +2165,65 @@ mod memory_guards {
     }
 
     #[test]
+    fn homalt_insertion_vs_compound_het_query_does_not_drain_as_tp() {
+        // chr1:150042104 (HG003 DeepVariant), reduced onto the real microsat
+        // reference slice that drives the decomposition. Truth is a homozygous
+        // insertion `A>ACCCT`; the query is a compound het that pre.py
+        // aggregates into `A>T 1/0` + `A>ACCCT,ACCCT 2/1` — both haplotypes
+        // carry the +CCCT insertion, but one also carries the `A>T` SNP.
+        //
+        // The duplicate-alt aggregate `ACCCT,ACCCT` looks like a clean
+        // homozygous insertion, but the co-anchor `A>T` puts a SNP on one
+        // haplotype (making it `TCCCT`), so legacy declines the match: truth
+        // is FN, both query alleles FP, all BK=lm. hap-rs must not drain the
+        // aggregate to a homalt TP.
+        let reference_slice = "TTCCATTTTGATTTACCCTTTAACCCAAGAATTCTTTCTTTCTTTATTTATTTTTTTGAGACAGAGTCTCACTCTGTCACCCAGGCTGGAATGCAGAGGTGCAGACCCTCCCTCCCTCCCTCCCTCCCTCCCTCCCTCCCTCCCTTCCTTCCTCCCTTCCTTCCTTCCTTCCTCCCTCCCTTCCTCCCTTCCTTCCTTCATCTCACTCTGTCGCCCAGGCTGGAATGCAGTGGCGCGGACTCGACTCACTG";
+        let cluster = Cluster {
+            chrom: "chr1".to_string(),
+            start: 105,
+            end: 105,
+            truth: vec![variant(105, "A", "ACCCT", "1/1")],
+            query: vec![
+                variant(105, "A", "T", "1/0"),
+                variant(105, "A", "ACCCT,ACCCT", "2/1"),
+            ],
+        };
+        let reference = BTreeMap::from([("chr1".to_string(), reference_slice.to_string())]);
+        let mut counts = BTreeMap::new();
+        let mut subtype_counts = BTreeMap::new();
+        let mut rows = Vec::new();
+        process_cluster(
+            &cluster,
+            &reference,
+            None,
+            ComparisonConfig {
+                no_hc: false,
+                max_enum: 100_000,
+                hb_expand: 0,
+            },
+            &mut counts,
+            &mut subtype_counts,
+            &mut rows,
+        )
+        .unwrap();
+
+        let lines: Vec<String> = rows.iter().map(|row| row.record.raw().to_line()).collect();
+        assert!(
+            !lines.iter().any(|line| line.contains(":TP:")),
+            "aggregate must not drain to TP, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(":FN:lm:")),
+            "truth insertion must be FN with BK=lm, got {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains(":FP:lm:")).count(),
+            2,
+            "both query alleles must be FP with BK=lm, got {lines:?}"
+        );
+    }
+
+    #[test]
     fn matched_insert_subst_conflict_does_not_suppress_adjacent_compound_het_mismatch() {
         // Broad-germline shape (reduced from GRCh37 HG002 7:130838422). Anchor
         // 100 carries a compound-het insertion pair: truth spells it as two
@@ -2216,7 +2275,10 @@ mod memory_guards {
             .iter()
             .filter(|row| row.record.raw().pos == 100)
             .collect();
-        assert!(!anchor_rows.is_empty(), "expected leftover rows at anchor 100");
+        assert!(
+            !anchor_rows.is_empty(),
+            "expected leftover rows at anchor 100"
+        );
         assert!(
             anchor_rows.iter().all(|row| {
                 row.record.samples_contain(":FN:lm:") || row.record.samples_contain(":FP:lm:")
@@ -2477,7 +2539,8 @@ mod memory_guards {
 
         assert!(!rows.is_empty());
         assert!(
-            rows.iter().all(|row| !row.record.samples_contain(":UNK:lm:")),
+            rows.iter()
+                .all(|row| !row.record.samples_contain(":UNK:lm:")),
             "reaching-insertion aggregate must stay BK=`.`, rows={:?}",
             rows.iter()
                 .map(|row| row.record.raw().to_line())

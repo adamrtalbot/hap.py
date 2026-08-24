@@ -101,7 +101,7 @@ cd verification
 nf-test test --ci --coverage
 ```
 
-Before opening a pull request, run all six lanes. `nf-test` expects 154 paired
+Before opening a pull request, run all six lanes. `nf-test` expects 156 paired
 legacy/Rust comparisons. Each must have `ok: true` and an empty `differences`
 list. `verification/README.md` tables every one of them.
 

@@ -590,11 +590,16 @@ pub(super) fn process_cluster(
         && matches!(insert_conflict_counterpart, Some(true))
         && conflict_positions_still_unmatched
         && cluster.query.iter().any(|variant| {
-            variant.key.alt_allele.contains(',')
-                && variant
-                    .key
-                    .alt_allele
-                    .split(',')
+            // The hapfail shape needs a genuine hetalt insertion aggregate
+            // (two DISTINCT alts, e.g. `TTGG,TTGGG`). A duplicate-alt
+            // aggregate (`ACCCT,ACCCT`) is a persisted HOMOZYGOUS insertion,
+            // not a reciprocal het pair; legacy still reaches hap:mismatch on
+            // those blocks (chr1:150042104 HG003 → BK=lm), so exclude them.
+            let alts: Vec<&str> = variant.key.alt_allele.split(',').collect();
+            let distinct: BTreeSet<&str> = alts.iter().copied().collect();
+            distinct.len() >= 2
+                && distinct
+                    .iter()
                     .any(|alt| alt.len() > variant.key.ref_allele.len())
         });
     let covered_multi_conflict_mismatch = graph_failed
@@ -2044,10 +2049,50 @@ pub(super) fn simple_compare_pairs_match(
     ) {
         return false;
     }
+    // A query duplicate-alt aggregate (`X,X`, GT 2/1) is the persisted form of
+    // two source het records that both produced the same edit X — one on each
+    // haplotype. Pairing it to a truth homalt claims both query haplotypes are
+    // exactly X. That claim is false when a SEPARATE query record shares this
+    // anchor with a GT-selected nonref allele: one of those haplotypes then
+    // also carries the neighbour's edit, so it is not X alone. Legacy defers
+    // such a block to hap-compare, which finds the two sides' haplotypes differ
+    // and leaves the truth FN with both query alleles FP. chr1:150042104
+    // (HG003 DeepVariant): truth `A>ACCCT 1/1`, query `A>ACCCT,ACCCT 2/1` +
+    // `A>T 1/0` — the SNP on one hap makes it `TCCCT`, so the aggregate is not
+    // a clean homozygous insertion and must not drain as a TP here.
+    if query_duplicate_alt_aggregate_has_conflicting_neighbor(query, cluster_query) {
+        return false;
+    }
     // `gttype` equality is implied by the selected multi-set equality —
     // homalt `1|1` selects `[X, X]` vs het `0|1` selects `[X]`; these
     // differ as multi-sets even when the nonref-set matches.
     true
+}
+
+/// True when `query` is a duplicate-alt aggregate (an ALT column listing the
+/// same allele more than once, e.g. `ACCCT,ACCCT`) AND another query record at
+/// the same anchor position carries a GT-selected nonref allele. In that shape
+/// the aggregate's implied homozygosity is contradicted by the neighbour's edit
+/// sharing a haplotype, so the pair is not a clean simple-compare match and
+/// must fall through to the block-level haplotype comparison.
+fn query_duplicate_alt_aggregate_has_conflicting_neighbor(
+    query: &Variant,
+    cluster_query: &[Variant],
+) -> bool {
+    let alts: Vec<&str> = query.key.alt_allele.split(',').collect();
+    if alts.len() < 2 {
+        return false;
+    }
+    let distinct: BTreeSet<&str> = alts.iter().copied().collect();
+    if distinct.len() == alts.len() {
+        // No repeated alt — not a duplicate-alt aggregate.
+        return false;
+    }
+    cluster_query.iter().any(|neighbour| {
+        neighbour.key.pos == query.key.pos
+            && neighbour.key != query.key
+            && !selected_alt_sequences(neighbour).is_empty()
+    })
 }
 
 /// True iff `split_query_primitives(query)` would fan the record into
