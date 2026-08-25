@@ -1,4 +1,4 @@
-//! Cohesive responsibility extracted from the command façade.
+//! Resolve somatic normalization options and load the classification and ambiguous-region BED annotations.
 
 use super::allele_frequency::parse_af_bins;
 use super::features::csv_join;

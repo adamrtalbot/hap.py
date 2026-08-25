@@ -13,7 +13,7 @@
 //! operations use an internal port of the AVX2/FMA scalar math selected by the
 //! Ubuntu glibc 2.39 reference so their last bits do not depend on the host libc.
 
-// Preserve the original Cephes decimal constants for source and bit-level parity.
+// Preserve the original Cephes decimal constants to match the legacy implementation exactly.
 #![allow(clippy::excessive_precision)]
 #![allow(clippy::needless_range_loop)]
 

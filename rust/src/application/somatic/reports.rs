@@ -1,4 +1,4 @@
-//! Cohesive responsibility extracted from the command façade.
+//! Write the somatic summary, extended, and ROC report tables.
 
 use super::allele_frequency::{parse_af_bins, round_four, rounded_metric};
 use super::features::{csv_join, parse_csv_line, write_simple_table};

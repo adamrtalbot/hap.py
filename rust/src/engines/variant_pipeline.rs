@@ -218,7 +218,7 @@ pub(crate) fn primitive_split_with_context(
 /// by `primitive_split`. Mirrors legacy `VariantAlleleNormalizer.cpp:209-238`:
 /// `leftShift → trimLeft(refpadding) → trimRight(refpadding) → `
 /// `nv.len==0 ⇒ --pos, len=1` insertion fixup. The slide step is
-/// load-bearing for byte parity — without it sibling primitives emitted
+/// load-bearing to match the legacy implementation — without it sibling primitives emitted
 /// at the same input anchor (e.g. `C → CACAC,CACAT`) would re-aggregate
 /// instead of decomposing into per-anchor records, and ambiguous indels
 /// in homopolymer / microsatellite contexts would sit at the wrong pos.

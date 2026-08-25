@@ -1,4 +1,4 @@
-//! Cohesive responsibility extracted from the command façade.
+//! Build and merge the somatic caller feature table from truth and query records.
 
 use crate::application::ftx;
 use crate::domain::RawVcfRecord;

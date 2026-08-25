@@ -572,13 +572,13 @@ pub(crate) fn format_metric(value: f64) -> String {
     full_repr_float(lossy)
 }
 
-/// Rust port of pandas 0.24 `xstrtod` (the lossy parser used by
+/// Reimplements pandas 0.24 `xstrtod` (the lossy parser used by
 /// `pandas.to_numeric`). Pandas applies the scale factor by walking the
 /// binary representation of the (positive) exponent magnitude and
 /// repeatedly multiplying or dividing by `p10 = 10, 100, 10000, ...`.
 /// The intermediate rounding produces results that differ by 1 ULP from
-/// `f64::from_str` on roughly half of inputs — for byte parity we have
-/// to reproduce that walk.
+/// `f64::from_str` on roughly half of inputs — to match the legacy
+/// implementation we have to reproduce that walk.
 pub(crate) fn pandas_xstrtod(s: &str) -> f64 {
     let bytes = s.as_bytes();
     let mut idx = 0;

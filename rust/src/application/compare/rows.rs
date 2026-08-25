@@ -1,4 +1,4 @@
-//! Extracted cohesive responsibility from the command façade.
+//! Build the per-variant comparison output rows and their FILTER/QUAL formatting.
 
 use super::genotype::parse_gt_alleles;
 use super::{AnnotatedRow, Cluster, SPLIT_LEFT_SHIFT_WINDOW, Side, Variant, fp_class_from_bk};

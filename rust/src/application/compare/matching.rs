@@ -1,4 +1,4 @@
-//! Extracted cohesive responsibility from the command façade.
+//! Cluster nearby variants and match truth against query within each superlocus.
 
 #[cfg(test)]
 use super::XCMP_ENUMERATION_THRESHOLD;

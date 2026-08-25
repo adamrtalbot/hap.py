@@ -1,4 +1,4 @@
-//! Extracted cohesive responsibility from the command façade.
+//! Decorate comparison rows for output: INFO-field rewriting, ROC-field capture, and requantify handoff sanitizing.
 
 #[cfg(test)]
 use super::CLUSTER_GAP_BP;

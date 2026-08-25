@@ -1,4 +1,4 @@
-//! Extracted cohesive responsibility from the command façade.
+//! Aggregate per-type and per-subtype variant counts and FP classifications for the comparison summary.
 
 use super::AnnotatedRow;
 use super::rows::{snp_bucket_label, subtype_label};

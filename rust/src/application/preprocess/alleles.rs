@@ -609,7 +609,7 @@ pub(super) fn copy_sample_formats_to_info(record: &mut RawVcfRecord, sample_name
     // `alleles` declares fields for every input sample but, due to its use of
     // the translated output header while mutating the record, only the first
     // sample's values survive into the emitted INFO payload. Preserve this
-    // long-standing observable quirk for byte parity.
+    // observable quirk to match the legacy implementation.
     for (sample_index, sample) in samples.iter().take(1).enumerate() {
         let prefix = sample_names
             .get(sample_index)
