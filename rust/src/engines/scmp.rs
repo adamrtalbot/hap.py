@@ -1136,12 +1136,7 @@ fn extract_occurrences(
         // Pinned SCMP constructs RefVar.end from ALT length. Keep that governed
         // emulation at the VCF-to-RefVar adapter instead of teaching the
         // normalization and matching algorithms the malformed span rule.
-        let end = super::compatibility::scmp_refvar_end(
-            super::compatibility::ScmpRefVarSpanPolicy::LegacyAltLength,
-            start,
-            record.ref_allele.len(),
-            alt.len(),
-        )?;
+        let end = super::compatibility::scmp_refvar_end(start, alt.len())?;
         occurrences.push(Occurrence {
             record_index,
             var: RefVar { start, end, alt },

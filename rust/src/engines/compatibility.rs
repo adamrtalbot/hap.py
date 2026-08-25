@@ -1,30 +1,14 @@
 //! Explicit policies for pinned engine quirks.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ScmpRefVarSpanPolicy {
-    LegacyAltLength,
-    #[cfg(test)]
-    ReferenceLength,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AlleleCountArrayPolicy {
     LegacyReuse,
     ResetPerTable,
 }
 
-pub(crate) fn scmp_refvar_end(
-    policy: ScmpRefVarSpanPolicy,
-    start: i64,
-    _reference_len: usize,
-    alt_len: usize,
-) -> anyhow::Result<i64> {
-    let span = match policy {
-        ScmpRefVarSpanPolicy::LegacyAltLength => alt_len,
-        #[cfg(test)]
-        ScmpRefVarSpanPolicy::ReferenceLength => _reference_len,
-    };
-    Ok(start + i64::try_from(span)? - 1)
+/// Pinned SCMP constructs `RefVar.end` from ALT length, not reference length.
+pub(crate) fn scmp_refvar_end(start: i64, alt_len: usize) -> anyhow::Result<i64> {
+    Ok(start + i64::try_from(alt_len)? - 1)
 }
 
 pub(crate) fn begin_allele_count_table(policy: AlleleCountArrayPolicy, counts: &mut Vec<usize>) {
@@ -50,18 +34,7 @@ mod tests {
 
     #[test]
     fn legacy_only_scmp_refvar_span_uses_alt_length() {
-        assert_eq!(
-            scmp_refvar_end(ScmpRefVarSpanPolicy::LegacyAltLength, 9, 1, 3).unwrap(),
-            11
-        );
-    }
-
-    #[test]
-    fn normative_scmp_refvar_span_uses_reference_length() {
-        assert_eq!(
-            scmp_refvar_end(ScmpRefVarSpanPolicy::ReferenceLength, 9, 1, 3).unwrap(),
-            9
-        );
+        assert_eq!(scmp_refvar_end(9, 3).unwrap(), 11);
     }
 
     #[test]

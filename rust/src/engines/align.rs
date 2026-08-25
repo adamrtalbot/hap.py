@@ -98,7 +98,6 @@ pub(crate) fn to_primitives(ref_start: usize, ref_allele: &[u8], alt_allele: &[u
             alt: inserted,
         });
     }
-    let _ = rend; // only used in the `reflen > 0` branch; tolerate for the insertion path
 
     out
 }

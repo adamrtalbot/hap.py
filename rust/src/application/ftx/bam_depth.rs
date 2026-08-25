@@ -161,10 +161,8 @@ fn read_bam<R: Read, F: FnMut(&R) -> Option<u64>>(
         let bin = bin_mq_name >> 16;
         let flag_and_cigar = u32::from_le_bytes(block[12..16].try_into().unwrap());
         let flags = (flag_and_cigar >> 16) as u16;
+        // `validate_record_layout` already rejected a negative query length.
         let query_len = i32::from_le_bytes(block[16..20].try_into().unwrap());
-        if query_len < 0 {
-            bail!("BAM alignment has a negative query length");
-        }
         if flags & 0x4 != 0 || reference_id < 0 {
             continue;
         }
