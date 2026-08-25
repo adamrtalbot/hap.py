@@ -1220,7 +1220,7 @@ fn legacy_levels(
         .map(|(level, below)| {
             let above = Cumul {
                 truth_tp: sub_buckets(&final_counts.truth_tp, &below.truth_tp),
-                truth_fn: add_buckets_total(&final_counts.truth_fn, &below.truth_tp),
+                truth_fn: sum_buckets(&final_counts.truth_fn, &below.truth_tp),
                 query_tp: sub_buckets(&final_counts.query_tp, &below.query_tp),
                 query_fp: sub_buckets(&final_counts.query_fp, &below.query_fp),
                 query_unk: sub_buckets(&final_counts.query_unk, &below.query_unk),
@@ -1276,7 +1276,7 @@ fn legacy_levels_store(
                 format!("{:.6}", observation.level as f32 as f64),
                 Cumul {
                     truth_tp: sub_buckets(&totals.truth_tp, &running.truth_tp),
-                    truth_fn: add_buckets_total(&totals.truth_fn, &running.truth_tp),
+                    truth_fn: sum_buckets(&totals.truth_fn, &running.truth_tp),
                     query_tp: sub_buckets(&totals.query_tp, &running.query_tp),
                     query_fp: sub_buckets(&totals.query_fp, &running.query_fp),
                     query_unk: sub_buckets(&totals.query_unk, &running.query_unk),
@@ -2889,7 +2889,7 @@ impl BoundedGroupAccum {
         let mut numeric_rows: Vec<EmittedRow> = Vec::with_capacity(kept.len());
         for (level, cum_through) in &kept {
             let mut truth_tp = sub_buckets(&total.truth_tp, &cum_through.truth_tp);
-            let mut truth_fn = add_buckets_total(&total_truth_fn, &cum_through.truth_tp);
+            let mut truth_fn = sum_buckets(&total_truth_fn, &cum_through.truth_tp);
             let mut query_tp = sub_buckets(&total.query_tp, &cum_through.query_tp);
             let mut query_fp = sub_buckets(&total.query_fp, &cum_through.query_fp);
             let mut query_unk = sub_buckets(&total.query_unk, &cum_through.query_unk);
@@ -3034,7 +3034,7 @@ impl BoundedGroupAccum {
             }
             previous_main = Some(level);
             let mut truth_tp = sub_buckets(&total.truth_tp, &cum_through.truth_tp);
-            let mut truth_fn = add_buckets_total(&total_truth_fn, &cum_through.truth_tp);
+            let mut truth_fn = sum_buckets(&total_truth_fn, &cum_through.truth_tp);
             let mut query_tp = sub_buckets(&total.query_tp, &cum_through.query_tp);
             let mut query_fp = sub_buckets(&total.query_fp, &cum_through.query_fp);
             let mut query_unk = sub_buckets(&total.query_unk, &cum_through.query_unk);
@@ -3152,16 +3152,6 @@ fn sub_buckets(a: &CountsBucket, b: &CountsBucket) -> CountsBucket {
         tv: a.tv.saturating_sub(b.tv),
         het: a.het.saturating_sub(b.het),
         homalt: a.homalt.saturating_sub(b.homalt),
-    }
-}
-
-fn add_buckets_total(a: &CountsBucket, b: &CountsBucket) -> CountsBucket {
-    CountsBucket {
-        total: a.total + b.total,
-        ti: a.ti + b.ti,
-        tv: a.tv + b.tv,
-        het: a.het + b.het,
-        homalt: a.homalt + b.homalt,
     }
 }
 
