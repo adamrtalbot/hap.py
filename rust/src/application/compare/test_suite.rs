@@ -2497,6 +2497,30 @@ mod memory_guards {
     }
 
     #[test]
+    fn oversized_block_span_hapfails_via_empty_signatures() {
+        // Measured on pinned hap.py 0.3.15 (chr6:31311209, HG003 v4.2.1 vs
+        // giab query): legacy declines to enumerate a haplotype block whose
+        // expanded reference span exceeds ~4098 bases and reports it as
+        // `hapfail` (BK=`.`), whether the span comes from one long deletion or
+        // a dense chain of small variants. `signatures` must therefore return
+        // None (which the caller routes through `graph_failed` -> hapfail) once
+        // the region is that wide, and keep enumerating just below the bound.
+        let reference = "A".repeat(6000);
+        let snp = variant(100, "A", "C", "0/1");
+        // The bound is on the expanded region span alone, independent of the
+        // variants inside it. 4097-base span still enumerates (Some); 4098 tips
+        // into hapfail (None).
+        assert!(
+            legacy_graph::signatures(std::slice::from_ref(&snp), &reference, 100, 4196, 16768)
+                .is_some()
+        );
+        assert!(
+            legacy_graph::signatures(std::slice::from_ref(&snp), &reference, 100, 4197, 16768)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn outside_conf_reaching_insertion_aggregate_keeps_block_kind_missing() {
         // Synthetic shape guard (all-T reference, invented aggregate) for the
         // reaching-insertion + two-allele aggregate shape. It is NOT itself

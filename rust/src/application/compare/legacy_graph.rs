@@ -272,6 +272,18 @@ fn path_sequence(
     Some(output.to_ascii_uppercase())
 }
 
+/// Reference span (in bases, inclusive of the `--expand-hapblocks` padding on
+/// both sides) beyond which legacy hap.py declines to enumerate a haplotype
+/// block and reports it as `hapfail` (BK=`.`) instead of a resolved
+/// match/mismatch. Measured on the pinned image (hap.py 0.3.15) at
+/// chr6:31311209 by shrinking the block until the verdict flipped: an expanded
+/// region of 4097 bases still resolves, 4098 hapfails — for both a single long
+/// deletion and a dense chain of small variants, so the bound is on the block
+/// span, not on any one allele's length or the enumeration count.
+// ponytail: calibrated at the default --xcmp-expand-hapblocks=30; the oracle
+// boundary was only measured at that padding. Re-measure if that flag changes.
+const MAX_GRAPH_REGION_SPAN: usize = 4098;
+
 pub(super) fn signatures(
     variants: &[Variant],
     reference: &str,
@@ -279,6 +291,12 @@ pub(super) fn signatures(
     region_end: usize,
     max_paths: usize,
 ) -> Option<BTreeSet<String>> {
+    // A block wider than legacy's graph-reference bound comes back as hapfail:
+    // returning None here routes it through the caller's `graph_failed` path,
+    // which suppresses the BK=lm promotion and leaves every row at BK=`.`.
+    if region_end.saturating_sub(region_start) + 1 >= MAX_GRAPH_REGION_SPAN {
+        return None;
+    }
     let unphased_hets = variants
         .iter()
         .filter(|variant| {
