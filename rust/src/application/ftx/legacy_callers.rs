@@ -41,13 +41,7 @@ pub(super) fn emit_pisces_with_depths(
             format_python_float(gqx),
             format_info_float(strelka::info_float(&record.info, "EVS").unwrap_or(-1.0)),
             format_python_float(t_dp),
-            format_python_float(
-                depths
-                    .get(&record.chrom)
-                    .filter(|depth| **depth != 0.0)
-                    .map(|depth| t_dp / depth)
-                    .unwrap_or(0.0),
-            ),
+            format_python_float(depth_rate(t_dp, depths.get(&record.chrom).copied())),
             format_python_float(vf),
             csv_escape(label),
         ];
