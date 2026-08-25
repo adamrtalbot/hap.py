@@ -4,8 +4,8 @@ use super::allele_frequency::{parse_af_bins, round_four, rounded_metric};
 use super::features::{csv_join, parse_csv_line, write_simple_table};
 use super::metrics::{jeffreys_ci, py_float, ratio};
 use super::{
-    AmbiguousInterval, FilteredCounts, FilteredRawRecord, SOM_VERSION, SOMATIC_ROC_CHUNK,
-    SOMATIC_ROC_MERGE_FAN_IN, SomaticCounts, StatsRowContext, somatic_roc_config,
+    AmbiguousInterval, FilteredCounts, SOM_VERSION, SOMATIC_ROC_CHUNK, SOMATIC_ROC_MERGE_FAN_IN,
+    SomaticCounts, StatsRowContext, somatic_roc_config,
 };
 use crate::adapters::vcf;
 use crate::domain::{Interval, RawVcfRecord};
@@ -770,11 +770,8 @@ pub(super) fn raw_type_label(record: &RawVcfRecord) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-pub(super) fn contigs_in_truth(truth: &[FilteredRawRecord]) -> BTreeSet<String> {
-    truth
-        .iter()
-        .map(|record| record.record.chrom.clone())
-        .collect()
+pub(super) fn contigs_in_truth(truth: &[RawVcfRecord]) -> BTreeSet<String> {
+    truth.iter().map(|record| record.chrom.clone()).collect()
 }
 
 pub(super) fn automatic_fp_intervals<'a>(
@@ -850,7 +847,7 @@ pub(super) fn calculate_fp_region_size(
     ambiguous_regions: &[AmbiguousInterval],
     locations: Option<&[vcf::LocationFilter]>,
     reference_sequences: &BTreeMap<String, String>,
-    truth: &[FilteredRawRecord],
+    truth: &[RawVcfRecord],
 ) -> usize {
     let reference_lengths = reference_sequences
         .iter()
@@ -914,16 +911,16 @@ pub(super) fn calculate_fp_region_size_for_contigs(
 }
 
 pub(super) fn pair_exact_records(
-    truth: &[FilteredRawRecord],
-    query: &[FilteredRawRecord],
+    truth: &[RawVcfRecord],
+    query: &[RawVcfRecord],
 ) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
     let mut truth_order = (0..truth.len()).collect::<Vec<_>>();
     truth_order.sort_unstable_by(|left, right| {
-        exact_record_key_cmp(&truth[*left].record, &truth[*right].record).then(left.cmp(right))
+        exact_record_key_cmp(&truth[*left], &truth[*right]).then(left.cmp(right))
     });
     let mut query_order = (0..query.len()).collect::<Vec<_>>();
     query_order.sort_unstable_by(|left, right| {
-        exact_record_key_cmp(&query[*left].record, &query[*right].record).then(left.cmp(right))
+        exact_record_key_cmp(&query[*left], &query[*right]).then(left.cmp(right))
     });
     let mut truth_matches = vec![None; truth.len()];
     let mut query_matches = vec![None; query.len()];
@@ -932,7 +929,7 @@ pub(super) fn pair_exact_records(
     while truth_position < truth_order.len() && query_position < query_order.len() {
         let truth_index = truth_order[truth_position];
         let query_index = query_order[query_position];
-        match exact_record_key_cmp(&truth[truth_index].record, &query[query_index].record) {
+        match exact_record_key_cmp(&truth[truth_index], &query[query_index]) {
             std::cmp::Ordering::Less => truth_position += 1,
             std::cmp::Ordering::Greater => query_position += 1,
             std::cmp::Ordering::Equal => {

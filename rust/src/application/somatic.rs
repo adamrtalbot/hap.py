@@ -1,6 +1,6 @@
 use crate::adapters::report::suffixed_report_path;
 use crate::application::{SomaticArgs, ValidatedSomaticArgs};
-use crate::domain::{Interval, RawVcfRecord};
+use crate::domain::Interval;
 use crate::{
     adapters::{fasta, vcf},
     application::ftx,
@@ -274,11 +274,6 @@ struct SomaticCounts {
     fn_count: usize,
     unk: usize,
     ambi: usize,
-}
-
-#[derive(Clone, Debug)]
-struct FilteredRawRecord {
-    record: RawVcfRecord,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -582,7 +577,7 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         filtered_records.tp += query_raw_filtered
             .iter()
             .zip(&query_matches)
-            .filter(|(record, matched)| matched.is_some() && !record.record.is_pass())
+            .filter(|(record, matched)| matched.is_some() && !record.is_pass())
             .count();
         let mut caller_tp_truth = Vec::new();
         let mut caller_tp_query = Vec::new();
@@ -591,14 +586,14 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
         let mut caller_ambi_query = Vec::new();
         let mut caller_unk_query = Vec::new();
         for (truth_index, truth_record) in truth_raw_filtered.iter().enumerate() {
-            let Some(label) = raw_type_label(&truth_record.record) else {
+            let Some(label) = raw_type_label(&truth_record) else {
                 continue;
             };
             by_type.entry(label).or_default().truth_total += 1;
             if let Some(query_index) = truth_matches[truth_index] {
                 by_type.entry(label).or_default().tp += 1;
                 let query_record = &query_raw_filtered[query_index];
-                if !query_record.record.is_pass() {
+                if !query_record.is_pass() {
                     filtered_by_type.entry(label).or_default().tp += 1;
                 }
                 if use_strelka_hcc_indel {
@@ -606,35 +601,31 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
                         0,
                         render_strelka_hcc_indel_tp_row(
                             0,
-                            &truth_record.record,
-                            &query_record.record,
+                            &truth_record,
+                            &query_record,
                             &query_depths,
                         ),
                     )?;
                 } else if use_generic_feature_table {
-                    feature_rows.push(
-                        0,
-                        render_generic_tp_row(0, &truth_record.record, &query_record.record),
-                    )?;
+                    feature_rows.push(0, render_generic_tp_row(0, &truth_record, &query_record))?;
                 } else if use_caller_feature_table {
-                    caller_tp_truth.push(truth_record.record.clone());
-                    caller_tp_query.push(query_record.record.clone());
+                    caller_tp_truth.push(truth_record.clone());
+                    caller_tp_query.push(query_record.clone());
                 }
             } else {
                 by_type.entry(label).or_default().fn_count += 1;
                 if use_strelka_hcc_indel {
-                    feature_rows
-                        .push(2, render_strelka_hcc_indel_fn_row(0, &truth_record.record))?;
+                    feature_rows.push(2, render_strelka_hcc_indel_fn_row(0, &truth_record))?;
                 } else if use_generic_feature_table {
-                    feature_rows.push(2, render_generic_fn_row(0, &truth_record.record))?;
+                    feature_rows.push(2, render_generic_fn_row(0, &truth_record))?;
                 } else if use_caller_feature_table {
-                    caller_fn_truth.push(truth_record.record.clone());
+                    caller_fn_truth.push(truth_record.clone());
                 }
             }
         }
 
         for (query_index, query_record) in query_raw_filtered.iter().enumerate() {
-            let type_label = raw_type_label(&query_record.record);
+            let type_label = raw_type_label(&query_record);
             if let Some(label) = type_label {
                 by_type.entry(label).or_default().query_total += 1;
             }
@@ -645,9 +636,9 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             // even for symbolic and gVCF records. INFO/END and FORMAT/LEN are used
             // by bcftools -R preprocessing, not by this classification step.
             let class = classify_query(
-                &query_record.record.chrom,
-                query_record.record.pos,
-                query_record.record.end_pos(),
+                &query_record.chrom,
+                query_record.pos,
+                query_record.end_pos(),
                 fp_regions.as_deref().unwrap_or(&[]),
                 &ambiguous_regions,
                 count_unk,
@@ -655,9 +646,9 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             );
             if args.explain_ambiguous {
                 record_ambiguous_explanation(
-                    &query_record.record.chrom,
-                    query_record.record.pos,
-                    query_record.record.end_pos(),
+                    &query_record.chrom,
+                    query_record.pos,
+                    query_record.end_pos(),
                     &explanation_regions,
                     ambi_fp,
                     &mut ambiguous_classes,
@@ -671,7 +662,7 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
                     QueryClass::Unk => row.unk += 1,
                     QueryClass::Ambi => row.ambi += 1,
                 }
-                if !query_record.record.is_pass() {
+                if !query_record.is_pass() {
                     let filtered = filtered_by_type.entry(label).or_default();
                     match class {
                         QueryClass::Fp => filtered.fp += 1,
@@ -694,7 +685,7 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
                     "AMBI"
                 }
             };
-            if !query_record.record.is_pass() {
+            if !query_record.is_pass() {
                 match class {
                     QueryClass::Fp => filtered_records.fp += 1,
                     QueryClass::Unk => filtered_records.unk += 1,
@@ -703,19 +694,15 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
             }
             if args.feature_table.is_some() {
                 if use_strelka_hcc_indel {
-                    let row = render_strelka_hcc_indel_query_row(
-                        0,
-                        &query_record.record,
-                        tag,
-                        &query_depths,
-                    );
+                    let row =
+                        render_strelka_hcc_indel_query_row(0, &query_record, tag, &query_depths);
                     match class {
                         QueryClass::Fp => feature_rows.push(1, row)?,
                         QueryClass::Unk => feature_rows.push(4, row)?,
                         QueryClass::Ambi => feature_rows.push(3, row)?,
                     }
                 } else if use_generic_feature_table {
-                    let row = render_generic_query_row(0, &query_record.record, tag);
+                    let row = render_generic_query_row(0, &query_record, tag);
                     match class {
                         QueryClass::Fp => feature_rows.push(1, row)?,
                         QueryClass::Unk => feature_rows.push(4, row)?,
@@ -723,9 +710,9 @@ fn run_inner(mut args: SomaticArgs) -> Result<()> {
                     }
                 } else if use_caller_feature_table {
                     match class {
-                        QueryClass::Fp => caller_fp_query.push(query_record.record.clone()),
-                        QueryClass::Unk => caller_unk_query.push(query_record.record.clone()),
-                        QueryClass::Ambi => caller_ambi_query.push(query_record.record.clone()),
+                        QueryClass::Fp => caller_fp_query.push(query_record.clone()),
+                        QueryClass::Unk => caller_unk_query.push(query_record.clone()),
+                        QueryClass::Ambi => caller_ambi_query.push(query_record.clone()),
                     }
                 }
             }

@@ -4,6 +4,7 @@
 mod tests {
     use super::super::*;
     use crate::cli_compat::cli::{Cli, Command};
+    use crate::domain::RawVcfRecord;
     use clap::Parser;
 
     fn parsed_somatic(extra: &[&str]) -> SomaticArgs {
@@ -1003,7 +1004,7 @@ mod tests {
         )
         .expect("filter sites-only VCF");
         assert_eq!(filtered.len(), 1);
-        assert!(filtered[0].record.samples.is_empty());
+        assert!(filtered[0].samples.is_empty());
     }
 
     #[test]
@@ -1023,20 +1024,15 @@ mod tests {
         )
         .expect("filter composite PASS VCF record");
         assert_eq!(filtered.len(), 1);
-        assert!(filtered[0].record.is_pass());
+        assert!(filtered[0].is_pass());
     }
 
     #[test]
     fn exact_pairing_preserves_duplicate_occurrences() {
         let first = raw_record("chr1\t10\t.\tA\tC\t.\tPASS\t.");
         let second = raw_record("chr1\t20\t.\tG\tT\t.\tPASS\t.");
-        let filtered = |record: RawVcfRecord| FilteredRawRecord { record };
-        let truth = vec![
-            filtered(second.clone()),
-            filtered(first.clone()),
-            filtered(first.clone()),
-        ];
-        let query = vec![filtered(first.clone()), filtered(second), filtered(first)];
+        let truth = vec![second.clone(), first.clone(), first.clone()];
+        let query = vec![first.clone(), second, first];
         let (truth_matches, query_matches) = pair_exact_records(&truth, &query);
         assert_eq!(truth_matches, vec![Some(1), Some(0), Some(2)]);
         assert_eq!(query_matches, vec![Some(1), Some(0), Some(2)]);

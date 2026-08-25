@@ -4,7 +4,7 @@ use super::allele_frequency::parse_af_bins;
 use super::features::csv_join;
 use super::features::write_simple_table;
 use super::metrics::python2_counter_indices;
-use super::{AmbiguousInterval, FilteredRawRecord, QueryClass};
+use super::{AmbiguousInterval, QueryClass};
 use crate::adapters::vcf;
 use crate::application::SomaticArgs;
 use crate::domain::{Interval, QueryProvenance, RawVcfRecord};
@@ -388,13 +388,9 @@ pub(super) struct ContigSpool {
 }
 
 impl ContigSpool {
-    pub(super) fn load(&self) -> Result<Vec<FilteredRawRecord>> {
+    pub(super) fn load(&self) -> Result<Vec<RawVcfRecord>> {
         vcf::open_validated_vcf(&self.path)?
-            .map(|record| {
-                Ok(FilteredRawRecord {
-                    record: record?.into_raw(),
-                })
-            })
+            .map(|record| Ok(record?.into_raw()))
             .collect()
     }
 }
@@ -413,7 +409,7 @@ pub(super) fn spool_filtered_contigs(
         };
         if active
             .as_ref()
-            .is_none_or(|(chrom, _, _)| chrom != &record.record.chrom)
+            .is_none_or(|(chrom, _, _)| chrom != &record.chrom)
         {
             if let Some((chrom, mut file, count)) = active.take() {
                 file.as_file_mut().flush()?;
@@ -424,21 +420,21 @@ pub(super) fn spool_filtered_contigs(
                     count,
                 });
             }
-            if closed.contains(&record.record.chrom) {
+            if closed.contains(&record.chrom) {
                 bail!(
                     "somatic records for chromosome {} are not contiguous in {}",
-                    record.record.chrom,
+                    record.chrom,
                     path.display()
                 );
             }
             active = Some((
-                record.record.chrom.clone(),
+                record.chrom.clone(),
                 tempfile::NamedTempFile::new().context("failed to create somatic contig spool")?,
                 0,
             ));
         }
         let (chrom, file, count) = active.as_mut().expect("somatic spool was just created");
-        writeln!(file.as_file_mut(), "{}", record.record.to_line())?;
+        writeln!(file.as_file_mut(), "{}", record.to_line())?;
         *count += 1;
         if *count > MAX_SOMATIC_CONTIG_RECORDS {
             bail!(
@@ -515,7 +511,7 @@ pub(super) fn filter_raw_records(
     records: Vec<RawVcfRecord>,
     path: &Path,
     options: &RawFilterOptions<'_>,
-) -> Result<Vec<FilteredRawRecord>> {
+) -> Result<Vec<RawVcfRecord>> {
     records
         .into_iter()
         .map(|record| filter_raw_record(record, path, options))
@@ -527,7 +523,7 @@ pub(super) fn filter_raw_record(
     record: RawVcfRecord,
     path: &Path,
     options: &RawFilterOptions<'_>,
-) -> Result<Option<FilteredRawRecord>> {
+) -> Result<Option<RawVcfRecord>> {
     let key = vcf::VariantKey {
         chrom: somatic_chrom(&record.chrom, options.reference_contigs, options.fixchr),
         pos: record.pos,
@@ -555,7 +551,7 @@ pub(super) fn filter_raw_record(
     normalized.chrom = key.chrom.clone();
     let normalized =
         vcf::ValidatedVcfRecord::try_from_raw(normalized, QueryProvenance::Unavailable)?.into_raw();
-    Ok(Some(FilteredRawRecord { record: normalized }))
+    Ok(Some(normalized))
 }
 
 pub(super) fn somatic_chrom(
