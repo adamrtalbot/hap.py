@@ -102,7 +102,8 @@ pub(crate) fn write_compare_runinfo(
 }
 
 fn final_args_json(args: &CompareRunArgs<'_>) -> String {
-    let mut fields = Vec::with_capacity(57);
+    const FINAL_ARG_COUNT: usize = 57;
+    let mut fields = Vec::with_capacity(FINAL_ARG_COUNT);
     let mut add = |key: &str, value: String| fields.push(format!("{}:{value}", json_string(key)));
     add(
         "_vcfs",
@@ -202,7 +203,7 @@ fn final_args_json(args: &CompareRunArgs<'_>) -> String {
     add("write_counts", json_bool(args.write_counts));
     add("write_json", json_bool(args.write_json));
     add("write_vcf", json_bool(args.write_vcf));
-    debug_assert_eq!(fields.len(), 57);
+    debug_assert_eq!(fields.len(), FINAL_ARG_COUNT);
     format!("{{{}}}", fields.join(","))
 }
 
