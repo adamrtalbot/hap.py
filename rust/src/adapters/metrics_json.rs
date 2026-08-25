@@ -523,7 +523,7 @@ fn render_confidence_interval(
     } else {
         upper
     };
-    json_repr_float(value)
+    crate::adapters::report::full_repr_float(value)
 }
 
 fn render_int(value: &str) -> String {
@@ -547,7 +547,7 @@ fn render_double(value: &str) -> String {
     if !number.is_finite() {
         return "null".to_string();
     }
-    json_repr_float(number)
+    crate::adapters::report::full_repr_float(number)
 }
 
 fn render_legacy_metric(value: &str) -> String {
@@ -560,7 +560,7 @@ fn render_legacy_metric(value: &str) -> String {
     let original = format!("{displayed:.6}");
     let number = crate::adapters::report::pandas_xstrtod(&original);
     if number.is_finite() {
-        json_repr_float(number)
+        crate::adapters::report::full_repr_float(number)
     } else {
         "null".to_string()
     }
@@ -602,7 +602,7 @@ fn render_legacy_ratio(
         return if let (Some(numerator), Some(denominator)) = (numerator, denominator)
             && denominator != 0.0
         {
-            json_repr_float(numerator / denominator)
+            crate::adapters::report::full_repr_float(numerator / denominator)
         } else {
             "null".to_string()
         };
@@ -622,9 +622,9 @@ fn render_legacy_ratio(
     if let Some(max_denominator) = max_denominator
         && let Some((numerator, denominator)) = limit_denominator(value, max_denominator)
     {
-        return json_repr_float(numerator as f64 / denominator as f64);
+        return crate::adapters::report::full_repr_float(numerator as f64 / denominator as f64);
     }
-    json_repr_float(value)
+    crate::adapters::report::full_repr_float(value)
 }
 
 /// Recover the unrounded integer ratios retained by legacy pandas from the
@@ -692,7 +692,7 @@ fn ratio_overrides_from_extended(path: &Path) -> Result<RatioOverrides> {
                         .unwrap_or("")
                         .to_string(),
                 ),
-                json_repr_float(numerator / denominator),
+                crate::adapters::report::full_repr_float(numerator / denominator),
             );
         }
     }
@@ -773,10 +773,6 @@ fn limit_denominator(value: f64, maximum: u64) -> Option<(u64, u64)> {
         bound1
     };
     Some((u64::try_from(best.0).ok()?, u64::try_from(best.1).ok()?))
-}
-
-fn json_repr_float(value: f64) -> String {
-    crate::adapters::report::full_repr_float(value)
 }
 
 fn push_field(out: &mut String, key: &str, value: &str) {
