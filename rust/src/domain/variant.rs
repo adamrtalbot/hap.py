@@ -32,3 +32,45 @@ pub(crate) struct RawVcfRecord {
     /// until location aggregation and is never published.
     pub(crate) primitive_identity: Option<PrimitiveIdentity>,
 }
+
+/// Legacy edit-classification bits for one REF/ALT pair: bit 1 substitution,
+/// bit 2 insertion, bit 4 deletion. Symbolic alternates map to insertion or
+/// deletion by their `<DEL...>` spelling.
+pub(crate) fn allele_edit_bits(reference: &str, alternate: &str) -> u8 {
+    if alternate.starts_with('<') {
+        return if alternate.starts_with("<DEL") { 4 } else { 2 };
+    }
+    let ref_bytes = reference.as_bytes();
+    let alt_bytes = alternate.as_bytes();
+    let prefix = ref_bytes
+        .iter()
+        .zip(alt_bytes)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix_limit = (ref_bytes.len() - prefix).min(alt_bytes.len() - prefix);
+    let suffix = (0..suffix_limit)
+        .take_while(|offset| {
+            ref_bytes[ref_bytes.len() - 1 - offset] == alt_bytes[alt_bytes.len() - 1 - offset]
+        })
+        .count();
+    let ref_remaining = ref_bytes.len() - prefix - suffix;
+    let alt_remaining = alt_bytes.len() - prefix - suffix;
+    match (ref_remaining, alt_remaining) {
+        (0, 0) => 0,
+        (0, _) => 2,
+        (_, 0) => 4,
+        (left, right) if left == right => 1,
+        (left, right) if left < right => 1 | 2,
+        _ => 1 | 4,
+    }
+}
+
+/// Legacy short name for a `allele_edit_bits` value combined with the optional
+/// reference-overlap flag (bit 0x08).
+pub(crate) fn legacy_type_bits(bits: u8) -> &'static str {
+    const NAMES: [&str; 16] = [
+        "nc", "s", "i", "si", "d", "sd", "id", "sid", "r", "rs", "ri", "rsi", "rd", "rsd", "rid",
+        "rsid",
+    ];
+    NAMES[usize::from(bits & 0x0f)]
+}

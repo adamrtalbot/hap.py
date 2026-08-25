@@ -791,7 +791,7 @@ fn json_optional_bool(value: Option<bool>) -> String {
     value.map(json_bool).unwrap_or_else(|| "null".to_string())
 }
 
-fn json_float(value: f64) -> String {
+pub(crate) fn json_float(value: f64) -> String {
     let mut rendered = value.to_string();
     if !rendered.contains(['.', 'e', 'E']) {
         rendered.push_str(".0");
@@ -812,7 +812,7 @@ fn json_bool(value: bool) -> String {
     if value { "true" } else { "false" }.to_string()
 }
 
-fn json_string(value: &str) -> String {
+pub(crate) fn json_string(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len() + 2);
     escaped.push('"');
     for character in value.chars() {

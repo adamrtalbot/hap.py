@@ -17,7 +17,7 @@ use crate::adapters::{
 };
 use crate::application::CompareArgs;
 use crate::application::preprocess;
-use crate::domain::RawVcfRecord;
+use crate::domain::{RawVcfRecord, allele_edit_bits, legacy_type_bits};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -532,43 +532,6 @@ pub(super) fn legacy_vtc(
         );
     }
     types.into_values().collect::<Vec<_>>().join(",")
-}
-
-pub(super) fn allele_edit_bits(reference: &str, alternate: &str) -> u8 {
-    if alternate.starts_with('<') {
-        return if alternate.starts_with("<DEL") { 4 } else { 2 };
-    }
-    let ref_bytes = reference.as_bytes();
-    let alt_bytes = alternate.as_bytes();
-    let prefix = ref_bytes
-        .iter()
-        .zip(alt_bytes)
-        .take_while(|(left, right)| left == right)
-        .count();
-    let suffix_limit = (ref_bytes.len() - prefix).min(alt_bytes.len() - prefix);
-    let suffix = (0..suffix_limit)
-        .take_while(|offset| {
-            ref_bytes[ref_bytes.len() - 1 - offset] == alt_bytes[alt_bytes.len() - 1 - offset]
-        })
-        .count();
-    let ref_remaining = ref_bytes.len() - prefix - suffix;
-    let alt_remaining = alt_bytes.len() - prefix - suffix;
-    match (ref_remaining, alt_remaining) {
-        (0, 0) => 0,
-        (0, _) => 2,
-        (_, 0) => 4,
-        (left, right) if left == right => 1,
-        (left, right) if left < right => 1 | 2,
-        _ => 1 | 4,
-    }
-}
-
-pub(super) fn legacy_type_bits(bits: u8) -> &'static str {
-    const NAMES: [&str; 16] = [
-        "nc", "s", "i", "si", "d", "sd", "id", "sid", "r", "rs", "ri", "rsi", "rd", "rsd", "rid",
-        "rsid",
-    ];
-    NAMES[usize::from(bits & 0x0f)]
 }
 
 pub(super) fn decorate_existing_comparison_vcf(

@@ -1,5 +1,6 @@
 //! Metrics JSON and confidence calculations.
 
+use crate::adapters::metrics_json::{json_float, json_string};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs;
@@ -331,22 +332,6 @@ pub(super) fn column_json(
         json_string(id),
         json_string(label)
     )
-}
-
-pub(super) fn json_float(value: f64) -> String {
-    let mut rendered = value.to_string();
-    if !rendered.contains(['.', 'e', 'E']) {
-        rendered.push_str(".0");
-    }
-    rendered
-}
-
-pub(super) fn json_string(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n");
-    format!("\"{escaped}\"")
 }
 
 /// Current UTC time formatted the same way Python's `datetime.datetime.now().isoformat()`
