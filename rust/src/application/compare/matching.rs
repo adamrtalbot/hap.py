@@ -3179,10 +3179,6 @@ pub(super) fn mark_cluster_match(
             &full_cluster.query,
             &full_cluster.truth,
         );
-        let any_primitive_in_conf = primitives
-            .iter()
-            .any(|primitive| region_state.query_is_conf(primitive));
-        let fanned_out = primitives.len() > 1;
         for primitive in primitives {
             let primitive_in_conf = region_state.query_is_conf(&primitive);
             let regions = region_state.row_tags(None, Some(&primitive));
@@ -3197,8 +3193,7 @@ pub(super) fn mark_cluster_match(
                     ".",
                 ));
             } else {
-                let fallback = bk_for_row(&primitive, &full_cluster.truth, false);
-                let bk = matched_query_unk_bk(fanned_out, any_primitive_in_conf, fallback);
+                let bk = bk_for_row(&primitive, &full_cluster.truth, false);
                 rows.push(fp_like_row(
                     &primitive,
                     reference,
@@ -3250,18 +3245,6 @@ pub(super) fn halfcall_is_covered_by_matched_deletion(
         !has_exact_query_deletion || requires_haplotype_reconciliation
     })
 }
-pub(super) fn matched_query_unk_bk(
-    _fanned_out: bool,
-    _any_primitive_in_conf: bool,
-    fallback: &'static str,
-) -> &'static str {
-    // Fan-out alone is not evidence of a local mismatch. In a hap:match
-    // block legacy leaves fully non-CONF residual primitives at BK=`.`;
-    // only an actual split insertion/deletion sibling (handled by
-    // `has_nonconf_split_sibling`) or another counterpart supplies `lm`.
-    fallback
-}
-
 pub(super) fn mark_cluster_mismatch(
     cluster: &Cluster,
     // Full (pre-exact-match) cluster — counterpart pool scanned by
@@ -3525,10 +3508,6 @@ pub(super) fn mark_cluster_mismatch(
             &full_cluster.query,
             &full_cluster.truth,
         );
-        let any_primitive_in_conf = primitives
-            .iter()
-            .any(|primitive| region_state.query_is_conf(primitive));
-        let fanned_out = primitives.len() > 1;
         for primitive in primitives {
             let is_conf = region_state.query_is_conf(&primitive);
             let bd: &'static str = if is_conf { "FP" } else { "UNK" };
@@ -3562,8 +3541,7 @@ pub(super) fn mark_cluster_mismatch(
                     |stats| &mut stats.query_unk,
                 );
             }
-            let fallback = bk_for_row(&primitive, &full_cluster.truth, hap_mismatch);
-            let primitive_bk = matched_query_unk_bk(fanned_out, any_primitive_in_conf, fallback);
+            let primitive_bk = bk_for_row(&primitive, &full_cluster.truth, hap_mismatch);
             let fp_class = if bd == "FP" {
                 fp_class_from_bk(primitive_bk)
             } else {

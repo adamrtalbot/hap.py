@@ -2586,14 +2586,6 @@ mod memory_guards {
         assert_eq!(display_ref(&variant, "aTg"), "T");
     }
 
-    #[test]
-    fn fully_nonconf_matched_fanout_keeps_fallback_bk() {
-        assert_eq!(matched_query_unk_bk(true, false, "."), ".");
-        assert_eq!(matched_query_unk_bk(true, true, "."), ".");
-        assert_eq!(matched_query_unk_bk(false, false, "."), ".");
-        assert_eq!(matched_query_unk_bk(true, false, "lm"), "lm");
-    }
-
     // Class 3 pin: `variant_is_conf` must apply legacy's
     // `!is_pure_insertion || fully_covered` rule using gvcf2bed-style
     // refrange. A pure insertion at a CONF edge (anchor in, anchor+1
