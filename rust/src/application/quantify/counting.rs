@@ -110,111 +110,61 @@ pub(super) fn register_subsets(
     }
 }
 
-pub(super) fn record_truth(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) {
-    if !matches!(classified.status.as_str(), "TP" | "FN") {
-        return;
-    }
-    add_variant_stats(
-        &mut counts
+fn walk_count_maps(
+    counts: &mut QuantifyCountMaps,
+    classified: &ClassifiedVariant,
+    mut apply: impl FnMut(&mut QuantifyTypeCounts),
+) {
+    apply(
+        counts
             .by_type
             .entry(classified.variant_type.clone())
-            .or_default()
-            .truth_total,
-        classified,
+            .or_default(),
     );
     for subtype in &classified.subtypes {
-        add_variant_stats(
-            &mut counts
+        apply(
+            counts
                 .by_subtype
                 .entry(classified.variant_type.clone())
                 .or_default()
                 .entry(subtype.clone())
-                .or_default()
-                .truth_total,
-            classified,
+                .or_default(),
         );
     }
     for subset in &classified.subsets {
-        add_variant_stats(
-            &mut counts
+        apply(
+            counts
                 .by_subset_type
                 .entry(subset.clone())
                 .or_default()
                 .entry(classified.variant_type.clone())
-                .or_default()
-                .truth_total,
-            classified,
+                .or_default(),
         );
         for subtype in &classified.subtypes {
-            add_variant_stats(
-                &mut counts
+            apply(
+                counts
                     .by_subset_subtype
                     .entry(subset.clone())
                     .or_default()
                     .entry(classified.variant_type.clone())
                     .or_default()
                     .entry(subtype.clone())
-                    .or_default()
-                    .truth_total,
-                classified,
+                    .or_default(),
             );
         }
     }
+}
 
-    add_variant_stats(
-        truth_bucket(
-            counts
-                .by_type
-                .entry(classified.variant_type.clone())
-                .or_default(),
-            &classified.status,
-        ),
-        classified,
-    );
-    for subtype in &classified.subtypes {
-        add_variant_stats(
-            truth_bucket(
-                counts
-                    .by_subtype
-                    .entry(classified.variant_type.clone())
-                    .or_default()
-                    .entry(subtype.clone())
-                    .or_default(),
-                &classified.status,
-            ),
-            classified,
-        );
+pub(super) fn record_truth(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) {
+    if !matches!(classified.status.as_str(), "TP" | "FN") {
+        return;
     }
-    for subset in &classified.subsets {
-        add_variant_stats(
-            truth_bucket(
-                counts
-                    .by_subset_type
-                    .entry(subset.clone())
-                    .or_default()
-                    .entry(classified.variant_type.clone())
-                    .or_default(),
-                &classified.status,
-            ),
-            classified,
-        );
-        for subtype in &classified.subtypes {
-            add_variant_stats(
-                truth_bucket(
-                    counts
-                        .by_subset_subtype
-                        .entry(subset.clone())
-                        .or_default()
-                        .entry(classified.variant_type.clone())
-                        .or_default()
-                        .entry(subtype.clone())
-                        .or_default(),
-                    &classified.status,
-                ),
-                classified,
-            );
-        }
-    }
+    walk_count_maps(counts, classified, |stats| {
+        add_variant_stats(&mut stats.truth_total, classified);
+    });
+    walk_count_maps(counts, classified, |stats| {
+        add_variant_stats(truth_bucket(stats, &classified.status), classified);
+    });
 }
 
 pub(super) fn record_truth_total_only(
@@ -224,52 +174,9 @@ pub(super) fn record_truth_total_only(
     if !matches!(classified.status.as_str(), "TP" | "FN") {
         return;
     }
-    add_variant_stats(
-        &mut counts
-            .by_type
-            .entry(classified.variant_type.clone())
-            .or_default()
-            .truth_total,
-        classified,
-    );
-    for subtype in &classified.subtypes {
-        add_variant_stats(
-            &mut counts
-                .by_subtype
-                .entry(classified.variant_type.clone())
-                .or_default()
-                .entry(subtype.clone())
-                .or_default()
-                .truth_total,
-            classified,
-        );
-    }
-    for subset in &classified.subsets {
-        add_variant_stats(
-            &mut counts
-                .by_subset_type
-                .entry(subset.clone())
-                .or_default()
-                .entry(classified.variant_type.clone())
-                .or_default()
-                .truth_total,
-            classified,
-        );
-        for subtype in &classified.subtypes {
-            add_variant_stats(
-                &mut counts
-                    .by_subset_subtype
-                    .entry(subset.clone())
-                    .or_default()
-                    .entry(classified.variant_type.clone())
-                    .or_default()
-                    .entry(subtype.clone())
-                    .or_default()
-                    .truth_total,
-                classified,
-            );
-        }
-    }
+    walk_count_maps(counts, classified, |stats| {
+        add_variant_stats(&mut stats.truth_total, classified);
+    });
 }
 
 pub(super) fn record_truth_filtered(
@@ -280,108 +187,18 @@ pub(super) fn record_truth_filtered(
     if !matches!(classified.status.as_str(), "TP" | "FN") {
         return;
     }
-    add_variant_stats(
-        truth_bucket(
-            counts
-                .by_type
-                .entry(classified.variant_type.clone())
-                .or_default(),
-            &classified.status,
-        ),
-        classified,
-    );
-    for subtype in &classified.subtypes {
-        add_variant_stats(
-            truth_bucket(
-                counts
-                    .by_subtype
-                    .entry(classified.variant_type.clone())
-                    .or_default()
-                    .entry(subtype.clone())
-                    .or_default(),
-                &classified.status,
-            ),
-            classified,
-        );
-    }
-    for subset in &classified.subsets {
-        add_variant_stats(
-            truth_bucket(
-                counts
-                    .by_subset_type
-                    .entry(subset.clone())
-                    .or_default()
-                    .entry(classified.variant_type.clone())
-                    .or_default(),
-                &classified.status,
-            ),
-            classified,
-        );
-        for subtype in &classified.subtypes {
-            add_variant_stats(
-                truth_bucket(
-                    counts
-                        .by_subset_subtype
-                        .entry(subset.clone())
-                        .or_default()
-                        .entry(classified.variant_type.clone())
-                        .or_default()
-                        .entry(subtype.clone())
-                        .or_default(),
-                    &classified.status,
-                ),
-                classified,
-            );
-        }
-    }
+    walk_count_maps(counts, classified, |stats| {
+        add_variant_stats(truth_bucket(stats, &classified.status), classified);
+    });
 }
 
 pub(super) fn record_query(counts: &mut QuantifyCountMaps, classified: &ClassifiedVariant) {
     if !matches!(classified.status.as_str(), "TP" | "FP" | "UNK" | "AMBI") {
         return;
     }
-    record_query_stats(
-        counts
-            .by_type
-            .entry(classified.variant_type.clone())
-            .or_default(),
-        classified,
-    );
-    for subtype in &classified.subtypes {
-        record_query_stats(
-            counts
-                .by_subtype
-                .entry(classified.variant_type.clone())
-                .or_default()
-                .entry(subtype.clone())
-                .or_default(),
-            classified,
-        );
-    }
-    for subset in &classified.subsets {
-        record_query_stats(
-            counts
-                .by_subset_type
-                .entry(subset.clone())
-                .or_default()
-                .entry(classified.variant_type.clone())
-                .or_default(),
-            classified,
-        );
-        for subtype in &classified.subtypes {
-            record_query_stats(
-                counts
-                    .by_subset_subtype
-                    .entry(subset.clone())
-                    .or_default()
-                    .entry(classified.variant_type.clone())
-                    .or_default()
-                    .entry(subtype.clone())
-                    .or_default(),
-                classified,
-            );
-        }
-    }
+    walk_count_maps(counts, classified, |stats| {
+        record_query_stats(stats, classified);
+    });
 }
 
 pub(super) fn record_query_stats(stats: &mut QuantifyTypeCounts, classified: &ClassifiedVariant) {

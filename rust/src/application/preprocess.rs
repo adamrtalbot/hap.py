@@ -592,229 +592,23 @@ fn run_inner(
                         )?;
                         continue;
                     }
-                    if args.convert_gvcf_to_vcf {
-                        ensure_missing_ad(&mut record);
-                    }
-                    // Allele-count INFO fields become stale after preprocessing splits
-                    // multi-allelics or decomposes complex variants. Legacy hap.py's C++
-                    // preprocess binary (via `VariantAlleleRemover` → `VariantCallsOnly`)
-                    // drops them so downstream tools recompute. We mirror that here on the
-                    // main code path so output stays deterministic for every caller, not
-                    // just the parity reference.
-                    strip_stale_info_keys(&mut record);
-
-                    // Legacy `VariantReader`/`VariantWriter` drops variant IDs (rsIDs) on
-                    // output — `preprocess` rebuilds records from CHROM/POS/REF/ALT only,
-                    // so the ID column always becomes `.`.
-                    record.id = ".".to_string();
-
-                    // Upper-case REF/ALT so soft-masked lowercase bases from the reference
-                    // come out as the canonical uppercase form legacy emits. We already
-                    // tolerate case when validating; now we normalise on output.
-                    record.ref_allele = record.ref_allele.to_ascii_uppercase();
-                    record.alt_allele = uppercase_alleles_preserving_breakends(&record.alt_allele);
-                    let import_failed = materialize_unsupported_import_failure(&mut record);
-
-                    // Legacy `VariantWriter` emits FILTER=`.` for PASS records (htslib's
-                    // `bcf_update_filter` treats an empty filter vector as `.`). Normalise
-                    // PASS to `.` so downstream byte-diff matches.
-                    if record.filter == "PASS" {
-                        record.filter = ".".to_string();
-                    }
-
-                    // Legacy stores INFO as an ordered map keyed alphabetically by tag
-                    // (std::map<std::string,...>) before serialising — htslib then writes
-                    // entries in that order. Sort our INFO tags the same way so output
-                    // byte-matches.
-                    sort_info_keys(&mut record);
-
-                    // Legacy represents PL internally as a single integer per sample (the
-                    // `v.asInt()` path in `VariantWriter.cpp` line 563). When bcftools
-                    // emits the record the array is truncated to the last stored value,
-                    // which for biallelic diploid sites is the HOM_ALT likelihood. We
-                    // reproduce that truncation here so SAMPLE cells byte-match.
-                    collapse_pl_to_last_value(&mut record);
-
-                    // Multi-allelic indel decomposition + primitive splitting.
-                    //
-                    // Replaces the previous `should_split_multi_allelic_indel +
-                    // split_multi_allelic` branch: `variant_pipeline::primitive_split`
-                    // implements the legacy `VariantPrimitiveSplitter` (stage 5 of
-                    // `VariantInput.cpp`) plus the `aggregate_hetalt` re-merge that
-                    // brings same-position primitives back to a multi-allelic shape.
-                    // Same-direction insertions (`T → TG,TTG`) re-merge into a single
-                    // record; mixed-direction or different-length deletions fan out
-                    // into per-primitive records anchored at their canonical position.
-                    // Insert the ADO field BEFORE primitive_split *and* before any GT
-                    // normalisation. Legacy computes `ad_other` (= ADO) from the
-                    // *original* GT+AD inside VariantReader, then preserves that value
-                    // across both the half-call AlleleSplitter and the per-allele
-                    // PrimitiveSplitter. Computing ADO after splitting OR after the
-                    // haploid → homalt expansion below would widen the "called" set
-                    // if computed after expansion (input `GT=1` ad=[1,23] becomes
-                    // `1/1` ad=[1,23] → ADO=AD[0]=1, the unused ref depth, which
-                    // matches legacy). Computing ADO from the original GT=1 first
-                    // preserves that ref-depth signal correctly.
-                    ensure_missing_ad(&mut record);
-                    insert_ado_format(&mut record);
-                    ensure_missing_dp(&mut record);
-
-                    // The legacy C++ Variant representation has MAX_GT=2. During
-                    // active preprocessing, wider calls are converted to no-calls
-                    // before VariantCallsOnly removes their now-uncalled record.
-                    // This is observable in hap.py's vcfeval handoff for triploid
-                    // and tetraploid query records.
-                    if somatic_mode.is_none() {
-                        mask_genotypes_wider_than_diploid(&mut record);
-                    }
-
-                    // VariantCallsOnly removes ALT alleles that no sample calls before
-                    // primitive decomposition. Besides reducing ordinary multi-allelic
-                    // records, this prevents the primitive splitter from emitting a
-                    // hom-ref sibling for every uncalled component of a complex allele.
-                    // Capture ADO first: legacy derives it from the original GT/AD and
-                    // then projects GT and AD onto the retained alleles.
-                    if somatic_mode.is_none()
-                        && !args.convert_gvcf_to_vcf
-                        && !import_failed
-                        && !retain_called_alternates(&mut record)
-                    {
-                        continue;
-                    }
-
-                    // Normalise haploid GTs to the legacy het / hom shape. The C++
-                    // VariantAlleleSplitter treats a single haploid alt call (ngt == 1
-                    // with gt[0] > 0) as a het half-call and emits `0/1` after the
-                    // half-call merge — see `VariantAlleleSplitter.cpp:180-227`. Mirror
-                    // that here so that haploid input lines (`GT=1` on autosomes) come
-                    // out byte-identical to legacy without a chrX/Y-specific shim.
-                    if somatic_mode.is_none() {
-                        normalise_haploid_genotypes(&mut record, gender == PreprocessGender::Male);
-                    }
-
-                    // Capture before record is potentially consumed by vec![record].
-                    let record_chrom = record.chrom.clone();
-                    let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
-                    let previous_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
-                    let release_leftshift_floor = released_following_deletions.contains(&(
-                        record.chrom.clone(),
-                        record.pos,
-                        record.ref_allele.clone(),
-                        record.alt_allele.clone(),
-                    ));
-                    let prev_end = previous_end;
-
-                    let source_records = if matches!(
+                    process_normalized_record(
+                        record,
                         symbolic_deletion,
-                        Some(SymbolicDeletionMaterialization::LeadingAnchor)
-                    ) {
-                        split_called_alleles(&record)
-                    } else {
-                        vec![MaterializedAlleleRecord {
-                            record,
-                            reverse_hetalt_samples: Vec::new(),
-                        }]
-                    };
-                    let mut emitted_groups = Vec::with_capacity(source_records.len());
-                    for source in source_records {
-                        let reverse_hetalt_samples = source.reverse_hetalt_samples;
-                        let mut source = source.record;
-                        let is_mixed_deletion_merge_partner = mixed_deletion_merge_partners
-                            .contains(&(
-                                source.chrom.clone(),
-                                source.pos,
-                                source.ref_allele.clone(),
-                                source.alt_allele.clone(),
-                            ));
-                        if is_mixed_deletion_merge_partner {
-                            source.mixed_edit_primitive = true;
-                            assign_passthrough_primitive_identity(&mut source);
-                        }
-                        let mut emitted = if is_mixed_deletion_merge_partner {
-                            vec![source]
-                        } else if decompose && !source.alt_allele.split(',').any(is_symbolic_allele)
-                        {
-                            if let Some(reference) = reference_sequences.get(&source.chrom) {
-                                variant_pipeline::primitive_split_with_context(
-                                    &source,
-                                    reference.as_bytes(),
-                                    prev_end,
-                                    following_spanning_deletions.contains(&(
-                                        source.chrom.clone(),
-                                        source.pos,
-                                        source.ref_allele.clone(),
-                                        source.alt_allele.clone(),
-                                    )),
-                                    equal_floor_blocked_deletions.contains(&(
-                                        source.chrom.clone(),
-                                        source.pos,
-                                        source.ref_allele.clone(),
-                                        source.alt_allele.clone(),
-                                    )),
-                                )
-                            } else {
-                                vec![source]
-                            }
-                        } else {
-                            vec![source]
-                        };
-                        if decompose {
-                            for record in &mut emitted {
-                                restore_legacy_hetalt_orientation(record, &reverse_hetalt_samples);
-                            }
-                        }
-                        emitted_groups.push(emitted);
-                    }
-                    for emitted in emitted_groups {
-                        // Only leftshift records that came through primitive_split
-                        // unchanged. Fanned-out primitives are already canonical.
-                        let leftshift_eligible = emitted.len() == 1;
-                        for mut split in emitted {
-                            if leftshift
-                                && leftshift_eligible
-                                && !split.alt_allele.contains(',')
-                                && split.alt_allele != "."
-                                && !split.alt_allele.is_empty()
-                                && !is_symbolic_allele(&split.alt_allele)
-                                && let Some(reference) = reference_sequences.get(&split.chrom)
-                            {
-                                if release_leftshift_floor {
-                                    extend_record_left(&mut split, reference.as_bytes());
-                                } else {
-                                    apply_left_shift(&mut split, reference.as_bytes(), prev_end);
-                                }
-                            }
-                            canonicalize_multi_allelic_order(&mut split);
-                            canonicalize_legacy_genotypes(&mut split);
-                            if split.qual.is_empty() || split.qual == "." {
-                                split.qual = "0".to_string();
-                            }
-                            blank_secondary_sample_annotations(
-                                &mut split,
-                                args.bcf,
-                                &string_format_fields,
-                            );
-                            // Canonical FORMAT ordering: GT → AD/ADO/DP (fixed) → other
-                            // integer-typed fields alphabetical → float-typed alphabetical →
-                            // string-typed alphabetical. Mirrors the `int_fmts/float_fmts/
-                            // string_fmts` loop order in `VariantWriter.cpp` combined with
-                            // dynamic per-value type detection.
-                            reorder_format_fields(&mut split);
-                            output.push(
-                                vcf::ValidatedVcfRecord::try_from_raw(
-                                    split,
-                                    QueryProvenance::Unavailable,
-                                )?,
-                                job_index,
-                            )?;
-                        }
-                    }
-                    // Advance the per-chromosome boundary so the next variant cannot
-                    // left-shift into this record's reference span.
-                    prev_end_by_chrom
-                        .entry(record_chrom)
-                        .and_modify(|e| *e = (*e).max(orig_end))
-                        .or_insert(orig_end);
+                        &mut prev_end_by_chrom,
+                        &args,
+                        gender,
+                        leftshift,
+                        decompose,
+                        somatic_mode,
+                        &string_format_fields,
+                        reference_sequences,
+                        &following_spanning_deletions,
+                        &equal_floor_blocked_deletions,
+                        &released_following_deletions,
+                        &mixed_deletion_merge_partners,
+                        |record| output.push(record, job_index),
+                    )?;
                 }
             }
         }
@@ -1019,22 +813,83 @@ fn process_normalized_record(
     if args.convert_gvcf_to_vcf {
         ensure_missing_ad(&mut record);
     }
+    // Allele-count INFO fields become stale after preprocessing splits
+    // multi-allelics or decomposes complex variants. Legacy hap.py's C++
+    // preprocess binary (via `VariantAlleleRemover` → `VariantCallsOnly`)
+    // drops them so downstream tools recompute. We mirror that here on the
+    // main code path so output stays deterministic for every caller, not
+    // just the parity reference.
     strip_stale_info_keys(&mut record);
+
+    // Legacy `VariantReader`/`VariantWriter` drops variant IDs (rsIDs) on
+    // output — `preprocess` rebuilds records from CHROM/POS/REF/ALT only,
+    // so the ID column always becomes `.`.
     record.id = ".".to_string();
+
+    // Upper-case REF/ALT so soft-masked lowercase bases from the reference
+    // come out as the canonical uppercase form legacy emits. We already
+    // tolerate case when validating; now we normalise on output.
     record.ref_allele = record.ref_allele.to_ascii_uppercase();
     record.alt_allele = uppercase_alleles_preserving_breakends(&record.alt_allele);
     let import_failed = materialize_unsupported_import_failure(&mut record);
+
+    // Legacy `VariantWriter` emits FILTER=`.` for PASS records (htslib's
+    // `bcf_update_filter` treats an empty filter vector as `.`). Normalise
+    // PASS to `.` so downstream byte-diff matches.
     if record.filter == "PASS" {
         record.filter = ".".to_string();
     }
+
+    // Legacy stores INFO as an ordered map keyed alphabetically by tag
+    // (std::map<std::string,...>) before serialising — htslib then writes
+    // entries in that order. Sort our INFO tags the same way so output
+    // byte-matches.
     sort_info_keys(&mut record);
+
+    // Legacy represents PL internally as a single integer per sample (the
+    // `v.asInt()` path in `VariantWriter.cpp` line 563). When bcftools
+    // emits the record the array is truncated to the last stored value,
+    // which for biallelic diploid sites is the HOM_ALT likelihood. We
+    // reproduce that truncation here so SAMPLE cells byte-match.
     collapse_pl_to_last_value(&mut record);
+
+    // Multi-allelic indel decomposition + primitive splitting.
+    //
+    // `variant_pipeline::primitive_split` implements the legacy
+    // `VariantPrimitiveSplitter` (stage 5 of `VariantInput.cpp`) plus the
+    // `aggregate_hetalt` re-merge that brings same-position primitives back
+    // to a multi-allelic shape. Same-direction insertions (`T → TG,TTG`)
+    // re-merge into a single record; mixed-direction or different-length
+    // deletions fan out into per-primitive records anchored at their
+    // canonical position. Insert the ADO field BEFORE primitive_split *and*
+    // before any GT normalisation. Legacy computes `ad_other` (= ADO) from
+    // the *original* GT+AD inside VariantReader, then preserves that value
+    // across both the half-call AlleleSplitter and the per-allele
+    // PrimitiveSplitter. Computing ADO after splitting OR after the
+    // haploid → homalt expansion below would widen the "called" set if
+    // computed after expansion (input `GT=1` ad=[1,23] becomes `1/1`
+    // ad=[1,23] → ADO=AD[0]=1, the unused ref depth, which matches legacy).
+    // Computing ADO from the original GT=1 first preserves that ref-depth
+    // signal correctly.
     ensure_missing_ad(&mut record);
     insert_ado_format(&mut record);
     ensure_missing_dp(&mut record);
+
+    // The legacy C++ Variant representation has MAX_GT=2. During active
+    // preprocessing, wider calls are converted to no-calls before
+    // VariantCallsOnly removes their now-uncalled record. This is
+    // observable in hap.py's vcfeval handoff for triploid and tetraploid
+    // query records.
     if somatic_mode.is_none() {
         mask_genotypes_wider_than_diploid(&mut record);
     }
+
+    // VariantCallsOnly removes ALT alleles that no sample calls before
+    // primitive decomposition. Besides reducing ordinary multi-allelic
+    // records, this prevents the primitive splitter from emitting a
+    // hom-ref sibling for every uncalled component of a complex allele.
+    // Capture ADO first: legacy derives it from the original GT/AD and
+    // then projects GT and AD onto the retained alleles.
     if somatic_mode.is_none()
         && !args.convert_gvcf_to_vcf
         && !import_failed
@@ -1042,20 +897,27 @@ fn process_normalized_record(
     {
         return Ok(());
     }
+
+    // Normalise haploid GTs to the legacy het / hom shape. The C++
+    // VariantAlleleSplitter treats a single haploid alt call (ngt == 1
+    // with gt[0] > 0) as a het half-call and emits `0/1` after the
+    // half-call merge — see `VariantAlleleSplitter.cpp:180-227`. Mirror
+    // that here so that haploid input lines (`GT=1` on autosomes) come
+    // out byte-identical to legacy without a chrX/Y-specific shim.
     if somatic_mode.is_none() {
         normalise_haploid_genotypes(&mut record, gender == PreprocessGender::Male);
     }
 
+    // Capture before record is potentially consumed by vec![record].
     let record_chrom = record.chrom.clone();
     let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
-    let previous_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
+    let prev_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
     let release_leftshift_floor = released_following_deletions.contains(&(
         record.chrom.clone(),
         record.pos,
         record.ref_allele.clone(),
         record.alt_allele.clone(),
     ));
-    let prev_end = previous_end;
     let source_records = if matches!(
         symbolic_deletion,
         Some(SymbolicDeletionMaterialization::LeadingAnchor)
@@ -1116,6 +978,8 @@ fn process_normalized_record(
         emitted_groups.push(emitted);
     }
     for emitted in emitted_groups {
+        // Only leftshift records that came through primitive_split
+        // unchanged. Fanned-out primitives are already canonical.
         let leftshift_eligible = emitted.len() == 1;
         for mut split in emitted {
             if leftshift
@@ -1138,6 +1002,11 @@ fn process_normalized_record(
                 split.qual = "0".to_string();
             }
             blank_secondary_sample_annotations(&mut split, args.bcf, string_format_fields);
+            // Canonical FORMAT ordering: GT → AD/ADO/DP (fixed) → other
+            // integer-typed fields alphabetical → float-typed alphabetical →
+            // string-typed alphabetical. Mirrors the `int_fmts/float_fmts/
+            // string_fmts` loop order in `VariantWriter.cpp` combined with
+            // dynamic per-value type detection.
             reorder_format_fields(&mut split);
             emit(vcf::ValidatedVcfRecord::try_from_raw(
                 split,
@@ -1145,6 +1014,8 @@ fn process_normalized_record(
             )?)?;
         }
     }
+    // Advance the per-chromosome boundary so the next variant cannot
+    // left-shift into this record's reference span.
     prev_end_by_chrom
         .entry(record_chrom)
         .and_modify(|end| *end = (*end).max(orig_end))
