@@ -1056,6 +1056,35 @@ mod tests {
         assert!(!ref_bytes_equal(b"AC", b"ACG"));
     }
 
+    #[test]
+    fn conform_record_reference_sets_ref_from_reference_on_mismatch() {
+        // Reference contig: pos 1..=9 == "ACGTACGTA".
+        let mut reference = std::collections::BTreeMap::new();
+        reference.insert("chr1".to_string(), "ACGTACGTA".to_string());
+
+        // A disagreeing REF (input C at pos 5 where reference is A) is set to
+        // the reference base rather than aborting the sample.
+        let mut mismatch = make_record(".");
+        mismatch.pos = 5;
+        mismatch.ref_allele = "C".into();
+        conform_record_reference(&mut mismatch, &reference).expect("must not abort");
+        assert_eq!(mismatch.ref_allele, "A");
+
+        // A REF that already agrees is left untouched (byte-for-byte).
+        let mut agrees = make_record(".");
+        agrees.pos = 2;
+        agrees.ref_allele = "CGT".into();
+        conform_record_reference(&mut agrees, &reference).expect("must not abort");
+        assert_eq!(agrees.ref_allele, "CGT");
+
+        // A record running past the contig end still aborts — legacy hap.py
+        // fails the same input, so this is parity, not a regression.
+        let mut past_end = make_record(".");
+        past_end.pos = 8;
+        past_end.ref_allele = "TACG".into();
+        assert!(conform_record_reference(&mut past_end, &reference).is_err());
+    }
+
     fn make_record(info: &str) -> RawVcfRecord {
         RawVcfRecord {
             chrom: "chr1".into(),

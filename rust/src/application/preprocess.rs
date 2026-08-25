@@ -564,7 +564,7 @@ fn run_inner(
                         continue;
                     }
                 } else if normalization_enabled {
-                    validate_record_reference(&record, &reference_sequences)?;
+                    conform_record_reference(&mut record, &reference_sequences)?;
                 }
 
                 let converted = if let (Some(mode), Some(sample_names)) =

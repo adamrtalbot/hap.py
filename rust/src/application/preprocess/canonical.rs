@@ -15,8 +15,8 @@ pub(super) fn ref_bytes_equal(left: &[u8], right: &[u8]) -> bool {
         })
 }
 
-pub(super) fn validate_record_reference(
-    record: &RawVcfRecord,
+pub(super) fn conform_record_reference(
+    record: &mut RawVcfRecord,
     reference_sequences: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     let reference = reference_sequences
@@ -38,13 +38,21 @@ pub(super) fn validate_record_reference(
     // Legacy hap.py tolerates case differences between the VCF REF and the
     // reference sequence — any N in either side also matches anything.
     if !ref_bytes_equal(observed, record.ref_allele.as_bytes()) {
-        bail!(
-            "record {}:{} REF={} does not match reference {}",
-            record.chrom,
-            record.pos,
-            record.ref_allele,
-            String::from_utf8_lossy(observed)
-        );
+        // A REF allele that genuinely disagrees with the reference (e.g. a
+        // caller emitting a variant in an N-masked region) is set to the
+        // reference window rather than aborting, matching legacy hap.py's
+        // preprocess REF-set behaviour (`bcftools norm -c s`). Downstream
+        // leftshift/decompose then re-derive the primitives from this window.
+        //
+        // ponytail: known ceiling — when the reference anchor base is `N`, a
+        // complex/indel ALT here decomposes to a single record instead of
+        // legacy's SNP+deletion split, because `base_equal`'s N-wildcard trim
+        // (partial_credit.rs) short-circuits realignment. This only bites
+        // variants anchored at N-masked reference bases, which sit outside
+        // GIAB confident regions and so do not move benchmark counts. Fixing
+        // it means a non-wildcard trim on the decompose path, which would
+        // regress the documented chr21 leftshift case — deferred.
+        record.ref_allele = String::from_utf8_lossy(observed).to_ascii_uppercase();
     }
     Ok(())
 }
