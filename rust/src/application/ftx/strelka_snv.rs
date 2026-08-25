@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use crate::domain::RawVcfRecord;
 use crate::engines::strelka;
 
-use super::common::{ScoringFeatures, csv_escape, format_info_float, parse_scoring_features};
+use super::common::{
+    ScoringFeatures, csv_escape, format_info_float, parse_scoring_features, render_filter,
+};
 
 /// Fixed column order, excluding the leading pandas index cell and the
 /// dynamic `E.<scoring-feature>` tail. The `SomaticEVS` column is kept
@@ -169,7 +171,7 @@ fn render_row(
     // the repair inserted (unlike MQ/MQ0, which are always float-cast).
     let snvsb_cell = info_float_or_integer_zero(info, "SNVSB");
     let rprs_cell = info_float_or_integer_zero(info, "ReadPosRankSum");
-    let filter_cell = csv_escape(&render_strelka_filter(&record.filter));
+    let filter_cell = csv_escape(&render_filter(&record.filter));
 
     let mut cells: Vec<String> =
         Vec::with_capacity(FIXED_COLUMNS.len() + scoring_features.columns.len() + 1);
@@ -321,17 +323,6 @@ fn info_float_or_integer_zero(info: &str, key: &str) -> String {
         .unwrap_or_else(|| "0".to_string())
 }
 
-/// Legacy joins `rec["FILTER"]` (a list split on commas by vcfExtract)
-/// with commas. Standard semicolon-separated FILTER tokens are therefore
-/// preserved verbatim; PASS and missing collapse to the empty list.
-fn render_strelka_filter(filter: &str) -> String {
-    if filter == "PASS" || filter == "." || filter.is_empty() {
-        String::new()
-    } else {
-        filter.to_string()
-    }
-}
-
 fn tier1_ref_alt(
     sample: &BTreeMap<String, String>,
     ref_allele: &str,
@@ -464,13 +455,10 @@ mod tests {
 
     #[test]
     fn strelka_filter_pass_and_missing_render_empty() {
-        assert_eq!(render_strelka_filter("PASS"), "");
-        assert_eq!(render_strelka_filter("."), "");
-        assert_eq!(render_strelka_filter(""), "");
-        assert_eq!(
-            render_strelka_filter("LowQscore;HighDepth"),
-            "LowQscore;HighDepth"
-        );
+        assert_eq!(render_filter("PASS"), "");
+        assert_eq!(render_filter("."), "");
+        assert_eq!(render_filter(""), "");
+        assert_eq!(render_filter("LowQscore;HighDepth"), "LowQscore;HighDepth");
     }
 
     #[test]
