@@ -406,13 +406,13 @@ pub(crate) fn write_extended(
                     // (including INDEL subtypes) leave them empty.
                     let titv = supports_titv && is_base_subtype;
                     let missing_titv = if has_conf_regions { "." } else { "" };
-                    append_extended_stats(&mut row, &stats.truth_total, titv, missing_titv);
-                    append_extended_stats(&mut row, &stats.truth_tp, titv, missing_titv);
-                    append_extended_stats(&mut row, &stats.truth_fn, titv, missing_titv);
-                    append_extended_stats(&mut row, &stats.query_total, titv, missing_titv);
-                    append_extended_stats(&mut row, &stats.query_tp, titv, missing_titv);
-                    append_extended_stats(&mut row, &stats.query_fp, titv, missing_titv);
-                    append_extended_stats(&mut row, &stats.query_unk, titv, missing_titv);
+                    append_stats_with_missing(&mut row, &stats.truth_total, titv, missing_titv);
+                    append_stats_with_missing(&mut row, &stats.truth_tp, titv, missing_titv);
+                    append_stats_with_missing(&mut row, &stats.truth_fn, titv, missing_titv);
+                    append_stats_with_missing(&mut row, &stats.query_total, titv, missing_titv);
+                    append_stats_with_missing(&mut row, &stats.query_tp, titv, missing_titv);
+                    append_stats_with_missing(&mut row, &stats.query_fp, titv, missing_titv);
+                    append_stats_with_missing(&mut row, &stats.query_unk, titv, missing_titv);
 
                     writeln!(writer, "{}", row.join(","))?;
                 }
@@ -469,15 +469,6 @@ pub(crate) fn empty_comparison_extended_lines(subset_size: usize) -> Vec<String>
             row.join(",")
         })
         .collect()
-}
-
-fn append_extended_stats(
-    row: &mut Vec<String>,
-    stats: &CountsBucket,
-    supports_titv: bool,
-    missing_titv: &str,
-) {
-    append_stats_with_missing(row, stats, supports_titv, missing_titv);
 }
 
 pub(crate) fn append_stats_with_missing(
