@@ -94,19 +94,9 @@ pub(super) fn canonicalise_info_entry(entry: &str) -> String {
             // (e.g. `set=variant2`, `culprit=FS`) untouched.
             if let Ok(f) = part.parse::<f64>()
                 && f == 0.0
-                && (part.starts_with('-') || part.contains('-'))
+                && part.contains('-')
             {
-                // Preserve the original integer / float visual shape
-                // (e.g. `-0` → `0`, `-0.0` → `0`) so downstream byte
-                // comparison sees what htslib would emit.
-                return if part.contains('.') || part.contains('e') || part.contains('E') {
-                    // Keep float shape — bcftools emits "0" for any
-                    // signed-zero float regardless of original
-                    // precision; mirror that.
-                    "0".to_string()
-                } else {
-                    "0".to_string()
-                };
+                return "0".to_string();
             }
             part.to_string()
         })
