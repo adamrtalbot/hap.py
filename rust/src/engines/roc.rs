@@ -7,7 +7,6 @@
 use crate::domain::AnnotatedRow;
 use anyhow::{Context, Result};
 use std::borrow::Borrow;
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -56,15 +55,8 @@ where
         ("roc.Locations.INDEL.csv.gz".to_string(), true),
         ("roc.Locations.INDEL.PASS.csv.gz".to_string(), true),
     ];
-    let mut seen = candidates
-        .iter()
-        .map(|(suffix, _)| suffix.clone())
-        .collect::<BTreeSet<_>>();
     for ty in ["SNP", "INDEL"] {
-        let suffix = format!("roc.Locations.{ty}.SEL.csv.gz");
-        if seen.insert(suffix.clone()) {
-            candidates.push((suffix, true));
-        }
+        candidates.push((format!("roc.Locations.{ty}.SEL.csv.gz"), true));
     }
 
     let mut csv = Vec::with_capacity(candidates.len());
