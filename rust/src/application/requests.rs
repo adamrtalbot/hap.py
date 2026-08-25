@@ -155,6 +155,46 @@ pub(crate) enum PreprocessGender {
     None,
 }
 
+/// Preprocessing/normalization knobs for the comparison's input stage. The
+/// `*/no_*` pairs preserve legacy's independent enable/disable flags; the read
+/// sites combine them (`leftshift && !no_leftshift`).
+#[derive(Debug, Clone)]
+pub(crate) struct PreprocessOptions {
+    pub(crate) preprocess_window: usize,
+    pub(crate) leftshift: bool,
+    pub(crate) no_leftshift: bool,
+    pub(crate) decompose: bool,
+    pub(crate) no_decompose: bool,
+    pub(crate) bcftools_norm: bool,
+    pub(crate) fixchr: Option<bool>,
+    pub(crate) no_fixchr: bool,
+    pub(crate) filter_nonref: bool,
+    pub(crate) set_gt: Option<SomaticGtMode>,
+    pub(crate) gender: PreprocessGender,
+}
+
+/// ROC sweep configuration: the QQ field name and its filtering/binning knobs.
+#[derive(Debug, Clone)]
+pub(crate) struct RocOptions {
+    pub(crate) roc: String,
+    pub(crate) no_roc: bool,
+    pub(crate) roc_regions: Vec<String>,
+    pub(crate) roc_filter: Option<String>,
+    pub(crate) roc_delta: f64,
+}
+
+/// Comparison-engine selection and its tuning parameters.
+#[derive(Debug, Clone)]
+pub(crate) struct EngineOptions {
+    pub(crate) engine: CompareEngine,
+    pub(crate) engine_vcfeval: Option<String>,
+    pub(crate) engine_vcfeval_template: Option<String>,
+    pub(crate) engine_scmp_distance: usize,
+    pub(crate) window: usize,
+    pub(crate) max_enum: usize,
+    pub(crate) hb_expand: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CompareArgs {
     pub(crate) truth: String,
@@ -170,20 +210,10 @@ pub(crate) struct CompareArgs {
     pub(crate) convert_gvcf_to_vcf: bool,
     pub(crate) usefiltered_truth: bool,
     pub(crate) filters_only: Option<String>,
-    pub(crate) preprocess_window: usize,
+    pub(crate) preprocess: PreprocessOptions,
     pub(crate) adjust_conf_regions: bool,
     pub(crate) no_adjust_conf_regions: bool,
-    pub(crate) leftshift: bool,
-    pub(crate) no_leftshift: bool,
-    pub(crate) decompose: bool,
-    pub(crate) no_decompose: bool,
-    pub(crate) bcftools_norm: bool,
-    pub(crate) fixchr: Option<bool>,
-    pub(crate) no_fixchr: bool,
-    pub(crate) filter_nonref: bool,
     pub(crate) somatic: bool,
-    pub(crate) set_gt: Option<SomaticGtMode>,
-    pub(crate) gender: PreprocessGender,
     pub(crate) bcf: bool,
     pub(crate) regions_bedfile: Option<String>,
     pub(crate) targets_bedfile: Option<String>,
@@ -199,21 +229,11 @@ pub(crate) struct CompareArgs {
     pub(crate) no_write_counts: bool,
     pub(crate) output_vtc: bool,
     pub(crate) preserve_info: bool,
-    pub(crate) roc: String,
-    pub(crate) no_roc: bool,
-    pub(crate) roc_regions: Vec<String>,
-    pub(crate) roc_filter: Option<String>,
-    pub(crate) roc_delta: f64,
+    pub(crate) roc: RocOptions,
     pub(crate) ci_alpha: f64,
     pub(crate) no_json: bool,
     pub(crate) no_hc: bool,
-    pub(crate) window: usize,
-    pub(crate) max_enum: usize,
-    pub(crate) hb_expand: usize,
-    pub(crate) engine: CompareEngine,
-    pub(crate) engine_vcfeval: Option<String>,
-    pub(crate) engine_vcfeval_template: Option<String>,
-    pub(crate) engine_scmp_distance: usize,
+    pub(crate) engine: EngineOptions,
     #[allow(dead_code, reason = "retained in the raw DTO for legacy CLI parity")]
     pub(crate) force_interactive: bool,
     pub(crate) scratch_prefix: Option<String>,
@@ -246,9 +266,9 @@ impl CompareArgs {
         require_optional_text(self.scratch_prefix.as_deref(), "scratch_prefix")?;
         require_optional_text(self.logfile.as_deref(), "logfile")?;
         require_texts(&self.strat_regions, "strat_regions")?;
-        require_texts(&self.roc_regions, "roc_regions")?;
+        require_texts(&self.roc.roc_regions, "roc_regions")?;
         require_threads(self.threads)?;
-        require_roc_delta(self.roc_delta)?;
+        require_roc_delta(self.roc.roc_delta)?;
         require_ci_alpha(self.ci_alpha)?;
         if let Some(annotation_type) = self.annotation_type.as_deref() {
             match annotation_type {
@@ -261,9 +281,9 @@ impl CompareArgs {
                 }
             }
         }
-        require_text(&self.roc, "roc")?;
-        if self.engine == CompareEngine::ScmpDistance
-            && self.engine_scmp_distance > i64::MAX as usize
+        require_text(&self.roc.roc, "roc")?;
+        if self.engine.engine == CompareEngine::ScmpDistance
+            && self.engine.engine_scmp_distance > i64::MAX as usize
         {
             return Err(RequestValidationError::new(
                 "engine_scmp_distance",
@@ -299,20 +319,22 @@ impl CompareArgs {
             convert_gvcf_to_vcf: false,
             usefiltered_truth: false,
             filters_only: None,
-            preprocess_window: 10_000,
+            preprocess: PreprocessOptions {
+                preprocess_window: 10_000,
+                leftshift: false,
+                no_leftshift: false,
+                decompose: false,
+                no_decompose: false,
+                bcftools_norm: false,
+                fixchr: None,
+                no_fixchr: false,
+                filter_nonref: false,
+                set_gt: None,
+                gender: PreprocessGender::Auto,
+            },
             adjust_conf_regions: true,
             no_adjust_conf_regions: false,
-            leftshift: false,
-            no_leftshift: false,
-            decompose: false,
-            no_decompose: false,
-            bcftools_norm: false,
-            fixchr: None,
-            no_fixchr: false,
-            filter_nonref: false,
             somatic: false,
-            set_gt: None,
-            gender: PreprocessGender::Auto,
             bcf: false,
             regions_bedfile: None,
             targets_bedfile: None,
@@ -327,21 +349,25 @@ impl CompareArgs {
             no_write_counts: false,
             output_vtc: false,
             preserve_info: false,
-            roc: "QUAL".to_string(),
-            no_roc: false,
-            roc_regions: Vec::new(),
-            roc_filter: None,
-            roc_delta: 0.5,
+            roc: RocOptions {
+                roc: "QUAL".to_string(),
+                no_roc: false,
+                roc_regions: Vec::new(),
+                roc_filter: None,
+                roc_delta: 0.5,
+            },
             ci_alpha: 0.0,
             no_json: false,
             no_hc: false,
-            window: 50,
-            max_enum: 16_768,
-            hb_expand: 30,
-            engine: CompareEngine::Xcmp,
-            engine_vcfeval: None,
-            engine_vcfeval_template: None,
-            engine_scmp_distance: 30,
+            engine: EngineOptions {
+                engine: CompareEngine::Xcmp,
+                engine_vcfeval: None,
+                engine_vcfeval_template: None,
+                engine_scmp_distance: 30,
+                window: 50,
+                max_enum: 16_768,
+                hb_expand: 30,
+            },
             force_interactive: false,
             scratch_prefix: None,
             keep_scratch: false,
@@ -779,10 +805,10 @@ mod tests {
     #[test]
     fn compare_rejects_bad_roc_and_ci_values() {
         let mut request = compare();
-        request.roc_delta = f64::NAN;
+        request.roc.roc_delta = f64::NAN;
         assert_eq!(request.validate().unwrap_err().field(), "roc_delta");
 
-        request.roc_delta = 0.5;
+        request.roc.roc_delta = 0.5;
         request.ci_alpha = 1.0;
         assert_eq!(request.validate().unwrap_err().field(), "ci_alpha");
     }

@@ -11,8 +11,8 @@ pub(crate) mod somatic;
 pub(crate) mod validate;
 
 pub(crate) use requests::{
-    CompareArgs, CompareEngine, FtxArgs, PreprocessArgs, PreprocessGender, QuantifyArgs,
-    RequestValidationError, SomaticArgs, SomaticGtMode, ValidateArgs, ValidatedCompareArgs,
-    ValidatedFtxArgs, ValidatedPreprocessArgs, ValidatedQuantifyArgs, ValidatedSomaticArgs,
-    ValidatedValidateArgs,
+    CompareArgs, CompareEngine, EngineOptions, FtxArgs, PreprocessArgs, PreprocessGender,
+    PreprocessOptions, QuantifyArgs, RequestValidationError, RocOptions, SomaticArgs,
+    SomaticGtMode, ValidateArgs, ValidatedCompareArgs, ValidatedFtxArgs, ValidatedPreprocessArgs,
+    ValidatedQuantifyArgs, ValidatedSomaticArgs, ValidatedValidateArgs,
 };

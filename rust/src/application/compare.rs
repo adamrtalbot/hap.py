@@ -613,12 +613,13 @@ pub(crate) fn run(args: ValidatedCompareArgs) -> Result<()> {
     if args.reference.is_empty() {
         bail!("no reference file found; pass --reference");
     }
-    ensure_aggregate_roc_region(&mut args.roc_regions);
+    ensure_aggregate_roc_region(&mut args.roc.roc_regions);
     normalize_engine_preprocessing(&mut args);
     let destination_prefix = PathBuf::from(&args.report_prefix);
     let (inputs, mut labels) = compare_inputs(&args)?;
     labels.extend(
-        args.roc_regions
+        args.roc
+            .roc_regions
             .iter()
             .filter(|label| label.as_str() != "*")
             .cloned(),
@@ -754,10 +755,10 @@ fn run_inner(
     // Legacy keeps vcfeval handoff files as VCF even when `--bcf` requests a
     // BCF report. The built-in xcmp and SCMP engines can consume BCF
     // intermediates directly.
-    let bcf_intermediates = args.bcf && args.engine != CompareEngine::Vcfeval;
+    let bcf_intermediates = args.bcf && args.engine.engine != CompareEngine::Vcfeval;
     preprocessing_args.bcf = bcf_intermediates;
-    if preprocessing_args.gender == PreprocessGender::Auto {
-        preprocessing_args.gender = preprocess::infer_gender(Path::new(&args.truth))?;
+    if preprocessing_args.preprocess.gender == PreprocessGender::Auto {
+        preprocessing_args.preprocess.gender = preprocess::infer_gender(Path::new(&args.truth))?;
     }
     let truth_prep = scratch.path().join(if bcf_intermediates {
         "truth.prep.bcf"
@@ -811,7 +812,7 @@ fn run_inner(
     )?;
     report_phase("query_preprocessing", query_preprocess_started);
 
-    if args.engine == CompareEngine::Vcfeval {
+    if args.engine.engine == CompareEngine::Vcfeval {
         log_compare_info(&args, "Running vcfeval comparison")?;
         return run_vcfeval(
             &args,
@@ -824,7 +825,7 @@ fn run_inner(
         );
     }
     if matches!(
-        args.engine,
+        args.engine.engine,
         CompareEngine::ScmpSomatic | CompareEngine::ScmpDistance
     ) {
         log_compare_info(&args, "Running SCMP comparison")?;
@@ -858,10 +859,10 @@ fn run_inner(
         .as_deref()
         .or_else(|| derived_locations.as_deref());
 
-    let cluster_gap = match args.engine {
+    let cluster_gap = match args.engine.engine {
         CompareEngine::ScmpSomatic => 0,
-        CompareEngine::ScmpDistance => args.engine_scmp_distance,
-        CompareEngine::Xcmp | CompareEngine::Vcfeval => args.window,
+        CompareEngine::ScmpDistance => args.engine.engine_scmp_distance,
+        CompareEngine::Xcmp | CompareEngine::Vcfeval => args.engine.window,
     };
     // Fold gvcf2bed-style insertion padding (derived from truth) into
     // the raw CONF bed before classification. Legacy hap.py does the
@@ -960,7 +961,7 @@ fn run_inner(
         .unwrap_or_default();
     let mut row_spool = ComparisonRowSpool::new();
     let needs_decoration =
-        args.preserve_info || args.output_vtc || !matches!(args.roc.as_str(), "QUAL" | "QQ");
+        args.preserve_info || args.output_vtc || !matches!(args.roc.roc.as_str(), "QUAL" | "QQ");
     let query_metadata = if needs_decoration {
         spool_comparison_contigs(&query_prep)?
     } else {
@@ -979,9 +980,9 @@ fn run_inner(
         &reference_sequences,
         adjusted_conf_bed.as_deref(),
         ComparisonConfig {
-            no_hc: args.no_hc || args.engine != CompareEngine::Xcmp,
-            max_enum: args.max_enum,
-            hb_expand: args.hb_expand,
+            no_hc: args.no_hc || args.engine.engine != CompareEngine::Xcmp,
+            max_enum: args.engine.max_enum,
+            hb_expand: args.engine.hb_expand,
         },
         |processed| {
             let cluster = processed.cluster;
@@ -1026,7 +1027,7 @@ fn run_inner(
                     &mut decorations,
                     spool::CollectOptions {
                         preserve_info: args.preserve_info,
-                        roc_field: &args.roc,
+                        roc_field: &args.roc.roc,
                         collect_filtered: true,
                     },
                 )?;
@@ -1040,7 +1041,7 @@ fn run_inner(
                     &mut decorations,
                     spool::CollectOptions {
                         preserve_info: args.preserve_info,
-                        roc_field: &args.roc,
+                        roc_field: &args.roc.roc,
                         collect_filtered: false,
                     },
                 )?;
@@ -1054,7 +1055,7 @@ fn run_inner(
                         &decorations,
                         args.preserve_info,
                         args.output_vtc,
-                        &args.roc,
+                        &args.roc.roc,
                     )?;
                 }
                 row_spool.push(row, filtered_match, sort_line)?;
@@ -1124,15 +1125,15 @@ fn run_inner(
         args.pass_only,
         args.output_vtc,
         args.preserve_info,
-        &args.roc,
+        &args.roc.roc,
     );
     let requantify = args.strat_tsv.is_some()
         || !args.strat_regions.is_empty()
         || args.strat_fixchr
-        || args.roc != "QUAL"
-        || args.roc_filter.is_some()
-        || args.roc_regions.iter().any(|region| region != "*")
-        || (args.roc_delta - 0.5).abs() > f64::EPSILON
+        || args.roc.roc != "QUAL"
+        || args.roc.roc_filter.is_some()
+        || args.roc.roc_regions.iter().any(|region| region != "*")
+        || (args.roc.roc_delta - 0.5).abs() > f64::EPSILON
         || args.ci_alpha != 0.0;
     let comparison_vcf = if requantify {
         scratch.path().join("comparison.vcf.gz")
@@ -1190,11 +1191,11 @@ fn run_inner(
                 verbose: false,
                 quiet: false,
                 force_interactive: false,
-                roc: args.roc.clone(),
-                do_roc: !args.no_roc,
-                roc_regions: args.roc_regions.clone(),
-                roc_filter: args.roc_filter.clone(),
-                roc_delta: args.roc_delta,
+                roc: args.roc.roc.clone(),
+                do_roc: !args.roc.no_roc,
+                roc_regions: args.roc.roc_regions.clone(),
+                roc_filter: args.roc.roc_filter.clone(),
+                roc_delta: args.roc.roc_delta,
                 ci_alpha: args.ci_alpha,
                 no_json: args.no_json,
             },
@@ -1206,7 +1207,7 @@ fn run_inner(
     } else {
         let roc_options = crate::engines::roc::RocOptions {
             threads: comparison_threads,
-            output_rocs: !args.no_roc,
+            output_rocs: !args.roc.no_roc,
             whole_reference_size: Some(whole_reference_size),
             preserve_raw_table: args.verbose,
             ..Default::default()
@@ -1218,7 +1219,7 @@ fn run_inner(
             conf_size,
             &roc_options,
         )?;
-        if args.no_roc {
+        if args.roc.no_roc {
             compact_no_roc_outputs(prefix)?;
         }
         indices
@@ -1412,8 +1413,8 @@ fn run_vcfeval(
         query_prep,
         Path::new(&args.reference),
         crate::engines::vcfeval::Options {
-            roc_field: &args.roc,
-            loose_match_distance: args.engine_scmp_distance,
+            roc_field: &args.roc.roc,
+            loose_match_distance: args.engine.engine_scmp_distance,
         },
     )?;
     let (vcfeval_headers, vcfeval_records) = validated.into_parts();
@@ -1438,11 +1439,11 @@ fn run_vcfeval(
             verbose: false,
             quiet: false,
             force_interactive: false,
-            roc: args.roc.clone(),
-            do_roc: !args.no_roc,
-            roc_regions: args.roc_regions.clone(),
-            roc_filter: args.roc_filter.clone(),
-            roc_delta: args.roc_delta,
+            roc: args.roc.roc.clone(),
+            do_roc: !args.roc.no_roc,
+            roc_regions: args.roc.roc_regions.clone(),
+            roc_filter: args.roc.roc_filter.clone(),
+            roc_delta: args.roc.roc_delta,
             ci_alpha: args.ci_alpha,
             no_json: args.no_json,
         },
@@ -1506,10 +1507,10 @@ fn run_scmp(
         }
         strat_regions.push(format!("CONF_VARS:{}", padding_path.display()));
     }
-    let mode = match args.engine {
+    let mode = match args.engine.engine {
         CompareEngine::ScmpSomatic => crate::engines::scmp::ScmpMode::Alleles,
         CompareEngine::ScmpDistance => crate::engines::scmp::ScmpMode::Distance {
-            max_distance: i64::try_from(args.engine_scmp_distance)
+            max_distance: i64::try_from(args.engine.engine_scmp_distance)
                 .context("SCMP match distance exceeds the supported range")?,
         },
         CompareEngine::Xcmp | CompareEngine::Vcfeval => {
@@ -1521,7 +1522,7 @@ fn run_scmp(
         query_prep,
         Path::new(&args.reference),
         mode,
-        &args.roc,
+        &args.roc.roc,
     )?;
     let (scmp_headers, scmp_records) = validated.into_parts();
     let write_counts = args.write_counts && !args.no_write_counts;
@@ -1546,18 +1547,18 @@ fn run_scmp(
             verbose: false,
             quiet: false,
             force_interactive: false,
-            roc: args.roc.clone(),
-            do_roc: !args.no_roc,
-            roc_regions: args.roc_regions.clone(),
-            roc_filter: args.roc_filter.clone(),
-            roc_delta: args.roc_delta,
+            roc: args.roc.roc.clone(),
+            do_roc: !args.roc.no_roc,
+            roc_regions: args.roc.roc_regions.clone(),
+            roc_filter: args.roc.roc_filter.clone(),
+            roc_delta: args.roc.roc_delta,
             ci_alpha: args.ci_alpha,
             no_json: args.no_json,
         },
         scmp_headers,
         scmp_records,
         crate::application::quantify::CompareQuantifyMode {
-            preserve_missing_query_qq: args.engine == CompareEngine::ScmpSomatic,
+            preserve_missing_query_qq: args.engine.engine == CompareEngine::ScmpSomatic,
             ..Default::default()
         },
     )?;
@@ -1577,24 +1578,24 @@ fn ensure_aggregate_roc_region(regions: &mut Vec<String>) {
 }
 
 fn normalize_engine_preprocessing(args: &mut CompareArgs) {
-    match args.engine {
+    match args.engine.engine {
         CompareEngine::ScmpSomatic => {
-            if !args.somatic && args.set_gt.is_none() {
+            if !args.somatic && args.preprocess.set_gt.is_none() {
                 args.somatic = true;
             }
             // Legacy turns partial-credit normalization off for the somatic
             // scmp engine after selecting the synthetic half genotype.
             args.preprocess_truth = false;
-            args.leftshift = false;
-            args.no_leftshift = true;
-            args.decompose = false;
-            args.bcftools_norm = false;
+            args.preprocess.leftshift = false;
+            args.preprocess.no_leftshift = true;
+            args.preprocess.decompose = false;
+            args.preprocess.bcftools_norm = false;
         }
         CompareEngine::ScmpDistance => {
-            if !args.somatic && args.set_gt.is_none() {
-                args.set_gt = Some(SomaticGtMode::First);
+            if !args.somatic && args.preprocess.set_gt.is_none() {
+                args.preprocess.set_gt = Some(SomaticGtMode::First);
             }
-            args.decompose = false;
+            args.preprocess.decompose = false;
         }
         CompareEngine::Xcmp | CompareEngine::Vcfeval => {}
     }
@@ -1658,7 +1659,8 @@ fn write_runinfo_for_args(
         annotation_type: args.annotation_type.as_deref(),
         pass_only: args.pass_only,
         preprocessing_truth: args.preprocess_truth,
-        preprocessing_leftshift: args.engine == CompareEngine::ScmpSomatic || !args.no_leftshift,
+        preprocessing_leftshift: args.engine.engine == CompareEngine::ScmpSomatic
+            || !args.preprocess.no_leftshift,
         preprocessing_decompose: effective_decomposition(args),
         regions_bedfile: args.regions_bedfile.as_deref(),
         targets_bedfile: args.targets_bedfile.as_deref(),
@@ -1677,45 +1679,45 @@ fn write_runinfo_for_args(
         convert_gvcf_query: args.convert_gvcf_query,
         convert_gvcf_to_vcf: args.convert_gvcf_to_vcf,
         convert_gvcf_truth: args.convert_gvcf_truth,
-        do_roc: !args.no_roc,
-        engine: args.engine.legacy_name(),
-        engine_scmp_distance: args.engine_scmp_distance,
-        engine_vcfeval: args.engine_vcfeval.as_deref().unwrap_or("rtg"),
-        engine_vcfeval_template: args.engine_vcfeval_template.as_deref(),
-        filter_nonref: args.filter_nonref,
+        do_roc: !args.roc.no_roc,
+        engine: args.engine.engine.legacy_name(),
+        engine_scmp_distance: args.engine.engine_scmp_distance,
+        engine_vcfeval: args.engine.engine_vcfeval.as_deref().unwrap_or("rtg"),
+        engine_vcfeval_template: args.engine.engine_vcfeval_template.as_deref(),
+        filter_nonref: args.preprocess.filter_nonref,
         filters_only: args.filters_only.as_deref(),
-        fixchr: if args.no_fixchr {
+        fixchr: if args.preprocess.no_fixchr {
             Some(false)
         } else {
-            args.fixchr
+            args.preprocess.fixchr
         },
         fp_adjust_conf: args.adjust_conf_regions && !args.no_adjust_conf_regions,
-        gender: match args.gender {
+        gender: match args.preprocess.gender {
             PreprocessGender::Male => "male",
             PreprocessGender::Female => "female",
             PreprocessGender::Auto => "auto",
             PreprocessGender::None => "none",
         },
-        hb_expand: args.hb_expand,
+        hb_expand: args.engine.hb_expand,
         logfile: published_logfile,
-        max_enum: args.max_enum,
+        max_enum: args.engine.max_enum,
         no_hc: args.no_hc,
         output_vtc: args.output_vtc,
-        preprocess_window: args.preprocess_window,
-        preprocessing_norm: args.bcftools_norm,
+        preprocess_window: args.preprocess.preprocess_window,
+        preprocessing_norm: args.preprocess.bcftools_norm,
         preserve_info: args.preserve_info,
         quiet: args.quiet,
-        roc: &args.roc,
-        roc_delta: args.roc_delta,
-        roc_filter: args.roc_filter.as_deref(),
-        roc_regions: &args.roc_regions,
+        roc: &args.roc.roc,
+        roc_delta: args.roc.roc_delta,
+        roc_filter: args.roc.roc_filter.as_deref(),
+        roc_regions: &args.roc.roc_regions,
         somatic: args.somatic,
-        somatic_mode: somatic_mode_name(args.set_gt),
+        somatic_mode: somatic_mode_name(args.preprocess.set_gt),
         strat_fixchr: args.strat_fixchr,
         strat_regions: &args.strat_regions,
         usefiltered_truth: args.usefiltered_truth,
         verbose: args.verbose,
-        window: args.window,
+        window: args.engine.window,
         write_counts,
         write_json: !args.no_json,
         write_vcf: true,
@@ -1800,20 +1802,21 @@ fn build_preprocess_args(
         targets_bedfile: args.targets_bedfile.clone(),
         // Germline preprocessing inherits legacy's automatic prefix policy:
         // add `chr` only when the reference uses it and the VCF does not.
-        fixchr: args.fixchr,
-        no_fixchr: args.no_fixchr,
+        fixchr: args.preprocess.fixchr,
+        no_fixchr: args.preprocess.no_fixchr,
         somatic: args.somatic,
-        set_gt: args.set_gt,
-        filter_nonref: args.filter_nonref && (!truth_side || preprocess_enabled),
+        set_gt: args.preprocess.set_gt,
+        filter_nonref: args.preprocess.filter_nonref && (!truth_side || preprocess_enabled),
         convert_gvcf_to_vcf: convert_gvcf,
         bcf: args.bcf,
-        bcftools_norm: args.bcftools_norm && (!truth_side || preprocess_enabled),
-        leftshift: preprocess_enabled && (args.leftshift || !args.no_leftshift),
+        bcftools_norm: args.preprocess.bcftools_norm && (!truth_side || preprocess_enabled),
+        leftshift: preprocess_enabled
+            && (args.preprocess.leftshift || !args.preprocess.no_leftshift),
         no_leftshift: false,
         decompose: preprocess_enabled && effective_decomposition(args),
         no_decompose: false,
-        gender: args.gender,
-        window_size: args.preprocess_window as i64,
+        gender: args.preprocess.gender,
+        window_size: args.preprocess.preprocess_window as i64,
         threads: args.threads,
         logfile: None,
         verbose: args.verbose,
@@ -1825,7 +1828,8 @@ fn build_preprocess_args(
 /// Legacy hap.py disables decomposition for somatic/set-gt preprocessing
 /// unless the user opts back in explicitly with `--decompose`.
 fn effective_decomposition(args: &CompareArgs) -> bool {
-    !args.no_decompose && (!(args.somatic || args.set_gt.is_some()) || args.decompose)
+    !args.preprocess.no_decompose
+        && (!(args.somatic || args.preprocess.set_gt.is_some()) || args.preprocess.decompose)
 }
 
 #[cfg(test)]

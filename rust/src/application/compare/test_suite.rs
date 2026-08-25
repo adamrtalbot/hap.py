@@ -85,7 +85,7 @@ mod scratch_tests {
     fn preprocessing_defaults_are_asymmetric_between_truth_and_query() {
         let root = test_root("preprocessing-defaults");
         let mut options = args(root.join("result"), &root.join("scratch"), false);
-        options.bcftools_norm = true;
+        options.preprocess.bcftools_norm = true;
         let truth = build_preprocess_args(
             &options,
             &options.truth,
@@ -122,22 +122,22 @@ mod scratch_tests {
     fn scmp_engines_apply_legacy_preprocessing_defaults() {
         let root = test_root("scmp-policy");
         let mut somatic = args(root.join("somatic"), &root, false);
-        somatic.engine = CompareEngine::ScmpSomatic;
+        somatic.engine.engine = CompareEngine::ScmpSomatic;
         somatic.preprocess_truth = true;
-        somatic.bcftools_norm = true;
+        somatic.preprocess.bcftools_norm = true;
         normalize_engine_preprocessing(&mut somatic);
         assert!(somatic.somatic);
-        assert_eq!(somatic.set_gt, None);
+        assert_eq!(somatic.preprocess.set_gt, None);
         assert!(!somatic.preprocess_truth);
-        assert!(somatic.no_leftshift);
-        assert!(!somatic.bcftools_norm);
+        assert!(somatic.preprocess.no_leftshift);
+        assert!(!somatic.preprocess.bcftools_norm);
         assert!(!effective_decomposition(&somatic));
 
         let mut distance = args(root.join("distance"), &root, false);
-        distance.engine = CompareEngine::ScmpDistance;
+        distance.engine.engine = CompareEngine::ScmpDistance;
         normalize_engine_preprocessing(&mut distance);
         assert_eq!(
-            distance.set_gt,
+            distance.preprocess.set_gt,
             Some(crate::application::SomaticGtMode::First)
         );
         assert!(!effective_decomposition(&distance));
@@ -180,8 +180,8 @@ mod scratch_tests {
         assert!(truth.leftshift);
         assert!(truth.decompose);
 
-        options.no_leftshift = true;
-        options.no_decompose = true;
+        options.preprocess.no_leftshift = true;
+        options.preprocess.no_decompose = true;
         let truth_disabled = build_preprocess_args(
             &options,
             &options.truth,
@@ -211,12 +211,12 @@ mod scratch_tests {
         options.filters_only = Some("LowQual,q10".to_string());
         options.convert_gvcf_truth = true;
         options.convert_gvcf_query = false;
-        options.filter_nonref = true;
+        options.preprocess.filter_nonref = true;
         options.preprocess_truth = true;
-        options.bcftools_norm = true;
-        options.fixchr = Some(true);
-        options.gender = crate::application::PreprocessGender::Male;
-        options.preprocess_window = 4096;
+        options.preprocess.bcftools_norm = true;
+        options.preprocess.fixchr = Some(true);
+        options.preprocess.gender = crate::application::PreprocessGender::Male;
+        options.preprocess.preprocess_window = 4096;
 
         let truth = build_preprocess_args(
             &options,
@@ -253,7 +253,7 @@ mod scratch_tests {
         let root = test_root("minimal-artifacts");
         let prefix = root.join("result");
         let mut options = args(prefix.clone(), &root.join("scratch"), false);
-        options.no_roc = true;
+        options.roc.no_roc = true;
         options.no_write_counts = true;
         options.no_json = true;
         run_args(options).unwrap();
@@ -535,7 +535,7 @@ mod scratch_tests {
         let confidence = root.join("confident.bed");
         fs::write(&confidence, "chr1\t0\t16\n").unwrap();
         let mut options = args(prefix.clone(), &root.join("scratch"), false);
-        options.engine = CompareEngine::ScmpDistance;
+        options.engine.engine = CompareEngine::ScmpDistance;
         options.bcf = true;
         options.fp_bedfile = Some(confidence.display().to_string());
         run_args(options).unwrap();
@@ -552,7 +552,7 @@ mod scratch_tests {
         let root = test_root("scmp-output-vtc");
         let prefix = root.join("result");
         let mut options = args(prefix.clone(), &root.join("scratch"), false);
-        options.engine = CompareEngine::ScmpDistance;
+        options.engine.engine = CompareEngine::ScmpDistance;
         options.output_vtc = true;
         run_args(options).unwrap();
 
@@ -634,9 +634,10 @@ mod scratch_tests {
             root.join("result").display().to_string(),
         );
         options.scratch_prefix = Some(root.join("scratch").display().to_string());
-        options.engine = CompareEngine::Vcfeval;
-        options.engine_vcfeval = Some("definitely-absent-rtg-for-test".to_string());
-        options.engine_vcfeval_template = Some(root.join("absent.sdf").display().to_string());
+        options.engine.engine = CompareEngine::Vcfeval;
+        options.engine.engine_vcfeval = Some("definitely-absent-rtg-for-test".to_string());
+        options.engine.engine_vcfeval_template =
+            Some(root.join("absent.sdf").display().to_string());
         run_args(options).unwrap();
         assert!(root.join("result.summary.csv").is_file());
         let (_, records) = vcf::load_raw_vcf(&root.join("result.vcf.gz")).unwrap();
@@ -666,7 +667,7 @@ mod scratch_tests {
         let mut options = args(root.join("result"), &root.join("scratch"), false);
         options.truth = truth_bcf.display().to_string();
         options.query = query_bcf.display().to_string();
-        options.engine = CompareEngine::Vcfeval;
+        options.engine.engine = CompareEngine::Vcfeval;
         options.output_vtc = true;
         run_args(options).unwrap();
 
@@ -684,7 +685,7 @@ mod scratch_tests {
         let preserve_prefix = root.join("preserve-result");
         let preserve_scratch = root.join("preserve-scratch");
         let mut preserve = args(preserve_prefix.clone(), &preserve_scratch, false);
-        preserve.engine = CompareEngine::Vcfeval;
+        preserve.engine.engine = CompareEngine::Vcfeval;
         preserve.preserve_info = true;
         run_args(preserve).unwrap();
         assert!(suffixed_report_path(&preserve_prefix, "runinfo.json").is_file());
@@ -714,13 +715,13 @@ mod scratch_tests {
             options
         };
         let mut somatic = engine_args(root.join("somatic"));
-        somatic.engine = CompareEngine::ScmpSomatic;
+        somatic.engine.engine = CompareEngine::ScmpSomatic;
         run_args(somatic).unwrap();
         let somatic_summary = fs::read_to_string(root.join("somatic.summary.csv")).unwrap();
 
         let mut distance = engine_args(root.join("distance"));
-        distance.engine = CompareEngine::ScmpDistance;
-        distance.engine_scmp_distance = 30;
+        distance.engine.engine = CompareEngine::ScmpDistance;
+        distance.engine.engine_scmp_distance = 30;
         run_args(distance).unwrap();
         let distance_summary = fs::read_to_string(root.join("distance.summary.csv")).unwrap();
         // Legacy AlleleMatcher's RefVar constructor uses ALT length for the

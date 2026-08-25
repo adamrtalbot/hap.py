@@ -1291,20 +1291,22 @@ impl TryFrom<CompareArgs> for crate::application::ValidatedCompareArgs {
             convert_gvcf_to_vcf: args.convert_gvcf_to_vcf,
             usefiltered_truth: args.usefiltered_truth,
             filters_only: args.filters_only,
-            preprocess_window: args.preprocess_window,
+            preprocess: crate::application::PreprocessOptions {
+                preprocess_window: args.preprocess_window,
+                leftshift: args.leftshift,
+                no_leftshift: args.no_leftshift,
+                decompose: args.decompose,
+                no_decompose: args.no_decompose,
+                bcftools_norm: args.bcftools_norm,
+                fixchr: args.fixchr,
+                no_fixchr: args.no_fixchr,
+                filter_nonref: args.filter_nonref,
+                set_gt: args.set_gt.map(Into::into),
+                gender: args.gender.into(),
+            },
             adjust_conf_regions: args.adjust_conf_regions,
             no_adjust_conf_regions: args.no_adjust_conf_regions,
-            leftshift: args.leftshift,
-            no_leftshift: args.no_leftshift,
-            decompose: args.decompose,
-            no_decompose: args.no_decompose,
-            bcftools_norm: args.bcftools_norm,
-            fixchr: args.fixchr,
-            no_fixchr: args.no_fixchr,
-            filter_nonref: args.filter_nonref,
             somatic: args.somatic,
-            set_gt: args.set_gt.map(Into::into),
-            gender: args.gender.into(),
             bcf: args.bcf,
             regions_bedfile: args.regions_bedfile,
             targets_bedfile: args.targets_bedfile,
@@ -1319,21 +1321,25 @@ impl TryFrom<CompareArgs> for crate::application::ValidatedCompareArgs {
             no_write_counts: args.no_write_counts,
             output_vtc: args.output_vtc,
             preserve_info: args.preserve_info,
-            roc: args.roc,
-            no_roc: args.no_roc,
-            roc_regions: args.roc_regions,
-            roc_filter: args.roc_filter,
-            roc_delta: args.roc_delta,
+            roc: crate::application::RocOptions {
+                roc: args.roc,
+                no_roc: args.no_roc,
+                roc_regions: args.roc_regions,
+                roc_filter: args.roc_filter,
+                roc_delta: args.roc_delta,
+            },
             ci_alpha: args.ci_alpha,
             no_json: args.no_json,
             no_hc: args.no_hc,
-            window: args.window,
-            max_enum: args.max_enum,
-            hb_expand: args.hb_expand,
-            engine: args.engine.into(),
-            engine_vcfeval: args.engine_vcfeval,
-            engine_vcfeval_template: args.engine_vcfeval_template,
-            engine_scmp_distance: args.engine_scmp_distance,
+            engine: crate::application::EngineOptions {
+                engine: args.engine.into(),
+                engine_vcfeval: args.engine_vcfeval,
+                engine_vcfeval_template: args.engine_vcfeval_template,
+                engine_scmp_distance: args.engine_scmp_distance,
+                window: args.window,
+                max_enum: args.max_enum,
+                hb_expand: args.hb_expand,
+            },
             force_interactive: args.force_interactive,
             scratch_prefix: args.scratch_prefix,
             keep_scratch: args.keep_scratch,
@@ -1621,14 +1627,17 @@ mod tests {
         let request = crate::application::ValidatedCompareArgs::try_from(args)
             .expect("valid CLI values should produce an application request");
         assert_eq!(
-            request.engine,
+            request.engine.engine,
             crate::application::CompareEngine::ScmpDistance
         );
         assert_eq!(
-            request.set_gt,
+            request.preprocess.set_gt,
             Some(crate::application::SomaticGtMode::First)
         );
-        assert_eq!(request.gender, crate::application::PreprocessGender::Female);
+        assert_eq!(
+            request.preprocess.gender,
+            crate::application::PreprocessGender::Female
+        );
     }
 
     #[test]
