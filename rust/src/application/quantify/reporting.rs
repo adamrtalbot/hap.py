@@ -176,7 +176,6 @@ pub(super) fn write_quantify_extended(
         for subset in &subsets {
             let (subset_size_for_row, subset_confidence_size) = named_subset_report_sizes(
                 subset,
-                options.subset_size,
                 options.whole_reference_size,
                 confidence_size_value,
                 options.stratification_sizes,
@@ -246,7 +245,6 @@ pub(super) fn write_quantify_extended(
                 for subset in &subsets {
                     let (subset_size_for_row, subset_confidence_size) = named_subset_report_sizes(
                         subset,
-                        options.subset_size,
                         options.whole_reference_size,
                         confidence_size_value,
                         options.stratification_sizes,
@@ -298,7 +296,6 @@ pub(super) fn write_quantify_extended(
 
 pub(super) fn named_subset_report_sizes(
     subset: &str,
-    _active_reference_size: usize,
     whole_reference_size: usize,
     confidence_size: Option<usize>,
     stratification_sizes: &BTreeMap<String, usize>,

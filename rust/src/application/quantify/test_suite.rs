@@ -1502,7 +1502,6 @@ mod tests {
         assert_eq!(
             named_subset_report_sizes(
                 "TS_boundary",
-                100,
                 140,
                 Some(141),
                 &stratification_sizes,
@@ -1513,7 +1512,6 @@ mod tests {
         assert_eq!(
             named_subset_report_sizes(
                 "EXTRA",
-                100,
                 140,
                 Some(141),
                 &stratification_sizes,
