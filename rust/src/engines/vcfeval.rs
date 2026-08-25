@@ -480,8 +480,7 @@ fn enumerate_paths(
         };
         let count = state.included.len();
         match paths.get_mut(&signature) {
-            Some(candidate) if candidate.count == count => {}
-            Some(candidate) if candidate.count > count => {}
+            Some(candidate) if candidate.count >= count => {}
             _ => {
                 paths.insert(
                     signature,
