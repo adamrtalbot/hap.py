@@ -275,7 +275,7 @@ impl CompareArgs {
 
     pub(crate) fn validated(self) -> Result<ValidatedCompareArgs, RequestValidationError> {
         self.validate()?;
-        Ok(ValidatedCompareArgs { values: self })
+        Ok(Validated(self))
     }
 
     #[cfg(test)]
@@ -352,24 +352,7 @@ impl CompareArgs {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ValidatedCompareArgs {
-    values: CompareArgs,
-}
-
-impl ValidatedCompareArgs {
-    pub(crate) fn into_inner(self) -> CompareArgs {
-        self.values
-    }
-}
-
-impl Deref for ValidatedCompareArgs {
-    type Target = CompareArgs;
-
-    fn deref(&self) -> &Self::Target {
-        &self.values
-    }
-}
+pub(crate) type ValidatedCompareArgs = Validated<CompareArgs>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PreprocessArgs {
@@ -536,7 +519,7 @@ impl QuantifyArgs {
 
     pub(crate) fn validated(self) -> Result<ValidatedQuantifyArgs, RequestValidationError> {
         self.validate()?;
-        Ok(ValidatedQuantifyArgs { values: self })
+        Ok(Validated(self))
     }
 }
 
@@ -755,24 +738,7 @@ pub(crate) type ValidatedSomaticArgs = Validated<SomaticArgs>;
 pub(crate) type ValidatedFtxArgs = Validated<FtxArgs>;
 pub(crate) type ValidatedValidateArgs = Validated<ValidateArgs>;
 
-#[derive(Debug, Clone)]
-pub(crate) struct ValidatedQuantifyArgs {
-    values: QuantifyArgs,
-}
-
-impl ValidatedQuantifyArgs {
-    pub(crate) fn into_inner(self) -> QuantifyArgs {
-        self.values
-    }
-}
-
-impl Deref for ValidatedQuantifyArgs {
-    type Target = QuantifyArgs;
-
-    fn deref(&self) -> &Self::Target {
-        &self.values
-    }
-}
+pub(crate) type ValidatedQuantifyArgs = Validated<QuantifyArgs>;
 
 #[cfg(test)]
 mod tests {
