@@ -23,17 +23,78 @@ pub(crate) struct TypeCounts {
     pub(crate) query_unk: CountsBucket,
 }
 
+/// False-positive subclass carried on an FP row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FpClass {
+    /// Genotype mismatch (`am` block kind).
+    Gt,
+    /// Allele mismatch (`lm` block kind).
+    Al,
+}
+
+impl FpClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Gt => "gt",
+            Self::Al => "al",
+        }
+    }
+}
+
+/// Legacy xcmp block-level comparison classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum XcmpCtype {
+    SimpleMatch,
+    SimpleMismatch,
+    HapMatch,
+    HapMismatch,
+    HapfailMismatch,
+}
+
+impl XcmpCtype {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SimpleMatch => "simple:match",
+            Self::SimpleMismatch => "simple:mismatch",
+            Self::HapMatch => "hap:match",
+            Self::HapMismatch => "hap:mismatch",
+            Self::HapfailMismatch => "hapfail:mismatch",
+        }
+    }
+}
+
+/// Lexicographic ordering key for a comparison row. Field order is the sort
+/// precedence and must not be reordered.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SortKey {
+    pub(crate) chrom: String,
+    pub(crate) pos: usize,
+    pub(crate) side_rank: usize,
+    pub(crate) type_rank: usize,
+}
+
+impl SortKey {
+    pub(crate) fn new(chrom: String, pos: usize, side_rank: usize, type_rank: usize) -> Self {
+        Self {
+            chrom,
+            pos,
+            side_rank,
+            type_rank,
+        }
+    }
+}
+
 /// A comparison record plus the domain facts needed by report engines.
 #[derive(Clone, Debug)]
 pub(crate) struct AnnotatedRow {
-    pub(crate) sort_key: (String, usize, usize, usize),
+    pub(crate) sort_key: SortKey,
     pub(crate) record: ComparisonRecord,
     /// Whether the originating query variant was PASS-filtered.
     pub(crate) query_pass: bool,
     /// False-positive subclass (`gt` or `al`) when this is an FP row.
-    pub(crate) fp_class: Option<&'static str>,
+    pub(crate) fp_class: Option<FpClass>,
     /// Legacy xcmp block-level comparison classification.
-    pub(crate) xcmp_ctype: Option<&'static str>,
+    pub(crate) xcmp_ctype: Option<XcmpCtype>,
     pub(crate) xcmp_hap_match: bool,
 }
 

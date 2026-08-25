@@ -397,14 +397,14 @@ fn run_inner(
     for record in input {
         let record = record?;
         observe_following_spanning_deletions(
-            &record,
+            record.raw(),
             &mut mixed_deletions_by_position,
             &mut deletions_by_position,
             &mut deletion_sets,
         );
-        input_contigs.insert(record.chrom.clone());
+        input_contigs.insert(record.raw().chrom.clone());
         if args.gender == PreprocessGender::Auto {
-            observe_gender(&record, &mut haploid_x, &mut diploid_x);
+            observe_gender(record.raw(), &mut haploid_x, &mut diploid_x);
         }
     }
     report_phase("input_header_inspection", phase_started);

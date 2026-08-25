@@ -3,7 +3,7 @@
 use super::output::DecorationIndex;
 use super::{AnnotatedRow, MAX_CLUSTER_VARIANTS};
 use crate::adapters::vcf::{self, ValidatedVcfReader, ValidatedVcfRecord, VariantKey};
-use crate::domain::RawVcfRecord;
+use crate::domain::{FpClass, RawVcfRecord, SortKey, XcmpCtype};
 use anyhow::{Context, Result, bail};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
@@ -72,11 +72,11 @@ impl ComparisonRowSpool {
         // allele spelling. The HG001 graph-order rule therefore remains the
         // leading rank while ordinary truth/query row precedence is retained.
         let key = (
-            row.sort_key.0.clone(),
-            row.sort_key.1,
+            row.sort_key.chrom.clone(),
+            row.sort_key.pos,
             u8::from(!filtered_truth_match),
-            row.sort_key.2,
-            row.sort_key.3,
+            row.sort_key.side_rank,
+            row.sort_key.type_rank,
             raw.ref_allele.clone(),
             raw.alt_allele.clone(),
             legacy_same_key_rank(&raw.samples),
@@ -225,8 +225,8 @@ fn write_comparison_spool_row(
         key.9,
         hex_encode(key.8.as_bytes()),
         u8::from(row.query_pass),
-        row.fp_class.unwrap_or("."),
-        row.xcmp_ctype.unwrap_or("."),
+        row.fp_class.map_or(".", FpClass::as_str),
+        row.xcmp_ctype.map_or(".", XcmpCtype::as_str),
         u8::from(row.xcmp_hap_match),
         row.record.raw().to_line()
     )?;
@@ -279,17 +279,17 @@ fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, Annotate
     .context("comparison spool sort row is not UTF-8")?;
     let query_pass = fields.next() == Some("1");
     let fp_class = match fields.next() {
-        Some("gt") => Some("gt"),
-        Some("al") => Some("al"),
+        Some("gt") => Some(FpClass::Gt),
+        Some("al") => Some(FpClass::Al),
         _ => None,
     };
     let xcmp_ctype = match fields.next() {
         Some(".") | None => None,
-        Some("simple:match") => Some("simple:match"),
-        Some("simple:mismatch") => Some("simple:mismatch"),
-        Some("hap:match") => Some("hap:match"),
-        Some("hap:mismatch") => Some("hap:mismatch"),
-        Some("hapfail:mismatch") => Some("hapfail:mismatch"),
+        Some("simple:match") => Some(XcmpCtype::SimpleMatch),
+        Some("simple:mismatch") => Some(XcmpCtype::SimpleMismatch),
+        Some("hap:match") => Some(XcmpCtype::HapMatch),
+        Some("hap:mismatch") => Some(XcmpCtype::HapMismatch),
+        Some("hapfail:mismatch") => Some(XcmpCtype::HapfailMismatch),
         Some(value) => bail!("comparison spool contains unknown XCMP context {value}"),
     };
     let xcmp_hap_match = fields.next() == Some("1");
@@ -310,7 +310,7 @@ fn parse_comparison_spool_row(line: &str) -> Result<(ComparisonSortKey, Annotate
     Ok((
         key,
         AnnotatedRow {
-            sort_key: (chrom, pos, row_side_rank, row_type_rank),
+            sort_key: SortKey::new(chrom, pos, row_side_rank, row_type_rank),
             record: record.into(),
             query_pass,
             fp_class,
@@ -548,7 +548,7 @@ impl ComparisonMetadataCursor {
 mod tests {
     use super::{ComparisonRowSpool, legacy_same_key_rank};
     use crate::application::compare::AnnotatedRow;
-    use crate::domain::RawVcfRecord;
+    use crate::domain::{RawVcfRecord, SortKey};
 
     fn row(
         reference: &str,
@@ -571,7 +571,7 @@ mod tests {
             primitive_identity: None,
         };
         AnnotatedRow {
-            sort_key: ("chr1".to_string(), 25, 1, side_rank),
+            sort_key: SortKey::new("chr1".to_string(), 25, 1, side_rank),
             record: raw.into(),
             query_pass: true,
             fp_class: None,
@@ -636,9 +636,9 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("rows decode");
 
-        assert_eq!(rows[0].sort_key.3, 0);
+        assert_eq!(rows[0].sort_key.type_rank, 0);
         assert_eq!(rows[0].record.raw().ref_allele, "ACG");
-        assert_eq!(rows[1].sort_key.3, 1);
+        assert_eq!(rows[1].sort_key.type_rank, 1);
         assert_eq!(rows[1].record.raw().ref_allele, "A");
     }
 }

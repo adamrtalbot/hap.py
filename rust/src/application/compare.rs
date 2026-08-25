@@ -1307,9 +1307,9 @@ fn retain_xcmp_truth_calls(variants: &mut Vec<Variant>) {
 fn sort_comparison_rows(rows: &mut [AnnotatedRow], filtered_truth_keys: &BTreeSet<VariantKey>) {
     rows.sort_by(|left, right| {
         left.sort_key
-            .0
-            .cmp(&right.sort_key.0)
-            .then(left.sort_key.1.cmp(&right.sort_key.1))
+            .chrom
+            .cmp(&right.sort_key.chrom)
+            .then(left.sort_key.pos.cmp(&right.sort_key.pos))
             // A query record sharing the exact key of a filtered truth call
             // occupies that merged record's slot in legacy xcmp, even though
             // the truth sample itself is excluded from comparison. It sorts
@@ -1319,8 +1319,8 @@ fn sort_comparison_rows(rows: &mut [AnnotatedRow], filtered_truth_keys: &BTreeSe
                 let right_filtered = row_matches_variant_key(right, filtered_truth_keys);
                 right_filtered.cmp(&left_filtered)
             })
-            .then(left.sort_key.2.cmp(&right.sort_key.2))
-            .then(left.sort_key.3.cmp(&right.sort_key.3))
+            .then(left.sort_key.side_rank.cmp(&right.sort_key.side_rank))
+            .then(left.sort_key.type_rank.cmp(&right.sort_key.type_rank))
             .then_with(|| {
                 (
                     &left.record.ref_allele,

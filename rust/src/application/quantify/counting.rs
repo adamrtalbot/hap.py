@@ -1,7 +1,7 @@
 //! Cohesive quantify counting responsibility.
 
 use super::{ClassifiedVariant, INDEL_SUBTYPES, QuantifyCountMaps, QuantifyTypeCounts};
-use crate::domain::{CountsBucket, RawVcfRecord, TypeCounts};
+use crate::domain::{CountsBucket, FpClass, RawVcfRecord, TypeCounts};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn classify_side(
@@ -58,26 +58,26 @@ pub(super) fn classify_side(
     })
 }
 
-pub(super) fn fp_class(decision: &str, match_kind: Option<&str>) -> Option<&'static str> {
+pub(super) fn fp_class(decision: &str, match_kind: Option<&str>) -> Option<FpClass> {
     if decision != "FP" {
         return None;
     }
     match match_kind {
-        Some("am") => Some("gt"),
-        Some("lm") => Some("al"),
+        Some("am") => Some(FpClass::Gt),
+        Some("lm") => Some(FpClass::Al),
         _ => None,
     }
 }
 
 #[cfg(test)]
-pub(super) fn query_fp_class(record: &RawVcfRecord) -> Option<&'static str> {
+pub(super) fn query_fp_class(record: &RawVcfRecord) -> Option<FpClass> {
     query_fp_class_for_sample(record, 1)
 }
 
 pub(super) fn query_fp_class_for_sample(
     record: &RawVcfRecord,
     sample_index: usize,
-) -> Option<&'static str> {
+) -> Option<FpClass> {
     let fields = record.sample_map(sample_index);
     fp_class(
         fields.get("BD").map(String::as_str).unwrap_or("."),
@@ -205,9 +205,9 @@ pub(super) fn record_query_stats(stats: &mut QuantifyTypeCounts, classified: &Cl
     add_variant_stats(&mut stats.query_total, classified);
     add_variant_stats(query_bucket(stats, &classified.status), classified);
     match classified.fp_class {
-        Some("gt") => stats.fp_gt += 1,
-        Some("al") => stats.fp_al += 1,
-        _ => {}
+        Some(FpClass::Gt) => stats.fp_gt += 1,
+        Some(FpClass::Al) => stats.fp_al += 1,
+        None => {}
     }
 }
 

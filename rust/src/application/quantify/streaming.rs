@@ -57,9 +57,9 @@ where
         for record in records {
             let mut record = record?;
             if qq_is_string {
-                validate_ga4gh_qq_record(&record)?;
+                validate_ga4gh_qq_record(record.raw())?;
             }
-            input_contigs.insert(record.chrom.clone());
+            input_contigs.insert(record.raw().chrom.clone());
             record.try_update(|raw| {
                 if args.preserve_info {
                     let extent = legacy_regions_extent(raw);
@@ -86,8 +86,8 @@ where
                 Ok(())
             })?;
 
-            let key = benchmark_superlocus(&record.info)
-                .map(|superlocus| (record.chrom.clone(), superlocus));
+            let key = benchmark_superlocus(&record.raw().info)
+                .map(|superlocus| (record.raw().chrom.clone(), superlocus));
             if !group.is_empty() && (key.is_none() || key != group_key) {
                 flush_quantify_group(
                     &mut writer,

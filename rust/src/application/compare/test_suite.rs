@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod scratch_tests {
     use super::super::*;
+    use crate::domain::SortKey;
     use std::thread;
 
     fn comparison_record(line: &str) -> crate::domain::ComparisonRecord {
@@ -566,7 +567,7 @@ mod scratch_tests {
     #[test]
     fn subset_derivation_stops_regions_at_the_next_info_field() {
         let rows = vec![AnnotatedRow {
-            sort_key: ("chr1".to_string(), 7, 0, 0),
+            sort_key: SortKey::new("chr1".to_string(), 7, 0, 0),
             record: comparison_record(concat!(
                 "chr1\t7\t.\tA\tC\t30\tPASS\t",
                 "BS=7;Regions=CONF,TS_boundary,TS_contained;AF=0.5;VTC=nuc__s\t",
@@ -594,7 +595,7 @@ mod scratch_tests {
     #[test]
     fn requantify_handoff_drops_only_provisional_truth_set_membership() {
         let rows = vec![AnnotatedRow {
-            sort_key: ("chr1".to_string(), 7, 0, 0),
+            sort_key: SortKey::new("chr1".to_string(), 7, 0, 0),
             record: comparison_record(concat!(
                 "chr1\t7\t.\tA\tC\t30\tPASS\t",
                 "BS=7;Regions=CONF,TS_boundary,EXTRA,TS_contained;RegionsExtent=7-7\t",
@@ -745,7 +746,7 @@ mod scratch_tests {
         )
         .unwrap();
         let mut rows = vec![AnnotatedRow {
-            sort_key: ("chr1".to_string(), 7, 0, 0),
+            sort_key: SortKey::new("chr1".to_string(), 7, 0, 0),
             record: comparison_record(concat!(
                 "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
                 "GT:BD:BK:BVT:BLT:QQ\t",
@@ -802,7 +803,7 @@ mod scratch_tests {
         )
         .unwrap();
         let mut rows = vec![AnnotatedRow {
-            sort_key: ("chr1".to_string(), 7, 0, 0),
+            sort_key: SortKey::new("chr1".to_string(), 7, 0, 0),
             record: comparison_record(concat!(
                 "chr1\t7\t.\tA\tC\t30\tPASS\tBS=7;Regions=CONF\t",
                 "GT:BD:BK:BVT:BLT:QQ\t",
@@ -1007,6 +1008,7 @@ mod scratch_tests {
 #[cfg(test)]
 mod memory_guards {
     use super::super::*;
+    use crate::domain::{SortKey, XcmpCtype};
 
     fn comparison_record(line: &str) -> crate::domain::ComparisonRecord {
         RawVcfRecord::from_line(line, Path::new("comparison-test.vcf"))
@@ -1515,7 +1517,7 @@ mod memory_guards {
     #[test]
     fn filtered_truth_counterpart_sorts_first_at_shared_locus() {
         let row = |alt: &str, side_rank| AnnotatedRow {
-            sort_key: ("chr21".to_string(), 15576177, side_rank, 0),
+            sort_key: SortKey::new("chr21".to_string(), 15576177, side_rank, 0),
             record: comparison_record(&format!(
                 "chr21\t15576177\t.\tG\t{alt}\t0\t.\tBS=15576177\tGT\t./.\t0/1"
             )),
@@ -2048,22 +2050,22 @@ mod memory_guards {
     #[test]
     fn hapfail_does_not_propagate_row_mismatch_to_exact_rows() {
         assert!(should_propagate_unreconciled_exact_rows(
-            "hap:mismatch",
+            XcmpCtype::HapMismatch,
             true,
             false,
         ));
         assert!(!should_propagate_unreconciled_exact_rows(
-            "hapfail:mismatch",
+            XcmpCtype::HapfailMismatch,
             true,
             false,
         ));
         assert!(should_propagate_unreconciled_exact_rows(
-            "hapfail:mismatch",
+            XcmpCtype::HapfailMismatch,
             true,
             true,
         ));
         assert!(!should_propagate_unreconciled_exact_rows(
-            "hap:mismatch",
+            XcmpCtype::HapMismatch,
             false,
             true,
         ));
@@ -2083,7 +2085,7 @@ mod memory_guards {
 
         assert_eq!(counterpart, Some(true));
         assert!(!should_propagate_unreconciled_exact_rows(
-            "hapfail:mismatch",
+            XcmpCtype::HapfailMismatch,
             true,
             matches!(counterpart, Some(false)),
         ));
@@ -2373,16 +2375,16 @@ mod memory_guards {
             tp_combined_row(&truth, &query, &reference, 100, ""),
         ];
         apply_legacy_halfcall_order(&mut matched);
-        assert_eq!(matched[0].sort_key.2, 2);
-        assert_eq!(matched[1].sort_key.2, 1);
+        assert_eq!(matched[0].sort_key.side_rank, 2);
+        assert_eq!(matched[1].sort_key.side_rank, 1);
 
         let mut truth_only = vec![
             fn_row(&halfcall, &reference, 100, "", "."),
             fn_row(&truth, &reference, 100, "", "."),
         ];
         apply_legacy_halfcall_order(&mut truth_only);
-        assert_eq!(truth_only[0].sort_key.2, 2);
-        assert_eq!(truth_only[1].sort_key.2, 3);
+        assert_eq!(truth_only[0].sort_key.side_rank, 2);
+        assert_eq!(truth_only[1].sort_key.side_rank, 3);
 
         let residual_query = variant(102, "A", "AG", "0/1");
         let mut three_grains = vec![
@@ -2391,9 +2393,9 @@ mod memory_guards {
             fp_like_row(&residual_query, &reference, 100, "", "UNK", None, "lm"),
         ];
         apply_legacy_halfcall_order(&mut three_grains);
-        assert_eq!(three_grains[0].sort_key.2, 2);
-        assert_eq!(three_grains[1].sort_key.2, 3);
-        assert_eq!(three_grains[2].sort_key.2, 4);
+        assert_eq!(three_grains[0].sort_key.side_rank, 2);
+        assert_eq!(three_grains[1].sort_key.side_rank, 3);
+        assert_eq!(three_grains[2].sort_key.side_rank, 4);
     }
 
     #[test]
@@ -2409,8 +2411,8 @@ mod memory_guards {
 
         apply_legacy_combined_before_truth_only_order(&mut rows);
 
-        assert_eq!(rows[0].sort_key.2, 1);
-        assert_eq!(rows[1].sort_key.2, 0);
+        assert_eq!(rows[0].sort_key.side_rank, 1);
+        assert_eq!(rows[1].sort_key.side_rank, 0);
     }
 
     #[test]

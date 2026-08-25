@@ -3,7 +3,7 @@
 use super::genotype::parse_gt_alleles;
 use super::{AnnotatedRow, Cluster, SPLIT_LEFT_SHIFT_WINDOW, Side, Variant, fp_class_from_bk};
 use crate::adapters::vcf::VariantKey;
-use crate::domain::{ComparisonRecord, RawVcfRecord};
+use crate::domain::{ComparisonRecord, FpClass, RawVcfRecord, SortKey};
 use crate::engines::partial_credit;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -203,7 +203,7 @@ pub(super) fn tp_combined_row(
     let query = projected_query.as_ref();
     let info = comparison_info(truth, reference);
     AnnotatedRow {
-        sort_key: (truth.key.chrom.clone(), truth.key.pos, 1, 0),
+        sort_key: SortKey::new(truth.key.chrom.clone(), truth.key.pos, 1, 0),
         query_pass: filter_is_pass(&query.filter),
         fp_class: None,
         xcmp_ctype: None,
@@ -252,7 +252,7 @@ pub(super) fn unk_combined_row(
     let query = projected_query.as_ref();
     let info = comparison_info(truth, reference);
     AnnotatedRow {
-        sort_key: (truth.key.chrom.clone(), truth.key.pos, 1, 0),
+        sort_key: SortKey::new(truth.key.chrom.clone(), truth.key.pos, 1, 0),
         query_pass: filter_is_pass(&query.filter),
         fp_class: None,
         xcmp_ctype: None,
@@ -349,7 +349,7 @@ pub(super) fn tp_single_side_row(
     if side == Side::Truth && variant.primary_type() == "UNK" {
         let end = variant.end_pos();
         return AnnotatedRow {
-            sort_key: (variant.key.chrom.clone(), variant.key.pos, 1, 0),
+            sort_key: SortKey::new(variant.key.chrom.clone(), variant.key.pos, 1, 0),
             query_pass: filter_is_pass(truth_filter),
             fp_class: None,
             xcmp_ctype: None,
@@ -381,7 +381,7 @@ pub(super) fn tp_single_side_row(
     let info = comparison_info(variant, reference);
     match side {
         Side::Truth => AnnotatedRow {
-            sort_key: (variant.key.chrom.clone(), variant.key.pos, 1, 0),
+            sort_key: SortKey::new(variant.key.chrom.clone(), variant.key.pos, 1, 0),
             // Truth-side TP split rows inherit the cluster's aggregated query
             // filter (see `cluster_query_filter` and call sites). When the
             // matching query is non-PASS, legacy demotes the truth-TP to FN
@@ -415,7 +415,7 @@ pub(super) fn tp_single_side_row(
             let projected_variant = legacy_duplicate_alt_query_output_projection(variant);
             let variant = projected_variant.as_ref();
             AnnotatedRow {
-                sort_key: (
+                sort_key: SortKey::new(
                     variant.key.chrom.clone(),
                     variant.key.pos,
                     1,
@@ -492,7 +492,7 @@ pub(super) fn fn_fp_combined_row(
         None
     };
     AnnotatedRow {
-        sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
+        sort_key: SortKey::new(truth.key.chrom.clone(), truth.key.pos, 0, 0),
         // Combined rows inherit the query's PASS status for the ALL vs
         // PASS bifurcation — query filter drives whether this row
         // contributes to the PASS-tier summary, consistent with
@@ -546,7 +546,7 @@ pub(super) fn fn_row(
     if truth.primary_type() == "UNK" {
         let end = truth.end_pos();
         return AnnotatedRow {
-            sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
+            sort_key: SortKey::new(truth.key.chrom.clone(), truth.key.pos, 0, 0),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -573,7 +573,7 @@ pub(super) fn fn_row(
     }
     let info = comparison_info(truth, reference);
     AnnotatedRow {
-        sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
+        sort_key: SortKey::new(truth.key.chrom.clone(), truth.key.pos, 0, 0),
         // FN rows count in both ALL and PASS tiers (legacy truth is already
         // pass-filtered upstream; the query-filter flag is not a gating
         // condition on truth-side FN counts).
@@ -617,7 +617,7 @@ pub(super) fn unk_truth_row(
     if truth.primary_type() == "UNK" {
         let end = truth.end_pos();
         return AnnotatedRow {
-            sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
+            sort_key: SortKey::new(truth.key.chrom.clone(), truth.key.pos, 0, 0),
             query_pass: true,
             fp_class: None,
             xcmp_ctype: None,
@@ -644,7 +644,7 @@ pub(super) fn unk_truth_row(
     }
     let info = comparison_info(truth, reference);
     AnnotatedRow {
-        sort_key: (truth.key.chrom.clone(), truth.key.pos, 0, 0),
+        sort_key: SortKey::new(truth.key.chrom.clone(), truth.key.pos, 0, 0),
         // UNK truth rows are not counted against the pass-only tier (same
         // semantics as FN rows, per legacy's Counts.cpp treatment).
         query_pass: true,
@@ -1083,14 +1083,14 @@ pub(super) fn fp_like_row(
     block_start: usize,
     regions: &str,
     bd: &str,
-    fp_class: Option<&'static str>,
+    fp_class: Option<FpClass>,
     bk: &'static str,
 ) -> AnnotatedRow {
     let projected_query = legacy_duplicate_alt_query_output_projection(query);
     let query = projected_query.as_ref();
     let info = comparison_info(query, reference);
     AnnotatedRow {
-        sort_key: (
+        sort_key: SortKey::new(
             query.key.chrom.clone(),
             query.key.pos,
             2,

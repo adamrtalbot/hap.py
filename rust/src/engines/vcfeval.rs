@@ -279,12 +279,13 @@ fn extract_calls(records: &[ValidatedVcfRecord]) -> Result<Vec<Call>> {
     let mut calls = Vec::new();
     for (record_index, record) in records.iter().enumerate() {
         let alts = record
+            .raw()
             .alt_allele
             .split(',')
             .map(str::to_string)
             .collect::<Vec<_>>();
         for (sample_index, side) in [(0, Side::Truth), (1, Side::Query)] {
-            let sample = record.sample_map(sample_index);
+            let sample = record.raw().sample_map(sample_index);
             let Some(gt) = sample.get("GT") else {
                 continue;
             };
@@ -299,8 +300,8 @@ fn extract_calls(records: &[ValidatedVcfRecord]) -> Result<Vec<Call>> {
             if invalid_index {
                 bail!(
                     "GT allele index exceeds ALT count at {}:{}",
-                    record.chrom,
-                    record.pos
+                    record.raw().chrom,
+                    record.raw().pos
                 );
             }
             let skipped = alleles.len() > 2
@@ -319,9 +320,9 @@ fn extract_calls(records: &[ValidatedVcfRecord]) -> Result<Vec<Call>> {
             calls.push(Call {
                 record_index,
                 side,
-                chrom: record.chrom.clone(),
-                pos: record.pos,
-                ref_allele: record.ref_allele.clone(),
+                chrom: record.raw().chrom.clone(),
+                pos: record.raw().pos,
+                ref_allele: record.raw().ref_allele.clone(),
                 alts: alts.clone(),
                 gt: alleles,
                 skipped,
@@ -677,7 +678,7 @@ fn apply_loose_matches(calls: &[Call], distance: usize, verdicts: &mut [Verdict]
 fn query_scores(merged: &ProvenancedMerge, field: &str) -> Result<BTreeMap<usize, String>> {
     let mut scores = BTreeMap::new();
     for (record_index, record) in merged.records.iter().enumerate() {
-        if !record.sample_map(1).get("GT").is_some_and(|gt| {
+        if !record.raw().sample_map(1).get("GT").is_some_and(|gt| {
             gt.split(['/', '|'])
                 .filter_map(|value| value.parse::<usize>().ok())
                 .any(|allele| allele > 0)
@@ -691,12 +692,12 @@ fn query_scores(merged: &ProvenancedMerge, field: &str) -> Result<BTreeMap<usize
             format!("vcfeval query provenance index {source_index} is out of bounds")
         })?;
         let value = if field == "QUAL" {
-            Some(source.qual.clone())
+            Some(source.raw().qual.clone())
         } else if let Some(key) = field.strip_prefix("INFO.") {
-            info_value(&source.info, key).map(str::to_string)
+            info_value(&source.raw().info, key).map(str::to_string)
         } else {
             let key = field.strip_prefix("FORMAT.").unwrap_or(field);
-            source.sample_map(0).get(key).cloned()
+            source.raw().sample_map(0).get(key).cloned()
         };
         if let Some(value) = value
             && value != "."
@@ -1061,9 +1062,9 @@ mod tests {
 
         annotate_records(&mut records, &calls, &verdicts, &scores);
 
-        assert_eq!(records[0].info, ".");
-        assert_eq!(records[0].format.as_deref(), Some("GT:BD"));
-        assert_eq!(records[0].samples, ["1/1:N", "1/1:N"]);
+        assert_eq!(records[0].raw().info, ".");
+        assert_eq!(records[0].raw().format.as_deref(), Some("GT:BD"));
+        assert_eq!(records[0].raw().samples, ["1/1:N", "1/1:N"]);
         Ok(())
     }
 }

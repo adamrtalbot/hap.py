@@ -17,7 +17,7 @@ use crate::adapters::{
 };
 use crate::application::CompareArgs;
 use crate::application::preprocess;
-use crate::domain::{RawVcfRecord, allele_edit_bits, legacy_type_bits};
+use crate::domain::{RawVcfRecord, SortKey, XcmpCtype, allele_edit_bits, legacy_type_bits};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -196,7 +196,7 @@ pub(super) fn decorate_output_rows_with_index(
             &record,
             &truth_fields,
             &query_fields,
-            row.xcmp_ctype.unwrap_or("simple:match"),
+            row.xcmp_ctype.map_or("simple:match", XcmpCtype::as_str),
         );
         if preserve_info {
             for (name, value) in comparison.preserved_fields(row.xcmp_hap_match) {
@@ -573,7 +573,7 @@ pub(super) fn decorate_existing_comparison_vcf(
         let record = record?;
         let raw = record.raw();
         let mut row = AnnotatedRow {
-            sort_key: (raw.chrom.clone(), raw.pos, 0, 0),
+            sort_key: SortKey::new(raw.chrom.clone(), raw.pos, 0, 0),
             record: raw.clone().into(),
             query_pass: true,
             fp_class: None,

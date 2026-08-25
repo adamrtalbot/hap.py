@@ -679,14 +679,6 @@ impl ValidatedVcfRecord {
     }
 }
 
-impl std::ops::Deref for ValidatedVcfRecord {
-    type Target = RawVcfRecord;
-
-    fn deref(&self) -> &Self::Target {
-        &self.raw
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

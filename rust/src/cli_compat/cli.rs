@@ -780,7 +780,7 @@ pub(crate) struct SomaticArgs {
     pub fp_region_size: Option<String>,
 
     #[arg(long = "feature-table", value_parser = parse_somatic_feature_table)]
-    pub feature_table: Option<String>,
+    pub feature_table: Option<SomaticFeatureTable>,
 
     #[arg(long = "happy-stats", default_value_t = false)]
     pub happy_stats: bool,
@@ -833,7 +833,7 @@ pub(crate) struct SomaticArgs {
     pub no_order_check: bool,
 
     #[arg(long = "roc", value_parser = parse_somatic_roc)]
-    pub roc: Option<String>,
+    pub roc: Option<SomaticRoc>,
 
     #[arg(long = "bin-afs", default_value_t = false)]
     pub af_strat: bool,
@@ -914,28 +914,98 @@ pub(crate) struct FtxArgs {
     pub keep_scratch: bool,
 }
 
-fn parse_somatic_feature_table(value: &str) -> Result<String, String> {
+/// Closed set of somatic feature tables accepted by `--feature-table`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SomaticFeatureTable {
+    Generic,
+    AdmixStrelkaSnv,
+    AdmixStrelkaIndel,
+    HccStrelkaSnv,
+    HccStrelkaIndel,
+    HccMutectSnv,
+    HccMutectIndel,
+    HccVarscan2Snv,
+    HccVarscan2Indel,
+    HccPiscesSnv,
+    HccPiscesIndel,
+}
+
+impl SomaticFeatureTable {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::AdmixStrelkaSnv => "admix.strelka.snv",
+            Self::AdmixStrelkaIndel => "admix.strelka.indel",
+            Self::HccStrelkaSnv => "hcc.strelka.snv",
+            Self::HccStrelkaIndel => "hcc.strelka.indel",
+            Self::HccMutectSnv => "hcc.mutect.snv",
+            Self::HccMutectIndel => "hcc.mutect.indel",
+            Self::HccVarscan2Snv => "hcc.varscan2.snv",
+            Self::HccVarscan2Indel => "hcc.varscan2.indel",
+            Self::HccPiscesSnv => "hcc.pisces.snv",
+            Self::HccPiscesIndel => "hcc.pisces.indel",
+        }
+    }
+}
+
+/// Closed set of somatic ROC modes accepted by `--roc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SomaticRoc {
+    StrelkaSnvQss,
+    StrelkaSnvVqsr,
+    StrelkaSnv,
+    StrelkaIndel,
+    StrelkaIndelEvs,
+    Varscan2Snv,
+    Varscan2Indel,
+    MutectSnv,
+    MutectIndel,
+}
+
+impl SomaticRoc {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::StrelkaSnvQss => "strelka.snv.qss",
+            Self::StrelkaSnvVqsr => "strelka.snv.vqsr",
+            Self::StrelkaSnv => "strelka.snv",
+            Self::StrelkaIndel => "strelka.indel",
+            Self::StrelkaIndelEvs => "strelka.indel.evs",
+            Self::Varscan2Snv => "varscan2.snv",
+            Self::Varscan2Indel => "varscan2.indel",
+            Self::MutectSnv => "mutect.snv",
+            Self::MutectIndel => "mutect.indel",
+        }
+    }
+}
+
+fn parse_somatic_feature_table(value: &str) -> Result<SomaticFeatureTable, String> {
     match value {
-        "generic"
-        | "admix.strelka.snv"
-        | "admix.strelka.indel"
-        | "hcc.strelka.snv"
-        | "hcc.strelka.indel"
-        | "hcc.mutect.snv"
-        | "hcc.mutect.indel"
-        | "hcc.varscan2.snv"
-        | "hcc.varscan2.indel"
-        | "hcc.pisces.snv"
-        | "hcc.pisces.indel" => Ok(value.to_string()),
+        "generic" => Ok(SomaticFeatureTable::Generic),
+        "admix.strelka.snv" => Ok(SomaticFeatureTable::AdmixStrelkaSnv),
+        "admix.strelka.indel" => Ok(SomaticFeatureTable::AdmixStrelkaIndel),
+        "hcc.strelka.snv" => Ok(SomaticFeatureTable::HccStrelkaSnv),
+        "hcc.strelka.indel" => Ok(SomaticFeatureTable::HccStrelkaIndel),
+        "hcc.mutect.snv" => Ok(SomaticFeatureTable::HccMutectSnv),
+        "hcc.mutect.indel" => Ok(SomaticFeatureTable::HccMutectIndel),
+        "hcc.varscan2.snv" => Ok(SomaticFeatureTable::HccVarscan2Snv),
+        "hcc.varscan2.indel" => Ok(SomaticFeatureTable::HccVarscan2Indel),
+        "hcc.pisces.snv" => Ok(SomaticFeatureTable::HccPiscesSnv),
+        "hcc.pisces.indel" => Ok(SomaticFeatureTable::HccPiscesIndel),
         _ => Err(format!("unsupported somatic feature table '{value}'")),
     }
 }
 
-fn parse_somatic_roc(value: &str) -> Result<String, String> {
+fn parse_somatic_roc(value: &str) -> Result<SomaticRoc, String> {
     match value {
-        "strelka.snv.qss" | "strelka.snv.vqsr" | "strelka.snv" | "strelka.indel"
-        | "strelka.indel.evs" | "varscan2.snv" | "varscan2.indel" | "mutect.snv"
-        | "mutect.indel" => Ok(value.to_string()),
+        "strelka.snv.qss" => Ok(SomaticRoc::StrelkaSnvQss),
+        "strelka.snv.vqsr" => Ok(SomaticRoc::StrelkaSnvVqsr),
+        "strelka.snv" => Ok(SomaticRoc::StrelkaSnv),
+        "strelka.indel" => Ok(SomaticRoc::StrelkaIndel),
+        "strelka.indel.evs" => Ok(SomaticRoc::StrelkaIndelEvs),
+        "varscan2.snv" => Ok(SomaticRoc::Varscan2Snv),
+        "varscan2.indel" => Ok(SomaticRoc::Varscan2Indel),
+        "mutect.snv" => Ok(SomaticRoc::MutectSnv),
+        "mutect.indel" => Ok(SomaticRoc::MutectIndel),
         _ => Err(format!("unsupported somatic ROC mode '{value}'")),
     }
 }
@@ -1452,7 +1522,7 @@ impl From<SomaticArgs> for crate::application::SomaticArgs {
             explain_ambiguous: args.explain_ambiguous,
             include_nonpass: args.include_nonpass,
             fp_region_size: args.fp_region_size,
-            feature_table: args.feature_table,
+            feature_table: args.feature_table.map(|f| f.as_str().to_string()),
             happy_stats: args.happy_stats,
             bams: args.bams,
             normalize_truth: args.normalize_truth,
@@ -1463,7 +1533,7 @@ impl From<SomaticArgs> for crate::application::SomaticArgs {
             no_fixchr_truth: args.no_fixchr_truth,
             no_fixchr_query: args.no_fixchr_query,
             no_order_check: args.no_order_check,
-            roc: args.roc,
+            roc: args.roc.map(|r| r.as_str().to_string()),
             af_strat: args.af_strat,
             af_strat_binsize: args.af_strat_binsize,
             af_strat_truth: args.af_strat_truth,

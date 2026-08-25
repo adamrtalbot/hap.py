@@ -3,7 +3,7 @@
 use super::AnnotatedRow;
 use super::rows::{snp_bucket_label, subtype_label};
 use crate::adapters::vcf::Variant;
-use crate::domain::{CountsBucket, RawVcfRecord, TypeCounts};
+use crate::domain::{CountsBucket, FpClass, RawVcfRecord, TypeCounts};
 use std::collections::{BTreeMap, BTreeSet};
 
 struct ComparisonSamples<'a> {
@@ -131,9 +131,9 @@ pub(super) fn derive_fp_classes(
             continue;
         };
         let bucket = out.entry(variant_type.to_string()).or_default();
-        if class == "gt" {
+        if class == FpClass::Gt {
             bucket.0 += 1;
-        } else if class == "al" {
+        } else if class == FpClass::Al {
             bucket.1 += 1;
         }
     }
@@ -176,9 +176,9 @@ pub(super) fn derive_subset_fp_classes(
                 .or_default()
                 .entry(variant_type.to_string())
                 .or_default();
-            if class == "gt" {
+            if class == FpClass::Gt {
                 bucket.0 += 1;
-            } else if class == "al" {
+            } else if class == FpClass::Al {
                 bucket.1 += 1;
             }
         }
@@ -358,9 +358,9 @@ pub(super) fn derive_subtype_fp_classes(
                 .or_default()
                 .entry(subtype)
                 .or_default();
-            if class == "gt" {
+            if class == FpClass::Gt {
                 bucket.0 += 1;
-            } else if class == "al" {
+            } else if class == FpClass::Al {
                 bucket.1 += 1;
             }
         }
@@ -406,9 +406,9 @@ pub(super) fn derive_subset_subtype_fp_classes(
                     .or_default()
                     .entry(subtype.clone())
                     .or_default();
-                if class == "gt" {
+                if class == FpClass::Gt {
                     bucket.0 += 1;
-                } else if class == "al" {
+                } else if class == FpClass::Al {
                     bucket.1 += 1;
                 }
             }

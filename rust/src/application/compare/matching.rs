@@ -16,7 +16,7 @@ use super::{
     RegionState, SPLIT_LEFT_SHIFT_WINDOW, Side, row_matches_variant_key,
 };
 use crate::adapters::vcf::{Variant, VariantKey};
-use crate::domain::{Interval, TypeCounts};
+use crate::domain::{FpClass, Interval, TypeCounts, XcmpCtype};
 use anyhow::{Result, bail};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -417,7 +417,7 @@ pub(super) fn process_cluster(
                 &identical_exact_keys,
             );
         }
-        set_xcmp_context(&mut rows[output_start..], "simple:match", false);
+        set_xcmp_context(&mut rows[output_start..], XcmpCtype::SimpleMatch, false);
         return Ok(());
     }
 
@@ -658,15 +658,15 @@ pub(super) fn process_cluster(
         legacy_repetitive_indel_hap_promotions(cluster, &region_state)
     };
     let (mut xcmp_ctype, mut xcmp_hap_match) = if !allow_haplotype_match {
-        ("simple:mismatch", false)
+        (XcmpCtype::SimpleMismatch, false)
     } else if graph_failed || shared_insert_conflict {
-        ("hapfail:mismatch", false)
+        (XcmpCtype::HapfailMismatch, false)
     } else {
         match (&truth_sig, &query_sig) {
-            (Some(_), Some(_)) if is_match => ("hap:match", true),
-            (Some(_), Some(_)) => ("hap:mismatch", false),
-            _ if hap_mismatch => ("hap:mismatch", false),
-            _ => ("hapfail:mismatch", false),
+            (Some(_), Some(_)) if is_match => (XcmpCtype::HapMatch, true),
+            (Some(_), Some(_)) => (XcmpCtype::HapMismatch, false),
+            _ if hap_mismatch => (XcmpCtype::HapMismatch, false),
+            _ => (XcmpCtype::HapfailMismatch, false),
         }
     };
     if is_match {
@@ -748,7 +748,7 @@ pub(super) fn process_cluster(
                 );
             }
         }
-        xcmp_ctype = "hap:match";
+        xcmp_ctype = XcmpCtype::HapMatch;
         xcmp_hap_match = true;
     }
     // A residual lm/am allele makes the entire outside-CONF exact-pair part
@@ -780,7 +780,7 @@ pub(super) fn process_cluster(
             .iter()
             .any(annotated_row_has_unreconciled_allele)
     {
-        xcmp_ctype = "hap:mismatch";
+        xcmp_ctype = XcmpCtype::HapMismatch;
         xcmp_hap_match = false;
     }
     // pre.py emits unphased, decomposed truth records. When a decomposed SNP
@@ -801,11 +801,11 @@ pub(super) fn process_cluster(
 }
 
 pub(super) fn should_propagate_unreconciled_exact_rows(
-    xcmp_ctype: &str,
+    xcmp_ctype: XcmpCtype,
     residual_is_unreconciled: bool,
     genuine_drain_mismatch: bool,
 ) -> bool {
-    residual_is_unreconciled && (xcmp_ctype == "hap:mismatch" || genuine_drain_mismatch)
+    residual_is_unreconciled && (xcmp_ctype == XcmpCtype::HapMismatch || genuine_drain_mismatch)
 }
 
 pub(super) fn apply_legacy_preprocessed_snp_first_order(
@@ -814,8 +814,8 @@ pub(super) fn apply_legacy_preprocessed_snp_first_order(
 ) {
     let snp_first_positions = legacy_preprocessed_snp_first_positions(cluster);
     for row in rows {
-        if snp_first_positions.contains(&row.sort_key.1) {
-            row.sort_key.2 = usize::from(!annotated_row_is_snp(row));
+        if snp_first_positions.contains(&row.sort_key.pos) {
+            row.sort_key.side_rank = usize::from(!annotated_row_is_snp(row));
         }
     }
 }
@@ -828,11 +828,11 @@ pub(super) fn apply_legacy_combined_before_truth_only_order(rows: &mut [Annotate
             (samples.len() >= 2
                 && !samples[0].contains("NOCALL:nocall")
                 && !samples[1].contains("NOCALL:nocall"))
-            .then_some(row.sort_key.1)
+            .then_some(row.sort_key.pos)
         })
         .collect::<BTreeSet<_>>();
     for row in rows {
-        if !combined_positions.contains(&row.sort_key.1) {
+        if !combined_positions.contains(&row.sort_key.pos) {
             continue;
         }
         let raw = row.record.raw();
@@ -843,13 +843,13 @@ pub(super) fn apply_legacy_combined_before_truth_only_order(rows: &mut [Annotate
             && !raw.samples[0].contains("NOCALL:nocall")
             && !raw.samples[1].contains("NOCALL:nocall")
         {
-            row.sort_key.2 = 0;
+            row.sort_key.side_rank = 0;
         } else if raw
             .samples
             .get(1)
             .is_some_and(|sample| sample.contains("NOCALL:nocall"))
         {
-            row.sort_key.2 = 1;
+            row.sort_key.side_rank = 1;
         }
     }
 }
@@ -867,14 +867,14 @@ pub(super) fn apply_legacy_halfcall_order(rows: &mut [AnnotatedRow]) {
         })
         .collect::<BTreeSet<_>>();
     for row in rows {
-        if !halfcall_positions.contains(&row.sort_key.1) {
+        if !halfcall_positions.contains(&row.sort_key.pos) {
             continue;
         }
         let raw = row.record.raw();
         if raw.alt_allele == "." {
             // Legacy emits a matched/combined allele first, then its
             // spanning-deletion halfcall companion.
-            row.sort_key.2 = 2;
+            row.sort_key.side_rank = 2;
         } else if raw
             .samples
             .get(1)
@@ -882,7 +882,7 @@ pub(super) fn apply_legacy_halfcall_order(rows: &mut [AnnotatedRow]) {
         {
             // When both rows are truth-only, the halfcall precedes the
             // ordinary FN/UNK allele instead.
-            row.sort_key.2 = 3;
+            row.sort_key.side_rank = 3;
         } else if raw
             .samples
             .first()
@@ -891,7 +891,7 @@ pub(super) fn apply_legacy_halfcall_order(rows: &mut [AnnotatedRow]) {
             // With all three grains present at one locus, legacy orders the
             // halfcall, then the truth-only ordinary allele, then the
             // query-only residual allele.
-            row.sort_key.2 = 4;
+            row.sort_key.side_rank = 4;
         }
     }
 }
@@ -1201,7 +1201,7 @@ pub(super) fn same_single_alt_indel_edit(left: &Variant, right: &Variant) -> boo
     edit(left) == edit(right)
 }
 
-pub(super) fn set_xcmp_context(rows: &mut [AnnotatedRow], ctype: &'static str, hap_match: bool) {
+pub(super) fn set_xcmp_context(rows: &mut [AnnotatedRow], ctype: XcmpCtype, hap_match: bool) {
     for row in rows {
         row.xcmp_ctype = Some(ctype);
         row.xcmp_hap_match = hap_match;
@@ -3588,10 +3588,10 @@ pub(super) fn mixed_type_same_locus_keeps_indel_rows_separate(
 /// genotype mismatch) bump `FP.gt`; FP rows tagged `BK=lm` (locus match,
 /// allele mismatch) bump `FP.al`; everything else (novel FPs with `BK=.`)
 /// stays unclassified and is omitted from both columns.
-pub(super) fn fp_class_from_bk(bk: &str) -> Option<&'static str> {
+pub(super) fn fp_class_from_bk(bk: &str) -> Option<FpClass> {
     match bk {
-        "am" => Some("gt"),
-        "lm" => Some("al"),
+        "am" => Some(FpClass::Gt),
+        "lm" => Some(FpClass::Al),
         _ => None,
     }
 }

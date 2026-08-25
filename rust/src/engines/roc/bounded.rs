@@ -18,7 +18,7 @@ use crate::adapters::report::{
     EXTENDED_HEADER, append_stats_with_missing, empty_comparison_extended_lines, f1_score,
     format_count, full_repr_float, het_hom_ratio, metric_ratio, suffixed_report_path, ti_tv_ratio,
 };
-use crate::domain::{AnnotatedRow, CountsBucket};
+use crate::domain::{AnnotatedRow, CountsBucket, FpClass};
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -3903,9 +3903,9 @@ fn emit_contributions_with_options<
                     Some("TP") => counts.query_tp = bucket,
                     Some("FP") => {
                         counts.query_fp = bucket;
-                        if row.fp_class == Some("gt") {
+                        if row.fp_class == Some(FpClass::Gt) {
                             counts.fp_gt = 1;
-                        } else if row.fp_class == Some("al") {
+                        } else if row.fp_class == Some(FpClass::Al) {
                             counts.fp_al = 1;
                         }
                     }
@@ -4001,9 +4001,9 @@ fn emit_contributions_with_options<
                     Some("TP") => counts.query_tp = bucket,
                     Some("FP") => {
                         counts.query_fp = bucket;
-                        if row.fp_class == Some("gt") {
+                        if row.fp_class == Some(FpClass::Gt) {
                             counts.fp_gt = 1;
-                        } else if row.fp_class == Some("al") {
+                        } else if row.fp_class == Some(FpClass::Al) {
                             counts.fp_al = 1;
                         }
                     }
@@ -4887,6 +4887,7 @@ fn write_optional_gzip_csv(path: &Path, header: &str, rows: &RenderedRows) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::SortKey;
 
     #[test]
     fn substat_cursor_matches_public_roc_bucket_identity() -> Result<()> {
@@ -5069,7 +5070,7 @@ mod tests {
         samples: [&str; 2],
         regions: &str,
         query_pass: bool,
-        fp_class: Option<&'static str>,
+        fp_class: Option<FpClass>,
     ) -> AnnotatedRow {
         let [truth_sample, query_sample] = samples;
         let regions_tag = if regions.is_empty() {
@@ -5081,7 +5082,7 @@ mod tests {
             "{chrom}\t{pos}\t.\tA\tT\t{qual}\t.\tBS=1{regions_tag}\tGT:BD:BK:BI:BVT:BLT:QQ\t{truth_sample}\t{query_sample}"
         );
         AnnotatedRow {
-            sort_key: (chrom.to_string(), pos, 1, 0),
+            sort_key: SortKey::new(chrom.to_string(), pos, 1, 0),
             record: crate::domain::ComparisonRecord::fixture(&line),
             query_pass,
             fp_class,

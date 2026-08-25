@@ -4,7 +4,7 @@ use crate::adapters::vcf::{
 };
 use crate::application::roc_publication;
 use crate::application::{QuantifyArgs, ValidatedQuantifyArgs};
-use crate::domain::{AnnotatedRow, Interval, RawVcfRecord, TypeCounts};
+use crate::domain::{AnnotatedRow, FpClass, Interval, RawVcfRecord, SortKey, TypeCounts};
 use crate::engines::roc;
 use crate::output::{OutputTransaction, benchmark_artifacts, stratification_inputs};
 use anyhow::{Context, Result, bail};
@@ -65,7 +65,7 @@ struct ClassifiedVariant {
     status: String,
     passes_filter: bool,
     subsets: Vec<String>,
-    fp_class: Option<&'static str>,
+    fp_class: Option<FpClass>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -321,10 +321,10 @@ fn run_with_metric_indices_inner(
         let record = record?;
         let truth = benchmark_samples
             .truth
-            .and_then(|sample_index| classify_side(&record, sample_index));
+            .and_then(|sample_index| classify_side(record.raw(), sample_index));
         let query = benchmark_samples
             .query
-            .and_then(|sample_index| classify_side(&record, sample_index));
+            .and_then(|sample_index| classify_side(record.raw(), sample_index));
 
         if let Some(classified) = truth {
             record_truth(&mut all_counts, &classified);
@@ -435,15 +435,15 @@ fn run_with_metric_indices_inner(
         .enumerate()
         .filter_map(|(index, record)| match record {
             Err(error) => Some(Err(error)),
-            Ok(record) => match roc_record(&record, benchmark_samples) {
+            Ok(record) => match roc_record(record.raw(), benchmark_samples) {
                 None => None,
                 Some(record_for_roc) => Some(Ok(AnnotatedRow {
-                    sort_key: (record.chrom.clone(), record.pos, index, 0),
+                    sort_key: SortKey::new(record.raw().chrom.clone(), record.raw().pos, index, 0),
                     record: record_for_roc.into(),
-                    query_pass: record.is_pass(),
-                    fp_class: benchmark_samples
-                        .query
-                        .and_then(|sample_index| query_fp_class_for_sample(&record, sample_index)),
+                    query_pass: record.raw().is_pass(),
+                    fp_class: benchmark_samples.query.and_then(|sample_index| {
+                        query_fp_class_for_sample(record.raw(), sample_index)
+                    }),
                     xcmp_ctype: None,
                     xcmp_hap_match: false,
                 })),

@@ -178,13 +178,13 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
 
     for record in &mut records {
         let mut record = record.map_err(restore_legacy_genotype_error)?;
-        if record.samples.len() < header.sample_count {
+        if record.raw().samples.len() < header.sample_count {
             writeln!(
                 diagnostics,
                 "[E::vcf_parse_format] Number of columns at {}:{} does not match the number of samples ({} vs {})",
-                record.chrom,
-                record.pos,
-                record.samples.len(),
+                record.raw().chrom,
+                record.raw().pos,
+                record.raw().samples.len(),
                 header.sample_count
             )?;
             if !parsed_any_record || previous_record_failed_to_parse {
@@ -198,7 +198,7 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
             Ok(())
         })?;
 
-        if let Some(parse_error) = header.format_parse_error(&record) {
+        if let Some(parse_error) = header.format_parse_error(record.raw()) {
             if parse_error.extreme_value && !reported_extreme_format_value {
                 let integer_suffix = match parse_error.value_type {
                     HeaderValueType::Integer => " and set to missing",
@@ -207,14 +207,20 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
                 writeln!(
                     diagnostics,
                     "[W::vcf_parse_format] Extreme FORMAT/{} value encountered{} at {}:{}",
-                    parse_error.key, integer_suffix, record.chrom, record.pos
+                    parse_error.key,
+                    integer_suffix,
+                    record.raw().chrom,
+                    record.raw().pos
                 )?;
                 reported_extreme_format_value = true;
             }
             writeln!(
                 diagnostics,
                 "[E::vcf_parse_format] Invalid character '{}' in '{}' FORMAT field at {}:{}",
-                parse_error.invalid_character, parse_error.key, record.chrom, record.pos
+                parse_error.invalid_character,
+                parse_error.key,
+                record.raw().chrom,
+                record.raw().pos
             )?;
             if !parsed_any_record || previous_record_failed_to_parse {
                 break;
@@ -225,13 +231,13 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
         parsed_any_record = true;
         previous_record_failed_to_parse = false;
 
-        let translation_error = header.translation_error(&record, diagnostics)?;
+        let translation_error = header.translation_error(record.raw(), diagnostics)?;
         if translation_error != 0 {
             if args.check_bcf_errors {
                 bail!(
                     "Record at {}:{} will not translate into BCF. Check if the header is incomplete (error code {}). The header must have all contigs present as #contig entries (contrary to the htslib error message, tabix indexing is not sufficient), and all the INFO and FORMAT types must match the values in all records.",
-                    record.chrom,
-                    record.pos,
+                    record.raw().chrom,
+                    record.raw().pos,
                     translation_error
                 );
             }
@@ -239,7 +245,9 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
                 writeln!(
                     diagnostics,
                     "[W] Record at {}:{} will not translate into BCF. Check if the header is incomplete  (error code {}) -- all records like this are skipped.",
-                    record.chrom, record.pos, translation_error
+                    record.raw().chrom,
+                    record.raw().pos,
+                    translation_error
                 )?;
             }
             counts.warnings[WARNING_BCFERROR] += 1;
@@ -247,9 +255,9 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
         }
 
         let chrom = if reference_contigs.is_empty() {
-            record.chrom.clone()
+            record.raw().chrom.clone()
         } else {
-            vcf::normalize_chrom(&record.chrom, &reference_contigs)
+            vcf::normalize_chrom(&record.raw().chrom, &reference_contigs)
         };
         record.try_update(|raw| {
             raw.chrom = chrom;
@@ -259,25 +267,25 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
         if let Some(filters) = locations.as_deref()
             && !filters
                 .iter()
-                .any(|filter| filter.matches(&record.chrom, record.pos))
+                .any(|filter| filter.matches(&record.raw().chrom, record.raw().pos))
         {
             continue;
         }
         if let Some(bed) = regions.as_deref()
             && !bed
                 .iter()
-                .any(|interval| interval.matches(&record.chrom, record.pos))
+                .any(|interval| interval.matches(&record.raw().chrom, record.raw().pos))
         {
             continue;
         }
         if let Some(bed) = targets.as_deref()
             && !bed
                 .iter()
-                .any(|interval| interval.matches(&record.chrom, record.pos))
+                .any(|interval| interval.matches(&record.raw().chrom, record.raw().pos))
         {
             continue;
         }
-        if args.apply_filters && !record.is_pass() {
+        if args.apply_filters && !record.raw().is_pass() {
             continue;
         }
         if args.limit_records.is_some_and(|limit| {
@@ -286,9 +294,9 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
             break;
         }
 
-        let genotype = inspect_genotypes(&record)?;
+        let genotype = inspect_genotypes(record.raw())?;
         update_warning_counts(
-            &record,
+            record.raw(),
             &genotype,
             &mut previous,
             &mut counts,
@@ -296,18 +304,23 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
             args.all_warnings,
             diagnostics,
         )?;
-        update_record_counts(&record, &genotype, &mut counts, location_is_lowercase_x);
+        update_record_counts(
+            record.raw(),
+            &genotype,
+            &mut counts,
+            location_is_lowercase_x,
+        );
 
         if let Some(reference_sequences) = &reference_sequences
-            && let Some(reason) = validate_record(&record, reference_sequences)
+            && let Some(reason) = validate_record(record.raw(), reference_sequences)
             && let Some((_, errors)) = errors.as_mut()
         {
             writeln!(
                 errors,
                 "{}\t{}\t{}\t{}",
-                record.chrom,
-                record.pos.saturating_sub(1),
-                record.end_pos(),
+                record.raw().chrom,
+                record.raw().pos.saturating_sub(1),
+                record.raw().end_pos(),
                 reason
             )?;
         }
@@ -316,7 +329,12 @@ fn run_with_diagnostics_inner<W: Write + ?Sized>(
             .message_every
             .is_some_and(|every| every > 0 && counts.records.is_multiple_of(every as usize))
         {
-            writeln!(diagnostics, "[PROGRESS] {}:{}", record.chrom, record.pos)?;
+            writeln!(
+                diagnostics,
+                "[PROGRESS] {}:{}",
+                record.raw().chrom,
+                record.raw().pos
+            )?;
         }
         counts.records += 1;
     }

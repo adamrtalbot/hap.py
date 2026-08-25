@@ -1170,30 +1170,31 @@ impl Iterator for VariantReader<'_> {
                 Ok(record) => record,
                 Err(error) => return Some(Err(error)),
             };
-            if record.format.is_none() || record.samples.is_empty() {
+            if record.raw().format.is_none() || record.raw().samples.is_empty() {
                 return Some(Err(anyhow::anyhow!(
                     "VCF record has fewer than 10 fields in {}",
                     self.path.display()
                 )));
             }
-            let chrom = normalize_chrom(&record.chrom, self.reference_contigs);
+            let chrom = normalize_chrom(&record.raw().chrom, self.reference_contigs);
             let format_keys: Vec<&str> = record
+                .raw()
                 .format
                 .as_deref()
                 .unwrap_or_default()
                 .split(':')
                 .collect();
-            let sample_values: Vec<&str> = record.samples[0].split(':').collect();
+            let sample_values: Vec<&str> = record.raw().samples[0].split(':').collect();
             let gt = match extract_gt(&format_keys, &sample_values) {
                 Ok(gt) => gt.to_string(),
                 Err(error) => return Some(Err(error)),
             };
-            let effective_end = match record.effective_end_pos(self.path) {
+            let effective_end = match record.raw().effective_end_pos(self.path) {
                 Ok(end) => end,
                 Err(error) => return Some(Err(error)),
             };
 
-            let spanning_deletion = record.alt_allele == "*";
+            let spanning_deletion = record.raw().alt_allele == "*";
             let gt = if spanning_deletion {
                 gt.split_inclusive(['/', '|'])
                     .map(|token| {
@@ -1209,16 +1210,16 @@ impl Iterator for VariantReader<'_> {
             let variant = Variant {
                 key: VariantKey {
                     chrom,
-                    pos: record.pos,
-                    ref_allele: record.ref_allele.clone(),
+                    pos: record.raw().pos,
+                    ref_allele: record.raw().ref_allele.clone(),
                     alt_allele: if spanning_deletion {
                         ".".to_string()
                     } else {
-                        record.alt_allele.clone()
+                        record.raw().alt_allele.clone()
                     },
                 },
-                qual: canonical_qual(&record.qual).to_string(),
-                filter: record.filter.clone(),
+                qual: canonical_qual(&record.raw().qual).to_string(),
+                filter: record.raw().filter.clone(),
                 gt: canonical_gt(&gt),
             };
 

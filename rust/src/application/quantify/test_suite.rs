@@ -303,14 +303,14 @@ mod tests {
 
         assert_eq!(counts.by_type["SNP"].fp_gt, 1);
         assert_eq!(counts.by_type["SNP"].fp_al, 0);
-        assert_eq!(query_fp_class(&record), Some("gt"));
+        assert_eq!(query_fp_class(&record), Some(FpClass::Gt));
 
         let allele_mismatch = RawVcfRecord::from_line(
             "chr1\t4\t.\tA\tG\t50\tPASS\tBS=4\tGT:BD:BK:BI:BVT:BLT:QQ\t0/1:FN:.:ti:SNP:het:.\t0/1:FP:lm:ti:SNP:het:30",
             Path::new("rtg.vcf"),
         )
         .unwrap();
-        assert_eq!(query_fp_class(&allele_mismatch), Some("al"));
+        assert_eq!(query_fp_class(&allele_mismatch), Some(FpClass::Al));
     }
 
     #[test]
