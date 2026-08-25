@@ -1106,16 +1106,20 @@ fn write_legacy_roc_table(
                 add_legacy_level(
                     &mut table,
                     key,
-                    subtype,
-                    genotype,
-                    "*",
+                    RowLabel {
+                        subtype,
+                        genotype,
+                        qq: "*",
+                    },
                     &totals,
                     counts_only,
-                    subset_size,
-                    options.whole_reference_size.unwrap_or(subset_size),
-                    conf_size,
-                    &options.subset_sizes,
-                    &options.subset_confidence_sizes,
+                    &RowSizes {
+                        subset_size,
+                        whole_reference_size: options.whole_reference_size.unwrap_or(subset_size),
+                        conf_size,
+                        subset_sizes: &options.subset_sizes,
+                        subset_confidence_sizes: &options.subset_confidence_sizes,
+                    },
                 )?;
                 if !counts_only && options.output_rocs {
                     sort_passes += 1;
@@ -1135,16 +1139,22 @@ fn write_legacy_roc_table(
                         add_legacy_level(
                             &mut table,
                             key,
-                            subtype,
-                            genotype,
-                            &qq,
+                            RowLabel {
+                                subtype,
+                                genotype,
+                                qq: &qq,
+                            },
                             &level,
                             false,
-                            subset_size,
-                            options.whole_reference_size.unwrap_or(subset_size),
-                            conf_size,
-                            &options.subset_sizes,
-                            &options.subset_confidence_sizes,
+                            &RowSizes {
+                                subset_size,
+                                whole_reference_size: options
+                                    .whole_reference_size
+                                    .unwrap_or(subset_size),
+                                conf_size,
+                                subset_sizes: &options.subset_sizes,
+                                subset_confidence_sizes: &options.subset_confidence_sizes,
+                            },
                         )?;
                     }
                 }
@@ -1294,21 +1304,42 @@ fn legacy_levels_store(
     Ok(levels)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn add_legacy_level(
-    table: &mut LegacyRawTable,
-    key: &RowKey,
-    subtype: &str,
-    genotype: &str,
-    qq: &str,
-    counts: &Cumul,
-    counts_only: bool,
+/// The reference/confidence sizing columns every ROC row renders against.
+struct RowSizes<'a> {
     subset_size: usize,
     whole_reference_size: usize,
     conf_size: usize,
-    subset_sizes: &BTreeMap<String, usize>,
-    subset_confidence_sizes: &BTreeMap<String, usize>,
+    subset_sizes: &'a BTreeMap<String, usize>,
+    subset_confidence_sizes: &'a BTreeMap<String, usize>,
+}
+
+/// The subtype/genotype/QQ triple identifying one legacy raw-table level.
+struct RowLabel<'a> {
+    subtype: &'a str,
+    genotype: &'a str,
+    qq: &'a str,
+}
+
+fn add_legacy_level(
+    table: &mut LegacyRawTable,
+    key: &RowKey,
+    label: RowLabel<'_>,
+    counts: &Cumul,
+    counts_only: bool,
+    sizes: &RowSizes<'_>,
 ) -> Result<()> {
+    let RowLabel {
+        subtype,
+        genotype,
+        qq,
+    } = label;
+    let &RowSizes {
+        subset_size,
+        whole_reference_size,
+        conf_size,
+        subset_sizes,
+        subset_confidence_sizes,
+    } = sizes;
     let is_baseline = qq == "*";
     let row_key = if is_baseline || genotype == "*" {
         legacy_row_key(&key.ty, subtype, &key.filter, &key.subset, qq)
@@ -4482,11 +4513,13 @@ fn render_rows(
                 render_row(
                     key,
                     &emitted,
-                    config.subset_size,
-                    config.whole_reference_size,
-                    config.conf_size,
-                    config.subset_sizes,
-                    config.subset_confidence_sizes,
+                    &RowSizes {
+                        subset_size: config.subset_size,
+                        whole_reference_size: config.whole_reference_size,
+                        conf_size: config.conf_size,
+                        subset_sizes: config.subset_sizes,
+                        subset_confidence_sizes: config.subset_confidence_sizes,
+                    },
                     is_filter_tier && config.filter_counts_only,
                     config.ci_alpha,
                 )
@@ -4507,18 +4540,20 @@ fn render_rows(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_row(
     key: &RowKey,
     emitted: &EmittedRow,
-    subset_size: usize,
-    whole_reference_size: usize,
-    conf_size: usize,
-    subset_sizes: &BTreeMap<String, usize>,
-    subset_confidence_sizes: &BTreeMap<String, usize>,
+    sizes: &RowSizes<'_>,
     counts_only: bool,
     ci_alpha: f64,
 ) -> String {
+    let &RowSizes {
+        subset_size,
+        whole_reference_size,
+        conf_size,
+        subset_sizes,
+        subset_confidence_sizes,
+    } = sizes;
     let counts = &emitted.cum;
     let truth_total = counts.truth_total();
     let query_total = counts.query_total();
@@ -5027,17 +5062,16 @@ mod tests {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)] // Keeps row fixtures legible at each call site.
     fn annotated(
         chrom: &str,
         pos: usize,
         qual: &str,
-        truth_sample: &str,
-        query_sample: &str,
+        samples: [&str; 2],
         regions: &str,
         query_pass: bool,
         fp_class: Option<&'static str>,
     ) -> AnnotatedRow {
+        let [truth_sample, query_sample] = samples;
         let regions_tag = if regions.is_empty() {
             String::new()
         } else {
@@ -5073,8 +5107,7 @@ mod tests {
                 "chr1",
                 100,
                 "0",
-                "0/1:TP:gm:tv:SNP:het:500",
-                "0/1:TP:gm:tv:SNP:het:0",
+                ["0/1:TP:gm:tv:SNP:het:500", "0/1:TP:gm:tv:SNP:het:0"],
                 "",
                 true,
                 None,
@@ -5111,8 +5144,7 @@ mod tests {
                 "chr1",
                 100,
                 "10",
-                "0/1:TP:gm:tv:SNP:het:10",
-                "0/1:TP:gm:tv:SNP:het:10",
+                ["0/1:TP:gm:tv:SNP:het:10", "0/1:TP:gm:tv:SNP:het:10"],
                 "",
                 true,
                 None,
@@ -5121,8 +5153,7 @@ mod tests {
                 "chr1",
                 200,
                 "20",
-                "1/1:TP:gm:ti:SNP:homalt:20",
-                "1/1:TP:gm:ti:SNP:homalt:20",
+                ["1/1:TP:gm:ti:SNP:homalt:20", "1/1:TP:gm:ti:SNP:homalt:20"],
                 "",
                 true,
                 None,
@@ -5131,8 +5162,7 @@ mod tests {
                 "chr1",
                 300,
                 "30",
-                "0/1:TP:gm:ti:SNP:het:30",
-                "0/1:TP:gm:ti:SNP:het:30",
+                ["0/1:TP:gm:ti:SNP:het:30", "0/1:TP:gm:ti:SNP:het:30"],
                 "",
                 true,
                 None,
@@ -5141,8 +5171,7 @@ mod tests {
                 "chr1",
                 400,
                 ".",
-                "0/1:TP:gm:tv:SNP:het:.",
-                "0/1:TP:gm:tv:SNP:het:.",
+                ["0/1:TP:gm:tv:SNP:het:.", "0/1:TP:gm:tv:SNP:het:."],
                 "",
                 true,
                 None,
@@ -5193,8 +5222,7 @@ mod tests {
             "chr1",
             100,
             "42",
-            "0/1:TP:gm:tv:SNP:het:42",
-            "0/1:TP:gm:tv:SNP:het:42",
+            ["0/1:TP:gm:tv:SNP:het:42", "0/1:TP:gm:tv:SNP:het:42"],
             "CONF,TS_contained,EXTRA",
             true,
             None,
@@ -5242,11 +5270,13 @@ mod tests {
         let rendered = render_row(
             &key,
             &emitted,
-            100,
-            140,
-            50,
-            &subset_sizes,
-            &subset_confidence_sizes,
+            &RowSizes {
+                subset_size: 100,
+                whole_reference_size: 140,
+                conf_size: 50,
+                subset_sizes: &subset_sizes,
+                subset_confidence_sizes: &subset_confidence_sizes,
+            },
             false,
             0.0,
         );
@@ -5275,11 +5305,13 @@ mod tests {
         let without_confidence = render_row(
             &key,
             &emitted,
-            100,
-            140,
-            0,
-            &subset_sizes,
-            &subset_confidence_sizes,
+            &RowSizes {
+                subset_size: 100,
+                whole_reference_size: 140,
+                conf_size: 0,
+                subset_sizes: &subset_sizes,
+                subset_confidence_sizes: &subset_confidence_sizes,
+            },
             false,
             0.0,
         );
@@ -5337,8 +5369,7 @@ mod tests {
             "chr1",
             100,
             "42",
-            "0/1:TP:gm:i1_5:INDEL:het:42",
-            "0/1:TP:gm:i1_5:INDEL:het:42",
+            ["0/1:TP:gm:i1_5:INDEL:het:42", "0/1:TP:gm:i1_5:INDEL:het:42"],
             "",
             true,
             None,
@@ -5363,8 +5394,7 @@ mod tests {
                 "chr1",
                 100,
                 "42",
-                "0/1:TP:gm:tv:SNP:het:42",
-                "0/1:TP:gm:tv:SNP:het:42",
+                ["0/1:TP:gm:tv:SNP:het:42", "0/1:TP:gm:tv:SNP:het:42"],
                 "",
                 true,
                 None,
@@ -5373,8 +5403,7 @@ mod tests {
                 "chr1",
                 200,
                 "41",
-                "0/1:TP:gm:i1_5:INDEL:het:41",
-                "0/1:TP:gm:i1_5:INDEL:het:41",
+                ["0/1:TP:gm:i1_5:INDEL:het:41", "0/1:TP:gm:i1_5:INDEL:het:41"],
                 "",
                 true,
                 None,
@@ -5422,8 +5451,7 @@ mod tests {
                 "chr1",
                 100,
                 "42",
-                "0/1:TP:gm:tv:SNP:het:42",
-                "0/1:TP:gm:tv:SNP:het:42",
+                ["0/1:TP:gm:tv:SNP:het:42", "0/1:TP:gm:tv:SNP:het:42"],
                 "",
                 true,
                 None,
@@ -5432,8 +5460,7 @@ mod tests {
                 "chr1",
                 200,
                 "41",
-                "0/1:TP:gm:i1_5:INDEL:het:41",
-                "0/1:TP:gm:i1_5:INDEL:het:41",
+                ["0/1:TP:gm:i1_5:INDEL:het:41", "0/1:TP:gm:i1_5:INDEL:het:41"],
                 "",
                 true,
                 None,
@@ -5481,8 +5508,7 @@ mod tests {
             "chr1",
             100,
             "10",
-            "0/1:TP:gm:tv:SNP:het:10",
-            "0/1:TP:gm:tv:SNP:het:10",
+            ["0/1:TP:gm:tv:SNP:het:10", "0/1:TP:gm:tv:SNP:het:10"],
             "",
             false,
             None,
@@ -5512,8 +5538,7 @@ mod tests {
                 "chr1",
                 100,
                 "10",
-                "0/0:.:.:.:NOCALL:homref:.",
-                "0/1:UNK:gm:tv:SNP:het:10",
+                ["0/0:.:.:.:NOCALL:homref:.", "0/1:UNK:gm:tv:SNP:het:10"],
                 "",
                 true,
                 None,
@@ -5522,8 +5547,7 @@ mod tests {
                 "chr1",
                 200,
                 "100",
-                "0/0:.:.:.:NOCALL:homref:.",
-                "0/1:.:gm:tv:SNP:het:100",
+                ["0/0:.:.:.:NOCALL:homref:.", "0/1:.:gm:tv:SNP:het:100"],
                 "",
                 false,
                 None,
@@ -5554,8 +5578,7 @@ mod tests {
                 "chr1",
                 100,
                 "50",
-                "0/1:TP:gm:tv:SNP:het:50",
-                "0/1:TP:gm:tv:SNP:het:50",
+                ["0/1:TP:gm:tv:SNP:het:50", "0/1:TP:gm:tv:SNP:het:50"],
                 "",
                 true,
                 None,
@@ -5564,8 +5587,7 @@ mod tests {
                 "chr1",
                 200,
                 "40",
-                "0/1:FN:gm:tv:SNP:het:40",
-                "0/1:FN:gm:tv:SNP:het:40",
+                ["0/1:FN:gm:tv:SNP:het:40", "0/1:FN:gm:tv:SNP:het:40"],
                 "",
                 true,
                 None,
@@ -5574,8 +5596,7 @@ mod tests {
                 "chr1",
                 300,
                 "30",
-                "0/1:TP:gm:tv:SNP:het:30",
-                "0/1:TP:gm:tv:SNP:het:30",
+                ["0/1:TP:gm:tv:SNP:het:30", "0/1:TP:gm:tv:SNP:het:30"],
                 "",
                 true,
                 None,
@@ -5627,8 +5648,7 @@ mod tests {
                 "chr1",
                 100,
                 "30.0",
-                "0/1:TP:gm:tv:SNP:het:30",
-                "0/1:TP:gm:tv:SNP:het:30",
+                ["0/1:TP:gm:tv:SNP:het:30", "0/1:TP:gm:tv:SNP:het:30"],
                 "",
                 true,
                 None,
@@ -5637,8 +5657,7 @@ mod tests {
                 "chr1",
                 200,
                 "30.3",
-                "0/1:TP:gm:tv:SNP:het:30.3",
-                "0/1:TP:gm:tv:SNP:het:30.3",
+                ["0/1:TP:gm:tv:SNP:het:30.3", "0/1:TP:gm:tv:SNP:het:30.3"],
                 "",
                 true,
                 None,
@@ -5647,8 +5666,7 @@ mod tests {
                 "chr1",
                 300,
                 "30.6",
-                "0/1:TP:gm:tv:SNP:het:30.6",
-                "0/1:TP:gm:tv:SNP:het:30.6",
+                ["0/1:TP:gm:tv:SNP:het:30.6", "0/1:TP:gm:tv:SNP:het:30.6"],
                 "",
                 true,
                 None,
@@ -5657,8 +5675,7 @@ mod tests {
                 "chr1",
                 400,
                 "30.9",
-                "0/1:TP:gm:tv:SNP:het:30.9",
-                "0/1:TP:gm:tv:SNP:het:30.9",
+                ["0/1:TP:gm:tv:SNP:het:30.9", "0/1:TP:gm:tv:SNP:het:30.9"],
                 "",
                 true,
                 None,
@@ -5667,8 +5684,7 @@ mod tests {
                 "chr1",
                 500,
                 "31.2",
-                "0/1:TP:gm:tv:SNP:het:31.2",
-                "0/1:TP:gm:tv:SNP:het:31.2",
+                ["0/1:TP:gm:tv:SNP:het:31.2", "0/1:TP:gm:tv:SNP:het:31.2"],
                 "",
                 true,
                 None,
@@ -5696,8 +5712,7 @@ mod tests {
                 "chr1",
                 100,
                 "10",
-                "0/1:TP:gm:tv:SNP:het:10",
-                "0/1:TP:gm:tv:SNP:het:10",
+                ["0/1:TP:gm:tv:SNP:het:10", "0/1:TP:gm:tv:SNP:het:10"],
                 "",
                 true,
                 None,
@@ -5706,8 +5721,7 @@ mod tests {
                 "chr1",
                 200,
                 "20",
-                "0/1:TP:gm:ti:SNP:het:20",
-                "0/1:TP:gm:ti:SNP:het:20",
+                ["0/1:TP:gm:ti:SNP:het:20", "0/1:TP:gm:ti:SNP:het:20"],
                 "",
                 true,
                 None,
@@ -5716,8 +5730,7 @@ mod tests {
                 "chr1",
                 300,
                 "30",
-                "1/1:TP:gm:ti:SNP:homalt:30",
-                "1/1:TP:gm:ti:SNP:homalt:30",
+                ["1/1:TP:gm:ti:SNP:homalt:30", "1/1:TP:gm:ti:SNP:homalt:30"],
                 "",
                 true,
                 None,
@@ -5726,8 +5739,7 @@ mod tests {
                 "chr1",
                 400,
                 "40",
-                "0/1:TP:gm:tv:SNP:het:40",
-                "0/1:TP:gm:tv:SNP:het:40",
+                ["0/1:TP:gm:tv:SNP:het:40", "0/1:TP:gm:tv:SNP:het:40"],
                 "",
                 true,
                 None,
@@ -5752,8 +5764,7 @@ mod tests {
             "chr1",
             100,
             "90",
-            "0/1:TP:gm:tv:SNP:het:90",
-            "0/1:TP:gm:tv:SNP:het:90",
+            ["0/1:TP:gm:tv:SNP:het:90", "0/1:TP:gm:tv:SNP:het:90"],
             "",
             true,
             None,
@@ -5769,8 +5780,7 @@ mod tests {
             "chr1",
             200,
             "80",
-            "0/1:TP:gm:tv:SNP:het:80",
-            "0/1:TP:gm:tv:SNP:het:80",
+            ["0/1:TP:gm:tv:SNP:het:80", "0/1:TP:gm:tv:SNP:het:80"],
             "",
             true,
             None,
@@ -5817,8 +5827,7 @@ mod tests {
             "chr1",
             100,
             "90",
-            "0/1:TP:gm:tv:SNP:het:90",
-            "0/1:TP:gm:tv:SNP:het:90",
+            ["0/1:TP:gm:tv:SNP:het:90", "0/1:TP:gm:tv:SNP:het:90"],
             "",
             true,
             None,
@@ -5848,8 +5857,7 @@ mod tests {
             "chr1",
             100,
             "20",
-            "0/1:TP:gm:tv:SNP:het:20",
-            "0/1:TP:gm:tv:SNP:het:20",
+            ["0/1:TP:gm:tv:SNP:het:20", "0/1:TP:gm:tv:SNP:het:20"],
             "",
             false,
             None,
@@ -5882,8 +5890,7 @@ mod tests {
             "chr1",
             100,
             "20",
-            "0/1:TP:gm:tv:SNP:het:20",
-            "0/1:TP:gm:tv:SNP:het:20",
+            ["0/1:TP:gm:tv:SNP:het:20", "0/1:TP:gm:tv:SNP:het:20"],
             "",
             false,
             None,
@@ -5986,11 +5993,13 @@ mod tests {
         let rendered = render_row(
             &key,
             &emitted,
-            100,
-            140,
-            50,
-            &subset_sizes,
-            &subset_confidence_sizes,
+            &RowSizes {
+                subset_size: 100,
+                whole_reference_size: 140,
+                conf_size: 50,
+                subset_sizes: &subset_sizes,
+                subset_confidence_sizes: &subset_confidence_sizes,
+            },
             true,
             0.05,
         );

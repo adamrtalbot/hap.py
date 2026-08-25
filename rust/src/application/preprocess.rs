@@ -105,16 +105,45 @@ impl BlocksplitSelection {
     }
 }
 
+/// Cross-record deletion bookkeeping gathered during the input pre-scan and
+/// consumed during normalization. Legacy `VariantInput` tracks these five
+/// identity sets together, so they travel as one cohesive bundle.
+#[derive(Default)]
+struct DeletionSets {
+    following_spanning: HashSet<RecordIdentity>,
+    equal_floor_blocked: HashSet<RecordIdentity>,
+    released_mixed: HashSet<RecordIdentity>,
+    released_following: HashSet<RecordIdentity>,
+    mixed_deletion_merge_partners: HashSet<RecordIdentity>,
+}
+
+/// Per-run normalization configuration shared by the block-split workers and
+/// the single-threaded fallback. Every reference borrows caller-owned state for
+/// the duration of the normalization phase.
+struct NormalizeContext<'a> {
+    args: &'a PreprocessArgs,
+    gender: PreprocessGender,
+    leftshift: bool,
+    decompose: bool,
+    somatic_mode: Option<crate::application::SomaticGtMode>,
+    string_format_fields: &'a BTreeSet<String>,
+    reference_sequences: &'a std::collections::BTreeMap<String, String>,
+    deletions: &'a DeletionSets,
+}
+
 fn observe_following_spanning_deletions(
     record: &crate::domain::RawVcfRecord,
     mixed_deletions_by_position: &mut HashMap<(String, usize), Vec<(RecordIdentity, usize)>>,
     deletions_by_position: &mut HashMap<(String, usize), Vec<(usize, usize)>>,
-    following_spanning_deletions: &mut HashSet<RecordIdentity>,
-    equal_floor_blocked_deletions: &mut HashSet<RecordIdentity>,
-    released_mixed_deletions: &mut HashSet<RecordIdentity>,
-    released_following_deletions: &mut HashSet<RecordIdentity>,
-    mixed_deletion_merge_partners: &mut HashSet<RecordIdentity>,
+    sets: &mut DeletionSets,
 ) {
+    let DeletionSets {
+        following_spanning: following_spanning_deletions,
+        equal_floor_blocked: equal_floor_blocked_deletions,
+        released_mixed: released_mixed_deletions,
+        released_following: released_following_deletions,
+        mixed_deletion_merge_partners,
+    } = sets;
     if let Some(previous_position) = record.pos.checked_sub(1)
         && let Some(candidates) =
             mixed_deletions_by_position.get(&(record.chrom.clone(), previous_position))
@@ -360,11 +389,7 @@ fn run_inner(
         append_somatic_info_headers(&mut headers, sample_names);
     }
     let mut input_contigs = BTreeSet::new();
-    let mut following_spanning_deletions = HashSet::new();
-    let mut equal_floor_blocked_deletions = HashSet::new();
-    let mut released_following_deletions = HashSet::new();
-    let mut released_mixed_deletions = HashSet::new();
-    let mut mixed_deletion_merge_partners = HashSet::new();
+    let mut deletion_sets = DeletionSets::default();
     let mut mixed_deletions_by_position = HashMap::new();
     let mut deletions_by_position = HashMap::new();
     let mut haploid_x = false;
@@ -375,11 +400,7 @@ fn run_inner(
             &record,
             &mut mixed_deletions_by_position,
             &mut deletions_by_position,
-            &mut following_spanning_deletions,
-            &mut equal_floor_blocked_deletions,
-            &mut released_mixed_deletions,
-            &mut released_following_deletions,
-            &mut mixed_deletion_merge_partners,
+            &mut deletion_sets,
         );
         input_contigs.insert(record.chrom.clone());
         if args.gender == PreprocessGender::Auto {
@@ -441,22 +462,22 @@ fn run_inner(
     let phase_started = std::time::Instant::now();
     let declared_contigs = declared_contig_order(&headers, fixchr);
     let mut output = PreprocessSpool::new(normalization_enabled, job_count, &declared_contigs)?;
+    let ctx = NormalizeContext {
+        args: &args,
+        gender,
+        leftshift,
+        decompose,
+        somatic_mode,
+        string_format_fields: &string_format_fields,
+        reference_sequences,
+        deletions: &deletion_sets,
+    };
     if let Some(prepared_records) = prepared_records {
         process_blocksplit_jobs(
             prepared_records,
             &blocksplit_selection,
             effective_threads,
-            &args,
-            gender,
-            leftshift,
-            decompose,
-            somatic_mode,
-            &string_format_fields,
-            &reference_sequences,
-            &following_spanning_deletions,
-            &equal_floor_blocked_deletions,
-            &released_following_deletions,
-            &mixed_deletion_merge_partners,
+            &ctx,
             &mut output,
         )?;
     } else {
@@ -596,17 +617,7 @@ fn run_inner(
                         record,
                         symbolic_deletion,
                         &mut prev_end_by_chrom,
-                        &args,
-                        gender,
-                        leftshift,
-                        decompose,
-                        somatic_mode,
-                        &string_format_fields,
-                        reference_sequences,
-                        &following_spanning_deletions,
-                        &equal_floor_blocked_deletions,
-                        &released_following_deletions,
-                        &mixed_deletion_merge_partners,
+                        &ctx,
                         |record| output.push(record, job_index),
                     )?;
                 }
@@ -662,22 +673,11 @@ fn report_phase(name: &str, started: std::time::Instant) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_blocksplit_jobs(
     prepared_records: PreparedRecordSpool,
     selection: &BlocksplitSelection,
     threads: usize,
-    args: &PreprocessArgs,
-    gender: PreprocessGender,
-    leftshift: bool,
-    decompose: bool,
-    somatic_mode: Option<crate::application::SomaticGtMode>,
-    string_format_fields: &BTreeSet<String>,
-    reference_sequences: &std::collections::BTreeMap<String, String>,
-    following_spanning_deletions: &HashSet<RecordIdentity>,
-    equal_floor_blocked_deletions: &HashSet<RecordIdentity>,
-    released_following_deletions: &HashSet<RecordIdentity>,
-    mixed_deletion_merge_partners: &HashSet<RecordIdentity>,
+    ctx: &NormalizeContext<'_>,
     output: &mut PreprocessSpool,
 ) -> Result<()> {
     let job_count = selection.jobs.as_ref().map_or(1, Vec::len);
@@ -741,17 +741,7 @@ fn process_blocksplit_jobs(
                                 record,
                                 symbolic_deletion,
                                 &mut previous_ends,
-                                args,
-                                gender,
-                                leftshift,
-                                decompose,
-                                somatic_mode,
-                                string_format_fields,
-                                reference_sequences,
-                                following_spanning_deletions,
-                                equal_floor_blocked_deletions,
-                                released_following_deletions,
-                                mixed_deletion_merge_partners,
+                                ctx,
                                 |record| {
                                     sender.send((job_index, Ok(record))).map_err(|_| {
                                         anyhow::anyhow!("preprocess output receiver closed")
@@ -792,24 +782,30 @@ fn process_blocksplit_jobs(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_normalized_record(
     mut record: crate::domain::RawVcfRecord,
     symbolic_deletion: Option<SymbolicDeletionMaterialization>,
     prev_end_by_chrom: &mut std::collections::HashMap<String, usize>,
-    args: &PreprocessArgs,
-    gender: PreprocessGender,
-    leftshift: bool,
-    decompose: bool,
-    somatic_mode: Option<crate::application::SomaticGtMode>,
-    string_format_fields: &BTreeSet<String>,
-    reference_sequences: &std::collections::BTreeMap<String, String>,
-    following_spanning_deletions: &HashSet<RecordIdentity>,
-    equal_floor_blocked_deletions: &HashSet<RecordIdentity>,
-    released_following_deletions: &HashSet<RecordIdentity>,
-    mixed_deletion_merge_partners: &HashSet<RecordIdentity>,
+    ctx: &NormalizeContext<'_>,
     mut emit: impl FnMut(vcf::ValidatedVcfRecord) -> Result<()>,
 ) -> Result<()> {
+    let &NormalizeContext {
+        args,
+        gender,
+        leftshift,
+        decompose,
+        somatic_mode,
+        string_format_fields,
+        reference_sequences,
+        deletions,
+    } = ctx;
+    let DeletionSets {
+        following_spanning: following_spanning_deletions,
+        equal_floor_blocked: equal_floor_blocked_deletions,
+        released_following: released_following_deletions,
+        mixed_deletion_merge_partners,
+        ..
+    } = deletions;
     if args.convert_gvcf_to_vcf {
         ensure_missing_ad(&mut record);
     }

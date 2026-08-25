@@ -163,30 +163,67 @@ pub(crate) fn write_summary(
         .with_context(|| format!("failed to flush {}", path.display()))
 }
 
-#[allow(clippy::too_many_arguments)] // Each map is a distinct legacy report axis/tier.
+/// The full set of count tables the extended report renders, one ALL/PASS pair
+/// per aggregation axis. Every field borrows a map the caller already holds.
+pub(crate) struct ExtendedTables<'a> {
+    pub(crate) all_counts: &'a BTreeMap<String, TypeCounts>,
+    pub(crate) pass_counts: &'a BTreeMap<String, TypeCounts>,
+    pub(crate) all_subtype: &'a BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pub(crate) pass_subtype: &'a BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pub(crate) all_subset: &'a BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pub(crate) pass_subset: &'a BTreeMap<String, BTreeMap<String, TypeCounts>>,
+    pub(crate) all_subset_subtype:
+        &'a BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+    pub(crate) pass_subset_subtype:
+        &'a BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
+    pub(crate) all_fp: &'a BTreeMap<String, (usize, usize)>,
+    pub(crate) pass_fp: &'a BTreeMap<String, (usize, usize)>,
+    pub(crate) all_subset_fp: &'a BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    pub(crate) pass_subset_fp: &'a BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    pub(crate) all_subtype_fp: &'a BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    pub(crate) pass_subtype_fp: &'a BTreeMap<String, BTreeMap<String, (usize, usize)>>,
+    pub(crate) all_subset_subtype_fp: &'a SubsetSubtypeFpCounts,
+    pub(crate) pass_subset_subtype_fp: &'a SubsetSubtypeFpCounts,
+}
+
+/// Reference/confidence sizing inputs shared by every row of the report.
+#[derive(Clone, Copy)]
+pub(crate) struct ExtendedSizes {
+    pub(crate) subset_size: usize,
+    pub(crate) whole_reference_size: usize,
+    pub(crate) conf_size: usize,
+    pub(crate) has_conf_regions: bool,
+}
+
 pub(crate) fn write_extended(
     path: &Path,
-    all_counts: &BTreeMap<String, TypeCounts>,
-    pass_counts: &BTreeMap<String, TypeCounts>,
-    all_subtype: &BTreeMap<String, BTreeMap<String, TypeCounts>>,
-    pass_subtype: &BTreeMap<String, BTreeMap<String, TypeCounts>>,
-    subset_size: usize,
-    whole_reference_size: usize,
-    conf_size: usize,
-    has_conf_regions: bool,
-    all_subset: &BTreeMap<String, BTreeMap<String, TypeCounts>>,
-    pass_subset: &BTreeMap<String, BTreeMap<String, TypeCounts>>,
-    all_subset_subtype: &BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
-    pass_subset_subtype: &BTreeMap<String, BTreeMap<String, BTreeMap<String, TypeCounts>>>,
-    all_fp: &BTreeMap<String, (usize, usize)>,
-    pass_fp: &BTreeMap<String, (usize, usize)>,
-    all_subset_fp: &BTreeMap<String, BTreeMap<String, (usize, usize)>>,
-    pass_subset_fp: &BTreeMap<String, BTreeMap<String, (usize, usize)>>,
-    all_subtype_fp: &BTreeMap<String, BTreeMap<String, (usize, usize)>>,
-    pass_subtype_fp: &BTreeMap<String, BTreeMap<String, (usize, usize)>>,
-    all_subset_subtype_fp: &SubsetSubtypeFpCounts,
-    pass_subset_subtype_fp: &SubsetSubtypeFpCounts,
+    tables: &ExtendedTables<'_>,
+    sizes: ExtendedSizes,
 ) -> Result<()> {
+    let &ExtendedTables {
+        all_counts,
+        pass_counts,
+        all_subtype,
+        pass_subtype,
+        all_subset,
+        pass_subset,
+        all_subset_subtype,
+        pass_subset_subtype,
+        all_fp,
+        pass_fp,
+        all_subset_fp,
+        pass_subset_fp,
+        all_subtype_fp,
+        pass_subtype_fp,
+        all_subset_subtype_fp,
+        pass_subset_subtype_fp,
+    } = tables;
+    let ExtendedSizes {
+        subset_size,
+        whole_reference_size,
+        conf_size,
+        has_conf_regions,
+    } = sizes;
     let mut writer = BufWriter::new(
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
     );
@@ -698,7 +735,8 @@ pub(crate) fn append_ci_cells(
 #[cfg(test)]
 mod format_tests {
     use super::{
-        SubsetSubtypeFpCounts, format_ratio, full_repr_float, write_extended, write_summary,
+        ExtendedSizes, ExtendedTables, SubsetSubtypeFpCounts, format_ratio, full_repr_float,
+        write_extended, write_summary,
     };
     use crate::domain::TypeCounts;
     use std::collections::BTreeMap;
@@ -853,26 +891,30 @@ mod format_tests {
 
         write_extended(
             output.path(),
-            &counts,
-            &counts,
-            &nested_counts,
-            &nested_counts,
-            100,
-            100,
-            80,
-            true,
-            &subset_counts,
-            &subset_counts,
-            &subset_subtype_counts,
-            &subset_subtype_counts,
-            &fp_counts,
-            &fp_counts,
-            &nested_fp_counts,
-            &nested_fp_counts,
-            &nested_fp_counts,
-            &nested_fp_counts,
-            &subset_subtype_fp_counts,
-            &subset_subtype_fp_counts,
+            &ExtendedTables {
+                all_counts: &counts,
+                pass_counts: &counts,
+                all_subtype: &nested_counts,
+                pass_subtype: &nested_counts,
+                all_subset: &subset_counts,
+                pass_subset: &subset_counts,
+                all_subset_subtype: &subset_subtype_counts,
+                pass_subset_subtype: &subset_subtype_counts,
+                all_fp: &fp_counts,
+                pass_fp: &fp_counts,
+                all_subset_fp: &nested_fp_counts,
+                pass_subset_fp: &nested_fp_counts,
+                all_subtype_fp: &nested_fp_counts,
+                pass_subtype_fp: &nested_fp_counts,
+                all_subset_subtype_fp: &subset_subtype_fp_counts,
+                pass_subset_subtype_fp: &subset_subtype_fp_counts,
+            },
+            ExtendedSizes {
+                subset_size: 100,
+                whole_reference_size: 100,
+                conf_size: 80,
+                has_conf_regions: true,
+            },
         )
         .expect("write extended report");
 

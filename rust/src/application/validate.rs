@@ -657,7 +657,6 @@ fn inspect_genotypes(record: &RawVcfRecord) -> Result<RecordGenotypes> {
     Ok(result)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_warning_counts<W: Write + ?Sized>(
     record: &RawVcfRecord,
     genotype: &RecordGenotypes,

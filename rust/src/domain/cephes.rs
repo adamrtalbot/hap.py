@@ -672,6 +672,31 @@ pub(crate) fn incbet(aa: f64, bb: f64, xx: f64) -> f64 {
 // incbi — inverse of incbet.
 // ---------------------------------------------------------------------------
 
+/// The nine working variables of the Cephes `incbi` root finder, threaded by
+/// value through the ihalve/newton iterations so each function's mutations stay
+/// local exactly as in the original C.
+#[derive(Clone, Copy)]
+struct IncbiState {
+    a: f64,
+    b: f64,
+    x: f64,
+    x0: f64,
+    x1: f64,
+    yl: f64,
+    yh: f64,
+    y: f64,
+    y0: f64,
+}
+
+/// The invariant problem parameters (`incbi`'s original `a`, `b`, `y0`) that
+/// the rflg branch swaps back to.
+#[derive(Clone, Copy)]
+struct IncbiParams {
+    aa: f64,
+    bb: f64,
+    yy0: f64,
+}
+
 #[allow(clippy::assign_op_pattern)] // Keep the Cephes expression form unchanged.
 pub(crate) fn incbi(aa: f64, bb: f64, yy0: f64) -> f64 {
     if yy0 <= 0.0 {
@@ -703,7 +728,21 @@ pub(crate) fn incbi(aa: f64, bb: f64, yy0: f64) -> f64 {
         x = a / (a + b);
         y = incbet(a, b, x);
         return ihalve_loop(
-            a, b, x, x0, x1, yl, yh, y, y0, rflg, nflg, dithresh, aa, bb, yy0,
+            IncbiState {
+                a,
+                b,
+                x,
+                x0,
+                x1,
+                yl,
+                yh,
+                y,
+                y0,
+            },
+            rflg,
+            nflg,
+            dithresh,
+            IncbiParams { aa, bb, yy0 },
         );
     } else {
         dithresh = 1.0e-4;
@@ -736,12 +775,40 @@ pub(crate) fn incbi(aa: f64, bb: f64, yy0: f64) -> f64 {
         if yp.abs() < 0.2 {
             // goto newt directly (skip ihalve)
             return newton_then_maybe_ihalve(
-                a, b, x, x0, x1, yl, yh, y, y0, rflg, &mut nflg, dithresh, aa, bb, yy0,
+                IncbiState {
+                    a,
+                    b,
+                    x,
+                    x0,
+                    x1,
+                    yl,
+                    yh,
+                    y,
+                    y0,
+                },
+                rflg,
+                &mut nflg,
+                dithresh,
+                IncbiParams { aa, bb, yy0 },
             );
         }
     }
     ihalve_loop(
-        a, b, x, x0, x1, yl, yh, y, y0, rflg, nflg, dithresh, aa, bb, yy0,
+        IncbiState {
+            a,
+            b,
+            x,
+            x0,
+            x1,
+            yl,
+            yh,
+            y,
+            y0,
+        },
+        rflg,
+        nflg,
+        dithresh,
+        IncbiParams { aa, bb, yy0 },
     )
 }
 
@@ -757,24 +824,25 @@ fn apply_rflg(x: f64, rflg: bool) -> f64 {
 /// newton; on bracket-crossing-0.75 with rflg==1, restart with swapped
 /// a/b. On full 100-iter exhaust, return x (relaxed-threshold restart
 /// is handled by the newton-then-maybe-ihalve loop).
-#[allow(clippy::too_many_arguments)]
 fn ihalve_loop(
-    mut a: f64,
-    mut b: f64,
-    mut x: f64,
-    mut x0: f64,
-    mut x1: f64,
-    mut yl: f64,
-    mut yh: f64,
-    mut y: f64,
-    mut y0: f64,
+    state: IncbiState,
     mut rflg: bool,
     mut nflg: bool,
     dithresh: f64,
-    aa: f64,
-    bb: f64,
-    yy0: f64,
+    params: IncbiParams,
 ) -> f64 {
+    let IncbiState {
+        mut a,
+        mut b,
+        mut x,
+        mut x0,
+        mut x1,
+        mut yl,
+        mut yh,
+        mut y,
+        mut y0,
+    } = state;
+    let IncbiParams { aa, bb, yy0 } = params;
     'outer: loop {
         let mut dir: i32 = 0;
         let mut di: f64 = 0.5;
@@ -796,13 +864,41 @@ fn ihalve_loop(
                 if yp.abs() < dithresh {
                     // goto newt
                     return newton_then_maybe_ihalve(
-                        a, b, x, x0, x1, yl, yh, y, y0, rflg, &mut nflg, dithresh, aa, bb, yy0,
+                        IncbiState {
+                            a,
+                            b,
+                            x,
+                            x0,
+                            x1,
+                            yl,
+                            yh,
+                            y,
+                            y0,
+                        },
+                        rflg,
+                        &mut nflg,
+                        dithresh,
+                        params,
                     );
                 }
                 let yp = (y - y0) / y0;
                 if yp.abs() < dithresh {
                     return newton_then_maybe_ihalve(
-                        a, b, x, x0, x1, yl, yh, y, y0, rflg, &mut nflg, dithresh, aa, bb, yy0,
+                        IncbiState {
+                            a,
+                            b,
+                            x,
+                            x0,
+                            x1,
+                            yl,
+                            yh,
+                            y,
+                            y0,
+                        },
+                        rflg,
+                        &mut nflg,
+                        dithresh,
+                        params,
                     );
                 }
             }
@@ -868,7 +964,21 @@ fn ihalve_loop(
         }
         // Fall through to newt (which will run since nflg still false).
         return newton_then_maybe_ihalve(
-            a, b, x, x0, x1, yl, yh, y, y0, rflg, &mut nflg, dithresh, aa, bb, yy0,
+            IncbiState {
+                a,
+                b,
+                x,
+                x0,
+                x1,
+                yl,
+                yh,
+                y,
+                y0,
+            },
+            rflg,
+            &mut nflg,
+            dithresh,
+            params,
         );
     }
 }
@@ -876,24 +986,24 @@ fn ihalve_loop(
 /// Run the Newton iteration. If it converges, return. If not,
 /// re-enter ihalve_loop with relaxed dithresh; on second visit
 /// to newton, nflg is true so it returns immediately.
-#[allow(clippy::too_many_arguments)]
 fn newton_then_maybe_ihalve(
-    a: f64,
-    b: f64,
-    mut x: f64,
-    mut x0: f64,
-    mut x1: f64,
-    mut yl: f64,
-    mut yh: f64,
-    mut y: f64,
-    y0: f64,
+    state: IncbiState,
     rflg: bool,
     nflg: &mut bool,
     _dithresh: f64,
-    aa: f64,
-    bb: f64,
-    yy0: f64,
+    params: IncbiParams,
 ) -> f64 {
+    let IncbiState {
+        a,
+        b,
+        mut x,
+        mut x0,
+        mut x1,
+        mut yl,
+        mut yh,
+        mut y,
+        y0,
+    } = state;
     if *nflg {
         return apply_rflg(x, rflg);
     }
@@ -954,7 +1064,21 @@ fn newton_then_maybe_ihalve(
     // Did not converge: relax dithresh and restart ihalve.
     let dithresh = 256.0 * MACHEP;
     ihalve_loop(
-        a, b, x, x0, x1, yl, yh, y, y0, rflg, *nflg, dithresh, aa, bb, yy0,
+        IncbiState {
+            a,
+            b,
+            x,
+            x0,
+            x1,
+            yl,
+            yh,
+            y,
+            y0,
+        },
+        rflg,
+        *nflg,
+        dithresh,
+        params,
     )
 }
 

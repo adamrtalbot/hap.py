@@ -272,10 +272,12 @@ fn run_with_metric_indices_inner(
     let (transformed, input_contigs) = spool_quantified_records(
         records,
         &headers,
-        annotation_type,
+        streaming::QuantifyAnnotation {
+            annotation_type,
+            mode,
+            benchmark_samples,
+        },
         &args,
-        mode,
-        benchmark_samples,
         confidence.as_deref(),
         &stratifications,
     )?;

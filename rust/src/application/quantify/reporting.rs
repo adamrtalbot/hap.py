@@ -166,11 +166,13 @@ pub(super) fn write_quantify_extended(
                 .get(variant_type)
                 .cloned()
                 .unwrap_or_default(),
-            options.subset_size,
-            0,
-            &confidence_size,
-            options.qq_field,
-            options.ci_alpha,
+            &ExtendedRowContext {
+                subset_size: options.subset_size,
+                subset_level: 0,
+                conf_size: &confidence_size,
+                qq_field: options.qq_field,
+                ci_alpha: options.ci_alpha,
+            },
         )?;
 
         for subset in &subsets {
@@ -203,15 +205,17 @@ pub(super) fn write_quantify_extended(
                 subset,
                 all,
                 pass,
-                subset_size_for_row,
-                options
-                    .stratification_levels
-                    .get(subset)
-                    .copied()
-                    .unwrap_or(0),
-                &subset_confidence_size,
-                options.qq_field,
-                options.ci_alpha,
+                &ExtendedRowContext {
+                    subset_size: subset_size_for_row,
+                    subset_level: options
+                        .stratification_levels
+                        .get(subset)
+                        .copied()
+                        .unwrap_or(0),
+                    conf_size: &subset_confidence_size,
+                    qq_field: options.qq_field,
+                    ci_alpha: options.ci_alpha,
+                },
             )?;
         }
 
@@ -236,11 +240,13 @@ pub(super) fn write_quantify_extended(
                     "*",
                     all,
                     pass,
-                    options.subset_size,
-                    0,
-                    &confidence_size,
-                    options.qq_field,
-                    options.ci_alpha,
+                    &ExtendedRowContext {
+                        subset_size: options.subset_size,
+                        subset_level: 0,
+                        conf_size: &confidence_size,
+                        qq_field: options.qq_field,
+                        ci_alpha: options.ci_alpha,
+                    },
                 )?;
                 for subset in &subsets {
                     let (subset_size_for_row, subset_confidence_size) = named_subset_report_sizes(
@@ -274,15 +280,17 @@ pub(super) fn write_quantify_extended(
                         subset,
                         all,
                         pass,
-                        subset_size_for_row,
-                        options
-                            .stratification_levels
-                            .get(subset)
-                            .copied()
-                            .unwrap_or(0),
-                        &subset_confidence_size,
-                        options.qq_field,
-                        options.ci_alpha,
+                        &ExtendedRowContext {
+                            subset_size: subset_size_for_row,
+                            subset_level: options
+                                .stratification_levels
+                                .get(subset)
+                                .copied()
+                                .unwrap_or(0),
+                            conf_size: &subset_confidence_size,
+                            qq_field: options.qq_field,
+                            ci_alpha: options.ci_alpha,
+                        },
                     )?;
                 }
             }
@@ -318,7 +326,16 @@ pub(super) fn named_subset_report_sizes(
     (subset_size, subset_confidence_size)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Row-layout context shared by every extended-table row: the subset sizing
+/// columns, the QQ field label, and the confidence-interval alpha.
+pub(super) struct ExtendedRowContext<'a> {
+    pub(super) subset_size: usize,
+    pub(super) subset_level: usize,
+    pub(super) conf_size: &'a str,
+    pub(super) qq_field: &'a str,
+    pub(super) ci_alpha: f64,
+}
+
 pub(super) fn write_extended_pair<W: Write>(
     writer: &mut W,
     variant_type: &str,
@@ -326,42 +343,13 @@ pub(super) fn write_extended_pair<W: Write>(
     subset: &str,
     all: QuantifyTypeCounts,
     pass: QuantifyTypeCounts,
-    subset_size: usize,
-    subset_level: usize,
-    conf_size: &str,
-    qq_field: &str,
-    ci_alpha: f64,
+    layout: &ExtendedRowContext<'_>,
 ) -> Result<()> {
-    write_extended_row(
-        writer,
-        variant_type,
-        subtype,
-        subset,
-        "ALL",
-        &all,
-        subset_size,
-        subset_level,
-        conf_size,
-        qq_field,
-        ci_alpha,
-    )?;
-    write_extended_row(
-        writer,
-        variant_type,
-        subtype,
-        subset,
-        "PASS",
-        &pass,
-        subset_size,
-        subset_level,
-        conf_size,
-        qq_field,
-        ci_alpha,
-    )?;
+    write_extended_row(writer, variant_type, subtype, subset, "ALL", &all, layout)?;
+    write_extended_row(writer, variant_type, subtype, subset, "PASS", &pass, layout)?;
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn write_extended_row<W: Write>(
     writer: &mut W,
     variant_type: &str,
@@ -369,12 +357,15 @@ pub(super) fn write_extended_row<W: Write>(
     subset: &str,
     filter: &str,
     stats: &QuantifyTypeCounts,
-    subset_size: usize,
-    subset_level: usize,
-    conf_size: &str,
-    qq_field: &str,
-    ci_alpha: f64,
+    layout: &ExtendedRowContext<'_>,
 ) -> Result<()> {
+    let &ExtendedRowContext {
+        subset_size,
+        subset_level,
+        conf_size,
+        qq_field,
+        ci_alpha,
+    } = layout;
     let supports_titv = variant_type == "SNP";
     let mut row = vec![
         variant_type.to_string(),

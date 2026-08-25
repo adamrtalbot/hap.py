@@ -456,17 +456,27 @@ pub(super) fn tp_single_side_row(
 /// Legacy emits BD=FN on truth, BD=FP on query, BK=am on both. Record QUAL
 /// is the maximum call QUAL, while query QQ retains the query's own score
 /// for downstream ROC enumeration.
-#[allow(clippy::too_many_arguments)] // Mirrors the two-sample legacy VCF row contract.
+/// Per-sample benchmark decision codes carried on a combined FN/FP row:
+/// the truth and query `BD` tags plus the shared `BK` match kind.
+pub(super) struct BenchmarkDecision<'a> {
+    pub(super) truth_bd: &'static str,
+    pub(super) query_bd: &'static str,
+    pub(super) bk: &'a str,
+}
+
 pub(super) fn fn_fp_combined_row(
     truth: &Variant,
     query: &Variant,
     reference: &str,
     block_start: usize,
     regions: &str,
-    truth_bd: &'static str,
-    query_bd: &'static str,
-    bk: &str,
+    decision: &BenchmarkDecision<'_>,
 ) -> AnnotatedRow {
+    let &BenchmarkDecision {
+        truth_bd,
+        query_bd,
+        bk,
+    } = decision;
     let projected_query = legacy_duplicate_alt_query_output_projection(query);
     let query = projected_query.as_ref();
     // Per-sample BI: legacy emits each sample's `BI` based on the alleles

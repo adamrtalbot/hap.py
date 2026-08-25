@@ -342,6 +342,12 @@ fn table_json_with_indices(
     let mut out = String::new();
     out.push_str("{\"data\":[");
     out.push_str(&index_column_json(rows.len(), indices));
+    let table_context = ColumnTableContext {
+        header: &header,
+        rows: &rows,
+        ci_alpha,
+        ratio_overrides,
+    };
     for (column, name) in header.iter().enumerate() {
         out.push(',');
         let values = rows
@@ -349,16 +355,7 @@ fn table_json_with_indices(
             .map(|row| row.get(column).map(String::as_str).unwrap_or(""))
             .collect::<Vec<_>>();
         let kind = legacy_column_type(id, name, &values);
-        out.push_str(&column_json(
-            name,
-            name,
-            kind,
-            &values,
-            &header,
-            &rows,
-            ci_alpha,
-            ratio_overrides,
-        ));
+        out.push_str(&column_json(name, name, kind, &values, table_context));
     }
     out.push_str("],\"properties\":[],\"type\":\"Table\",\"id\":");
     out.push_str(&json_string(id));
@@ -425,16 +422,29 @@ fn legacy_column_type(table: &str, column: &str, values: &[&str]) -> &'static st
     }
 }
 
+/// Table-wide inputs that every column in a `Table` node renders against.
+/// Constant across the column loop, so they travel as one borrowed bundle.
+#[derive(Clone, Copy)]
+struct ColumnTableContext<'a> {
+    header: &'a [String],
+    rows: &'a [Vec<String>],
+    ci_alpha: Option<f64>,
+    ratio_overrides: Option<&'a RatioOverrides>,
+}
+
 fn column_json(
     id: &str,
     label: &str,
     kind: &str,
     values: &[&str],
-    header: &[String],
-    rows: &[Vec<String>],
-    ci_alpha: Option<f64>,
-    ratio_overrides: Option<&RatioOverrides>,
+    ctx: ColumnTableContext<'_>,
 ) -> String {
+    let ColumnTableContext {
+        header,
+        rows,
+        ci_alpha,
+        ratio_overrides,
+    } = ctx;
     let rendered = values
         .iter()
         .enumerate()
@@ -979,10 +989,12 @@ mod tests {
             "thresholds",
             "double",
             &values,
-            &[],
-            &rows,
-            None,
-            None,
+            ColumnTableContext {
+                header: &[],
+                rows: &rows,
+                ci_alpha: None,
+                ratio_overrides: None,
+            },
         );
         assert_eq!(
             json,

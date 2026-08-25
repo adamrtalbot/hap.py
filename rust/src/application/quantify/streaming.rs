@@ -18,20 +18,32 @@ use std::io::{BufWriter, Write};
 
 const MAX_QUANTIFY_SUPERLOCUS_RECORDS: usize = 1_000_000;
 
-#[allow(clippy::too_many_arguments)]
+/// Annotation settings shared by the quantify streaming pass: which annotation
+/// dialect to write, the mode toggles that gate legacy quirks, and which
+/// samples carry benchmark decisions.
+#[derive(Clone, Copy)]
+pub(super) struct QuantifyAnnotation<'a> {
+    pub(super) annotation_type: &'a str,
+    pub(super) mode: CompareQuantifyMode,
+    pub(super) benchmark_samples: BenchmarkSamples,
+}
+
 pub(super) fn spool_quantified_records<I>(
     records: I,
     headers: &[String],
-    annotation_type: &str,
+    annotation: QuantifyAnnotation<'_>,
     args: &QuantifyArgs,
-    mode: CompareQuantifyMode,
-    benchmark_samples: BenchmarkSamples,
     confidence: Option<&[crate::domain::Interval]>,
     stratifications: &RegionMap,
 ) -> Result<(tempfile::NamedTempFile, BTreeSet<String>)>
 where
     I: IntoIterator<Item = Result<ValidatedVcfRecord>>,
 {
+    let QuantifyAnnotation {
+        annotation_type,
+        mode,
+        benchmark_samples,
+    } = annotation;
     let mut spool = tempfile::NamedTempFile::new().context("failed to create quantify spool")?;
     let qq_is_string = annotation_type == "ga4gh" && ga4gh_qq_is_string(headers);
     let mut input_contigs = BTreeSet::new();
@@ -80,10 +92,8 @@ where
                 flush_quantify_group(
                     &mut writer,
                     &mut group,
-                    annotation_type,
+                    annotation,
                     args,
-                    mode,
-                    benchmark_samples,
                     confidence.is_some(),
                 )?;
             }
@@ -100,10 +110,8 @@ where
                 flush_quantify_group(
                     &mut writer,
                     &mut group,
-                    annotation_type,
+                    annotation,
                     args,
-                    mode,
-                    benchmark_samples,
                     confidence.is_some(),
                 )?;
             }
@@ -111,10 +119,8 @@ where
         flush_quantify_group(
             &mut writer,
             &mut group,
-            annotation_type,
+            annotation,
             args,
-            mode,
-            benchmark_samples,
             confidence.is_some(),
         )?;
         writer.flush()?;
@@ -123,16 +129,18 @@ where
     Ok((spool, input_contigs))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn flush_quantify_group(
     writer: &mut dyn Write,
     group: &mut Vec<ValidatedVcfRecord>,
-    annotation_type: &str,
+    annotation: QuantifyAnnotation<'_>,
     args: &QuantifyArgs,
-    mode: CompareQuantifyMode,
-    benchmark_samples: BenchmarkSamples,
     has_confidence: bool,
 ) -> Result<()> {
+    let QuantifyAnnotation {
+        annotation_type,
+        mode,
+        benchmark_samples,
+    } = annotation;
     if group.is_empty() {
         return Ok(());
     }

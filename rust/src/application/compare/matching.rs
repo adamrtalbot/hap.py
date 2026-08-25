@@ -6,8 +6,8 @@ use super::genotype::{equivalent_gt, parse_gt_alleles};
 use super::legacy_graph;
 use super::metrics::{add_variant_stats, add_variant_stats_subtype};
 use super::rows::{
-    bk_for_row, cluster_query_filter, compute_shift_target, fn_fp_combined_row, fn_row,
-    fp_like_row, gt_selected_nonref_alts, legacy_duplicate_alt_query_output_projection,
+    BenchmarkDecision, bk_for_row, cluster_query_filter, compute_shift_target, fn_fp_combined_row,
+    fn_row, fp_like_row, gt_selected_nonref_alts, legacy_duplicate_alt_query_output_projection,
     split_query_primitives_with_neighbors, tp_combined_row, tp_single_side_row, trim_variant,
     try_split_same_anchor_via_shift, unk_combined_row, unk_truth_row,
 };
@@ -3372,9 +3372,11 @@ pub(super) fn mark_cluster_mismatch(
             reference,
             cluster.start,
             &region_state.row_tags(Some(truth), Some(query)),
-            truth_bd,
-            query_bd,
-            bk,
+            &BenchmarkDecision {
+                truth_bd,
+                query_bd,
+                bk,
+            },
         ));
     }
     for (ti, truth) in cluster.truth.iter().enumerate() {

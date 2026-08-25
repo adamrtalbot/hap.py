@@ -2160,24 +2160,28 @@ mod tests {
     ) {
         let mut pending = HashMap::new();
         let mut deletion_ends = HashMap::new();
-        let mut spanning = HashSet::new();
-        let mut equal_floor = HashSet::new();
-        let mut released_mixed = HashSet::new();
-        let mut released_following = HashSet::new();
-        let mut merge_partners = HashSet::new();
+        let mut sets = DeletionSets::default();
         for record in records {
             observe_following_spanning_deletions(
                 record,
                 &mut pending,
                 &mut deletion_ends,
-                &mut spanning,
-                &mut equal_floor,
-                &mut released_mixed,
-                &mut released_following,
-                &mut merge_partners,
+                &mut sets,
             );
         }
-        (spanning, equal_floor, released_following, merge_partners)
+        let DeletionSets {
+            following_spanning,
+            equal_floor_blocked,
+            released_following,
+            mixed_deletion_merge_partners,
+            ..
+        } = sets;
+        (
+            following_spanning,
+            equal_floor_blocked,
+            released_following,
+            mixed_deletion_merge_partners,
+        )
     }
 
     fn record_at(pos: usize, reference: &str, alternate: &str) -> RawVcfRecord {

@@ -6,7 +6,6 @@ use super::genotype::expand_haploid_gt;
 use crate::domain::RawVcfRecord;
 use crate::engines::partial_credit;
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_left_shift(record: &mut RawVcfRecord, reference: &[u8], neighbor_end: usize) {
     let ref_len = record.ref_allele.len();
     if ref_len == 0 {

@@ -453,6 +453,14 @@ pub(super) struct ActiveComparisonMetadata {
     pub(super) query: Option<ComparisonMetadataCursor>,
 }
 
+/// Collection settings for one metadata sweep: whether to keep INFO, which QQ
+/// field drives ROC decorations, and whether to record filtered truth keys.
+pub(super) struct CollectOptions<'a> {
+    pub(super) preserve_info: bool,
+    pub(super) roc_field: &'a str,
+    pub(super) collect_filtered: bool,
+}
+
 impl ComparisonMetadataCursor {
     pub(super) fn open(spool: &ComparisonContigSpool) -> Result<Self> {
         Ok(Self {
@@ -463,7 +471,6 @@ impl ComparisonMetadataCursor {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn collect(
         &mut self,
         chrom: &str,
@@ -471,10 +478,13 @@ impl ComparisonMetadataCursor {
         end: usize,
         filtered_truth_keys: &mut BTreeSet<VariantKey>,
         decorations: &mut DecorationIndex,
-        preserve_info: bool,
-        roc_field: &str,
-        collect_filtered: bool,
+        options: CollectOptions<'_>,
     ) -> Result<()> {
+        let CollectOptions {
+            preserve_info,
+            roc_field,
+            collect_filtered,
+        } = options;
         if start.saturating_add(COMPARISON_METADATA_LOOKBEHIND) < self.furthest_start {
             bail!(
                 "comparison metadata range for {chrom}:{start}-{end} moved more than {} bases behind the streaming cursor",

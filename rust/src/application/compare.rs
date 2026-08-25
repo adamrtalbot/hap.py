@@ -1024,9 +1024,11 @@ fn run_inner(
                     emitted_end,
                     &mut filtered_truth_keys,
                     &mut decorations,
-                    args.preserve_info,
-                    &args.roc,
-                    true,
+                    spool::CollectOptions {
+                        preserve_info: args.preserve_info,
+                        roc_field: &args.roc,
+                        collect_filtered: true,
+                    },
                 )?;
             }
             if needs_decoration && let Some(query_cursor) = &mut metadata.query {
@@ -1036,9 +1038,11 @@ fn run_inner(
                     emitted_end,
                     &mut filtered_truth_keys,
                     &mut decorations,
-                    args.preserve_info,
-                    &args.roc,
-                    false,
+                    spool::CollectOptions {
+                        preserve_info: args.preserve_info,
+                        roc_field: &args.roc,
+                        collect_filtered: false,
+                    },
                 )?;
             }
             for mut row in cluster_rows {
@@ -1088,26 +1092,30 @@ fn run_inner(
     if write_counts {
         report::write_extended(
             &suffixed_report_path(prefix, "extended.csv"),
-            &tallies.all_counts,
-            &tallies.pass_counts,
-            &tallies.all_subtype,
-            &tallies.pass_subtype,
-            subset_size,
-            whole_reference_size,
-            conf_size,
-            conf_bed.is_some(),
-            &tallies.all_subset,
-            &tallies.pass_subset,
-            &tallies.all_subset_subtype,
-            &tallies.pass_subset_subtype,
-            &tallies.all_fp,
-            &tallies.pass_fp,
-            &tallies.all_subset_fp,
-            &tallies.pass_subset_fp,
-            &tallies.all_subtype_fp,
-            &tallies.pass_subtype_fp,
-            &tallies.all_subset_subtype_fp,
-            &tallies.pass_subset_subtype_fp,
+            &report::ExtendedTables {
+                all_counts: &tallies.all_counts,
+                pass_counts: &tallies.pass_counts,
+                all_subtype: &tallies.all_subtype,
+                pass_subtype: &tallies.pass_subtype,
+                all_subset: &tallies.all_subset,
+                pass_subset: &tallies.pass_subset,
+                all_subset_subtype: &tallies.all_subset_subtype,
+                pass_subset_subtype: &tallies.pass_subset_subtype,
+                all_fp: &tallies.all_fp,
+                pass_fp: &tallies.pass_fp,
+                all_subset_fp: &tallies.all_subset_fp,
+                pass_subset_fp: &tallies.pass_subset_fp,
+                all_subtype_fp: &tallies.all_subtype_fp,
+                pass_subtype_fp: &tallies.pass_subtype_fp,
+                all_subset_subtype_fp: &tallies.all_subset_subtype_fp,
+                pass_subset_subtype_fp: &tallies.pass_subset_subtype_fp,
+            },
+            report::ExtendedSizes {
+                subset_size,
+                whole_reference_size,
+                conf_size,
+                has_conf_regions: conf_bed.is_some(),
+            },
         )?;
     }
     let vcf_headers = build_vcf_headers(

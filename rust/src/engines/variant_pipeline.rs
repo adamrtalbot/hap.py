@@ -137,16 +137,20 @@ pub(crate) fn primitive_split_with_context(
             if let Some(rec) = primitive_to_record(
                 record,
                 &prim,
-                target,
-                ad_index,
-                gt_index,
-                &format_keys,
                 reference,
-                preserve_mixed_anchor,
-                was_realigned,
-                previous_end,
-                has_following_spanning_deletion,
-                equal_floor_blocked,
+                &SampleProjection {
+                    target,
+                    ad_index,
+                    gt_index,
+                    format_keys: &format_keys,
+                    was_realigned,
+                },
+                &AnchorContext {
+                    preserve_mixed_anchor,
+                    previous_end,
+                    has_following_spanning_deletion,
+                    equal_floor_blocked,
+                },
             ) {
                 let mut rec = rec;
                 rec.mixed_edit_primitive = preserve_mixed_anchor;
@@ -397,20 +401,44 @@ fn allele_primitives(record: &RawVcfRecord, alt: &str, reference: &[u8]) -> Vec<
 /// SNP primitives stay at their reported position. AD is projected to
 /// `[AD[0], AD[target_index]]` and GT canonicalised to the het / hom-alt
 /// shape that matches legacy's per-allele split.
-fn primitive_to_record(
-    record: &RawVcfRecord,
-    prim: &RefVar,
+/// Per-sample GT/AD projection inputs for one split allele.
+struct SampleProjection<'a> {
     target: u32,
     ad_index: Option<usize>,
     gt_index: Option<usize>,
-    format_keys: &[String],
-    reference: &[u8],
-    preserve_mixed_anchor: bool,
+    format_keys: &'a [String],
     was_realigned: bool,
+}
+
+/// Left-anchor bookkeeping that decides how a deletion or insertion primitive
+/// anchors against its preceding record.
+struct AnchorContext {
+    preserve_mixed_anchor: bool,
     previous_end: usize,
     has_following_spanning_deletion: bool,
     equal_floor_blocked: bool,
+}
+
+fn primitive_to_record(
+    record: &RawVcfRecord,
+    prim: &RefVar,
+    reference: &[u8],
+    projection: &SampleProjection<'_>,
+    anchor: &AnchorContext,
 ) -> Option<RawVcfRecord> {
+    let &SampleProjection {
+        target,
+        ad_index,
+        gt_index,
+        format_keys,
+        was_realigned,
+    } = projection;
+    let &AnchorContext {
+        preserve_mixed_anchor,
+        previous_end,
+        has_following_spanning_deletion,
+        equal_floor_blocked,
+    } = anchor;
     let mut out = record.clone();
     let reflen_i = (prim.end as i64) - (prim.start as i64) + 1;
     let altlen = prim.alt.len();
