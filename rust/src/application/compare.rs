@@ -430,6 +430,13 @@ impl RegionState {
                 variant_is_conf(query, reference, cluster.start, cluster.end, conf_bed);
             if parent_covered {
                 state.covered_query.insert(query.key.clone());
+                // `mark_cluster_mismatch` decomposes a covered duplicate-alt
+                // deletion aggregate into two single-alt het copies; register
+                // that collapsed key here so those copies inherit the parent's
+                // confident-region membership (chr6:91567856).
+                if let Some([copy, _]) = split_matched_deletion_aggregate(query, &cluster.truth) {
+                    state.covered_query.insert(copy.key);
+                }
             }
 
             // Per-primitive coverage: legacy's QuantifyRegions::annotate

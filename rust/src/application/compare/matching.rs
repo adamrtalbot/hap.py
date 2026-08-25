@@ -2095,6 +2095,74 @@ fn query_duplicate_alt_aggregate_has_conflicting_neighbor(
     })
 }
 
+/// Legacy renders a query duplicate-alt DELETION aggregate (`X,X` selecting
+/// both indices, X shorter than ref) that faces a truth homalt for the same
+/// deletion as TWO het rows: one deletion copy allele-matches the truth
+/// (combined FN:am/FP:am row) and the other is excess (FP:lm). Its graph
+/// aligns one homozygous truth-deletion haplotype to the clean query
+/// haplotype and leaves the copy sharing a haplotype with a conflicting
+/// neighbour unmatched. Duplicate-alt INSERTION aggregates stay collapsed as
+/// one homalt FP:lm row (chr1:150042104, chr3:30297039, chr7:68324852,
+/// chr13:74256688 all measured that way), so this fires for deletions only.
+///
+/// Rewriting the aggregate into `[X 0/1, X 1/0]` lets the existing pairing
+/// loop bind the `0/1` copy to the truth homalt as `am` (its selected
+/// multiset `[X]` differs from the truth's `[X, X]`, so the genotype-mismatch
+/// gate passes) while the `1/0` copy falls through to the unpaired-query
+/// emitter and picks up `lm` from `bk_for_row`. The `0/1` copy is listed
+/// first so the pairing loop's first-match `break` binds it, matching
+/// legacy's `0/1` on the am row and `1/0` on the standalone FP.
+/// chr6:91567856 (HG003 DeepVariant): truth `TC>T 1/1`, query `TC>T,T 1/2`
+/// beside a `T>A 1/0` SNP.
+pub(super) fn split_matched_deletion_aggregate(
+    query: &Variant,
+    truth: &[Variant],
+) -> Option<[Variant; 2]> {
+    let alts: Vec<&str> = query.key.alt_allele.split(',').collect();
+    let [left, right] = alts.as_slice() else {
+        return None;
+    };
+    if left != right {
+        return None;
+    }
+    let alt = *left;
+    // Deletion only — an insertion aggregate stays collapsed as one homalt row.
+    if alt.len() >= query.key.ref_allele.len() {
+        return None;
+    }
+    let selected: BTreeSet<usize> = parse_gt_alleles(&query.gt).into_iter().collect();
+    if selected != BTreeSet::from([1, 2]) {
+        return None;
+    }
+    // A truth homalt for exactly this deletion must exist in the block — that
+    // homozygous truth haplotype is what makes one query copy an allele match.
+    let has_truth_homalt = truth.iter().any(|t| {
+        t.key.chrom == query.key.chrom
+            && t.key.pos == query.key.pos
+            && t.key.ref_allele == query.key.ref_allele
+            && t.key.alt_allele == alt
+            && {
+                let gt = parse_gt_alleles(&t.gt);
+                !gt.is_empty() && gt.iter().all(|allele| *allele == 1)
+            }
+    });
+    if !has_truth_homalt {
+        return None;
+    }
+    let make = |gt: &str| Variant {
+        key: VariantKey {
+            chrom: query.key.chrom.clone(),
+            pos: query.key.pos,
+            ref_allele: query.key.ref_allele.clone(),
+            alt_allele: alt.to_string(),
+        },
+        qual: query.qual.clone(),
+        filter: query.filter.clone(),
+        gt: gt.to_string(),
+    };
+    Some([make("0/1"), make("1/0")])
+}
+
 /// True iff `split_query_primitives(query)` would fan the record into
 /// multiple per-primitive rows. Two paths qualify:
 ///
@@ -3267,6 +3335,37 @@ pub(super) fn mark_cluster_mismatch(
         subtype_counts,
         rows,
     } = outputs;
+    // Decompose query duplicate-alt DELETION aggregates that face a truth
+    // homalt into two het copies (`0/1` am-copy first, `1/0` lm-copy) so the
+    // pairing loop below binds one as `am` and the other emits as an `lm` FP,
+    // mirroring legacy at chr6:91567856. Insertion aggregates are untouched.
+    let decomposed_cluster;
+    let cluster = {
+        let mut changed = false;
+        let mut new_query = Vec::with_capacity(cluster.query.len());
+        for query in &cluster.query {
+            match split_matched_deletion_aggregate(query, &cluster.truth) {
+                Some([am_copy, lm_copy]) => {
+                    new_query.push(am_copy);
+                    new_query.push(lm_copy);
+                    changed = true;
+                }
+                None => new_query.push(query.clone()),
+            }
+        }
+        if changed {
+            decomposed_cluster = Cluster {
+                chrom: cluster.chrom.clone(),
+                start: cluster.start,
+                end: cluster.end,
+                truth: cluster.truth.clone(),
+                query: new_query,
+            };
+            &decomposed_cluster
+        } else {
+            cluster
+        }
+    };
     // Same-locus FN+FP pairs: when a truth record and a query record
     // share chrom/pos/ref/alt set but disagree on genotype (e.g. truth
     // 0|1 het vs query 1/1 homalt), legacy emits a single combined row

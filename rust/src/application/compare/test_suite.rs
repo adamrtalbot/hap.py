@@ -2227,6 +2227,91 @@ mod memory_guards {
     }
 
     #[test]
+    fn duplicate_alt_deletion_aggregate_splits_into_am_pair_and_lm_copy() {
+        // chr6:91567856 (HG003 DeepVariant), rebased onto the real TC-microsat
+        // reference slice (91567800-91568050). Truth is a homozygous deletion
+        // `TC>T`; pre.py aggregates the query into `T>A 1/0` + `TC>T,T 2/1` — a
+        // duplicate-alt DELETION aggregate beside a SNP.
+        //
+        // Legacy decomposes the aggregate into two het copies: one deletion
+        // copy allele-matches the truth homalt (combined FN:am/FP:am row) and
+        // the other is an excess FP:lm; the SNP is a separate FP:lm. The
+        // measured pinned-oracle rows at pos 57 are (query sample):
+        //   TC>T 1/1 FN:am | 0/1 FP:am     (combined)
+        //   T>A          | 1/0 FP:lm       (SNP)
+        //   TC>T         | 1/0 FP:lm       (excess deletion copy)
+        // hap-rs previously collapsed the aggregate into one `1/1 FP:lm:homalt`
+        // row and left the truth as a standalone FN:lm.
+        let reference_slice = "TCTAACTCTGTTTCTCTCTCTCTCTCTAACTCTGTTTCTCTCTCTCTCTCTCTCTCTCGCTCCTGCTTTCACCACATGATTTTCCTGCTCCCACTTCACTTTCTGCCATGATTGTAAGCTTTTTGAGGCCCTCACCAGAAGCTGAGCAGATGCTGGTGCCATGCTTATATGGCCTGCAGAACTGTAATCCAATTTAACCTCTTTTCTTTATCAATTACCCAGACTCAGATATTTCTTTGTAGCAACTCAAG";
+        let reference = BTreeMap::from([("chr6".to_string(), reference_slice.to_string())]);
+        // The `1/2` / `2/1` spelling of the aggregate is phase-only; both must
+        // decompose identically (the gate is `selected == {1, 2}`).
+        for aggregate_gt in ["2/1", "1/2"] {
+            let cluster = Cluster {
+                chrom: "chr6".to_string(),
+                start: 55,
+                end: 57,
+                truth: vec![variant(55, "TC", "T", "1/1"), variant(57, "TC", "T", "1/1")],
+                query: vec![
+                    variant(55, "TC", "T", "1/1"),
+                    variant(57, "T", "A", "1/0"),
+                    variant(57, "TC", "T,T", aggregate_gt),
+                ],
+            };
+            let mut counts = BTreeMap::new();
+            let mut subtype_counts = BTreeMap::new();
+            let mut rows = Vec::new();
+            process_cluster(
+                &cluster,
+                &reference,
+                None,
+                ComparisonConfig {
+                    no_hc: false,
+                    max_enum: 100_000,
+                    hb_expand: 0,
+                },
+                &mut counts,
+                &mut subtype_counts,
+                &mut rows,
+            )
+            .unwrap();
+
+            let lines: Vec<String> = rows.iter().map(|row| row.record.raw().to_line()).collect();
+            let at_57: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.split('\t').nth(1) == Some("57"))
+                .collect();
+            // Combined am row: truth deletion FN, query one copy FP, BK=am.
+            assert_eq!(
+                at_57
+                    .iter()
+                    .filter(|line| line.contains(":FN:am:") && line.contains(":FP:am:"))
+                    .count(),
+                1,
+                "{aggregate_gt}: one combined FN:am/FP:am deletion row expected, got {at_57:?}"
+            );
+            // Excess deletion copy + SNP: two separate FP:lm rows.
+            assert_eq!(
+                at_57.iter().filter(|line| line.contains(":FP:lm:")).count(),
+                2,
+                "{aggregate_gt}: excess deletion copy and SNP must each be FP:lm, got {at_57:?}"
+            );
+            // The aggregate must not survive as one collapsed homalt FP row, and
+            // the truth must not fall through to a standalone FN:lm.
+            assert!(
+                !at_57
+                    .iter()
+                    .any(|line| line.contains(":FP:lm:d1_5:INDEL:homalt:")),
+                "{aggregate_gt}: deletion aggregate must not collapse to a homalt FP row, got {at_57:?}"
+            );
+            assert!(
+                !at_57.iter().any(|line| line.contains(":FN:lm:")),
+                "{aggregate_gt}: truth homalt must am-pair, not emit standalone FN:lm, got {at_57:?}"
+            );
+        }
+    }
+
+    #[test]
     fn matched_insert_subst_conflict_does_not_suppress_adjacent_compound_het_mismatch() {
         // Broad-germline shape (reduced from GRCh37 HG002 7:130838422). Anchor
         // 100 carries a compound-het insertion pair: truth spells it as two
