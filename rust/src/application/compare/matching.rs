@@ -544,7 +544,15 @@ pub(super) fn process_cluster(
         (Some(left), Some(right)) if left.intersection(right).next().is_some()
     );
     let graph_failed = allow_haplotype_match && (truth_sig.is_none() || query_sig.is_none());
-    let is_match = signatures_overlap && !overlapping_deletion_mismatch && !graph_failed;
+    // The overlapping-deletion GT discordance is a mismatch-promotion signal,
+    // not a match veto. When the truth and query signature sets share a diploid
+    // haplotype pair, legacy's DiploidCompare returns hap:match regardless of
+    // the deletion-overlap shape, so `is_match` keys off the signatures alone.
+    // `overlapping_deletion_mismatch` still promotes an *unmatched* block to
+    // BK=lm via `hap_mismatch` below (chr20 fixture drains to hapfail without
+    // it); it just no longer overrides a genuine match (HG003 DeepVariant
+    // chr11:7757959 adjacent/compound INDEL block, which legacy resolves gm).
+    let is_match = signatures_overlap && !graph_failed;
     // Legacy's `ctype == "hap:mismatch"` fires only when the block-level
     // haplotype comparator actually ran (both signatures computed) AND
     // the two sides disagreed. A None signature — hapcmp skipped on the
