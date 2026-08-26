@@ -117,6 +117,55 @@ struct DeletionSets {
     mixed_deletion_merge_partners: HashSet<RecordIdentity>,
 }
 
+/// Per-chromosome left-shift state carried across records during normalization.
+///
+/// `prev_end` is the running maximum reference end feeding the primitive
+/// splitter (unchanged legacy semantics). The remaining fields compute the
+/// left-shift floor — how far left a record may slide — as the maximum of:
+///
+/// * `barrier`: the end of a *non-insertion* record (deletion / substitution /
+///   complex) at a strictly earlier original position. A left-shift may not
+///   cross a base another variant deleted or changed.
+/// * substitution ends at the *same* original position: a SNP sharing a
+///   position with a deletion still blocks it (chr21:9920194). These come from
+///   `NormalizeContext::substitution_end_by_position`, pre-scanned so the
+///   barrier is order-invariant regardless of which record is listed first.
+///
+/// A pure insertion never floors anything, and records at the same position do
+/// not floor each other unless one is a substitution — so a colocated het
+/// insertion + deletion both reach their shared anchor and the location
+/// aggregator re-merges them into one het-alt, order-invariantly.
+/// `group_pos`/`pending` stage the current position's non-insertion end until a
+/// later position commits it into `barrier`.
+#[derive(Clone, Copy, Default)]
+struct ShiftFloors {
+    prev_end: usize,
+    barrier: usize,
+    group_pos: usize,
+    pending: usize,
+}
+
+/// A pure insertion extends the REF prefix on every ALT — it adds bases without
+/// deleting or changing any, so it never blocks a neighbour's left-shift.
+fn record_is_pure_insertion(record: &crate::domain::RawVcfRecord) -> bool {
+    let reference = record.ref_allele.as_bytes();
+    record
+        .alt_allele
+        .split(',')
+        .all(|alt| alt.len() > reference.len() && alt.as_bytes().starts_with(reference))
+}
+
+/// A substitution changes an existing reference base (SNP, MNP, complex): some
+/// ALT is neither a REF prefix (deletion) nor a REF-prefixed extension
+/// (insertion). These block a left-shift even at the same position.
+fn record_is_substitution(record: &crate::domain::RawVcfRecord) -> bool {
+    let reference = record.ref_allele.as_bytes();
+    record.alt_allele.split(',').any(|alt| {
+        let alt = alt.as_bytes();
+        !alt.starts_with(reference) && !reference.starts_with(alt)
+    })
+}
+
 /// Per-run normalization configuration shared by the block-split workers and
 /// the single-threaded fallback. Every reference borrows caller-owned state for
 /// the duration of the normalization phase.
@@ -129,6 +178,11 @@ struct NormalizeContext<'a> {
     string_format_fields: &'a BTreeSet<String>,
     reference_sequences: &'a std::collections::BTreeMap<String, String>,
     deletions: &'a DeletionSets,
+    /// Greatest reference end of a substitution at each `(chrom, pos)`. A
+    /// deletion sharing a position with a SNP is floored here regardless of the
+    /// two records' input order, so the barrier stays order-invariant
+    /// (chr21:9920194). Built in the single input pre-scan.
+    substitution_end_by_position: &'a HashMap<(String, usize), usize>,
 }
 
 fn observe_following_spanning_deletions(
@@ -392,6 +446,7 @@ fn run_inner(
     let mut deletion_sets = DeletionSets::default();
     let mut mixed_deletions_by_position = HashMap::new();
     let mut deletions_by_position = HashMap::new();
+    let mut substitution_end_by_position: HashMap<(String, usize), usize> = HashMap::new();
     let mut haploid_x = false;
     let mut diploid_x = false;
     for record in input {
@@ -402,6 +457,14 @@ fn run_inner(
             &mut deletions_by_position,
             &mut deletion_sets,
         );
+        if record_is_substitution(record.raw()) {
+            let raw = record.raw();
+            let end = raw.pos + raw.ref_allele.len().max(1) - 1;
+            substitution_end_by_position
+                .entry((raw.chrom.clone(), raw.pos))
+                .and_modify(|current| *current = (*current).max(end))
+                .or_insert(end);
+        }
         input_contigs.insert(record.raw().chrom.clone());
         if args.gender == PreprocessGender::Auto {
             observe_gender(record.raw(), &mut haploid_x, &mut diploid_x);
@@ -471,6 +534,7 @@ fn run_inner(
         string_format_fields: &string_format_fields,
         reference_sequences,
         deletions: &deletion_sets,
+        substitution_end_by_position: &substitution_end_by_position,
     };
     if let Some(prepared_records) = prepared_records {
         process_blocksplit_jobs(
@@ -489,7 +553,7 @@ fn run_inner(
             let mut normalized_seen = HashSet::new();
             // Each legacy partial-credit job owns an independent left-shift
             // boundary, so overlapping jobs must process their copies separately.
-            let mut prev_end_by_chrom: std::collections::HashMap<String, usize> =
+            let mut prev_end_by_chrom: std::collections::HashMap<String, ShiftFloors> =
                 std::collections::HashMap::new();
             let mut prepared_record_index = 0usize;
             for record in vcf::open_validated_vcf(input_path)? {
@@ -717,7 +781,8 @@ fn process_blocksplit_jobs(
                     if job_index >= job_count {
                         break;
                     }
-                    let mut previous_ends = std::collections::HashMap::new();
+                    let mut previous_ends: std::collections::HashMap<String, ShiftFloors> =
+                        std::collections::HashMap::new();
                     let mut reader = match prepared_records.reader() {
                         Ok(reader) => reader,
                         Err(error) => {
@@ -785,7 +850,7 @@ fn process_blocksplit_jobs(
 fn process_normalized_record(
     mut record: crate::domain::RawVcfRecord,
     symbolic_deletion: Option<SymbolicDeletionMaterialization>,
-    prev_end_by_chrom: &mut std::collections::HashMap<String, usize>,
+    prev_end_by_chrom: &mut std::collections::HashMap<String, ShiftFloors>,
     ctx: &NormalizeContext<'_>,
     mut emit: impl FnMut(vcf::ValidatedVcfRecord) -> Result<()>,
 ) -> Result<()> {
@@ -798,6 +863,7 @@ fn process_normalized_record(
         string_format_fields,
         reference_sequences,
         deletions,
+        substitution_end_by_position,
     } = ctx;
     let DeletionSets {
         following_spanning: following_spanning_deletions,
@@ -907,7 +973,31 @@ fn process_normalized_record(
     // Capture before record is potentially consumed by vec![record].
     let record_chrom = record.chrom.clone();
     let orig_end = record.pos + record.ref_allele.len().max(1) - 1;
-    let prev_end = prev_end_by_chrom.get(&record_chrom).copied().unwrap_or(0);
+    let record_pos = record.pos;
+    let is_pure_insertion = record_is_pure_insertion(&record);
+    let is_substitution = record_is_substitution(&record);
+    let floors = prev_end_by_chrom.entry(record_chrom.clone()).or_default();
+    // Advancing to a strictly later position commits the previous position's
+    // non-insertion end into the barrier and clears the staged term.
+    if record_pos > floors.group_pos {
+        floors.barrier = floors.barrier.max(floors.pending);
+        floors.group_pos = record_pos;
+        floors.pending = 0;
+    }
+    let prev_end = floors.prev_end;
+    // A substitution at this position floors a shifting record here (a SNP
+    // blocks a colocated deletion). Substitutions do not left-shift themselves,
+    // so they don't consult it. The lookup is pre-scanned, so it is independent
+    // of whether the SNP or the deletion is listed first.
+    let same_position_substitution = if is_substitution {
+        0
+    } else {
+        substitution_end_by_position
+            .get(&(record_chrom.clone(), record_pos))
+            .copied()
+            .unwrap_or(0)
+    };
+    let leftshift_floor = floors.barrier.max(same_position_substitution);
     let release_leftshift_floor = released_following_deletions.contains(&(
         record.chrom.clone(),
         record.pos,
@@ -989,7 +1079,7 @@ fn process_normalized_record(
                 if release_leftshift_floor {
                     extend_record_left(&mut split, reference.as_bytes());
                 } else {
-                    apply_left_shift(&mut split, reference.as_bytes(), prev_end);
+                    apply_left_shift(&mut split, reference.as_bytes(), leftshift_floor);
                 }
             }
             canonicalize_multi_allelic_order(&mut split);
@@ -1010,12 +1100,15 @@ fn process_normalized_record(
             )?)?;
         }
     }
-    // Advance the per-chromosome boundary so the next variant cannot
-    // left-shift into this record's reference span.
-    prev_end_by_chrom
-        .entry(record_chrom)
-        .and_modify(|end| *end = (*end).max(orig_end))
-        .or_insert(orig_end);
+    // Advance the per-chromosome boundaries. `prev_end` tracks every record's
+    // span for the primitive splitter. A non-insertion contributes its end to
+    // the current position group, committed into `barrier` at the next
+    // position; same-position substitution floors come from the pre-scan.
+    let floors = prev_end_by_chrom.entry(record_chrom).or_default();
+    floors.prev_end = floors.prev_end.max(orig_end);
+    if !is_pure_insertion {
+        floors.pending = floors.pending.max(orig_end);
+    }
     Ok(())
 }
 

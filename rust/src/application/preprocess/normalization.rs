@@ -17,8 +17,13 @@ pub(super) fn apply_left_shift(record: &mut RawVcfRecord, reference: &[u8], neig
         end,
         alt: record.alt_allele.clone(),
     };
-    // neighbor_end is the reference end of the previous record: don't allow
-    // left-shifting into that span (mirrors legacy partialcredit.py behaviour).
+    // `neighbor_end` is the reference end of the nearest preceding
+    // reference-altering variant (SNP/MNP/deletion/complex) at a strictly
+    // earlier position. A left-shift may not cross a base another variant has
+    // changed or removed, so it stops there. Pure insertions never contribute
+    // to this floor: they add bases without altering the run, so colocated or
+    // repeat-run insertions and deletions still slide to the shared anchor for
+    // the downstream location aggregator to re-merge into one het-alt record.
     let pos_min = record
         .pos
         .saturating_sub(LEFT_SHIFT_WINDOW)

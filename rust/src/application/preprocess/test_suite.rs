@@ -2222,6 +2222,37 @@ mod tests {
     }
 
     #[test]
+    fn left_shift_barrier_classification() {
+        // Pure insertions and pure deletions leave their anchor base intact, so
+        // they never floor a colocated indel — that is what lets a het
+        // insertion + het deletion slide to a shared anchor and re-merge.
+        let insertion = record_at(41, "A", "AA");
+        assert!(record_is_pure_insertion(&insertion));
+        assert!(!record_is_substitution(&insertion));
+
+        let deletion = record_at(41, "AAAA", "A");
+        assert!(!record_is_pure_insertion(&deletion));
+        assert!(!record_is_substitution(&deletion));
+
+        // A substitution changes an existing base, so it blocks a colocated
+        // deletion's left-shift (chr21:9920194's SNP over the deletion).
+        let snp = record_at(9_920_194, "A", "C");
+        assert!(!record_is_pure_insertion(&snp));
+        assert!(record_is_substitution(&snp));
+
+        // A complex allele that both trims and changes a base is a barrier.
+        let complex = record_at(10, "ATC", "GC");
+        assert!(!record_is_pure_insertion(&complex));
+        assert!(record_is_substitution(&complex));
+
+        // Multi-allelic: a single substitution ALT makes the record a barrier
+        // even when another ALT is a clean insertion.
+        let mixed = record_at(10, "A", "AA,C");
+        assert!(!record_is_pure_insertion(&mixed));
+        assert!(record_is_substitution(&mixed));
+    }
+
+    #[test]
     fn shorter_following_deletion_releases_its_own_floor() {
         let mixed = record_at(100, "AACTTTTA", "G");
         let following = record_at(101, "ACT", "A");
