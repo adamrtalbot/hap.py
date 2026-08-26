@@ -1141,6 +1141,17 @@ pub(super) fn legacy_preprocessed_snp_first_positions(cluster: &Cluster) -> BTre
                             query.key == truth.key && equivalent_gt(&query.gt, &truth.gt)
                         })
                 })
+                // Decomposition products of a single truth variant carry the
+                // identical genotype string, and only those get SNP-first
+                // ordering from legacy's aggregator. Independent colocated
+                // records on opposite haplotypes (e.g. an insertion `1/0` and
+                // a SNP `0/1`) are two separate variants; legacy keeps their
+                // prep-stream order, which the ordinary ALT-lexical sort
+                // already reproduces. Gate on shared GT so this rule only
+                // fires for the genuine decomposition shape.
+                && truth_at_pos
+                    .first()
+                    .is_some_and(|first| truth_at_pos.iter().all(|v| v.gt == first.gt))
         })
         .collect()
 }

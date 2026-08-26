@@ -1502,6 +1502,34 @@ mod memory_guards {
     }
 
     #[test]
+    fn snp_first_skips_opposite_haplotype_colocated_records() {
+        // bk_lm shape: an insertion on hap0 (`1/0`) and a SNP on hap1 (`0/1`)
+        // colocate but are independent variants, not decomposition products of
+        // one truth call. Legacy keeps prep-stream order (indel first via the
+        // ordinary ALT-lexical sort), so the SNP-first rule must not fire.
+        let indel = variant(124, "G", "GT", "1/0");
+        let snp = variant(124, "G", "T", "0/1");
+        let query_snp = variant(124, "G", "T", "0/1");
+        let cluster = Cluster {
+            chrom: "chr1".to_string(),
+            start: 124,
+            end: 124,
+            truth: vec![indel, snp],
+            query: vec![query_snp],
+        };
+        assert!(legacy_preprocessed_snp_first_positions(&cluster).is_empty());
+
+        // Same locus, shared genotype (`0/1` both) is a genuine decomposition
+        // and still triggers SNP-first ordering.
+        let mut shared_gt = cluster.clone();
+        shared_gt.truth[0].gt = "0/1".to_string();
+        assert_eq!(
+            legacy_preprocessed_snp_first_positions(&shared_gt),
+            BTreeSet::from([124])
+        );
+    }
+
+    #[test]
     fn xcmp_excludes_filtered_truth_after_preprocessing() {
         let pass = variant(100, "A", "G", "1|1");
         let mut filtered = variant(101, "C", "T", "1|1");
