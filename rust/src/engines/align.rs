@@ -28,9 +28,18 @@
 
 use crate::engines::partial_credit::RefVar;
 
-const MATCH_SCORE: i32 = 2;
+// Legacy klib (ksw) global alignment scores — the BWA-MEM defaults declared in
+// hap.py `AlignmentParameters` (src/c++/include/Alignment.hh): match +1,
+// mismatch -4, gap-open 6, gap-extend 1, with an affine cost of
+// `GAP_OPEN + len * GAP_EXTEND` for a gap of `len` bases. Affine gaps make one
+// contiguous indel cheaper than several spread ones, so complex alleles keep
+// their insertions/deletions together (and prefer SNPs over a delete+insert
+// pair) exactly as legacy does.
+const MATCH_SCORE: i32 = 1;
 const MISMATCH_SCORE: i32 = -4;
-const GAP_SCORE: i32 = -4;
+const GAP_OPEN: i32 = 6;
+const GAP_EXTEND: i32 = 1;
+const NEG_INF: i32 = i32::MIN / 4;
 
 /// Decompose a REF/ALT pair into legacy-style primitives. `ref_start` is the
 /// 1-based absolute position of the first base of `ref_allele` on the contig.
@@ -112,12 +121,15 @@ enum Op {
     D,
 }
 
-/// Trace-source flag for backtrace tie-breaking.
+/// Which affine-DP layer a cell's optimum came from, for backtrace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Trace {
-    Diag,
-    Up,   // from (i-1, j): ref advanced without alt → deletion
-    Left, // from (i, j-1): alt advanced without ref → insertion
+enum Layer {
+    /// Diagonal step — ref and alt both advance (match or mismatch).
+    Match,
+    /// Gap in ref — alt advances only (insertion).
+    Insert,
+    /// Gap in alt — ref advances only (deletion).
+    Delete,
 }
 
 fn score_of(a: u8, b: u8) -> i32 {
@@ -128,81 +140,119 @@ fn score_of(a: u8, b: u8) -> i32 {
     }
 }
 
-/// Global pairwise alignment returning a CIGAR as a flat `Op` list (one entry
-/// per consumed base, not run-length encoded). Tie-breaks prefer diagonal
-/// steps, then `Up` (deletion), then `Left` (insertion), which in practice
-/// places gaps at the rightmost valid position — matching the orientation
-/// legacy `ksw`-style alignment produces on the REF/ALT pairs prepy stresses.
+/// Affine-gap global alignment (Gotoh) returning a per-base CIGAR as a flat
+/// `Op` list. Three layers are tracked: `h` (ends in a diagonal step), `e`
+/// (ends in an insertion — a gap in ref), and `f` (ends in a deletion — a gap
+/// in alt). A gap of `len` costs `GAP_OPEN + len * GAP_EXTEND`.
+///
+/// Tie-breaking mirrors legacy `ksw_global`, which right-aligns gaps: on equal
+/// score a diagonal step is preferred over opening a gap, and among gap layers
+/// the alignment prefers to *keep extending* an already-open gap rather than
+/// close and reopen it. This keeps a complex allele's indel contiguous and at
+/// the right-hand end of the aligned block.
 fn needleman_wunsch(ref_allele: &[u8], alt_allele: &[u8]) -> Vec<Op> {
     let m = ref_allele.len();
     let n = alt_allele.len();
 
-    let mut score = vec![vec![0i32; n + 1]; m + 1];
-    let mut trace = vec![vec![Trace::Diag; n + 1]; m + 1];
+    // h/e/f score layers and their backtrace pointers.
+    let mut h = vec![vec![NEG_INF; n + 1]; m + 1];
+    let mut e = vec![vec![NEG_INF; n + 1]; m + 1];
+    let mut f = vec![vec![NEG_INF; n + 1]; m + 1];
+    // For each layer, which layer we stepped from.
+    let mut h_from = vec![vec![Layer::Match; n + 1]; m + 1];
+    let mut e_from = vec![vec![Layer::Insert; n + 1]; m + 1];
+    let mut f_from = vec![vec![Layer::Delete; n + 1]; m + 1];
 
+    h[0][0] = 0;
     for i in 1..=m {
-        score[i][0] = GAP_SCORE * i as i32;
-        trace[i][0] = Trace::Up;
+        // Deletion of the first `i` reference bases.
+        f[i][0] = -(GAP_OPEN + i as i32 * GAP_EXTEND);
+        f_from[i][0] = Layer::Delete;
     }
     for j in 1..=n {
-        score[0][j] = GAP_SCORE * j as i32;
-        trace[0][j] = Trace::Left;
+        // Insertion of the first `j` alternate bases.
+        e[0][j] = -(GAP_OPEN + j as i32 * GAP_EXTEND);
+        e_from[0][j] = Layer::Insert;
     }
 
     for i in 1..=m {
         for j in 1..=n {
-            let diag = score[i - 1][j - 1] + score_of(ref_allele[i - 1], alt_allele[j - 1]);
-            let up = score[i - 1][j] + GAP_SCORE; // delete ref base
-            let left = score[i][j - 1] + GAP_SCORE; // insert alt base
-
-            // Tie-break rule: strict preference for Diag only when it is
-            // *strictly* better than both gap directions. On a tie between
-            // Diag and Left we prefer Left so the insertion ends up on the
-            // right-hand side of the alignment — this matches legacy's
-            // left-to-right `toPrimitives` walk which always emits tail
-            // insertions after all matches have been consumed. Among gap
-            // directions, Left (insertion) beats Up (deletion) on ties.
-            let (best_score, best_trace) = if diag > up && diag > left {
-                (diag, Trace::Diag)
-            } else if left >= up {
-                (left, Trace::Left)
+            // Insertion (gap in ref): alt advanced. Prefer extending an open
+            // insertion over reopening on a tie.
+            let open_e = h[i][j - 1] - (GAP_OPEN + GAP_EXTEND);
+            let extend_e = e[i][j - 1] - GAP_EXTEND;
+            if extend_e >= open_e {
+                e[i][j] = extend_e;
+                e_from[i][j] = Layer::Insert;
             } else {
-                (up, Trace::Up)
-            };
+                e[i][j] = open_e;
+                e_from[i][j] = Layer::Match;
+            }
 
-            score[i][j] = best_score;
-            trace[i][j] = best_trace;
+            // Deletion (gap in alt): ref advanced.
+            let open_f = h[i - 1][j] - (GAP_OPEN + GAP_EXTEND);
+            let extend_f = f[i - 1][j] - GAP_EXTEND;
+            if extend_f >= open_f {
+                f[i][j] = extend_f;
+                f_from[i][j] = Layer::Delete;
+            } else {
+                f[i][j] = open_f;
+                f_from[i][j] = Layer::Match;
+            }
+
+            // Diagonal step: best predecessor across layers, plus sub score.
+            let diag_prev = h[i - 1][j - 1].max(e[i - 1][j - 1]).max(f[i - 1][j - 1]);
+            h[i][j] = diag_prev + score_of(ref_allele[i - 1], alt_allele[j - 1]);
+            h_from[i][j] = if h[i - 1][j - 1] >= e[i - 1][j - 1] && h[i - 1][j - 1] >= f[i - 1][j - 1]
+            {
+                Layer::Match
+            } else if e[i - 1][j - 1] >= f[i - 1][j - 1] {
+                Layer::Insert
+            } else {
+                Layer::Delete
+            };
         }
     }
+
+    // Start in the highest-scoring layer at the corner. On a tie prefer a gap
+    // layer (Insert, then Delete) over Match so a trailing gap right-aligns.
+    let (mut layer, _) = [
+        (Layer::Insert, e[m][n]),
+        (Layer::Delete, f[m][n]),
+        (Layer::Match, h[m][n]),
+    ]
+    .into_iter()
+    .fold(
+        (Layer::Match, NEG_INF),
+        |(best_layer, best), (layer, score)| {
+            if score > best {
+                (layer, score)
+            } else {
+                (best_layer, best)
+            }
+        },
+    );
 
     let mut ops = Vec::with_capacity(m + n);
     let mut i = m;
     let mut j = n;
     while i > 0 || j > 0 {
-        match trace[i][j] {
-            Trace::Diag if i > 0 && j > 0 => {
+        match layer {
+            Layer::Match => {
                 ops.push(Op::M);
+                layer = h_from[i][j];
                 i -= 1;
                 j -= 1;
             }
-            Trace::Up if i > 0 => {
-                ops.push(Op::D);
-                i -= 1;
-            }
-            Trace::Left if j > 0 => {
+            Layer::Insert => {
                 ops.push(Op::I);
+                layer = e_from[i][j];
                 j -= 1;
             }
-            // Fall-back for degenerate edges (i==0 or j==0 where trace is
-            // forced by the border).
-            _ => {
-                if i > 0 {
-                    ops.push(Op::D);
-                    i -= 1;
-                } else {
-                    ops.push(Op::I);
-                    j -= 1;
-                }
+            Layer::Delete => {
+                ops.push(Op::D);
+                layer = f_from[i][j];
+                i -= 1;
             }
         }
     }
@@ -373,6 +423,42 @@ mod tests {
         assert_eq!(primitives.len(), 1);
         assert_eq!(primitives[0].start, 202);
         assert_eq!(primitives[0].end, 201);
+        assert_eq!(primitives[0].alt, "C");
+    }
+
+    #[test]
+    fn affine_gaps_keep_complex_insertions_contiguous() {
+        // CC → TCTCT in a CT repeat. Affine gaps prefer one contiguous
+        // insertion (SNP C>T then a 3-base insertion) over three spread single
+        // insertions, matching legacy klib. Positions are relative to ref_start.
+        let primitives = realign_ref_var(216, b"CC", b"TCTCT");
+        assert_eq!(primitives.len(), 2, "{primitives:?}");
+        // SNP C>T at the first base.
+        assert_eq!((primitives[0].start, primitives[0].end), (216, 216));
+        assert_eq!(primitives[0].alt, "T");
+        // Contiguous insertion of "TCT" after the second base (reflen 0).
+        assert_eq!((primitives[1].start, primitives[1].end), (218, 217));
+        assert_eq!(primitives[1].alt, "TCT");
+    }
+
+    #[test]
+    fn affine_prefers_two_snps_over_delete_insert_on_a_swap() {
+        // GC → CG. Two mismatches (-8) beat a delete+insert pair (two gap
+        // opens), so a transposition decomposes into two SNPs, not an indel
+        // pair.
+        let primitives = realign_ref_var(26, b"GC", b"CG");
+        assert_eq!(primitives.len(), 2, "{primitives:?}");
+        assert_eq!((primitives[0].start, primitives[0].alt.as_str()), (26, "C"));
+        assert_eq!((primitives[1].start, primitives[1].alt.as_str()), (27, "G"));
+    }
+
+    #[test]
+    fn affine_finds_a_clean_middle_insertion() {
+        // GA → GCA. A single clean insertion beats a mismatch-plus-insertion,
+        // so the extra base is inserted between the two matches.
+        let primitives = realign_ref_var(17, b"GA", b"GCA");
+        assert_eq!(primitives.len(), 1, "{primitives:?}");
+        assert_eq!((primitives[0].start, primitives[0].end), (18, 17));
         assert_eq!(primitives[0].alt, "C");
     }
 
