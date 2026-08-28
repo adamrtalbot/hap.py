@@ -203,14 +203,14 @@ fn needleman_wunsch(ref_allele: &[u8], alt_allele: &[u8]) -> Vec<Op> {
             // Diagonal step: best predecessor across layers, plus sub score.
             let diag_prev = h[i - 1][j - 1].max(e[i - 1][j - 1]).max(f[i - 1][j - 1]);
             h[i][j] = diag_prev + score_of(ref_allele[i - 1], alt_allele[j - 1]);
-            h_from[i][j] = if h[i - 1][j - 1] >= e[i - 1][j - 1] && h[i - 1][j - 1] >= f[i - 1][j - 1]
-            {
-                Layer::Match
-            } else if e[i - 1][j - 1] >= f[i - 1][j - 1] {
-                Layer::Insert
-            } else {
-                Layer::Delete
-            };
+            h_from[i][j] =
+                if h[i - 1][j - 1] >= e[i - 1][j - 1] && h[i - 1][j - 1] >= f[i - 1][j - 1] {
+                    Layer::Match
+                } else if e[i - 1][j - 1] >= f[i - 1][j - 1] {
+                    Layer::Insert
+                } else {
+                    Layer::Delete
+                };
         }
     }
 

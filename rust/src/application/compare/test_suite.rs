@@ -1336,7 +1336,7 @@ mod memory_guards {
         // htslib pairs on allele spelling: the insertion is the only key the
         // other input also carries, so it leads its position regardless of
         // which line came first in this file.
-        let paired = BTreeSet::from([insertion.key.clone()]);
+        let paired = BTreeMap::from([(insertion.key.clone(), 1)]);
 
         let truth_order =
             legacy_graph_truth_order(&[snp.clone(), insertion.clone(), later.clone()], &paired);
@@ -1352,7 +1352,7 @@ mod memory_guards {
         // the insertion stays behind the substitution it followed in the file.
         let raw = legacy_graph_truth_order(
             &[snp.clone(), insertion.clone(), later.clone()],
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         );
         assert_eq!(
             raw.iter().map(|v| v.key.clone()).collect::<Vec<_>>(),
@@ -1364,7 +1364,7 @@ mod memory_guards {
         // on it even when the file listed them the other way round.
         let query_order = legacy_graph_query_order(
             &[insertion.clone(), snp.clone(), later.clone()],
-            &BTreeSet::new(),
+            &BTreeMap::new(),
             &[],
         );
         assert_eq!(
@@ -1372,11 +1372,11 @@ mod memory_guards {
                 .iter()
                 .map(|v| v.key.clone())
                 .collect::<Vec<_>>(),
-            vec![snp.key.clone(), insertion.key.clone(), later.key]
+            vec![snp.key.clone(), insertion.key.clone(), later.key.clone()]
         );
 
         // Paired query records take the truth stream's order instead.
-        let both = BTreeSet::from([snp.key.clone(), insertion.key.clone()]);
+        let both = BTreeMap::from([(snp.key.clone(), 1), (insertion.key.clone(), 1)]);
         let truth = legacy_graph_truth_order(&[insertion.clone(), snp.clone()], &both);
         let paired_query =
             legacy_graph_query_order(&[snp.clone(), insertion.clone()], &both, &truth);
@@ -1385,7 +1385,25 @@ mod memory_guards {
                 .iter()
                 .map(|v| v.key.clone())
                 .collect::<Vec<_>>(),
-            vec![insertion.key, snp.key]
+            vec![insertion.key.clone(), snp.key.clone()]
+        );
+
+        // A spelling one side repeats pairs only as often as the other side
+        // carries it; the excess copies join the single-file class. The bound
+        // is min(truth copies, query copies), so it holds in both directions.
+        assert_eq!(
+            paired_multiplicities(
+                std::slice::from_ref(&snp),
+                &[snp.clone(), snp.clone(), later.clone()]
+            ),
+            BTreeMap::from([(snp.key.clone(), 1)])
+        );
+        assert_eq!(
+            paired_multiplicities(
+                &[snp.clone(), snp.clone(), later.clone()],
+                std::slice::from_ref(&snp)
+            ),
+            BTreeMap::from([(snp.key.clone(), 1)])
         );
     }
 
@@ -2337,6 +2355,76 @@ mod memory_guards {
                 "{aggregate_gt}: truth homalt must am-pair, not emit standalone FN:lm, got {at_57:?}"
             );
         }
+    }
+
+    #[test]
+    fn duplicate_deletion_spelling_beside_snp_keeps_local_mismatch_block_kind() {
+        // chr6:57 as pre.py actually hands it to xcmp: the query carries the
+        // same `TC>T` spelling twice (opposite haplotypes) plus a `T>A` SNP,
+        // against a single truth `TC>T` homalt.
+        //
+        // htslib's synced reader pairs one line per file into a variant set, so
+        // only the FIRST query `TC>T` shares truth's set; the duplicate joins
+        // the single-file class and follows the SNP, whose trimmed edit start
+        // (57) precedes the deletion's (58). That order gives the SNP node a
+        // forward edge into a deletion node, so the graph enumerates a
+        // SNP+deletion haplotype, the signature sets are disjoint, and legacy
+        // reports hap:mismatch — `BK=lm` on both query-only FP rows.
+        //
+        // The legacy verdict here is not asserted from this fixture: the shape
+        // is driven by the pinned HAPPY samplesheet case
+        // `duplicate_alt_deletion_aggregate`, whose query `TC>A` decomposes to
+        // exactly these three rows. This test is the fast guard for that lane.
+        let reference_slice = "TCTAACTCTGTTTCTCTCTCTCTCTCTAACTCTGTTTCTCTCTCTCTCTCTCTCTCTCGCTCCTGCTTTCACCACATGATTTTCCTGCTCCCACTTCACTTTCTGCCATGATTGTAAGCTTTTTGAGGCCCTCACCAGAAGCTGAGCAGATGCTGGTGCCATGCTTATATGGCCTGCAGAACTGTAATCCAATTTAACCTCTTTTCTTTATCAATTACCCAGACTCAGATATTTCTTTGTAGCAACTCAAG";
+        let reference = BTreeMap::from([("chr6".to_string(), reference_slice.to_string())]);
+        let cluster = Cluster {
+            chrom: "chr6".to_string(),
+            start: 55,
+            end: 57,
+            truth: vec![variant(55, "TC", "T", "1/1"), variant(57, "TC", "T", "1/1")],
+            query: vec![
+                variant(55, "TC", "T", "1/1"),
+                variant(57, "TC", "T", "0/1"),
+                variant(57, "T", "A", "1/0"),
+                variant(57, "TC", "T", "1/0"),
+            ],
+        };
+        let mut counts = BTreeMap::new();
+        let mut subtype_counts = BTreeMap::new();
+        let mut rows = Vec::new();
+        process_cluster(
+            &cluster,
+            &reference,
+            None,
+            ComparisonConfig {
+                no_hc: false,
+                max_enum: 100_000,
+                hb_expand: 0,
+            },
+            &mut counts,
+            &mut subtype_counts,
+            &mut rows,
+        )
+        .unwrap();
+
+        let at_57: Vec<String> = rows
+            .iter()
+            .map(|row| row.record.raw().to_line())
+            .filter(|line| line.split('\t').nth(1) == Some("57"))
+            .collect();
+        assert_eq!(
+            at_57
+                .iter()
+                .filter(|line| line.contains(":FN:am:") && line.contains(":FP:am:"))
+                .count(),
+            1,
+            "one combined FN:am/FP:am deletion row expected, got {at_57:?}"
+        );
+        assert_eq!(
+            at_57.iter().filter(|line| line.contains(":FP:lm:")).count(),
+            2,
+            "duplicate deletion and SNP must each be FP:lm, got {at_57:?}"
+        );
     }
 
     #[test]

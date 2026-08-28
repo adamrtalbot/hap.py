@@ -259,6 +259,52 @@ fn push_cluster_entry(cluster: &mut Cluster, entry: Entry) {
     }
 }
 
+/// How many records of each spelling the two sides can pair up.
+///
+/// A variant set in htslib's synced reader holds at most one line per file, so
+/// a `(pos, ref, alt)` carried `n` times by the truth and `m` times by the
+/// query pairs `min(n, m)` of them; the excess copies stay in the single-file
+/// class alongside the spellings only one side has. pre.py emits a repeated
+/// deletion spelling as two opposite-haplotype rows, so a block can hold two
+/// query copies against one truth record.
+pub(super) fn paired_multiplicities(
+    truth: &[Variant],
+    query: &[Variant],
+) -> BTreeMap<VariantKey, usize> {
+    let mut slots = BTreeMap::<VariantKey, usize>::new();
+    for variant in truth {
+        *slots.entry(variant.key.clone()).or_default() += 1;
+    }
+    let mut paired = BTreeMap::new();
+    for variant in query {
+        if take_slot(&mut slots, &variant.key) {
+            *paired.entry(variant.key.clone()).or_default() += 1;
+        }
+    }
+    paired
+}
+
+/// Claim one of `key`'s remaining slots, reporting whether one was left.
+fn take_slot(slots: &mut BTreeMap<VariantKey, usize>, key: &VariantKey) -> bool {
+    match slots.get_mut(key) {
+        Some(remaining) if *remaining > 0 => {
+            *remaining -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Mark the first `paired[key]` occurrences of each spelling as paired, in the
+/// side's own stream order.
+fn paired_flags(records: &[Variant], paired: &BTreeMap<VariantKey, usize>) -> Vec<bool> {
+    let mut slots = paired.clone();
+    records
+        .iter()
+        .map(|variant| take_slot(&mut slots, &variant.key))
+        .collect()
+}
+
 /// Order one side's block records the way legacy xcmp sees them.
 ///
 /// legacy's `VariantReader` pulls records through htslib's synced reader,
@@ -287,16 +333,15 @@ fn push_cluster_entry(cluster: &mut Cluster, entry: Entry) {
 /// truth-only positions keep raw order in the cases where the two disagree.
 pub(super) fn legacy_graph_truth_order(
     truth: &[Variant],
-    paired_keys: &BTreeSet<VariantKey>,
+    paired: &BTreeMap<VariantKey, usize>,
 ) -> Vec<Variant> {
-    let mut ordered = truth.to_vec();
-    ordered.sort_by_key(|variant| {
-        (
-            variant.key.pos,
-            usize::from(!paired_keys.contains(&variant.key)),
-        )
-    });
-    ordered
+    let mut ordered = truth
+        .iter()
+        .cloned()
+        .zip(paired_flags(truth, paired))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(variant, is_paired)| (variant.key.pos, usize::from(!*is_paired)));
+    ordered.into_iter().map(|(variant, _)| variant).collect()
 }
 
 /// Query-side counterpart of [`legacy_graph_truth_order`]. Paired records take
@@ -305,28 +350,36 @@ pub(super) fn legacy_graph_truth_order(
 /// and the query-only remainder follows pre.py's trimmed-start order.
 pub(super) fn legacy_graph_query_order(
     query: &[Variant],
-    paired_keys: &BTreeSet<VariantKey>,
+    paired: &BTreeMap<VariantKey, usize>,
     truth_order: &[Variant],
 ) -> Vec<Variant> {
-    let truth_rank = truth_order
+    // A spelling the truth repeats takes the rank of its FIRST copy: htslib
+    // fills the variant sets in stream order, so query copy 1 rides with truth
+    // copy 1. `or_insert` keeps that first rank where `collect` would keep the
+    // last.
+    let mut truth_rank = BTreeMap::new();
+    for (rank, variant) in truth_order.iter().enumerate() {
+        truth_rank
+            .entry(variant.key.clone())
+            .or_insert(rank as isize);
+    }
+    let mut ordered = query
         .iter()
-        .enumerate()
-        .map(|(rank, variant)| (variant.key.clone(), rank as isize))
-        .collect::<BTreeMap<_, _>>();
-    let mut ordered = query.to_vec();
-    ordered.sort_by_key(|variant| {
-        let paired = paired_keys.contains(&variant.key);
+        .cloned()
+        .zip(paired_flags(query, paired))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(variant, is_paired)| {
         (
             variant.key.pos,
-            usize::from(!paired),
-            if paired {
+            usize::from(!*is_paired),
+            if *is_paired {
                 truth_rank.get(&variant.key).copied().unwrap_or(0)
             } else {
                 legacy_graph::selected_edit_start(variant)
             },
         )
     });
-    ordered
+    ordered.into_iter().map(|(variant, _)| variant).collect()
 }
 
 pub(super) fn process_cluster(
@@ -496,24 +549,12 @@ pub(super) fn process_cluster(
     let (mut truth_sig, mut query_sig) = (linear_truth_sig.clone(), linear_query_sig.clone());
     if allow_haplotype_match {
         // htslib pairs the two inputs' lines on allele spelling alone, so the
-        // "seen on both sides" class is the intersection of the block's
-        // (pos, ref, alt) keys — genotypes play no part.
-        let truth_keys = cluster
-            .truth
-            .iter()
-            .map(|variant| variant.key.clone())
-            .collect::<BTreeSet<_>>();
-        let query_keys = cluster
-            .query
-            .iter()
-            .map(|variant| variant.key.clone())
-            .collect::<BTreeSet<_>>();
-        let paired_keys = truth_keys
-            .intersection(&query_keys)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let graph_truth = legacy_graph_truth_order(&cluster.truth, &paired_keys);
-        let graph_query = legacy_graph_query_order(&cluster.query, &paired_keys, &graph_truth);
+        // "seen on both sides" class keys off the block's (pos, ref, alt) —
+        // genotypes play no part — bounded by how many copies of a spelling
+        // each side carries.
+        let paired = paired_multiplicities(&cluster.truth, &cluster.query);
+        let graph_truth = legacy_graph_truth_order(&cluster.truth, &paired);
+        let graph_query = legacy_graph_query_order(&cluster.query, &paired, &graph_truth);
         truth_sig = legacy_graph::signatures(
             &graph_truth,
             reference,
