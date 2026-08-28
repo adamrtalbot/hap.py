@@ -793,6 +793,12 @@ pub(crate) fn aggregate_location_records_with_successor(
     aggregate_location_records_inner(records, false, successor_present)
 }
 
+/// One reference base replaced by one alternate base: the aggregator classes
+/// every other single-ALT shape as an indel.
+fn record_is_snp(record: &RawVcfRecord) -> bool {
+    record.ref_allele.len() == 1 && record.alt_allele.len() == 1
+}
+
 fn aggregate_location_records_inner(
     mut records: Vec<RawVcfRecord>,
     preserve_pair_order: bool,
@@ -818,25 +824,20 @@ fn aggregate_location_records_inner(
         let has_deletion = records
             .iter()
             .any(|record| record.ref_allele.len() > record.alt_allele.len());
-        let has_snp = records
-            .iter()
-            .any(|record| record.ref_allele.len() == 1 && record.alt_allele.len() == 1);
+        let has_snp = records.iter().any(record_is_snp);
         let mut snp_keys = std::collections::HashSet::new();
         let has_duplicate_snp = records.iter().any(|record| {
-            record.ref_allele.len() == 1
-                && record.alt_allele.len() == 1
+            record_is_snp(record)
                 && !snp_keys.insert((record.ref_allele.as_str(), record.alt_allele.as_str()))
         });
         let preserve_sorted_pair_order =
             has_insertion && has_deletion && has_snp && has_duplicate_snp;
         if has_insertion && has_deletion && has_snp && !has_duplicate_snp {
-            records.sort_by_key(|record| {
-                usize::from(!(record.ref_allele.len() == 1 && record.alt_allele.len() == 1))
-            });
+            records.sort_by_key(|record| usize::from(!record_is_snp(record)));
         } else if !(has_insertion && has_deletion) || preserve_sorted_pair_order {
             records.sort_by(|left, right| {
                 let class = |record: &RawVcfRecord| {
-                    if record.ref_allele.len() == 1 && record.alt_allele.len() == 1 {
+                    if record_is_snp(record) {
                         0
                     } else if record.ref_allele.len() > record.alt_allele.len() {
                         1
@@ -871,9 +872,23 @@ fn aggregate_location_records_inner(
         }
         return aggregated;
     }
-    if records.len() != 2
-        || records[0].chrom != records[1].chrom
-        || records[0].pos != records[1].pos
+    let same_location_pair = records.len() == 2
+        && records[0].chrom == records[1].chrom
+        && records[0].pos == records[1].pos;
+    // A SNP sharing a position with an indel never merges, and legacy emits
+    // the SNP first whatever order the input listed the two in. The longer
+    // groups above already class-sort SNPs to the front, and a merged het-alt
+    // tail is never a SNP, so only a fresh pair can arrive the other way up.
+    // Legacy splits every multi-allelic record before this stage, so a comma
+    // ALT has no measured order and keeps its arrival position.
+    if same_location_pair
+        && record_is_snp(&records[1])
+        && !record_is_snp(&records[0])
+        && !records[0].alt_allele.contains(',')
+    {
+        records.swap(0, 1);
+    }
+    if !same_location_pair
         || records.iter().any(|record| record.alt_allele.contains(','))
         || records[0].filter != records[1].filter
         || records[0].format != records[1].format
@@ -881,9 +896,7 @@ fn aggregate_location_records_inner(
     {
         return records;
     }
-    let first_is_snp = records[0].ref_allele.len() == 1 && records[0].alt_allele.len() == 1;
-    let second_is_snp = records[1].ref_allele.len() == 1 && records[1].alt_allele.len() == 1;
-    if first_is_snp != second_is_snp {
+    if record_is_snp(&records[0]) != record_is_snp(&records[1]) {
         return records;
     }
     let format_keys = records[0]
@@ -1324,6 +1337,52 @@ mod tests {
         assert_eq!(out[0].ref_allele, "TCT");
         assert_eq!(out[0].alt_allele, "TACT,T");
         assert_eq!(out[0].samples[0], "2/1");
+    }
+
+    #[test]
+    fn location_aggregator_emits_snp_before_indel_at_a_shared_position() {
+        // Measured on the pinned pre.py: a deletion listed ahead of a
+        // same-position SNP comes back SNP first, and so does an insertion.
+        let deletion = make_record("chr1", 41, "TGA", "T", "GT", "0/1");
+        let snp = make_record("chr1", 41, "T", "C", "GT", "0/1");
+
+        let out = aggregate_location_records(vec![deletion, snp]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alt_allele, "C");
+        assert_eq!(out[1].ref_allele, "TGA");
+
+        let insertion = make_record("chr1", 41, "T", "TCC", "GT", "0/1");
+        let snp = make_record("chr1", 41, "T", "C", "GT", "1/1");
+
+        let out = aggregate_location_records(vec![insertion, snp]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alt_allele, "C");
+        assert_eq!(out[1].alt_allele, "TCC");
+
+        // The hoist happens before the pair reaches the guards that refuse
+        // records differing in FILTER, so a filtered indel still trails.
+        let mut deletion = make_record("chr1", 20, "CCA", "C", "GT", "0/1");
+        deletion.filter = "LowQual".into();
+        let snp = make_record("chr1", 20, "C", "G", "GT", "0/1");
+
+        let out = aggregate_location_records(vec![deletion, snp]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alt_allele, "G");
+        assert_eq!(out[1].filter, "LowQual");
+
+        // Legacy splits multi-allelics upstream, so a comma ALT reaching the
+        // aggregator has no measured order and keeps its arrival position.
+        let multiallelic = make_record("chr1", 41, "T", "A,G", "GT", "1/2");
+        let snp = make_record("chr1", 41, "T", "C", "GT", "0/1");
+
+        let out = aggregate_location_records(vec![multiallelic, snp]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alt_allele, "A,G");
+        assert_eq!(out[1].alt_allele, "C");
     }
 
     #[test]
