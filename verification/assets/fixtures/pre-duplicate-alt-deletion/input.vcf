@@ -1,0 +1,11 @@
+##fileformat=VCFv4.2
+##contig=<ID=chrA,length=200>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype quality">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+##FORMAT=<ID=VAF,Number=A,Type=Float,Description="Variant allele fraction">
+##FORMAT=<ID=PL,Number=G,Type=Integer,Description="Phred genotype likelihoods">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+chrA	100	.	TGAGA	C	61.6	PASS	.	GT:GQ:DP:AD:VAF:PL	1/0:19:24:0,0:0:61,21,52
+chrA	100	.	TGAGA	T	61.6	PASS	.	GT:GQ:DP:AD:VAF:PL	0/1:19:24:0,24:1:61,21,51

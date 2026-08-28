@@ -863,12 +863,11 @@ fn aggregate_location_records_inner(
                 preserve_sorted_pair_order,
                 successor_present,
             );
-            if merged.len() == 1 {
-                aggregated.extend(merged);
-            } else {
-                aggregated.push(previous);
-                aggregated.push(record);
-            }
+            // Emit the pair in the order the aggregator returned. That order is
+            // the input order for every path except duplicate-alt deletions,
+            // which legacy orders direct-before-realigned (chr1:118558359
+            // TGAGA>T 0/1 then 1/0).
+            aggregated.extend(merged);
         }
         return aggregated;
     }
@@ -1005,18 +1004,33 @@ fn aggregate_location_records_inner(
     if records[0].alt_allele == records[1].alt_allele {
         // VariantAlleleUniq.cpp keys alleles on their internal RefVar before
         // final VCF padding. Exact internal duplicates collapse to one hom-alt.
-        // Distinct edits can serialize to the same padded REF/ALT spelling;
-        // legacy preserves both ALT entries and their aggregator-derived
-        // het-alt genotype. xcmp's VariantReader.cpp then deduplicates those
-        // spellings when it reads the VCF.
+        // Distinct edits that serialize to the same padded REF/ALT spelling are
+        // shaped differently by pre.py depending on the primitive kind (all
+        // measured against pinned happy-0.3.15):
+        //   - identical INSERTIONS aggregate into one het-alt `X,X` (2/1)
+        //     (chr6:6 A>AGTGTGTGT twice, chr1:105 A>ACCCT twice).
+        //   - identical DELETIONS stay as two separate rows, each keeping its
+        //     own genotype (HG003 PEPPER chr1:118558359 TGAGA>T 0/1 and 1/0,
+        //     plus 158893037 CT>C, 226545091 CT>C, 45831780 GT>G; the happy
+        //     fixture chr6:57 TC>T is the same shape).
         let distinct_internal_edits = records[0]
             .primitive_identity
             .as_ref()
             .zip(records[1].primitive_identity.as_ref())
             .is_some_and(|(first, second)| first != second);
+        let both_insertions = records
+            .iter()
+            .all(|record| record.ref_allele.len() < record.alt_allele.len());
         if distinct_internal_edits {
-            let merged = merge_records(records, ad_index, Some(gt_index));
-            return vec![merged];
+            if both_insertions {
+                let merged = merge_records(records, ad_index, Some(gt_index));
+                return vec![merged];
+            }
+            // Legacy emits the direct deletion (non-mixed primitive) before the
+            // one recovered from a complex allele's realignment (measured at
+            // chr1:118558359: TGAGA>T 0/1 then TGAGA>T 1/0).
+            records.sort_by_key(|record| record.mixed_edit_primitive);
+            return records;
         }
         let mut merged = records.remove(0);
         for sample in &mut merged.samples {
@@ -1774,9 +1788,39 @@ mod tests {
 
         let out = aggregate_location_records(vec![direct, realigned]);
 
+        // Distinct internal edits that pad to the same INSERTION spelling
+        // aggregate into one het-alt row (measured: chr6:6 A>AGTGTGTGT twice).
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].alt_allele, "AT,AT");
         assert_eq!(out[0].samples[0], "2/1");
+    }
+
+    #[test]
+    fn legacy_only_distinct_internal_deletions_stay_two_rows() {
+        // Two identical-spelling DELETIONS with distinct internal edits stay as
+        // two separate rows in pre.py, each keeping its own genotype (measured:
+        // HG003 PEPPER chr1:118558359 TGAGA>T emitted 0/1 and 1/0).
+        let mut direct = make_record("chr1", 105, "TGAGA", "T", "GT", "0/1");
+        direct.primitive_identity = Some(PrimitiveIdentity {
+            start: 105,
+            end: 109,
+            alt: "T".to_string(),
+        });
+        let mut realigned = make_record("chr1", 105, "TGAGA", "T", "GT", "1/0");
+        realigned.mixed_edit_primitive = true;
+        realigned.primitive_identity = Some(PrimitiveIdentity {
+            start: 106,
+            end: 109,
+            alt: String::new(),
+        });
+
+        let out = aggregate_location_records(vec![direct, realigned]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alt_allele, "T");
+        assert_eq!(out[1].alt_allele, "T");
+        assert_eq!(out[0].samples[0], "0/1");
+        assert_eq!(out[1].samples[0], "1/0");
     }
 
     #[test]
