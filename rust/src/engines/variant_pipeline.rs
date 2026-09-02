@@ -313,6 +313,15 @@ fn swap_hetalt_gt(gt: &str) -> String {
     gt.to_string()
 }
 
+/// Whether the primitive splitter fans this record out on its own. When it
+/// returns false the record passes through `primitive_split_with_context`
+/// whole, so a multi-allelic ALT would reach the aggregator un-split unless
+/// the caller runs `VariantAlleleSplitter` first.
+pub(crate) fn record_needs_primitive_split(record: &RawVcfRecord) -> bool {
+    let alts: Vec<&str> = record.alt_allele.split(',').collect();
+    needs_primitive_split(record, &alts)
+}
+
 fn needs_primitive_split(record: &RawVcfRecord, alts: &[&str]) -> bool {
     if record.alt_allele == "." || record.alt_allele.is_empty() {
         return false;

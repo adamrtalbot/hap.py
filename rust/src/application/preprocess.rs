@@ -1004,11 +1004,42 @@ fn process_normalized_record(
         record.ref_allele.clone(),
         record.alt_allele.clone(),
     ));
+    // Legacy always runs VariantAlleleSplitter, fanning a multi-allelic record
+    // into one record per called ALT before the location aggregator. The
+    // primitive splitter (decompose) already splits the indel/complex alleles
+    // it recognizes, so only pre-split the multi-allelics it leaves whole: in
+    // no-decompose mode that is every multi-allelic, in decompose mode just the
+    // pure-SNP ones `record_needs_primitive_split` skips. Without this a comma
+    // ALT reaches `aggregate_location_records_inner`, which refuses to merge it
+    // with a colocated single, so a het-alt like `T>A,C` never forms and a
+    // standalone `TGA>T,TG` never fans out to its two per-position deletions.
+    //
+    // ponytail: single-sample only. The split's per-position primitives are
+    // re-merged by `aggregate_location_records_inner`, whose het-alt merge is
+    // not lossless for multi-sample records (splitting a 2-sample somatic
+    // `C>T,G` drops an allele). Legacy splits regardless of sample count; the
+    // upgrade path is a multi-sample-correct aggregator re-merge, after which
+    // this `samples.len() == 1` guard can drop.
+    let is_multi_allelic = record.alt_allele.contains(',')
+        && !record.alt_allele.split(',').any(is_symbolic_allele);
+    let split_multi_allelic = is_multi_allelic
+        && record.samples.len() == 1
+        && (!decompose || !variant_pipeline::record_needs_primitive_split(&record));
     let source_records = if matches!(
         symbolic_deletion,
         Some(SymbolicDeletionMaterialization::LeadingAnchor)
     ) {
         split_called_alleles(&record)
+    } else if split_multi_allelic {
+        // The reversed het-of-alts orientation is a symbolic-deletion detail;
+        // the plain allele split keeps each call's projected GT verbatim.
+        split_called_alleles(&record)
+            .into_iter()
+            .map(|mut materialized| {
+                materialized.reverse_hetalt_samples = Vec::new();
+                materialized
+            })
+            .collect()
     } else {
         vec![MaterializedAlleleRecord {
             record,
